@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Result;
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
-use tantivy::schema::{IndexRecordOption, OwnedDocument, Term, Value};
+use tantivy::schema::{IndexRecordOption, TantivyDocument, Term, Value};
 use tantivy::{Index, IndexReader};
 
 use crate::search::tantivy::fields_from_schema;
@@ -97,7 +97,7 @@ impl SearchClient {
         let top_docs = searcher.search(&q, &TopDocs::with_limit(limit))?;
         let mut hits = Vec::new();
         for (score, addr) in top_docs {
-            let doc: OwnedDocument = searcher.doc(addr)?;
+            let doc = searcher.doc::<TantivyDocument>(addr)?;
             let title = doc_title(&doc, self.fields.title);
             let snippet = doc_snippet(&doc, self.fields.content);
             let source = doc_text(&doc, self.fields.source_path);
@@ -112,14 +112,14 @@ impl SearchClient {
     }
 }
 
-fn doc_title(doc: &OwnedDocument, field: tantivy::schema::Field) -> String {
+fn doc_title(doc: &TantivyDocument, field: tantivy::schema::Field) -> String {
     doc.get_first(field)
-        .and_then(|v| v.as_text())
+        .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
 }
 
-fn doc_snippet(doc: &OwnedDocument, field: tantivy::schema::Field) -> String {
+fn doc_snippet(doc: &TantivyDocument, field: tantivy::schema::Field) -> String {
     doc_text(doc, field)
         .lines()
         .next()
@@ -127,9 +127,9 @@ fn doc_snippet(doc: &OwnedDocument, field: tantivy::schema::Field) -> String {
         .to_string()
 }
 
-fn doc_text(doc: &OwnedDocument, field: tantivy::schema::Field) -> String {
+fn doc_text(doc: &TantivyDocument, field: tantivy::schema::Field) -> String {
     doc.get_first(field)
-        .and_then(|v: &Value| v.as_text())
+        .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
 }

@@ -93,7 +93,7 @@ pub fn fields_from_schema(schema: &Schema) -> Result<Fields> {
     let get = |name: &str| {
         schema
             .get_field(name)
-            .ok_or_else(|| anyhow!("schema missing {}", name))
+            .map_err(|_| anyhow!("schema missing {}", name))
     };
     Ok(Fields {
         agent: get("agent")?,
