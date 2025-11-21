@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use notify::{recommended_watcher, RecursiveMode, Watcher};
+use notify::{RecursiveMode, Watcher, recommended_watcher};
 
 use crate::connectors::NormalizedConversation;
 use crate::connectors::{
@@ -12,6 +12,7 @@ use crate::connectors::{
 use crate::search::tantivy::{TantivyIndex, index_dir};
 use crate::storage::sqlite::SqliteStorage;
 
+#[derive(Clone)]
 pub struct IndexOptions {
     pub full: bool,
     pub watch: bool,
@@ -48,7 +49,7 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
     t_index.commit()?;
 
     if opts.watch {
-        watch_sources(|| {
+        watch_sources(move || {
             let _ = run_index(IndexOptions {
                 watch: false,
                 ..opts.clone()
@@ -65,13 +66,13 @@ fn ingest_batch(
     convs: Vec<NormalizedConversation>,
 ) -> Result<()> {
     for conv in convs {
-        super::persist::persist_conversation(storage, t_index, &conv)?;
+        persist::persist_conversation(storage, t_index, &conv)?;
     }
     Ok(())
 }
 
 fn watch_sources<F: Fn() + Send + 'static>(callback: F) -> Result<()> {
-    let mut watcher = recommended_watcher(move |res| {
+    let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| {
         if res.is_ok() {
             callback();
         }
@@ -87,24 +88,18 @@ fn watch_sources<F: Fn() + Send + 'static>(callback: F) -> Result<()> {
 }
 
 fn watch_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    roots.push(
+    vec![
         std::env::var("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".codex/sessions")),
-    );
-    roots.push(
         dirs::home_dir()
             .unwrap_or_default()
             .join(".config/Code/User/globalStorage/saoudrizwan.claude-dev"),
-    );
-    roots.push(dirs::home_dir().unwrap_or_default().join(".gemini/tmp"));
-    roots.push(
+        dirs::home_dir().unwrap_or_default().join(".gemini/tmp"),
         dirs::home_dir()
             .unwrap_or_default()
             .join(".claude/projects"),
-    );
-    roots
+    ]
 }
 
 pub mod persist {
