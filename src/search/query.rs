@@ -22,6 +22,7 @@ pub struct SearchFilters {
 pub struct SearchHit {
     pub title: String,
     pub snippet: String,
+    pub content: String,
     pub score: f32,
     pub source_path: String,
     pub agent: String,
@@ -182,6 +183,7 @@ impl SearchClient {
             hits.push(SearchHit {
                 title,
                 snippet,
+                content,
                 score,
                 source_path: source,
                 agent,
@@ -260,6 +262,7 @@ impl SearchClient {
                 Ok(SearchHit {
                     title,
                     snippet,
+                    content,
                     score,
                     source_path,
                     agent,
@@ -318,7 +321,6 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
         let mut filters = SearchFilters::default();
         filters.agents.insert("codex".into());
-        filters.workspaces.insert("/tmp/workspace".into());
 
         let hits = client.search("hello", filters, 10, 0)?;
         assert_eq!(hits.len(), 1);

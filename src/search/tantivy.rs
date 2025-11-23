@@ -46,7 +46,29 @@ impl TantivyIndex {
     }
 
     pub fn add_conversation(&mut self, conv: &NormalizedConversation) -> Result<()> {
-        for msg in &conv.messages {
+        self.add_messages(conv, &conv.messages)
+    }
+
+    pub fn delete_all(&mut self) -> Result<()> {
+        self.writer.delete_all_documents()?;
+        Ok(())
+    }
+
+    pub fn commit(&mut self) -> Result<()> {
+        self.writer.commit()?;
+        Ok(())
+    }
+
+    pub fn reader(&self) -> Result<IndexReader> {
+        Ok(self.index.reader()?)
+    }
+
+    pub fn add_messages(
+        &mut self,
+        conv: &NormalizedConversation,
+        messages: &[crate::connectors::NormalizedMessage],
+    ) -> Result<()> {
+        for msg in messages {
             let mut d = doc! {
                 self.fields.agent => conv.agent_slug.clone(),
                 self.fields.source_path => conv.source_path.to_string_lossy().into_owned(),
@@ -65,15 +87,6 @@ impl TantivyIndex {
             self.writer.add_document(d)?;
         }
         Ok(())
-    }
-
-    pub fn commit(&mut self) -> Result<()> {
-        self.writer.commit()?;
-        Ok(())
-    }
-
-    pub fn reader(&self) -> Result<IndexReader> {
-        Ok(self.index.reader()?)
     }
 }
 
