@@ -7,7 +7,24 @@ on:
       - 'v*'
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: fmt
+        run: cargo fmt -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: tests (unit + e2e)
+        run: |
+          cargo test
+          cargo test --test install_scripts -- --test-threads=1
+          cargo test --test e2e_index_tui -- --test-threads=1
+          cargo test --test e2e_install_easy -- --test-threads=1
+
   dist:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,8 +42,18 @@ jobs:
           find target/dist -type f ! -name "*.sha256" -print0 | while IFS= read -r -d '' f; do
             sha256sum "$f" > "$f.sha256";
           done
-      - name: Upload artifacts
+      - name: Upload artifacts (workflow)
         uses: actions/upload-artifact@v4
         with:
           name: dist-artifacts
           path: target/dist/**/*
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            target/dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
