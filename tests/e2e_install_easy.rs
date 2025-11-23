@@ -58,6 +58,8 @@ fn install_easy_mode_end_to_end() {
         .arg("30s")
         .arg("bash")
         .arg("install.sh")
+        .arg("--version")
+        .arg("vtest")
         .arg("--easy-mode")
         .arg("--verify")
         .arg("--dest")
