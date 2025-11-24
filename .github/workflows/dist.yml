@@ -44,21 +44,25 @@ jobs:
         run: |
           ~/.cargo/bin/dist build --installer shell --installer powershell
       - name: List dist contents
-        run: ls -laR target/dist
+        run: ls -laR target/distrib
       - name: Checksums
         run: |
-          cd target/dist
-          find . -maxdepth 1 -type f ! -name "*.sha256" -print0 | while IFS= read -r -d '' f; do
+          cd target/distrib
+          find . -maxdepth 1 -type f ! -name "*.sha256" ! -name "sha256.sum" -print0 | while IFS= read -r -d '' f; do
             # Strip leading ./ from find output
             filename="${f#./}"
-            echo "Hashing $filename ..."
-            sha256sum "$filename" > "$filename.sha256" || { echo "Failed to hash $filename"; exit 1; }
+            if [ ! -f "$filename.sha256" ]; then
+              echo "Hashing $filename ..."
+              sha256sum "$filename" > "$filename.sha256" || { echo "Failed to hash $filename"; exit 1; }
+            else
+              echo "Skipping $filename (already hashed)"
+            fi
           done
       - name: Upload artifacts (workflow)
         uses: actions/upload-artifact@v4
         with:
           name: dist-artifacts
-          path: target/dist/**/*
+          path: target/distrib/**/*
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -66,6 +70,6 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            target/dist/*
+            target/distrib/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
