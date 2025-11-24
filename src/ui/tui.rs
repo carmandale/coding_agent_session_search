@@ -114,7 +114,7 @@ fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
     lines.extend(add_section(
         "Filters",
         &[
-            "F3 agent | F4 workspace | F5 from | F6 to | F11 clear all",
+            "F3 agent | F4 workspace | F5 from | F6 to | Ctrl+Del clear all",
             "Shift+F3 scope to active agent | Shift+F4 clear scope | Shift+F5 cycle time presets (24h/7d/30d/all)",
             "Chips in search bar; Backspace removes last; Enter (query empty) edits last chip",
         ],
@@ -177,6 +177,9 @@ fn render_help_overlay(frame: &mut Frame, palette: ThemePalette, scroll: u16) {
         .title(Span::styled("Help / Shortcuts", palette.title()))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette.accent));
+    
+    frame.render_widget(ratatui::widgets::Clear, popup_area);
+    
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -418,9 +421,9 @@ enum FocusRegion {
 
 pub fn footer_legend(show_help: bool) -> &'static str {
     if show_help {
-        "Esc/F10 quit • arrows + Left/Right pane • PgUp/PgDn page • Tab Focus • [ / ] Tabs • F3/F4/F5/F6 filters • F11 clear • F7 context • F9 mode • F2 theme • Enter/F8 open • Alt+NumPad 1-9 pane • Ctrl-R history • y copy"
+        "Esc/F10 quit • arrows + Left/Right pane • PgUp/PgDn page • Tab Focus • [ / ] Tabs • F3/F4/F5/F6 filters • Ctrl+Del clear • F7 context • F9 mode • F2 theme • Enter/F8 open • Alt+NumPad 1-9 pane • Ctrl-R history • y copy"
     } else {
-        "F1 help | F3 agent | F4 workspace | F5/F6 time | F7 context | F11 clear | F9 mode | F2 theme | Enter/F8 open | Alt+NumPad pane | y copy | Esc/F10 quit"
+        "F1 help | F3 agent | F4 workspace | F5/F6 time | F7 context | Ctrl+Del clear | F9 mode | F2 theme | Enter/F8 open | Alt+NumPad pane | y copy | Esc/F10 quit"
     }
 }
 
@@ -642,7 +645,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
 
                         lines.push(Line::from(""));
                         lines.push(Line::from(Span::raw(
-                            "Tip: toggle F9 prefix mode or clear all filters with F11",
+                            "Tip: toggle F9 prefix mode or clear all filters with Ctrl+Del",
                         )));
                     }
 
@@ -1355,7 +1358,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                             );
                             dirty_since = Some(Instant::now());
                         }
-                        KeyCode::F(11) => {
+                        KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             filters = SearchFilters::default();
                             page = 0;
                             status = format!(
