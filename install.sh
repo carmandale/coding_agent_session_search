@@ -175,14 +175,14 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   ensure_rust
   git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
   (cd "$TMP/src" && cargo build --release)
-  BIN="$TMP/src/target/release/coding-agent-search"
+  BIN="$TMP/src/target/release/cass"
   [ -x "$BIN" ] || { err "Build failed"; exit 1; }
   install -m 0755 "$BIN" "$DEST"
-  ok "Installed to $DEST/coding-agent-search (source build)"
+  ok "Installed to $DEST/cass (source build)"
   maybe_add_path
-  if [ "$VERIFY" -eq 1 ]; then "$DEST/coding-agent-search" --version || true; ok "Self-test complete"; fi
-  if [ "$QUICKSTART" -eq 1 ]; then info "Running index --full (quickstart)"; "$DEST/coding-agent-search" index --full || warn "index --full failed"; fi
-  ok "Done. Run: coding-agent-search tui"
+  if [ "$VERIFY" -eq 1 ]; then "$DEST/cass" --version || true; ok "Self-test complete"; fi
+  if [ "$QUICKSTART" -eq 1 ]; then info "Running index --full (quickstart)"; "$DEST/cass" index --full || warn "index --full failed"; fi
+  ok "Done. Run: cass"
   exit 0
 fi
 
@@ -203,27 +203,34 @@ ok "Checksum verified"
 
 info "Extracting"
 tar -xf "$TMP/$TAR" -C "$TMP"
-BIN="$TMP/coding-agent-search"
+BIN="$TMP/cass"
 if [ ! -x "$BIN" ] && [ -n "$TARGET" ]; then
-  BIN="$TMP/coding-agent-search-${TARGET}/coding-agent-search"
+  BIN="$TMP/coding-agent-search-${TARGET}/cass"
 fi
 if [ ! -x "$BIN" ]; then
-  BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search" -perm -111 | head -n 1)
+  BIN=$(find "$TMP" -maxdepth 3 -type f -name "cass" -perm -111 | head -n 1)
 fi
+# Fallback for older versions or if name mismatch?
+if [ ! -x "$BIN" ]; then
+   BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search" -perm -111 | head -n 1)
+   if [ -x "$BIN" ]; then
+      warn "Found 'coding-agent-search' binary instead of 'cass'; installing as 'cass'"
+   fi
+fi
+
 [ -x "$BIN" ] || { err "Binary not found in tar"; exit 1; }
-install -m 0755 "$BIN" "$DEST"
-ok "Installed to $DEST/coding-agent-search"
+install -m 0755 "$BIN" "$DEST/cass"
+ok "Installed to $DEST/cass"
 maybe_add_path
 
-
 if [ "$VERIFY" -eq 1 ]; then
-  "$DEST/coding-agent-search" --version || true
+  "$DEST/cass" --version || true
   ok "Self-test complete"
 fi
 
 if [ "$QUICKSTART" -eq 1 ]; then
   info "Running index --full (quickstart)"
-  "$DEST/coding-agent-search" index --full || warn "index --full failed"
+  "$DEST/cass" index --full || warn "index --full failed"
 fi
 
-ok "Done. Run: coding-agent-search tui"
+ok "Done. Run: cass"

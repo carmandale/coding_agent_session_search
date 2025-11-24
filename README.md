@@ -51,37 +51,21 @@ install.ps1 -EasyMode -Verify
    ```
    - Flags: `--dest DIR`, `--system`, `--artifact-url`, `--checksum`, `--checksum-url`, `--quickstart`, `--quiet`.
    - Skipping rustup: set `RUSTUP_INIT_SKIP=1` (for environments with nightly already installed).
-2) **Index** your logs:
+2) **Launch TUI** (automatically indexes in background):
    ```bash
-   coding-agent-search index --full
-   # optional: --data-dir /path/to/state
+   cass
    ```
-3) **Launch TUI**:
-   ```bash
-   coding-agent-search tui
-   # headless smoke: TUI_HEADLESS=1 coding-agent-search tui --once --data-dir <dir>
-   ```
-
-### TUI keymap (current)
-- Search: type; `/` focuses query. Ctrl-R cycles query history.
-- Filters: `F3` agent, `F4` workspace, `F5/F6` time range; `Shift+F3` scope to active agent; `Shift+F4` clear agent scope; `Shift+F5` cycle time presets (24h/7d/30d/all); `F11` clear all filters; backspace on empty query peels last filter.
-- Modes: `F9` toggles match mode (prefix ↔ standard). `F12` cycles ranking (recent-heavy → balanced → relevance-heavy). `F2` toggles theme.
-- Context: `F7` cycles context window (S/M/L/XL); `Space` temporarily peeks XL then returns.
-- Density: `Shift+=/+` increase per-pane items, `-` decrease (min 4, max 50).
-- Navigation: arrows move within pane; Left/Right switch panes; `PgUp/PgDn` paginate; `Alt+NumPad 1-9` jump to pane; `g/G` jump to first/last item in pane.
-- Detail tabs: `Tab`/`BackTab` cycle Messages/Snippets/Raw.
-- Actions: `Enter`/`F8` open hit in `$EDITOR`; `Esc`/`F10` quit; `F1` toggles help modal.
-- Empty state: shows recent per-agent conversations before typing; recent queries list when query is empty.
-
-State: match mode and context window persist in `tui_state.json` under the data dir; delete that file to reset.
+   - Or explicitly: `cass tui`
+   - Index only: `cass index --full`
 
 ## 🛠️ CLI reference
 ```bash
-coding-agent-search index [--full] [--watch] [--data-dir DIR] [--db PATH]
-coding-agent-search tui [--data-dir DIR] [--once]
-coding-agent-search completions <shell>
-coding-agent-search man
+cass [tui] [--data-dir DIR] [--once]
+cass index [--full] [--watch] [--data-dir DIR] [--db PATH]
+cass completions <shell>
+cass man
 ```
+- **cass (default)**: starts TUI and spawns a background indexer (watch mode).
 - **index --full** truncates DB/index (non-destructive to source logs) then re-ingests.
 - **index --watch** debounced file watcher; routes changes to matching connector; maintains `watch_state.json`.
 - **Data locations**: defaults to platform data dir (`directories`); override with `--data-dir`.
@@ -150,6 +134,8 @@ flowchart LR
 ## ⚙️ Environment
 - Loads `.env` via `dotenvy::dotenv().ok()`; configure API/base paths there (see pattern in code). Do not overwrite `.env`.
 - Default data dir: `directories::ProjectDirs` for `coding-agent-search`; override via flags.
+- Logs are written to `cass.log` (daily rotating) in the data directory.
+- On interactive TUI startup we check GitHub releases and prompt to self-update; skip with `CODING_AGENT_SEARCH_NO_UPDATE_PROMPT=1`, `TUI_HEADLESS=1`, or in CI/non-TTY.
 
 ## 🧪 Developer workflow
 - `cargo fmt --check`

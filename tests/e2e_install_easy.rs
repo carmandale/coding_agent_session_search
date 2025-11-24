@@ -54,7 +54,7 @@ fn install_easy_mode_end_to_end() {
         }
     }
 
-    let status = Command::new("timeout")
+    let output = Command::new("timeout")
         .arg("30s")
         .arg("bash")
         .arg("install.sh")
@@ -76,13 +76,19 @@ fn install_easy_mode_end_to_end() {
         .env("ARTIFACT_URL", format!("file://{}", tar.display()))
         .env("CHECKSUM", checksum)
         .env("RUSTUP_INIT_SKIP", "1")
-        .status()
+        .output()
         .expect("run installer");
 
-    assert!(status.success(), "installer should succeed");
+    assert!(output.status.success(), "installer should succeed");
 
-    let bin = dest.path().join("coding-agent-search");
-    assert!(bin.exists());
+    // Verify installation
+    let bin = dest.path().join("cass");
+    assert!(bin.exists(), "Binary not found at expected path");
+    
+    // Verify self-test worked (printed version)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("fixture-linux"));
+    assert!(stdout.contains("Done. Run: cass"));
     Command::new(&bin)
         .arg("--help")
         .status()

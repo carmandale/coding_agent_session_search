@@ -30,7 +30,7 @@ fn index_then_tui_once_headless() {
     make_codex_fixture(&data_dir);
 
     // Run index --full against this data dir.
-    cargo_bin_cmd!("coding-agent-search")
+    cargo_bin_cmd!("cass")
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -39,7 +39,7 @@ fn index_then_tui_once_headless() {
         .success();
 
     // Smoke run TUI once in headless mode using the same data dir.
-    cargo_bin_cmd!("coding-agent-search")
+    cargo_bin_cmd!("cass")
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)

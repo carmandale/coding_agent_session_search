@@ -30,7 +30,7 @@ fn install_sh_succeeds_with_valid_checksum() {
         .expect("run install.sh");
 
     assert!(status.success());
-    let bin = dest.path().join("coding-agent-search");
+    let bin = dest.path().join("cass");
     assert!(bin.exists());
     let output = Command::new(&bin).output().expect("run installed bin");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -55,7 +55,7 @@ fn install_sh_fails_with_bad_checksum() {
         .expect("run install.sh");
 
     assert!(!status.success());
-    assert!(!dest.path().join("coding-agent-search").exists());
+    assert!(!dest.path().join("cass").exists());
 }
 
 fn find_powershell() -> Option<String> {
@@ -106,7 +106,7 @@ fn install_ps1_succeeds_with_valid_checksum() {
         .expect("run install.ps1");
 
     assert!(status.success());
-    let bin = dest.path().join("coding-agent-search.exe");
+    let bin = dest.path().join("cass.exe");
     assert!(bin.exists());
     let content = fs::read_to_string(&bin).unwrap();
     assert!(content.contains("fixture-windows"));
@@ -145,5 +145,5 @@ fn install_ps1_fails_with_bad_checksum() {
         .expect("run install.ps1");
 
     assert!(!status.success());
-    assert!(!dest.path().join("coding-agent-search.exe").exists());
+    assert!(!dest.path().join("cass.exe").exists());
 }
