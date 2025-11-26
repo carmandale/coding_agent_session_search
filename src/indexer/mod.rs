@@ -18,6 +18,7 @@ use crate::storage::sqlite::SqliteStorage;
 #[derive(Clone)]
 pub struct IndexOptions {
     pub full: bool,
+    pub force_rebuild: bool,
     pub watch: bool,
     pub db_path: PathBuf,
     pub data_dir: PathBuf,
@@ -25,7 +26,13 @@ pub struct IndexOptions {
 
 pub fn run_index(opts: IndexOptions) -> Result<()> {
     let mut storage = SqliteStorage::open(&opts.db_path)?;
-    let mut t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir)?)?;
+    let index_path = index_dir(&opts.data_dir)?;
+    let mut t_index = if opts.force_rebuild {
+        std::fs::remove_dir_all(&index_path).ok();
+        TantivyIndex::open_or_create(&index_path)?
+    } else {
+        TantivyIndex::open_or_create(&index_path)?
+    };
 
     if opts.full {
         reset_storage(&mut storage)?;
@@ -610,6 +617,7 @@ mod tests {
         let opts = super::IndexOptions {
             full: false,
             watch: false,
+            force_rebuild: false,
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
         };
