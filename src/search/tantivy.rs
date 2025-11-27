@@ -51,12 +51,6 @@ impl TantivyIndex {
             std::fs::create_dir_all(path)?;
         }
 
-        // Remove any stale writer lock before opening/creating.
-        let lock_path = path.join(".tantivy-writer.lock");
-        if lock_path.exists() {
-            let _ = std::fs::remove_file(&lock_path);
-        }
-
         let mut index = if path.join("meta.json").exists() && !needs_rebuild {
             Index::open_in_dir(path)?
         } else {
