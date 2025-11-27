@@ -215,7 +215,9 @@ impl SearchClient {
         let sanitized = sanitize_query(query);
 
         // Schedule warmup for likely prefixes when user pauses typing.
-        if offset == 0 && let Some(tx) = &self.warm_tx {
+        if offset == 0
+            && let Some(tx) = &self.warm_tx
+        {
             let _ = tx.send(WarmJob {
                 query: sanitized.clone(),
                 _filters: filters.clone(),

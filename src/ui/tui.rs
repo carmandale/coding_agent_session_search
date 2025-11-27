@@ -1234,12 +1234,8 @@ fn render_inline_markdown_line(
             && let Some(end) = content.find("**")
         {
             let (bold_text, tail) = content.split_at(end);
-            let highlighted = highlight_spans_owned(
-                bold_text,
-                query,
-                palette,
-                base.add_modifier(Modifier::BOLD),
-            );
+            let highlighted =
+                highlight_spans_owned(bold_text, query, palette, base.add_modifier(Modifier::BOLD));
             spans.extend(highlighted);
             rest = tail.trim_start_matches('*');
             continue;
