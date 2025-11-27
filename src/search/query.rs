@@ -188,11 +188,7 @@ impl SearchClient {
         let shared_filters = Arc::new(Mutex::new(()));
 
         let warm_pair = if let Some((reader, fields)) = &tantivy {
-            maybe_spawn_warm_worker(
-                reader.clone(),
-                fields.clone(),
-                Arc::downgrade(&shared_filters),
-            )
+            maybe_spawn_warm_worker(reader.clone(), *fields, Arc::downgrade(&shared_filters))
         } else {
             None
         };
@@ -219,13 +215,11 @@ impl SearchClient {
         let sanitized = sanitize_query(query);
 
         // Schedule warmup for likely prefixes when user pauses typing.
-        if offset == 0 {
-            if let Some(tx) = &self.warm_tx {
-                let _ = tx.send(WarmJob {
-                    query: sanitized.clone(),
-                    _filters: filters.clone(),
-                });
-            }
+        if offset == 0 && let Some(tx) = &self.warm_tx {
+            let _ = tx.send(WarmJob {
+                query: sanitized.clone(),
+                _filters: filters.clone(),
+            });
         }
 
         // Fast path: reuse cached prefix when user is typing forward (offset 0 only).
@@ -317,40 +311,37 @@ impl SearchClient {
         if !terms.is_empty() {
             for term_str in terms {
                 let term_lower = term_str.to_lowercase();
-                let mut term_shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-
-                // Exact/Standard match (boosted)
-                term_shoulds.push((
-                    Occur::Should,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(fields.title, &term_lower),
-                        IndexRecordOption::WithFreqsAndPositions,
-                    )),
-                ));
-                term_shoulds.push((
-                    Occur::Should,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(fields.content, &term_lower),
-                        IndexRecordOption::WithFreqsAndPositions,
-                    )),
-                ));
-
-                // Prefix/Ngram match (via edge_ngram field)
-                term_shoulds.push((
-                    Occur::Should,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(fields.title_prefix, &term_lower),
-                        IndexRecordOption::WithFreqsAndPositions,
-                    )),
-                ));
-                term_shoulds.push((
-                    Occur::Should,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(fields.content_prefix, &term_lower),
-                        IndexRecordOption::WithFreqsAndPositions,
-                    )),
-                ));
-
+                // Match in title, content, or their prefix (edge n-gram) variants
+                let term_shoulds: Vec<(Occur, Box<dyn Query>)> = vec![
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(fields.title, &term_lower),
+                            IndexRecordOption::WithFreqsAndPositions,
+                        )),
+                    ),
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(fields.content, &term_lower),
+                            IndexRecordOption::WithFreqsAndPositions,
+                        )),
+                    ),
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(fields.title_prefix, &term_lower),
+                            IndexRecordOption::WithFreqsAndPositions,
+                        )),
+                    ),
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(fields.content_prefix, &term_lower),
+                            IndexRecordOption::WithFreqsAndPositions,
+                        )),
+                    ),
+                ];
                 clauses.push((Occur::Must, Box::new(BooleanQuery::new(term_shoulds))));
             }
         } else {
@@ -632,21 +623,22 @@ fn maybe_spawn_warm_worker(
             let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
             for term_str in job.query.split_whitespace() {
                 let term_lower = term_str.to_lowercase();
-                let mut term_shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-                term_shoulds.push((
-                    Occur::Should,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(fields.title, &term_lower),
-                        IndexRecordOption::WithFreqsAndPositions,
-                    )),
-                ));
-                term_shoulds.push((
-                    Occur::Should,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(fields.content, &term_lower),
-                        IndexRecordOption::WithFreqsAndPositions,
-                    )),
-                ));
+                let term_shoulds: Vec<(Occur, Box<dyn Query>)> = vec![
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(fields.title, &term_lower),
+                            IndexRecordOption::WithFreqsAndPositions,
+                        )),
+                    ),
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(fields.content, &term_lower),
+                            IndexRecordOption::WithFreqsAndPositions,
+                        )),
+                    ),
+                ];
                 clauses.push((Occur::Must, Box::new(BooleanQuery::new(term_shoulds))));
             }
             if !clauses.is_empty() {
@@ -885,8 +877,7 @@ mod tests {
             metrics: Metrics::default(),
         };
 
-        let mut hits = Vec::new();
-        hits.push(SearchHit {
+        let hits = vec![SearchHit {
             title: "こんにちは".into(),
             snippet: "".into(),
             content: "こんにちは 世界".into(),
@@ -896,7 +887,7 @@ mod tests {
             workspace: "w".into(),
             created_at: None,
             line_number: None,
-        });
+        }];
 
         client.put_cache("こん", &SearchFilters::default(), &hits);
 

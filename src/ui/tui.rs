@@ -1230,55 +1230,54 @@ fn render_inline_markdown_line(
     let mut rest = line;
 
     while !rest.is_empty() {
-        if let Some(content) = rest.strip_prefix("**") {
-            if let Some(end) = content.find("**") {
-                let (bold_text, tail) = content.split_at(end);
-                let highlighted = highlight_spans_owned(
-                    bold_text,
-                    query,
-                    palette,
-                    base.add_modifier(Modifier::BOLD),
-                );
-                spans.extend(highlighted);
-                rest = tail.trim_start_matches('*');
-                continue;
-            }
+        if let Some(content) = rest.strip_prefix("**")
+            && let Some(end) = content.find("**")
+        {
+            let (bold_text, tail) = content.split_at(end);
+            let highlighted = highlight_spans_owned(
+                bold_text,
+                query,
+                palette,
+                base.add_modifier(Modifier::BOLD),
+            );
+            spans.extend(highlighted);
+            rest = tail.trim_start_matches('*');
+            continue;
         }
 
-        if let Some(content) = rest.strip_prefix('`') {
-            if let Some(end) = content.find('`') {
-                let (code_text, tail) = content.split_at(end);
-                let highlighted = highlight_spans_owned(
-                    code_text,
-                    query,
-                    palette,
-                    base.bg(palette.surface).fg(palette.accent_alt),
-                );
-                spans.extend(highlighted);
-                rest = &tail[1..]; // skip closing backtick
-                continue;
-            }
+        if let Some(content) = rest.strip_prefix('`')
+            && let Some(end) = content.find('`')
+        {
+            let (code_text, tail) = content.split_at(end);
+            let highlighted = highlight_spans_owned(
+                code_text,
+                query,
+                palette,
+                base.bg(palette.surface).fg(palette.accent_alt),
+            );
+            spans.extend(highlighted);
+            rest = &tail[1..]; // skip closing backtick
+            continue;
         }
 
-        if let Some(content) = rest.strip_prefix('*') {
-            if !content.starts_with('*') {
-                if let Some(end) = content.find('*') {
-                    let (ital_text, tail) = content.split_at(end);
-                    let highlighted = highlight_spans_owned(
-                        ital_text,
-                        query,
-                        palette,
-                        base.add_modifier(Modifier::ITALIC),
-                    );
-                    spans.extend(highlighted);
-                    rest = tail.trim_start_matches('*');
-                    continue;
-                }
-            }
+        if let Some(content) = rest.strip_prefix('*')
+            && !content.starts_with('*')
+            && let Some(end) = content.find('*')
+        {
+            let (ital_text, tail) = content.split_at(end);
+            let highlighted = highlight_spans_owned(
+                ital_text,
+                query,
+                palette,
+                base.add_modifier(Modifier::ITALIC),
+            );
+            spans.extend(highlighted);
+            rest = tail.trim_start_matches('*');
+            continue;
         }
 
         // Plain chunk until next special token
-        let next_special = rest.find(|c| c == '*' || c == '`').unwrap_or(rest.len());
+        let next_special = rest.find(['*', '`']).unwrap_or(rest.len());
 
         if next_special == 0 {
             // Avoid infinite loop on stray marker; emit literally and advance

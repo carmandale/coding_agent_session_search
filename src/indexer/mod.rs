@@ -46,10 +46,8 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
             && !std::fs::read_to_string(index_path.join("schema_hash.json"))?
                 .contains(crate::search::tantivy::SCHEMA_HASH));
 
-    if needs_rebuild {
-        if let Some(p) = &opts.progress {
-            p.is_rebuilding.store(true, Ordering::Relaxed);
-        }
+    if needs_rebuild && let Some(p) = &opts.progress {
+        p.is_rebuilding.store(true, Ordering::Relaxed);
     }
 
     let mut t_index = if needs_rebuild {
