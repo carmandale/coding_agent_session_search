@@ -1145,6 +1145,40 @@ fn save_state(path: &std::path::Path, state: &TuiStatePersisted) {
     }
 }
 
+/// Save a query to the history, avoiding duplicates and limiting size.
+/// Only call this on explicit user commit actions (Enter on result, F8 editor, y copy).
+fn save_query_to_history(query: &str, history: &mut VecDeque<String>, cap: usize) {
+    let q = query.trim();
+    if !q.is_empty() && history.front().map(|h| h != q).unwrap_or(true) {
+        history.push_front(q.to_string());
+        if history.len() > cap {
+            history.pop_back();
+        }
+    }
+}
+
+/// Deduplicate history by removing queries that are strict prefixes of other queries.
+/// This cleans up any pollution from incremental typing before this fix was implemented.
+/// Example: ["foobar", "foo", "foob", "bar"] -> ["foobar", "bar"]
+fn dedupe_history_prefixes(history: Vec<String>) -> Vec<String> {
+    let mut result: Vec<String> = Vec::with_capacity(history.len());
+    for q in history {
+        // Skip if this query is a strict prefix of any existing entry
+        let is_prefix_of_existing = result.iter().any(|existing| {
+            existing.starts_with(&q) && existing.len() > q.len()
+        });
+        if is_prefix_of_existing {
+            continue;
+        }
+        // Remove any existing entries that are strict prefixes of this query
+        result.retain(|existing| {
+            !(q.starts_with(existing) && q.len() > existing.len())
+        });
+        result.push(q);
+    }
+    result
+}
+
 fn apply_match_mode(query: &str, mode: MatchMode) -> String {
     match mode {
         MatchMode::Standard => query.to_string(),
@@ -2610,6 +2644,8 @@ pub fn run_tui(
                         },
                         KeyCode::Char('y') => {
                             if let Some(hit) = active_hit(&panes, active_pane) {
+                                // User committed to copying result - save query to history
+                                save_query_to_history(&query, &mut query_history, history_cap);
                                 let text_to_copy = if matches!(focus_region, FocusRegion::Detail) {
                                     if let Some((_, _)) = &cached_detail {
                                         hit.content.clone()
@@ -2796,6 +2832,8 @@ pub fn run_tui(
                         }
                         KeyCode::F(8) => {
                             if let Some(hit) = active_hit(&panes, active_pane) {
+                                // User committed to viewing result in editor - save query to history
+                                save_query_to_history(&query, &mut query_history, history_cap);
                                 let path = &hit.source_path;
                                 // Prefer line_number field, fallback to parsing snippet
                                 let line_hint = hit.line_number.or_else(|| {
@@ -3094,11 +3132,15 @@ pub fn run_tui(
                             } else if active_hit(&panes, active_pane).is_some()
                                 && cached_detail.is_some()
                             {
+                                // User committed to viewing a result - save query to history
+                                save_query_to_history(&query, &mut query_history, history_cap);
                                 // Open full-screen detail modal for parsed viewing
                                 show_detail_modal = true;
                                 modal_scroll = 0;
                                 status = "Detail view · Esc close · c copy · n nano".to_string();
                             } else if active_hit(&panes, active_pane).is_some() {
+                                // User committed to viewing a result - save query to history
+                                save_query_to_history(&query, &mut query_history, history_cap);
                                 status = "Loading conversation...".to_string();
                             }
                         }
@@ -3379,14 +3421,8 @@ pub fn run_tui(
                                 } else {
                                     format!("{} results across {} agents", total_hits, panes.len())
                                 };
-                                if !query.trim().is_empty()
-                                    && query_history.front().map(|q| q != &query).unwrap_or(true)
-                                {
-                                    query_history.push_front(query.clone());
-                                    if query_history.len() > history_cap {
-                                        query_history.pop_back();
-                                    }
-                                }
+                                // Query history is now saved only on explicit commit actions
+                                // (Enter on result, F8 editor, y copy) via save_query_to_history()
                                 history_cursor = None;
                                 needs_draw = true;
                             }
@@ -3424,8 +3460,8 @@ pub fn run_tui(
         context_window: Some(context_window.label().into()),
         // Mark that user has seen (or had opportunity to see) the help overlay
         has_seen_help: Some(true),
-        // Persist query history for next session
-        query_history: Some(query_history.iter().cloned().collect()),
+        // Persist query history for next session, deduplicating prefix pollution
+        query_history: Some(dedupe_history_prefixes(query_history.iter().cloned().collect())),
     };
     save_state(&state_path, &persisted_out);
 
