@@ -4532,7 +4532,8 @@ pub fn run_tui(
                                 detail_scroll = detail_scroll.saturating_sub(20);
                             }
                         },
-                        KeyCode::Char('y') => {
+                        // Yank (copy to clipboard): Ctrl+Y copies path or content
+                        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             if let Some(hit) = active_hit(&panes, active_pane) {
                                 // User committed to copying result - save query to history
                                 save_query_to_history(&query, &mut query_history, history_cap);
@@ -4586,8 +4587,8 @@ pub fn run_tui(
                                 }
                             }
                         }
-                        // Multi-select: 'm' toggles selection on current item
-                        KeyCode::Char('m') => {
+                        // Multi-select: Ctrl+M toggles selection on current item
+                        KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             if let Some(pane) = panes.get(active_pane) {
                                 let key = (active_pane, pane.selected);
                                 if selected.contains(&key) {
@@ -4596,7 +4597,7 @@ pub fn run_tui(
                                 } else {
                                     selected.insert(key);
                                     status = format!(
-                                        "Selected ({} total) · m toggle · A bulk actions · Esc clear",
+                                        "Selected ({} total) · Ctrl+M toggle · A bulk actions · Esc clear",
                                         selected.len()
                                     );
                                 }
