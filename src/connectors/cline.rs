@@ -108,7 +108,13 @@ impl Connector for ClineConnector {
 
             let data =
                 fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-            let val: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+            let val: Value = match serde_json::from_str(&data) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(path = %file.display(), error = %e, "cline skipping malformed JSON");
+                    continue;
+                }
+            };
 
             let mut messages = Vec::new();
             if let Some(arr) = val.as_array() {
@@ -120,12 +126,10 @@ impl Connector for ClineConnector {
                         .or_else(|| item.get("ts"))
                         .and_then(crate::connectors::parse_timestamp);
 
-                    // Skip if older than since_ts
-                    if let (Some(since), Some(ts)) = (ctx.since_ts, created)
-                        && ts <= since
-                    {
-                        continue;
-                    }
+                    // NOTE: Do NOT filter individual messages by timestamp here!
+                    // The file-level check in file_modified_since() is sufficient.
+                    // Filtering messages would cause older messages to be lost when
+                    // the file is re-indexed after new messages are added.
 
                     let role = item
                         .get("role")

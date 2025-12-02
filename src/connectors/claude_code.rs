@@ -124,11 +124,10 @@ impl Connector for ClaudeCodeConnector {
                         .get("timestamp")
                         .and_then(crate::connectors::parse_timestamp);
 
-                    if let (Some(since), Some(ts)) = (ctx.since_ts, created)
-                        && ts <= since
-                    {
-                        continue;
-                    }
+                    // NOTE: Do NOT filter individual messages by timestamp here!
+                    // The file-level check in file_modified_since() is sufficient.
+                    // Filtering messages would cause older messages to be lost when
+                    // the file is re-indexed after new messages are added.
 
                     started_at = started_at.or(created);
                     ended_at = created.or(ended_at);
@@ -175,7 +174,13 @@ impl Connector for ClaudeCodeConnector {
                 }
             } else {
                 // JSON or Claude format files
-                let val: Value = serde_json::from_str(&content).unwrap_or(Value::Null);
+                let val: Value = match serde_json::from_str(&content) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!(path = %entry.path().display(), error = %e, "claude_code skipping malformed JSON");
+                        continue;
+                    }
+                };
                 if let Some(arr) = val.get("messages").and_then(|m| m.as_array()) {
                     for item in arr {
                         let role = item
@@ -190,11 +195,8 @@ impl Connector for ClaudeCodeConnector {
                             .or_else(|| item.get("time"))
                             .and_then(crate::connectors::parse_timestamp);
 
-                        if let (Some(since), Some(ts)) = (ctx.since_ts, created)
-                            && ts <= since
-                        {
-                            continue;
-                        }
+                        // NOTE: Do NOT filter individual messages by timestamp.
+                        // File-level check is sufficient for incremental indexing.
 
                         started_at = started_at.or(created);
                         ended_at = created.or(ended_at);

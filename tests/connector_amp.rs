@@ -32,8 +32,11 @@ fn amp_parses_minimal_cache() {
     assert!(!c.messages.is_empty());
 }
 
+/// since_ts controls file-level filtering (via file mtime), NOT message-level filtering.
+/// When a file is modified after since_ts, ALL messages from that file are re-indexed
+/// to avoid data loss from partial re-indexing.
 #[test]
-fn amp_respects_since_ts_and_reindexes_indices() {
+fn amp_includes_all_messages_when_file_modified() {
     let fixture_root = PathBuf::from("tests/fixtures/amp");
     let conn = AmpConnector::new();
     let ctx = ScanContext {
@@ -43,10 +46,16 @@ fn amp_respects_since_ts_and_reindexes_indices() {
     let convs = conn.scan(&ctx).expect("scan");
     assert_eq!(convs.len(), 1);
     let c = &convs[0];
-    assert_eq!(c.messages.len(), 1);
+    // File-level filtering means ALL messages are included when file is modified
+    assert_eq!(c.messages.len(), 2);
+    // Messages should be re-indexed with sequential indices
     assert_eq!(c.messages[0].idx, 0);
-    assert_eq!(c.messages[0].created_at, Some(1_700_000_005_000));
-    assert_eq!(c.started_at, Some(1_700_000_005_000));
+    assert_eq!(c.messages[1].idx, 1);
+    // Timestamps preserved from original messages
+    assert_eq!(c.messages[0].created_at, Some(1_700_000_000_000));
+    assert_eq!(c.messages[1].created_at, Some(1_700_000_005_000));
+    // started_at and ended_at reflect earliest and latest message timestamps
+    assert_eq!(c.started_at, Some(1_700_000_000_000));
     assert_eq!(c.ended_at, Some(1_700_000_005_000));
 }
 

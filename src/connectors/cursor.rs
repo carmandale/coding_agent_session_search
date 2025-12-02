@@ -151,7 +151,7 @@ impl CursorConnector {
         key: &str,
         value: &str,
         db_path: &Path,
-        since_ts: Option<i64>,
+        _since_ts: Option<i64>, // File-level filtering done in scan(); message filtering not needed
         seen_ids: &mut HashSet<String>,
     ) -> Option<NormalizedConversation> {
         let val: Value = serde_json::from_str(value).ok()?;
@@ -168,12 +168,9 @@ impl CursorConnector {
         // Extract timestamps
         let created_at = val.get("createdAt").and_then(|v| v.as_i64());
 
-        // Skip if older than since_ts
-        if let (Some(since), Some(ts)) = (since_ts, created_at)
-            && ts <= since
-        {
-            return None;
-        }
+        // NOTE: Do NOT filter conversations/messages by timestamp here!
+        // The file-level check in file_modified_since() is sufficient.
+        // Filtering would cause data loss when the file is re-indexed.
 
         let mut messages = Vec::new();
 
@@ -320,7 +317,7 @@ impl CursorConnector {
         key: &str,
         value: &str,
         db_path: &Path,
-        since_ts: Option<i64>,
+        _since_ts: Option<i64>, // File-level filtering done in scan(); message filtering not needed
         seen_ids: &mut HashSet<String>,
     ) -> Option<NormalizedConversation> {
         let val: Value = serde_json::from_str(value).ok()?;
@@ -341,12 +338,7 @@ impl CursorConnector {
             for tab in tabs {
                 let tab_ts = tab.get("timestamp").and_then(|v| v.as_i64());
 
-                // Skip if older than since_ts
-                if let (Some(since), Some(ts)) = (since_ts, tab_ts)
-                    && ts <= since
-                {
-                    continue;
-                }
+                // NOTE: Do NOT filter by timestamp here! File-level check is sufficient.
 
                 if let Some(bubbles) = tab.get("bubbles").and_then(|v| v.as_array()) {
                     for bubble in bubbles {

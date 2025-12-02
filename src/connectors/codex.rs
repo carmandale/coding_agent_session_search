@@ -80,10 +80,6 @@ impl Connector for CodexConnector {
         let mut convs = Vec::new();
 
         for file in files {
-            // Skip files not modified since last scan (incremental indexing)
-            if !crate::connectors::file_modified_since(&file, ctx.since_ts) {
-                continue;
-            }
             let source_path = file.clone();
             // Use relative path from sessions dir as external_id for uniqueness
             // e.g., "2025/11/20/rollout-1" instead of just "rollout-1"

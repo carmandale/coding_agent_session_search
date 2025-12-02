@@ -97,7 +97,10 @@ fn gemini_detect_returns_true_for_existing_dir() {
 
 /// Test incremental indexing with since_ts filter
 #[test]
-fn gemini_incremental_indexing_filters_old_messages() {
+/// since_ts controls file-level filtering (via file mtime), NOT message-level filtering.
+/// When a file is modified after since_ts, ALL messages from that file are re-indexed
+/// to avoid data loss from partial re-indexing.
+fn gemini_includes_all_messages_when_file_modified() {
     let tmp = tempfile::TempDir::new().unwrap();
     let chats_dir = tmp.path().join("hash123").join("chats");
     fs::create_dir_all(&chats_dir).unwrap();
@@ -130,9 +133,8 @@ fn gemini_incremental_indexing_filters_old_messages() {
 
     let conn = GeminiConnector::new();
 
-    // Scan with since_ts that filters out the old message
-    // parse_timestamp returns milliseconds, so since_ts must be in milliseconds too
-    // "2024-01-01T12:00:00Z" (noon) in milliseconds
+    // File-level filtering: since_ts is used to filter FILES by mtime, not messages.
+    // Since this file was just created (mtime = now), it will be included.
     let since_ts = chrono::DateTime::parse_from_rfc3339("2024-01-01T12:00:00Z")
         .unwrap()
         .timestamp_millis();
@@ -144,10 +146,11 @@ fn gemini_incremental_indexing_filters_old_messages() {
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());
 
-    // Only the new message should be included
+    // File-level filtering means ALL messages are included when file is modified
     let c = &convs[0];
-    assert_eq!(c.messages.len(), 1);
-    assert_eq!(c.messages[0].content, "New message");
+    assert_eq!(c.messages.len(), 2);
+    assert_eq!(c.messages[0].content, "Old message");
+    assert_eq!(c.messages[1].content, "New message");
 }
 
 /// Test workspace extraction from AGENTS.md pattern in content

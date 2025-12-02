@@ -173,7 +173,7 @@ impl Connector for AmpConnector {
     }
 }
 
-fn extract_messages(val: &Value, since_ts: Option<i64>) -> Option<Vec<NormalizedMessage>> {
+fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<NormalizedMessage>> {
     let msgs = val
         .get("messages")
         .and_then(|m| m.as_array().cloned())
@@ -217,12 +217,10 @@ fn extract_messages(val: &Value, since_ts: Option<i64>) -> Option<Vec<Normalized
             .and_then(|v| v.as_str())
             .map(std::string::ToString::to_string);
 
-        if let Some(since) = since_ts
-            && let Some(ts) = created_at
-            && ts <= since
-        {
-            continue;
-        }
+        // NOTE: Do NOT filter individual messages by timestamp here!
+        // The file-level check in file_modified_since() is sufficient.
+        // Filtering messages would cause older messages to be lost when
+        // the file is re-indexed after new messages are added.
 
         out.push(NormalizedMessage {
             idx: 0, // Will be re-assigned after filtering

@@ -259,11 +259,10 @@ impl Connector for GeminiConnector {
                     .get("timestamp")
                     .and_then(crate::connectors::parse_timestamp);
 
-                if let (Some(since), Some(ts)) = (ctx.since_ts, created)
-                    && ts <= since
-                {
-                    continue;
-                }
+                // NOTE: Do NOT filter individual messages by timestamp here!
+                // The file-level check in file_modified_since() is sufficient.
+                // Filtering messages would cause older messages to be lost when
+                // the file is re-indexed after new messages are added.
 
                 started_at = started_at.or(created);
                 ended_at = created.or(ended_at);

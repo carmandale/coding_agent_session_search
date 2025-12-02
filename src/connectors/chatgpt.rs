@@ -211,7 +211,7 @@ impl ChatGptConnector {
     fn parse_conversation_file(
         &self,
         path: &PathBuf,
-        since_ts: Option<i64>,
+        _since_ts: Option<i64>,
         is_encrypted: bool,
     ) -> Result<Option<NormalizedConversation>> {
         let content_bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
@@ -319,12 +319,10 @@ impl ChatGptConnector {
                     .and_then(|v| v.as_f64())
                     .map(|ts| (ts * 1000.0) as i64);
 
-                // Apply since_ts filter
-                if let (Some(since), Some(ts)) = (since_ts, created_at)
-                    && ts <= since
-                {
-                    continue;
-                }
+                // NOTE: Do NOT filter individual messages by timestamp here!
+                // The file-level check in file_modified_since() is sufficient.
+                // Filtering messages would cause older messages to be lost when
+                // the file is re-indexed after new messages are added.
 
                 if started_at.is_none() {
                     started_at = created_at;
@@ -375,11 +373,8 @@ impl ChatGptConnector {
                     .or_else(|| item.get("create_time"))
                     .and_then(crate::connectors::parse_timestamp);
 
-                if let (Some(since), Some(ts)) = (since_ts, created_at)
-                    && ts <= since
-                {
-                    continue;
-                }
+                // NOTE: Do NOT filter individual messages by timestamp here!
+                // File-level check is sufficient for incremental indexing.
 
                 if started_at.is_none() {
                     started_at = created_at;

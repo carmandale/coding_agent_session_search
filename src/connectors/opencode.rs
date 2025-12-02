@@ -159,11 +159,11 @@ fn load_db(
     let rows = stmt.query_map([], |row| message_from_row(row, &msg_cols))?;
     for msg in rows {
         let msg = msg?;
-        if let (Some(since), Some(ts)) = (since_ts, msg.created_at)
-            && ts <= since
-        {
-            continue;
-        }
+        // NOTE: Do NOT filter individual messages by timestamp here!
+        // The file-level check in file_modified_since() is sufficient.
+        // Filtering messages would cause older messages to be lost when
+        // the file is re-indexed after new messages are added.
+
         if let Some(id) = msg
             .extra
             .get("session_id")

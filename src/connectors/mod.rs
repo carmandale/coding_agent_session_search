@@ -82,12 +82,16 @@ pub fn file_modified_since(path: &std::path::Path, since_ts: Option<i64>) -> boo
     match since_ts {
         None => true, // No timestamp filter, process all files
         Some(ts) => {
+            // Provide a small slack window to account for filesystem mtime granularity.
+            // Some filesystems store mtime with 1s resolution, which can cause updates
+            // that happen shortly after a scan to be missed if we compare exact millis.
+            let threshold = ts.saturating_sub(1_000);
             // Get file modification time
             std::fs::metadata(path)
                 .and_then(|m| m.modified())
                 .map(|mt| {
                     mt.duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| (d.as_millis() as i64) >= ts)
+                        .map(|d| (d.as_millis() as i64) >= threshold)
                         .unwrap_or(true) // On time error, process the file
                 })
                 .unwrap_or(true) // On metadata error, process the file
