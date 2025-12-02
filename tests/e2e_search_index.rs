@@ -9,6 +9,7 @@
 //! Part of bead: coding_agent_session_search-0jt (TST.11)
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use std::fs;
 use std::path::Path;
 
@@ -38,6 +39,29 @@ fn make_claude_session(root: &Path, project: &str, filename: &str, content: &str
 {{"type": "assistant", "timestamp": "{ts}", "message": {{"role": "assistant", "content": "{content}_response"}}}}"#
     );
     fs::write(file, sample).unwrap();
+}
+
+/// Append an additional Codex message pair (user + assistant) to an existing rollout file.
+fn append_codex_session(file: &Path, content: &str, ts: u64) {
+    use std::io::Write;
+
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(file)
+        .expect("open rollout for append");
+    let sample = format!(
+        "{{\"type\": \"event_msg\", \"timestamp\": {ts}, \"payload\": {{\"type\": \"user_message\", \"message\": \"{content}\"}}}}\n{{\"type\": \"response_item\", \"timestamp\": {}, \"payload\": {{\"role\": \"assistant\", \"content\": \"{content}_response\"}}}}\n",
+        ts + 1000
+    );
+    f.write_all(sample.as_bytes()).unwrap();
+}
+
+fn count_messages(db_path: &Path) -> i64 {
+    let storage = SqliteStorage::open(db_path).expect("open sqlite");
+    storage
+        .raw()
+        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .expect("count messages")
 }
 
 /// Test: Full index pipeline - index --full creates DB and index
@@ -79,6 +103,177 @@ fn index_full_creates_artifacts() {
         data_dir.join("index").exists(),
         "Tantivy index directory should exist"
     );
+}
+
+/// Incremental re-index must preserve existing messages and ingest new ones from the same file.
+#[test]
+fn incremental_reindex_preserves_and_appends_messages() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    // Initial session
+    let ts = 1_732_118_400_000u64; // stable timestamp
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-incremental.jsonl",
+        "initial_keep_token",
+        ts,
+    );
+    let session_file = codex_home.join("sessions/2024/11/20/rollout-incremental.jsonl");
+
+    // Full index
+    cargo_bin_cmd!("cass")
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .assert()
+        .success();
+
+    // Baseline search should find the initial content
+    let baseline = cargo_bin_cmd!("cass")
+        .args(["search", "initial_keep_token", "--robot", "--data-dir"])
+        .arg(&data_dir)
+        .env("HOME", home)
+        .output()
+        .expect("baseline search");
+    assert!(baseline.status.success());
+    let baseline_json: serde_json::Value =
+        serde_json::from_slice(&baseline.stdout).expect("baseline json");
+    let baseline_hits = baseline_json
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .map(|v| v.len())
+        .unwrap_or(0);
+    assert!(baseline_hits >= 1, "initial content should be indexed");
+
+    // Append new content to the same file (simulates conversation growth)
+    append_codex_session(&session_file, "appended_token_beta", ts + 10_000);
+
+    // Incremental re-index (no --full)
+    cargo_bin_cmd!("cass")
+        .args(["index", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .assert()
+        .success();
+
+    // Original content must still be present
+    let preserved = cargo_bin_cmd!("cass")
+        .args(["search", "initial_keep_token", "--robot", "--data-dir"])
+        .arg(&data_dir)
+        .env("HOME", home)
+        .output()
+        .expect("preserved search");
+    assert!(preserved.status.success());
+    let preserved_hits = serde_json::from_slice::<serde_json::Value>(&preserved.stdout)
+        .unwrap()
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .map(|v| v.len())
+        .unwrap_or(0);
+    assert!(
+        preserved_hits >= baseline_hits,
+        "existing messages should not be dropped on reindex"
+    );
+
+    // New content must be discoverable
+    let appended = cargo_bin_cmd!("cass")
+        .args(["search", "appended_token_beta", "--robot", "--data-dir"])
+        .arg(&data_dir)
+        .env("HOME", home)
+        .output()
+        .expect("appended search");
+    assert!(appended.status.success());
+    let appended_hits = serde_json::from_slice::<serde_json::Value>(&appended.stdout)
+        .unwrap()
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .map(|v| v.len())
+        .unwrap_or(0);
+    assert!(
+        appended_hits >= 1,
+        "appended content should be indexed during incremental run"
+    );
+}
+
+/// Reindexing must never drop previously ingested messages in SQLite or Tantivy.
+#[test]
+fn reindex_does_not_drop_messages_in_db_or_search() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    // Seed a rollout with two messages
+    let ts = 1_732_118_400_000u64;
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-drop-guard.jsonl",
+        "persist_me",
+        ts,
+    );
+    let session_file = codex_home.join("sessions/2024/11/20/rollout-drop-guard.jsonl");
+
+    cargo_bin_cmd!("cass")
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .assert()
+        .success();
+
+    let db_path = data_dir.join("agent_search.db");
+    let baseline_count = count_messages(&db_path);
+    assert_eq!(baseline_count, 2, "initial two messages recorded");
+
+    // Append another turn and reindex incrementally
+    append_codex_session(&session_file, "persist_me_again", ts + 5_000);
+    cargo_bin_cmd!("cass")
+        .args(["index", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .assert()
+        .success();
+
+    let after_count = count_messages(&db_path);
+    assert_eq!(
+        after_count,
+        baseline_count + 2,
+        "messages should only grow after reindex"
+    );
+
+    // Verify both old and new content are searchable (Tantivy layer)
+    for term in ["persist_me", "persist_me_again"] {
+        let out = cargo_bin_cmd!("cass")
+            .args(["search", term, "--robot", "--data-dir"])
+            .arg(&data_dir)
+            .env("HOME", home)
+            .output()
+            .expect("search");
+        assert!(out.status.success(), "search should succeed for {term}");
+        let hits = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .unwrap()
+            .get("hits")
+            .and_then(|h| h.as_array())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        assert!(hits >= 1, "{term} should remain indexed");
+    }
 }
 
 /// Test: Search returns hits with correct match_type
