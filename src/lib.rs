@@ -293,6 +293,15 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy. For agent pre-flight checks.
+    Health {
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output as JSON (`{"healthy": bool, "latency_ms": N}`)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -483,11 +492,18 @@ impl WrapConfig {
     }
 }
 
-/// Normalize common robot-mode invocation mistakes to make the CLI more forgiving.
-/// - Converts `--robot-docs` (and `--robot-docs=topic`) into the `robot-docs` subcommand.
-/// - Lifts global flags (color/progress/wrap/nowrap/db/quiet/verbose/trace-file/robot-help)
-///   in front of subcommands so `cass robot-docs commands --color=never` is accepted.
-///   Returns normalized argv plus an optional note for stderr when changes were made.
+/// Normalize common robot-mode invocation mistakes to make the CLI more forgiving for AI agents.
+///
+/// This function applies multiple layers of normalization to maximize acceptance of
+/// commands where intent is clear, even if syntax is imperfect:
+///
+/// 1. **Single-dash long flags**: `-robot` → `--robot`, `-limit` → `--limit`
+/// 2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
+/// 3. **Subcommand aliases**: `find`/`query`/`q` → `search`, `ls`/`list` → `stats`, etc.
+/// 4. **Flag-as-subcommand**: `--robot-docs` → `robot-docs` subcommand
+/// 5. **Global flag hoisting**: Moves global flags to front regardless of position
+///
+/// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     if raw.is_empty() {
         return (raw, None);
@@ -496,7 +512,87 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     let mut globals: Vec<String> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
     let mut sub_seen = false;
-    let mut rewrote = false;
+    let mut corrections: Vec<String> = Vec::new();
+
+    // Known long flags (without --) for single-dash and case normalization
+    const KNOWN_LONG_FLAGS: &[&str] = &[
+        "robot",
+        "json",
+        "limit",
+        "offset",
+        "agent",
+        "workspace",
+        "fields",
+        "max-tokens",
+        "request-id",
+        "cursor",
+        "since",
+        "until",
+        "days",
+        "today",
+        "week",
+        "full",
+        "watch",
+        "data-dir",
+        "verbose",
+        "quiet",
+        "color",
+        "progress",
+        "wrap",
+        "nowrap",
+        "db",
+        "trace-file",
+        "robot-help",
+        "robot-docs",
+        "help",
+        "version",
+        "force",
+        "dry-run",
+        "no-cache",
+    ];
+
+    // Subcommand aliases for common mistakes
+    const SUBCOMMAND_ALIASES: &[(&str, &str)] = &[
+        // Search aliases
+        ("find", "search"),
+        ("query", "search"),
+        ("q", "search"),
+        ("lookup", "search"),
+        ("grep", "search"),
+        // Stats aliases
+        ("ls", "stats"),
+        ("list", "stats"),
+        ("info", "stats"),
+        ("summary", "stats"),
+        // Status aliases
+        ("st", "status"),
+        ("state", "status"),
+        // Index aliases
+        ("reindex", "index"),
+        ("idx", "index"),
+        ("rebuild", "index"),
+        // View aliases
+        ("show", "view"),
+        ("get", "view"),
+        ("read", "view"),
+        // Diag aliases
+        ("diagnose", "diag"),
+        ("debug", "diag"),
+        ("check", "diag"),
+        // Capabilities aliases
+        ("caps", "capabilities"),
+        ("cap", "capabilities"),
+        // Introspect aliases
+        ("inspect", "introspect"),
+        ("intro", "introspect"),
+        // Robot-docs aliases
+        ("docs", "robot-docs"),
+        ("help-robot", "robot-docs"),
+        ("robotdocs", "robot-docs"),
+    ];
+
+    // Short flags that should remain as single-dash
+    const VALID_SHORT_FLAGS: &[&str] = &["-q", "-v", "-h", "-V"];
 
     // Global flags that take a value via separate argument (--flag VALUE)
     let global_with_value = |s: &str| {
@@ -505,6 +601,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             "--color" | "--progress" | "--wrap" | "--db" | "--trace-file"
         )
     };
+
     // Global flags that take a value via `=` syntax or are standalone
     let is_global = |s: &str| {
         s == "--color"
@@ -525,46 +622,126 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             || s == "--robot-help"
     };
 
+    /// Normalize a single argument: single-dash → double-dash, case → lowercase
+    fn normalize_single_arg(arg: &str, corrections: &mut Vec<String>) -> String {
+        // Skip if already valid short flag
+        if VALID_SHORT_FLAGS.contains(&arg) {
+            return arg.to_string();
+        }
+
+        // Handle single-dash long flags: -robot → --robot, -limit=5 → --limit=5
+        if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 2 {
+            let (flag_part, value_part) = if let Some(idx) = arg.find('=') {
+                (&arg[1..idx], Some(&arg[idx..]))
+            } else {
+                (&arg[1..], None)
+            };
+            let flag_lower = flag_part.to_lowercase();
+            if KNOWN_LONG_FLAGS.contains(&flag_lower.as_str()) {
+                let corrected = if let Some(val) = value_part {
+                    format!("--{flag_lower}{val}")
+                } else {
+                    format!("--{flag_lower}")
+                };
+                corrections.push(format!(
+                    "'{arg}' → '{corrected}' (use double-dash for long flags)"
+                ));
+                return corrected;
+            }
+        }
+
+        // Handle case normalization for double-dash flags: --Robot → --robot
+        if let Some(stripped) = arg.strip_prefix("--") {
+            let (flag_part, value_part) = if let Some(idx) = stripped.find('=') {
+                (&stripped[..idx], Some(&stripped[idx..]))
+            } else {
+                (stripped, None)
+            };
+            let flag_lower = flag_part.to_lowercase();
+            if flag_part != flag_lower && KNOWN_LONG_FLAGS.contains(&flag_lower.as_str()) {
+                let corrected = if let Some(val) = value_part {
+                    format!("--{flag_lower}{val}")
+                } else {
+                    format!("--{flag_lower}")
+                };
+                corrections.push(format!("'{arg}' → '{corrected}' (flags are lowercase)"));
+                return corrected;
+            }
+        }
+
+        arg.to_string()
+    }
+
     let args: Vec<_> = raw.iter().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
-        let arg = &args[i];
+        let arg = args[i];
 
-        // Handle --robot-docs and --robot-docs=topic
-        if *arg == "--robot-docs" {
+        // First, normalize the argument (single-dash, case)
+        let normalized_arg = normalize_single_arg(arg, &mut corrections);
+
+        // Handle --robot-docs and --robot-docs=topic (flag used as subcommand)
+        if normalized_arg == "--robot-docs" {
             rest.push("robot-docs".into());
-            rewrote = true;
+            corrections
+                .push("'--robot-docs' → 'robot-docs' (it's a subcommand, not a flag)".into());
             i += 1;
             continue;
         }
-        if let Some(topic) = arg.strip_prefix("--robot-docs=") {
+        if let Some(topic) = normalized_arg.strip_prefix("--robot-docs=") {
             rest.push("robot-docs".into());
             if !topic.is_empty() {
                 rest.push(topic.to_string());
             }
-            rewrote = true;
+            corrections.push(format!(
+                "'{}' → 'robot-docs {topic}' (robot-docs is a subcommand)",
+                arg
+            ));
             i += 1;
             continue;
         }
 
-        if is_global(arg) {
-            globals.push(arg.to_string());
-            rewrote = true;
+        // Check for subcommand aliases (only before first subcommand seen)
+        if !sub_seen && !normalized_arg.starts_with('-') {
+            let lower = normalized_arg.to_lowercase();
+            if let Some(&(alias, canonical)) = SUBCOMMAND_ALIASES
+                .iter()
+                .find(|(a, _)| a.eq_ignore_ascii_case(&lower))
+            {
+                rest.push(canonical.to_string());
+                corrections.push(format!(
+                    "'{alias}' → '{canonical}' (canonical subcommand name)"
+                ));
+                sub_seen = true;
+                i += 1;
+                continue;
+            }
+        }
+
+        // Handle global flags
+        if is_global(&normalized_arg) {
+            globals.push(normalized_arg.clone());
+            // Only note if globals appear after subcommand (moved to front)
+            if sub_seen && !corrections.iter().any(|c| c.contains("moved to front")) {
+                corrections.push("Global flags moved to front of command".into());
+            }
             // If this global takes a value and doesn't use `=` syntax, consume the next arg
-            if global_with_value(arg) && !arg.contains('=') {
-                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    globals.push(args[i + 1].to_string());
-                    i += 1;
-                }
+            if global_with_value(&normalized_arg)
+                && !normalized_arg.contains('=')
+                && i + 1 < args.len()
+                && !args[i + 1].starts_with('-')
+            {
+                globals.push(args[i + 1].to_string());
+                i += 1;
             }
             i += 1;
             continue;
         }
 
-        if !sub_seen && !arg.starts_with('-') {
+        if !sub_seen && !normalized_arg.starts_with('-') {
             sub_seen = true;
         }
-        rest.push(arg.to_string());
+        rest.push(normalized_arg);
         i += 1;
     }
 
@@ -573,14 +750,19 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     normalized.extend(globals);
     normalized.extend(rest);
 
-    let note = rewrote.then(|| {
-        let joined = if normalized.len() > 1 {
-            normalized[1..].join(" ")
-        } else {
-            String::new()
-        };
-        format!("Normalized arguments for you: {joined}")
-    });
+    let note = if corrections.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Auto-corrected: {}. Canonical form: {}",
+            corrections.join("; "),
+            if normalized.len() > 1 {
+                normalized[1..].join(" ")
+            } else {
+                String::new()
+            }
+        ))
+    };
     (normalized, note)
 }
 
@@ -589,13 +771,21 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
     let is_robot = raw.iter().any(|s| s == "--json" || s == "--robot");
 
     if is_robot {
-        let mut err_map = serde_json::Map::new();
-        err_map.insert("status".into(), "error".into());
-        err_map.insert("error".into(), err.to_string().into());
-        err_map.insert("kind".into(), "argument_parsing".into());
+        let mut error_obj = serde_json::Map::new();
+        error_obj.insert("code".into(), serde_json::json!(2));
+        error_obj.insert("kind".into(), "usage".into());
+        // Strip ANSI codes if present, though clap::Error::to_string() usually is plain text.
+        // We can't easily strip ANSI here without a crate, but to_string() should be safe.
+        error_obj.insert("message".into(), err.to_string().into());
+
+        error_obj.insert(
+            "hint".into(),
+            "Check command syntax. See examples below or run 'cass --robot-help'.".into(),
+        );
+        error_obj.insert("retryable".into(), serde_json::json!(false));
 
         if raw != normalized && normalized.len() > 1 {
-            err_map.insert(
+            error_obj.insert(
                 "normalized_attempt".into(),
                 normalized[1..].join(" ").into(),
             );
@@ -606,13 +796,12 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
             "cass search \"query\" --robot --limit 5",
             "cass capabilities --json",
         ];
-        err_map.insert("examples".into(), serde_json::json!(suggestions));
-        err_map.insert(
-            "hint".into(),
-            "Check flags syntax (e.g. --limit 5 not limit=5)".into(),
-        );
+        error_obj.insert("examples".into(), serde_json::json!(suggestions));
 
-        return serde_json::to_string_pretty(&err_map).unwrap_or_else(|_| err.to_string());
+        let mut payload = serde_json::Map::new();
+        payload.insert("error".into(), serde_json::Value::Object(error_obj));
+
+        return serde_json::to_string_pretty(&payload).unwrap_or_else(|_| err.to_string());
     }
 
     let mut parts = Vec::new();
@@ -791,12 +980,27 @@ pub async fn run() -> CliResult<()> {
     let (cli, heuristic_note) = match Cli::try_parse_from(&normalized_args) {
         Ok(cli) => (cli, None),
         Err(err) => {
+            // Let clap handle help/version natively (exit 0, print to stdout)
+            use clap::error::ErrorKind;
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                err.exit();
+            }
             // Attempt heuristic recovery
             if let Some((recovered_args, note)) = heuristic_parse_recovery(&err, &normalized_args) {
                 // Try parsing again with recovered args
                 match Cli::try_parse_from(&recovered_args) {
                     Ok(cli) => (cli, Some(note)),
-                    Err(_) => {
+                    Err(retry_err) => {
+                        // Check again for help/version in case recovered args triggered it
+                        if matches!(
+                            retry_err.kind(),
+                            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                        ) {
+                            retry_err.exit();
+                        }
                         // Recovery failed to produce valid args, fail with original error + friendly help
                         let friendly =
                             format_friendly_parse_error(err, &raw_args, &normalized_args);
@@ -822,15 +1026,42 @@ pub async fn run() -> CliResult<()> {
     let start_instant = Instant::now();
     let command_label = describe_command(&cli);
 
-    // If robot mode, we might output JSON.
-    // If we have a heuristic correction note, we need to inject it into the JSON output _if possible_,
-    // or print it to stderr if we are strict.
-    // For now, let's print to stderr as a warning so agents can see it in their logs.
-    if let Some(note) = parse_note {
-        eprintln!("WARN: {note}");
-    }
-    if let Some(note) = heuristic_note {
-        eprintln!("WARN: Auto-corrected command: {note}");
+    // Output correction notices for AI agents
+    // These teach the agent proper syntax while still honoring their intent
+    // Detect robot mode from raw args (more reliable than pattern matching complex enums)
+    let is_robot_mode = raw_args
+        .iter()
+        .any(|s| s == "--json" || s == "--robot" || s == "-json" || s == "-robot")
+        || matches!(&cli.command, Some(Commands::Capabilities { .. }))
+        || matches!(&cli.command, Some(Commands::Introspect { .. }));
+
+    // Combine all correction notes
+    let all_notes: Vec<&str> = [parse_note.as_deref(), heuristic_note.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    if !all_notes.is_empty() {
+        if is_robot_mode {
+            // Output JSON-formatted correction notice for agents
+            let correction_json = serde_json::json!({
+                "type": "syntax_correction",
+                "message": "Your command was auto-corrected. Please use the canonical form in future requests.",
+                "corrections": all_notes,
+                "tip": "Run 'cass robot-docs' for complete syntax documentation."
+            });
+            eprintln!(
+                "{}",
+                serde_json::to_string(&correction_json).unwrap_or_else(|_| all_notes.join("; "))
+            );
+        } else {
+            // Human-readable correction notice
+            eprintln!("Note: Your command was auto-corrected:");
+            for note in &all_notes {
+                eprintln!("  • {note}");
+            }
+            eprintln!("Tip: Run 'cass --help' for proper syntax.");
+        }
     }
 
     let result = execute_cli(
@@ -1296,6 +1527,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::State { .. }) => "state".to_string(),
         Some(Commands::Introspect { .. }) => "introspect".to_string(),
         Some(Commands::RobotDocs { topic }) => format!("robot-docs:{topic:?}"),
+        Some(Commands::Health { .. }) => "health".to_string(),
         None => "(default)".to_string(),
     }
 }
@@ -1319,6 +1551,7 @@ fn is_robot_mode(command: &Commands) -> bool {
         Commands::View { json, .. } => *json,
         Commands::Capabilities { json, .. } => *json,
         Commands::Introspect { json, .. } => *json,
+        Commands::Health { json, .. } => *json,
         _ => false,
     }
 }
@@ -1369,6 +1602,8 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  cass search \"api\" --week --agent codex  # Last 7 days, codex only",
         "  cass stats --json                    # Get index statistics",
         "  cass view /path/file.jsonl -n 42    # View file at line 42",
+        "  cass robot-docs commands            # Machine-readable command list",
+        "  cass --robot-docs=commands          # Also accepted (auto-normalized)",
         "",
         "TIME FILTERS:",
         "  --today | --yesterday | --week | --days N",
@@ -1398,6 +1633,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "commands:".to_string(),
             "  (global) --quiet / -q  Suppress info logs (auto-enabled in robot mode)".to_string(),
             "  (global) --verbose/-v  Enable debug logs (overrides auto-quiet)".to_string(),
+            "  Tip: `--robot-docs=<topic>` is normalized to `robot-docs <topic>`; globals can appear before/after subcommands.".to_string(),
             "  cass search <query> [OPTIONS]".to_string(),
             "    --agent A         Filter by agent (codex, claude_code, gemini, opencode, amp, cline)".to_string(),
             "    --workspace W     Filter by workspace path".to_string(),
@@ -3058,6 +3294,85 @@ fn run_status(
     }
 
     Ok(())
+}
+
+/// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
+/// Designed for agent pre-flight checks before complex operations.
+#[allow(dead_code)]
+fn run_health(
+    data_dir_override: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    json: bool,
+) -> CliResult<()> {
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let index_base = data_dir.join("index");
+
+    let mut issues = Vec::new();
+
+    // Check database exists
+    let db_exists = db_path.exists();
+    if !db_exists {
+        issues.push("database not found".to_string());
+    }
+
+    // Check database is readable
+    let db_readable = if db_exists {
+        rusqlite::Connection::open(&db_path).is_ok()
+    } else {
+        false
+    };
+    if db_exists && !db_readable {
+        issues.push("database not readable".to_string());
+    }
+
+    // Check index exists (index/<version>/ directory with content)
+    let index_exists = index_base.exists()
+        && index_base.is_dir()
+        && std::fs::read_dir(&index_base)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+    if !index_exists {
+        issues.push("index missing".to_string());
+    }
+
+    let healthy = db_exists && db_readable && index_exists;
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    if json {
+        let mut payload = serde_json::json!({
+            "healthy": healthy,
+            "latency_ms": latency_ms
+        });
+        if !issues.is_empty() {
+            payload["issues"] = serde_json::json!(issues);
+        }
+        println!("{}", serde_json::to_string(&payload).unwrap());
+    } else if healthy {
+        println!("✓ Healthy ({latency_ms}ms)");
+    } else {
+        println!("✗ Unhealthy ({latency_ms}ms)");
+        for issue in &issues {
+            println!("  - {issue}");
+        }
+        println!();
+        println!("Run 'cass index --full' to fix.");
+    }
+
+    if healthy {
+        Ok(())
+    } else {
+        Err(CliError {
+            code: 1,
+            kind: "health",
+            message: format!("Health check failed: {}", issues.join(", ")),
+            hint: Some("Run 'cass index --full' to create/rebuild the index".to_string()),
+            retryable: true,
+        })
+    }
 }
 
 /// Capabilities response for agent introspection.

@@ -195,6 +195,7 @@ pub fn run_index(
                         state.clone(),
                         storage.clone(),
                         t_index.clone(),
+                        true,
                     );
                 } else {
                     let _ = reindex_paths(
@@ -203,6 +204,7 @@ pub fn run_index(
                         state.clone(),
                         storage.clone(),
                         t_index.clone(),
+                        false,
                     );
                 }
             },
@@ -357,6 +359,7 @@ fn reindex_paths(
     state: Arc<Mutex<HashMap<ConnectorKind, i64>>>,
     storage: Arc<Mutex<SqliteStorage>>,
     t_index: Arc<Mutex<TantivyIndex>>,
+    force_full: bool,
 ) -> Result<()> {
     let mut storage = storage
         .lock()
@@ -389,7 +392,9 @@ fn reindex_paths(
             p.phase.store(1, Ordering::Relaxed);
         }
 
-        let since_ts = {
+        let since_ts = if force_full {
+            None
+        } else {
             let guard = state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
@@ -824,6 +829,7 @@ mod tests {
             state.clone(),
             storage,
             t_index,
+            false,
         )
         .unwrap();
 
@@ -915,7 +921,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         let storage = Arc::new(Mutex::new(storage));
         let t_index = Arc::new(Mutex::new(t_index));
 
-        reindex_paths(&opts, vec![amp_file], state, storage, t_index).unwrap();
+        reindex_paths(&opts, vec![amp_file], state, storage, t_index, false).unwrap();
 
         // Progress should reflect the indexed conversation
         assert_eq!(progress.total.load(Ordering::Relaxed), 1);

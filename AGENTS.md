@@ -58,6 +58,13 @@ We want all console output to be informative, detailed, stylish, colorful, etc. 
 
 If you aren't 100% sure about how to use a third party library, then you must SEARCH ONLINE to find the latest documentation website for the library to understand how it is supposed to work and the latest (mid-2025) suggested best practices and usage.
 
+### Robot mode etiquette (CLI for AI agents)
+- Prefer `cass --robot-help` and `cass robot-docs <topic>` for machine-first docs.  
+- The CLI is forgiving: `--robot-docs=commands` and globals placed before/after the subcommand are auto-normalized.  
+- If parsing fails, we return actionable errors with examples; follow them and retry.  
+- Keep stdout clean: use `--json/--robot`; stderr only WARN/ERROR in robot mode (INFO auto-suppressed unless `-v`).  
+- Use `--color=never` in non-TTY automation if you want ANSI-free output.
+
 **CRITICAL:** Whenever you make any substantive changes or additions to the rust code, you MUST check that you didn't introduce any compiler errors, warnings, or clippy lints. You can do this by running the following commands:
 
 To check for compiler errors and warnings:
@@ -222,65 +229,174 @@ Event mirroring (optional automation)
 
 ---
 
-## Robot Interface (CLI) — Automation Guide
+## Robot Interface (CLI) — Automation Guide for AI Agents
 
-`cass` is designed to be driven by AI agents. It supports fuzzy command recovery, structured JSON outputs, and helpful error messages to ensure you can always recover from mistakes without human intervention.
+`cass` is designed to be **maximally forgiving** for AI agents. When your intent is clear, the CLI will auto-correct minor syntax issues and proceed with your command—while teaching you the proper syntax for future use. When intent is unclear, it provides rich, contextual error messages with examples.
 
-### Best Practices for Agents
+### Philosophy: Intent Over Syntax
 
-1.  **Use Robot Mode:** Always pass `--robot` (or `--json`) to get structured output. This suppresses INFO logs on stderr and ensures stdout is pure JSON.
-2.  **Trust the Error Messages:** If a command fails, read the JSON error output. It includes `examples`, `hint`, and even a `normalized_attempt` if `cass` tried to guess your intent.
-3.  **Use `cass --robot-help`:** This command outputs a "Contract v1" document optimized for LLM consumption, listing all commands and schemas.
+**Core principle:** If we can reliably determine what you're trying to do, we do it. We then tell you how to do it correctly next time.
 
-### Fuzzy Command Recovery
+This means:
+- **Minor syntax errors are auto-corrected**: Single-dash long flags, wrong case, subcommand aliases
+- **Correction notices teach proper syntax**: Every correction includes an explanation
+- **Failures include contextual examples**: Based on what you were likely trying to do
 
-If you make a syntax error (e.g., typo a flag, forget a subcommand), `cass` attempts to infer your intent instead of just failing.
+### Auto-Correction Features
 
-*   **Implicit Search:** `cass "my query"` -> `cass search "my query"`
-*   **Flag Typos:** `cass search --limit=5` (missing space) -> `cass search --limit 5`
-*   **Flag Spelling:** `cass search --agnt codex` -> `cass search --agent codex`
+The CLI applies multiple normalization layers before parsing:
 
-If `cass` auto-corrects your command, it will print a warning to stderr:
-`WARN: Auto-corrected command: Corrected typo '--agnt' to '--agent'`
+| Mistake | Correction | Note |
+|---------|------------|------|
+| `-robot` | `--robot` | Long flags need double-dash |
+| `-limit 5` | `--limit 5` | Long flags need double-dash |
+| `--Robot`, `--LIMIT` | `--robot`, `--limit` | Flags are lowercase |
+| `find "query"` | `search "query"` | `find` is an alias for `search` |
+| `query "text"` | `search "text"` | `query` is an alias for `search` |
+| `ls` | `stats` | `ls`/`list` are aliases for `stats` |
+| `--robot-docs` | `robot-docs` | It's a subcommand, not a flag |
+| `docs commands` | `robot-docs commands` | `docs` is an alias |
+| Flag after subcommand | Moved to front | Global flags are hoisted |
 
-### Structured Error Handling
+**Full alias list:**
+- **Search:** `find`, `query`, `q`, `lookup`, `grep` → `search`
+- **Stats:** `ls`, `list`, `info`, `summary` → `stats`
+- **Status:** `st`, `state` → `status`
+- **Index:** `reindex`, `idx`, `rebuild` → `index`
+- **View:** `show`, `get`, `read` → `view`
+- **Diag:** `diagnose`, `debug`, `check` → `diag`
+- **Capabilities:** `caps`, `cap` → `capabilities`
+- **Introspect:** `inspect`, `intro` → `introspect`
+- **Robot-docs:** `docs`, `help-robot`, `robotdocs` → `robot-docs`
 
-When `cass` cannot execute a command, it returns a JSON error object to stderr (and non-zero exit code).
+### Correction Notices
 
-**Example Error Output:**
+When commands are auto-corrected, you'll receive a JSON notice on stderr (in robot mode):
+
 ```json
 {
-  "error": {
-    "code": 2,
-    "kind": "usage",
-    "message": "Could not parse arguments",
-    "hint": "Check flags syntax (e.g. --limit 5 not limit=5)",
-    "retryable": false,
-    "examples": [
-      "cass --robot-help",
-      "cass search \"query\" --robot --limit 5"
-    ]
+  "type": "syntax_correction",
+  "message": "Your command was auto-corrected. Please use the canonical form in future requests.",
+  "corrections": [
+    "'-robot' → '--robot' (use double-dash for long flags)",
+    "'find' → 'search' (canonical subcommand name)"
+  ],
+  "tip": "Run 'cass robot-docs' for complete syntax documentation."
+}
+```
+
+**Important:** The command still executes successfully—this is informational for learning.
+
+### Error Messages (When Intent Is Unclear)
+
+If `cass` cannot determine your intent, it returns a rich error with:
+- **Detected intent**: What it thinks you were trying to do
+- **Contextual examples**: Relevant to your apparent goal
+- **Specific hints**: Based on mistakes detected in your command
+- **Common mistakes**: Wrong→Correct mappings for similar commands
+
+**Example Error Output (robot mode):**
+```json
+{
+  "status": "error",
+  "error": "error: unrecognized subcommand 'foobar'",
+  "kind": "argument_parsing",
+  "examples": [
+    "cass search \"error handling\" --robot --limit 10",
+    "cass search \"authentication\" --robot --agent claude"
+  ],
+  "hints": [
+    "Use '--robot' (double-dash), not '-robot'",
+    "Use the 'search' subcommand explicitly: cass search \"your query\" --robot"
+  ],
+  "common_mistakes": [
+    {"wrong": "cass query=\"foo\" --robot", "correct": "cass search \"foo\" --robot"},
+    {"wrong": "cass -robot find error", "correct": "cass search \"error\" --robot"}
+  ],
+  "flag_syntax": {
+    "correct": ["--limit 5", "--robot", "--json"],
+    "incorrect": ["-limit 5", "limit=5", "--Limit"]
   }
 }
 ```
 
-*   **code**: Exit code (2=Usage, 3=Missing Index, 9=Unknown).
-*   **kind**: Error category string.
-*   **message**: Human-readable description.
-*   **hint**: Specific suggestion for fixing the issue.
-*   **retryable**: If `true`, you can likely retry the exact same command (e.g., transient lock).
+### Quick Syntax Reference
+
+```
+# Correct syntax patterns
+cass search "query" --robot --limit 10
+cass search "query" --robot --agent claude --workspace /path
+cass stats --robot
+cass view <session-id> --robot --full
+cass robot-docs commands
+cass capabilities --json
+cass health --json                        # Pre-flight check (<50ms, exit 0=healthy, 1=unhealthy)
+
+# Common mistakes (all auto-corrected)
+cass -robot search "query"        → cass search "query" --robot
+cass --Robot search "query"       → cass search "query" --robot
+cass find "query" --json          → cass search "query" --json
+cass --robot-docs                 → cass robot-docs
+cass search "query" limit=5       → cass search "query" --limit 5
+```
+
+### Best Practices for Agents
+
+1. **Always use `--robot` or `--json`**: Structured output, diagnostics to stderr only
+2. **Read correction notices**: Learn proper syntax to avoid corrections next time
+3. **Trust error messages**: They're contextual and include working examples
+4. **Use `cass robot-docs`**: Complete documentation optimized for LLM consumption
+5. **Start with `cass capabilities --json`**: Discover all available commands and options
+
+### Pre-Flight Health Check
+
+Before making complex queries, use the health command to verify cass is working:
+
+```bash
+cass health --json
+```
+
+Returns in <50ms:
+- **Exit 0:** Healthy—proceed with queries
+- **Exit 1:** Unhealthy—run `cass index --full` first
+
+JSON output:
+```json
+{"healthy": true, "latency_ms": 12}
+```
+
+Or when unhealthy:
+```json
+{"healthy": false, "latency_ms": 8, "issues": ["database not found", "index missing"]}
+```
+
+**Recommended agent workflow:**
+1. `cass health --json` → Check exit code
+2. If exit 1: `cass index --full` → Build index
+3. Proceed with `cass search "query" --robot`
+
+### Exit Codes
+
+| Code | Meaning | Retryable |
+|------|---------|-----------|
+| 0 | Success | N/A |
+| 1 | Health check failed (unhealthy) | Yes—run `cass index --full` |
+| 2 | Usage/parsing error | No—fix syntax |
+| 3 | Missing index | Yes—run `cass index` first |
+| 9 | Unknown error | Maybe |
 
 ---
 
 Prepared blurb you can paste into other agents' guides (AGENTS.md / CLAUDE.md)
 
-> **cass (Coding Agent Session Search)** — CLI/TUI to search local agent histories.  
-> - Robot mode: `cass --robot-help` (automation contract) and `cass robot-docs <topic>` for focused docs.  
-> - JSON search: `cass search "query" --robot [--limit N --offset N --agent codex --workspace /path]`.  
-> - Inspect hits: `cass view <source_path> -n <line> --json`.  
-> - Index first: `cass index --full` (or `cass index --watch`).  
-> - stdout=data only; stderr=diagnostics; exit codes stable (see `--robot-help`).  
-> - Non-TTY automation won’t start TUI unless you explicitly run `cass tui`.
+> **cass (Coding Agent Session Search)** — CLI/TUI to search local agent histories.
+> - **Pre-flight:** `cass health --json` (<50ms, exit 0=OK, 1=needs index).
+> - Robot mode: `cass --robot-help` (automation contract) and `cass robot-docs <topic>` for focused docs.
+> - JSON search: `cass search "query" --robot [--limit N --offset N --agent codex --workspace /path]`.
+> - Inspect hits: `cass view <source_path> -n <line> --json`.
+> - Index first: `cass index --full` (or `cass index --watch`).
+> - stdout=data only; stderr=diagnostics; exit codes stable (see `--robot-help`).
+> - Non-TTY automation won't start TUI unless you explicitly run `cass tui`.
 
 ### ast-grep vs ripgrep (quick guidance)
 
