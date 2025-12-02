@@ -5,9 +5,11 @@ use std::path::PathBuf;
 
 pub mod aider;
 pub mod amp;
+pub mod chatgpt;
 pub mod claude_code;
 pub mod cline;
 pub mod codex;
+pub mod cursor;
 pub mod gemini;
 pub mod opencode;
 

@@ -11,9 +11,9 @@ use notify::{RecursiveMode, Watcher, recommended_watcher};
 
 use crate::connectors::NormalizedConversation;
 use crate::connectors::{
-    Connector, aider::AiderConnector, amp::AmpConnector, claude_code::ClaudeCodeConnector,
-    cline::ClineConnector, codex::CodexConnector, gemini::GeminiConnector,
-    opencode::OpenCodeConnector,
+    Connector, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
+    claude_code::ClaudeCodeConnector, cline::ClineConnector, codex::CodexConnector,
+    cursor::CursorConnector, gemini::GeminiConnector, opencode::OpenCodeConnector,
 };
 use crate::search::tantivy::{TantivyIndex, index_dir};
 use crate::storage::sqlite::SqliteStorage;
@@ -115,6 +115,8 @@ pub fn run_index(
         ("opencode", Box::new(OpenCodeConnector::new())),
         ("amp", Box::new(AmpConnector::new())),
         ("aider", Box::new(AiderConnector::new())),
+        ("cursor", Box::new(CursorConnector::new())),
+        ("chatgpt", Box::new(ChatGptConnector::new())),
     ];
 
     // First pass: Scan all to get counts if we have progress tracker
@@ -323,7 +325,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
 }
 
 fn watch_roots() -> Vec<PathBuf> {
-    vec![
+    let mut roots = vec![
         std::env::var("CODEX_HOME").map_or_else(
             |_| dirs::home_dir().unwrap_or_default().join(".codex/sessions"),
             PathBuf::from,
@@ -345,7 +347,22 @@ fn watch_roots() -> Vec<PathBuf> {
             .unwrap_or_default()
             .join(".opencode"),
         dirs::home_dir().unwrap_or_default().join(".opencode"),
-    ]
+    ];
+
+    // Cursor IDE chat storage
+    if let Some(cursor_base) = crate::connectors::cursor::CursorConnector::app_support_dir() {
+        roots.push(cursor_base);
+    }
+
+    // ChatGPT desktop (macOS)
+    if let Some(chat_base) = crate::connectors::chatgpt::ChatGptConnector::app_support_dir() {
+        roots.push(chat_base);
+    }
+
+    // Aider keeps history alongside the current workspace
+    roots.push(std::env::current_dir().unwrap_or_default());
+
+    roots
 }
 
 fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
@@ -395,6 +412,8 @@ fn reindex_paths(
             ConnectorKind::Amp => Box::new(AmpConnector::new()),
             ConnectorKind::OpenCode => Box::new(OpenCodeConnector::new()),
             ConnectorKind::Aider => Box::new(AiderConnector::new()),
+            ConnectorKind::Cursor => Box::new(CursorConnector::new()),
+            ConnectorKind::ChatGpt => Box::new(ChatGptConnector::new()),
         };
         let detect = conn.detect();
         if !detect.detected {
@@ -463,6 +482,8 @@ enum ConnectorKind {
     Amp,
     OpenCode,
     Aider,
+    Cursor,
+    ChatGpt,
 }
 
 fn state_path(data_dir: &Path) -> PathBuf {
@@ -516,6 +537,10 @@ fn classify_paths(paths: Vec<PathBuf>) -> Vec<(ConnectorKind, Option<i64>)> {
                     Some(ConnectorKind::OpenCode)
                 } else if s.contains(".aider.chat.history.md") {
                     Some(ConnectorKind::Aider)
+                } else if s.contains("Cursor/User") || s.contains("cursor/User") {
+                    Some(ConnectorKind::Cursor)
+                } else if s.contains("com.openai.chat") || s.contains("conversations-") {
+                    Some(ConnectorKind::ChatGpt)
                 } else {
                     None
                 };
@@ -778,12 +803,29 @@ mod tests {
         std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
         std::fs::write(&claude, "{{}}").unwrap();
 
-        let paths = vec![codex.clone(), claude.clone()];
+        let aider = tmp.path().join("repo/.aider.chat.history.md");
+        std::fs::create_dir_all(aider.parent().unwrap()).unwrap();
+        std::fs::write(&aider, "user\nassistant").unwrap();
+
+        let cursor = tmp.path().join("Cursor/User/globalStorage/state.vscdb");
+        std::fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+        std::fs::write(&cursor, b"").unwrap();
+
+        let chatgpt = tmp
+            .path()
+            .join("Library/Application Support/com.openai.chat/conversations-abc/data.json");
+        std::fs::create_dir_all(chatgpt.parent().unwrap()).unwrap();
+        std::fs::write(&chatgpt, "{}").unwrap();
+
+        let paths = vec![codex.clone(), claude.clone(), aider, cursor, chatgpt];
         let classified = classify_paths(paths);
 
         let kinds: std::collections::HashSet<_> = classified.iter().map(|(k, _)| *k).collect();
         assert!(kinds.contains(&ConnectorKind::Codex));
         assert!(kinds.contains(&ConnectorKind::Claude));
+        assert!(kinds.contains(&ConnectorKind::Aider));
+        assert!(kinds.contains(&ConnectorKind::Cursor));
+        assert!(kinds.contains(&ConnectorKind::ChatGpt));
 
         for (_, ts) in classified {
             assert!(ts.is_some(), "mtime should be captured");
@@ -811,7 +853,8 @@ mod tests {
     #[serial]
     fn watch_state_updates_after_reindex_paths() {
         let tmp = TempDir::new().unwrap();
-        let xdg = tmp.path().join("xdg");
+        // Use unique subdirectory to avoid conflicts with other tests
+        let xdg = tmp.path().join("xdg_watch_state");
         std::fs::create_dir_all(&xdg).unwrap();
         let prev = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
@@ -859,8 +902,8 @@ mod tests {
             &opts,
             vec![amp_file.clone()],
             state.clone(),
-            storage,
-            t_index,
+            storage.clone(),
+            t_index.clone(),
             false,
         )
         .unwrap();
@@ -869,6 +912,11 @@ mod tests {
         assert!(loaded.contains_key(&ConnectorKind::Amp));
         let ts = loaded.get(&ConnectorKind::Amp).copied().unwrap();
         assert!(ts > 0);
+
+        // Explicitly drop resources to release locks before cleanup
+        drop(t_index);
+        drop(storage);
+        drop(state);
 
         if let Some(prev) = prev {
             unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
@@ -888,7 +936,7 @@ mod tests {
             .collect();
         if !cols.iter().any(|c| c == "created_at") {
             conn.execute_batch(
-                r#""
+                r#"
 DROP TABLE IF EXISTS fts_messages;
 CREATE VIRTUAL TABLE fts_messages USING fts5(
     content,
@@ -900,7 +948,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
     message_id UNINDEXED,
     tokenize='porter'
 );
-""#,
+"#,
             )
             .unwrap();
         }
@@ -910,7 +958,8 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
     #[serial]
     fn reindex_paths_updates_progress() {
         let tmp = TempDir::new().unwrap();
-        let xdg = tmp.path().join("xdg");
+        // Use unique subdirectory to avoid conflicts with other tests
+        let xdg = tmp.path().join("xdg_progress");
         std::fs::create_dir_all(&xdg).unwrap();
         let prev = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
@@ -953,13 +1002,26 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         let storage = Arc::new(Mutex::new(storage));
         let t_index = Arc::new(Mutex::new(t_index));
 
-        reindex_paths(&opts, vec![amp_file], state, storage, t_index, false).unwrap();
+        reindex_paths(
+            &opts,
+            vec![amp_file],
+            state.clone(),
+            storage.clone(),
+            t_index.clone(),
+            false,
+        )
+        .unwrap();
 
         // Progress should reflect the indexed conversation
         assert_eq!(progress.total.load(Ordering::Relaxed), 1);
         assert_eq!(progress.current.load(Ordering::Relaxed), 1);
         // Phase resets to 0 (idle) at the end
         assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
+
+        // Explicitly drop resources to release locks before cleanup
+        drop(t_index);
+        drop(storage);
+        drop(state);
 
         if let Some(prev) = prev {
             unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
