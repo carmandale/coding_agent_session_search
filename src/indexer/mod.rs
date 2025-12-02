@@ -36,6 +36,10 @@ pub struct IndexingProgress {
     // Simple phase indicator: 0=Idle, 1=Scanning, 2=Indexing
     pub phase: AtomicUsize,
     pub is_rebuilding: AtomicBool,
+    /// Number of coding agents discovered so far during scanning
+    pub discovered_agents: AtomicUsize,
+    /// Names of discovered agents (protected by mutex for concurrent access)
+    pub discovered_agent_names: Mutex<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -110,50 +114,76 @@ pub fn run_index(
     // Record scan start time before scanning
     let scan_start_ts = SqliteStorage::now_millis();
 
-    let connectors: Vec<(&'static str, Box<dyn Connector>)> = vec![
-        ("codex", Box::new(CodexConnector::new())),
-        ("cline", Box::new(ClineConnector::new())),
-        ("gemini", Box::new(GeminiConnector::new())),
-        ("claude", Box::new(ClaudeCodeConnector::new())),
-        ("opencode", Box::new(OpenCodeConnector::new())),
-        ("amp", Box::new(AmpConnector::new())),
-        ("aider", Box::new(AiderConnector::new())),
-        ("cursor", Box::new(CursorConnector::new())),
-        ("chatgpt", Box::new(ChatGptConnector::new())),
-    ];
-
     // First pass: Scan all to get counts if we have progress tracker
-    let mut pending_batches = Vec::new();
+    // Use parallel iteration for faster agent discovery
     if let Some(p) = &opts.progress {
         p.phase.store(1, Ordering::Relaxed); // Scanning
         // Reset; totals will be populated during scanning.
         p.total.store(0, Ordering::Relaxed);
         p.current.store(0, Ordering::Relaxed);
+        p.discovered_agents.store(0, Ordering::Relaxed);
+        if let Ok(mut names) = p.discovered_agent_names.lock() {
+            names.clear();
+        }
     }
 
-    for (name, conn) in &connectors {
-        let detect = conn.detect();
-        if !detect.detected {
-            continue;
-        }
-        let ctx = crate::connectors::ScanContext {
-            data_root: opts.data_dir.clone(),
-            since_ts,
-        };
-        // We scan here. For optimization in non-progress mode, we could stream.
-        // But to show accurate "X/Y", we need to collect.
-        match conn.scan(&ctx) {
-            Ok(convs) => {
-                if let Some(p) = &opts.progress {
-                    p.total.fetch_add(convs.len(), Ordering::Relaxed);
+    // Define connector factories for parallel execution
+    // Each tuple: (name, factory_fn) where factory_fn creates a fresh Connector
+    let connector_factories: Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> = vec![
+        ("codex", || Box::new(CodexConnector::new())),
+        ("cline", || Box::new(ClineConnector::new())),
+        ("gemini", || Box::new(GeminiConnector::new())),
+        ("claude", || Box::new(ClaudeCodeConnector::new())),
+        ("opencode", || Box::new(OpenCodeConnector::new())),
+        ("amp", || Box::new(AmpConnector::new())),
+        ("aider", || Box::new(AiderConnector::new())),
+        ("cursor", || Box::new(CursorConnector::new())),
+        ("chatgpt", || Box::new(ChatGptConnector::new())),
+    ];
+
+    // Run connector detection and scanning in parallel using rayon
+    use rayon::prelude::*;
+
+    let progress_ref = opts.progress.as_ref();
+    let data_dir = opts.data_dir.clone();
+
+    let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>)> = connector_factories
+        .into_par_iter()
+        .filter_map(|(name, factory)| {
+            let conn = factory();
+            let detect = conn.detect();
+            if !detect.detected {
+                return None;
+            }
+
+            // Update discovered agents count immediately when detected
+            if let Some(p) = progress_ref {
+                p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+                if let Ok(mut names) = p.discovered_agent_names.lock() {
+                    names.push(name.to_string());
                 }
-                pending_batches.push((name, convs));
             }
-            Err(e) => {
-                tracing::warn!("scan failed for {}: {}", name, e);
+
+            let ctx = crate::connectors::ScanContext {
+                data_root: data_dir.clone(),
+                since_ts,
+            };
+
+            match conn.scan(&ctx) {
+                Ok(convs) => {
+                    if let Some(p) = progress_ref {
+                        p.total.fetch_add(convs.len(), Ordering::Relaxed);
+                    }
+                    tracing::info!(connector = name, conversations = convs.len(), "parallel_scan_complete");
+                    Some((name, convs))
+                }
+                Err(e) => {
+                    tracing::warn!("scan failed for {}: {}", name, e);
+                    None
+                }
             }
-        }
-    }
+        })
+        .collect();
 
     if let Some(p) = &opts.progress {
         p.phase.store(2, Ordering::Relaxed); // Indexing

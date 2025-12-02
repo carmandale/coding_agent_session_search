@@ -2509,19 +2509,24 @@ pub fn run_tui(
     let mut progress_history: std::collections::VecDeque<u8> =
         std::collections::VecDeque::with_capacity(24);
 
-    // Helper to get indexing phase info (returns phase, current, total, is_rebuild, pct)
-    let get_indexing_state = |progress: &std::sync::Arc<crate::indexer::IndexingProgress>| -> (usize, usize, usize, bool, usize) {
+    // Track last indexing state to detect changes and trigger redraw
+    // Tuple: (phase, current, total, is_rebuild, discovered_agents)
+    let mut last_indexing_state: Option<(usize, usize, usize, bool, usize)> = None;
+
+    // Helper to get indexing phase info (returns phase, current, total, is_rebuild, pct, discovered_agents)
+    let get_indexing_state = |progress: &std::sync::Arc<crate::indexer::IndexingProgress>| -> (usize, usize, usize, bool, usize, usize) {
         use std::sync::atomic::Ordering;
         let phase = progress.phase.load(Ordering::Relaxed);
         let total = progress.total.load(Ordering::Relaxed);
         let current = progress.current.load(Ordering::Relaxed);
         let is_rebuild = progress.is_rebuilding.load(Ordering::Relaxed);
+        let discovered = progress.discovered_agents.load(Ordering::Relaxed);
         let pct = if total > 0 {
             (current as f32 / total as f32 * 100.0) as usize
         } else {
             0
         };
-        (phase, current, total, is_rebuild, pct)
+        (phase, current, total, is_rebuild, pct, discovered)
     };
 
     // Render tiny sparkline from history (0-100 mapped to ▁▂▃▄▅▆▇█)
@@ -2539,11 +2544,11 @@ pub fn run_tui(
             .collect()
     };
 
-    // Helper to render progress for footer (enhanced with icons + sparkline)
+    // Helper to render progress for footer (enhanced with icons + sparkline + discovered agents)
     let render_progress = |progress: &std::sync::Arc<crate::indexer::IndexingProgress>,
                            history: &std::collections::VecDeque<u8>|
      -> String {
-        let (phase, current, total, is_rebuild, pct) = get_indexing_state(progress);
+        let (phase, current, total, is_rebuild, pct, discovered) = get_indexing_state(progress);
         if phase == 0 {
             return String::new();
         }
@@ -2563,8 +2568,16 @@ pub fn run_tui(
         let bar = format!("{}{}", "█".repeat(filled.min(bar_width)), "░".repeat(empty));
         let spark = render_sparkline(history);
 
-        let mut s = format!(" | {icon} {phase_str} {current}/{total} ({pct}%) {bar}");
-        if !spark.is_empty() {
+        // Build progress string with discovered agents count during discovery phase
+        let mut s = if phase == 1 {
+            // During discovery, show agents found
+            format!(" | {icon} {phase_str} ({discovered} agents found)")
+        } else {
+            // During indexing, show items progress
+            format!(" | {icon} {phase_str} {current}/{total} ({pct}%) {bar}")
+        };
+
+        if !spark.is_empty() && phase == 2 {
             s.push_str(&format!(" {spark}"));
         }
         if is_rebuild {
@@ -2744,7 +2757,7 @@ pub fn run_tui(
                     // Check if indexing is in progress - show prominent banner
                     let indexing_active = progress.as_ref().map(get_indexing_state);
 
-                    if let Some((phase, current, total, is_rebuild, pct)) = indexing_active
+                    if let Some((phase, current, total, is_rebuild, pct, discovered)) = indexing_active
                         && phase > 0
                     {
                         // Show indexing banner
@@ -2784,25 +2797,35 @@ pub fn run_tui(
                                 ),
                             ]));
                             lines.push(Line::from(""));
-                            // Progress bar
-                            let bar_width = 30;
-                            let filled = (pct * bar_width / 100).min(bar_width);
-                            let empty = bar_width - filled;
-                            lines.push(Line::from(vec![
-                                Span::styled("  [", Style::default().fg(palette.border)),
-                                Span::styled(
-                                    "█".repeat(filled),
-                                    Style::default().fg(palette.accent),
-                                ),
-                                Span::styled("░".repeat(empty), Style::default().fg(palette.hint)),
-                                Span::styled("]", Style::default().fg(palette.border)),
-                                Span::styled(format!(" {pct}%"), Style::default().fg(palette.hint)),
-                            ]));
-                            lines.push(Line::from(""));
-                            lines.push(Line::from(Span::styled(
-                                format!("  Processing {current} of {total} items"),
-                                Style::default().fg(palette.hint),
-                            )));
+
+                            if phase == 1 {
+                                // Discovery phase - show agents found count
+                                lines.push(Line::from(Span::styled(
+                                    format!("  Found {discovered} coding agent(s) so far..."),
+                                    Style::default().fg(palette.hint),
+                                )));
+                                lines.push(Line::from(""));
+                            } else {
+                                // Indexing phase - show progress bar
+                                let bar_width = 30;
+                                let filled = (pct * bar_width / 100).min(bar_width);
+                                let empty = bar_width - filled;
+                                lines.push(Line::from(vec![
+                                    Span::styled("  [", Style::default().fg(palette.border)),
+                                    Span::styled(
+                                        "█".repeat(filled),
+                                        Style::default().fg(palette.accent),
+                                    ),
+                                    Span::styled("░".repeat(empty), Style::default().fg(palette.hint)),
+                                    Span::styled("]", Style::default().fg(palette.border)),
+                                    Span::styled(format!(" {pct}%"), Style::default().fg(palette.hint)),
+                                ]));
+                                lines.push(Line::from(""));
+                                lines.push(Line::from(Span::styled(
+                                    format!("  Processing {current} of {total} items"),
+                                    Style::default().fg(palette.hint),
+                                )));
+                            }
                             lines.push(Line::from(Span::styled(
                                 "  Search results will appear once indexing completes.",
                                 Style::default().fg(palette.hint),
@@ -2813,7 +2836,7 @@ pub fn run_tui(
 
                     // Only show history/empty state if not indexing OR if indexing but user typed a query
                     let show_normal_empty = indexing_active
-                        .is_none_or(|(phase, _, _, _, _)| phase == 0)
+                        .is_none_or(|(phase, _, _, _, _, _)| phase == 0)
                         || !query.trim().is_empty();
 
                     if show_normal_empty {
@@ -3172,7 +3195,7 @@ pub fn run_tui(
 
                     // Show "indexing in progress" warning when we have results but indexing is active
                     if let Some(prog) = &progress {
-                        let (phase, _, _, _, pct) = get_indexing_state(prog);
+                        let (phase, _, _, _, pct, _discovered) = get_indexing_state(prog);
                         if phase > 0 {
                             let indicator =
                                 format!(" ⚠ Indexing {pct}% - results may be incomplete ");
@@ -3522,7 +3545,7 @@ pub fn run_tui(
 
                 if let Some(p) = &progress {
                     // update sparkline history once per frame
-                    let (_, _, _, _, pct) = get_indexing_state(p);
+                    let (_, _, _, _, pct, _discovered) = get_indexing_state(p);
                     if pct <= 100 {
                         if progress_history.len() == progress_history.capacity() {
                             progress_history.pop_front();
@@ -6260,6 +6283,16 @@ pub fn run_tui(
                     needs_draw = true;
                 }
                 update_info = info;
+            }
+            // Check if indexing progress changed and trigger redraw (bead 019)
+            // Includes discovered_agents to trigger redraw when new agents are found
+            if let Some(ref p) = progress {
+                let (phase, current, total, is_rebuild, _pct, discovered) = get_indexing_state(p);
+                let current_state = (phase, current, total, is_rebuild, discovered);
+                if last_indexing_state.as_ref() != Some(&current_state) {
+                    last_indexing_state = Some(current_state);
+                    needs_draw = true;
+                }
             }
             last_tick = Instant::now();
         }
