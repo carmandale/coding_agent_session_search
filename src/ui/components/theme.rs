@@ -44,7 +44,7 @@ pub mod colors {
     pub const TEXT_SECONDARY: Color = Color::Rgb(169, 177, 214); // #a9b1d6
 
     /// Muted text - hints, placeholders, timestamps
-    pub const TEXT_MUTED: Color = Color::Rgb(86, 95, 137); // #565f89
+    pub const TEXT_MUTED: Color = Color::Rgb(104, 114, 165); // #6872a5 (boosted contrast for WCAG)
 
     /// Disabled/inactive text
     pub const TEXT_DISABLED: Color = Color::Rgb(68, 75, 106); // #444b6a
@@ -341,7 +341,7 @@ impl ThemePalette {
             bg: Color::Rgb(250, 250, 252),          // Off-white
             fg: Color::Rgb(36, 41, 46),             // Near-black
             surface: Color::Rgb(240, 241, 245),     // Light gray
-            hint: Color::Rgb(139, 148, 158),        // Medium gray
+            hint: Color::Rgb(125, 134, 144),        // Medium gray (higher contrast)
             border: Color::Rgb(216, 222, 228),      // Border gray
             user: Color::Rgb(45, 138, 72),          // Forest green
             agent: Color::Rgb(47, 107, 231),        // Rich blue
@@ -826,7 +826,7 @@ impl ThemePalette {
             bg: Color::Rgb(40, 42, 54),            // Background
             fg: Color::Rgb(248, 248, 242),         // Foreground
             surface: Color::Rgb(68, 71, 90),       // Current Line
-            hint: Color::Rgb(98, 114, 164),        // Comment
+            hint: Color::Rgb(130, 146, 200),       // Comment (higher contrast)
             border: Color::Rgb(68, 71, 90),        // Current Line
             user: Color::Rgb(80, 250, 123),        // Green
             agent: Color::Rgb(189, 147, 249),      // Purple
@@ -847,7 +847,7 @@ impl ThemePalette {
             bg: Color::Rgb(46, 52, 64),        // Nord0 (polar night)
             fg: Color::Rgb(236, 239, 244),     // Nord6 (snow storm)
             surface: Color::Rgb(59, 66, 82),   // Nord1
-            hint: Color::Rgb(76, 86, 106),     // Nord3
+            hint: Color::Rgb(130, 144, 170),   // Nord3 (higher contrast)
             border: Color::Rgb(67, 76, 94),    // Nord2
             user: Color::Rgb(163, 190, 140),   // Nord14 (aurora green)
             agent: Color::Rgb(136, 192, 208),  // Nord8 (frost cyan)
