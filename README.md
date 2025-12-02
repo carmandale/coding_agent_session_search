@@ -235,6 +235,8 @@ cass
 - **Actions**:
     - `Enter`: Open original log file in `$EDITOR`.
     - `y`: Copy file path or snippet to clipboard.
+    - `Ctrl+Shift+R`: Trigger manual re-index (refresh search results).
+    - `Ctrl+Shift+Del`: Reset TUI state (clear history, filters, layout).
 
 ---
 

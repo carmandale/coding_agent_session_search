@@ -275,7 +275,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
             }
         } else {
             let now = std::time::Instant::now();
-            let elapsed = now.duration_since(first_event.unwrap());
+            let elapsed = now.duration_since(first_event.unwrap_or(now));
             if elapsed >= max_wait {
                 callback(std::mem::take(&mut pending), false);
                 first_event = None;
@@ -389,7 +389,9 @@ fn reindex_paths(
         }
 
         let since_ts = {
-            let guard = state.lock().unwrap();
+            let guard = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
             guard
                 .get(&kind)
                 .cloned()
@@ -415,7 +417,9 @@ fn reindex_paths(
         t_index.commit()?;
 
         if let Some(ts_val) = ts {
-            let mut guard = state.lock().unwrap();
+            let mut guard = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
             let entry = guard.entry(kind).or_insert(ts_val);
             *entry = (*entry).max(ts_val);
             save_watch_state(&opts.data_dir, &guard)?;

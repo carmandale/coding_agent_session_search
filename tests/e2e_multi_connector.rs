@@ -1,3 +1,11 @@
+//! E2E tests for multi-connector scenarios.
+//!
+//! These tests verify that multiple connectors work together correctly:
+//! - Multiple connectors can be indexed in a single run
+//! - Search returns results from all indexed connectors
+//! - Agent filtering correctly isolates connector results
+//! - Results are properly attributed to their source connector
+
 use assert_cmd::cargo::cargo_bin_cmd;
 use std::fs;
 use std::path::Path;
