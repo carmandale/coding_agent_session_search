@@ -12,9 +12,9 @@ use notify::{RecursiveMode, Watcher, recommended_watcher};
 use crate::connectors::NormalizedConversation;
 use crate::connectors::{
     Connector, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
-    claude_code::ClaudeCodeConnector, cline::ClineConnector, codex::CodexConnector,
-    cursor::CursorConnector, gemini::GeminiConnector, opencode::OpenCodeConnector,
-    pi_agent::PiAgentConnector,
+    claude_code::ClaudeCodeConnector, cline::ClineConnector, codebuff::CodebuffConnector,
+    codex::CodexConnector, cursor::CursorConnector, gemini::GeminiConnector,
+    opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
 };
 use crate::search::tantivy::{TantivyIndex, index_dir};
 use crate::storage::sqlite::SqliteStorage;
@@ -142,6 +142,7 @@ pub fn run_index(
         ("cursor", || Box::new(CursorConnector::new())),
         ("chatgpt", || Box::new(ChatGptConnector::new())),
         ("pi_agent", || Box::new(PiAgentConnector::new())),
+        ("codebuff", || Box::new(CodebuffConnector::new())),
     ];
 
     // Run connector detection and scanning in parallel using rayon
@@ -408,6 +409,14 @@ fn watch_roots() -> Vec<PathBuf> {
     // Aider keeps history alongside the current workspace
     roots.push(std::env::current_dir().unwrap_or_default());
 
+    // Codebuff (manicode) stores sessions in ~/.config/manicode/projects
+    // Note: Codebuff uses Linux-style XDG path even on macOS
+    roots.push(
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config/manicode/projects"),
+    );
+
     roots
 }
 
@@ -460,6 +469,7 @@ fn reindex_paths(
             ConnectorKind::Aider => Box::new(AiderConnector::new()),
             ConnectorKind::Cursor => Box::new(CursorConnector::new()),
             ConnectorKind::ChatGpt => Box::new(ChatGptConnector::new()),
+            ConnectorKind::Codebuff => Box::new(CodebuffConnector::new()),
         };
         let detect = conn.detect();
         if !detect.detected {
@@ -531,6 +541,7 @@ enum ConnectorKind {
     Aider,
     Cursor,
     ChatGpt,
+    Codebuff,
 }
 
 fn state_path(data_dir: &Path) -> PathBuf {
@@ -588,6 +599,8 @@ fn classify_paths(paths: Vec<PathBuf>) -> Vec<(ConnectorKind, Option<i64>)> {
                     Some(ConnectorKind::Cursor)
                 } else if s.contains("com.openai.chat") || s.contains("conversations-") {
                     Some(ConnectorKind::ChatGpt)
+                } else if s.contains("manicode/projects") || s.contains("chat-messages.json") {
+                    Some(ConnectorKind::Codebuff)
                 } else {
                     None
                 };

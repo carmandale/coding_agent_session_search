@@ -4609,6 +4609,7 @@ fn run_capabilities(json: bool) -> CliResult<()> {
             "cursor".to_string(),
             "chatgpt".to_string(),
             "pi_agent".to_string(),
+            "codebuff".to_string(),
         ],
         limits: CapabilitiesLimits {
             max_limit: 10000,
