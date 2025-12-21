@@ -393,6 +393,103 @@ impl SqliteStorage {
         Ok(out)
     }
 
+    /// List conversations filtered by workspace path.
+    /// If workspace is None, returns all conversations (same as list_conversations).
+    /// Returns conversations ordered by started_at DESC with message counts.
+    pub fn list_conversations_for_workspace(
+        &self,
+        workspace: Option<&Path>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<(Conversation, usize)>> {
+        let query = match workspace {
+            Some(_) => {
+                r"SELECT c.id, a.slug, w.path, c.external_id, c.title, c.source_path,
+                         c.started_at, c.ended_at, c.approx_tokens, c.metadata_json,
+                         (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as msg_count
+                  FROM conversations c
+                  JOIN agents a ON c.agent_id = a.id
+                  LEFT JOIN workspaces w ON c.workspace_id = w.id
+                  WHERE w.path = ?
+                  ORDER BY c.started_at IS NULL, c.started_at DESC, c.id DESC
+                  LIMIT ? OFFSET ?"
+            }
+            None => {
+                r"SELECT c.id, a.slug, w.path, c.external_id, c.title, c.source_path,
+                         c.started_at, c.ended_at, c.approx_tokens, c.metadata_json,
+                         (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as msg_count
+                  FROM conversations c
+                  JOIN agents a ON c.agent_id = a.id
+                  LEFT JOIN workspaces w ON c.workspace_id = w.id
+                  ORDER BY c.started_at IS NULL, c.started_at DESC, c.id DESC
+                  LIMIT ? OFFSET ?"
+            }
+        };
+
+        let mut stmt = self.conn.prepare(query)?;
+
+        let rows = if let Some(ws) = workspace {
+            let ws_str = ws.to_string_lossy();
+            stmt.query_map(
+                params![ws_str, limit, offset],
+                Self::map_conversation_with_count,
+            )?
+        } else {
+            stmt.query_map(params![limit, offset], Self::map_conversation_with_count)?
+        };
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Count total conversations for a workspace (for pagination info).
+    pub fn count_conversations_for_workspace(&self, workspace: Option<&Path>) -> Result<i64> {
+        match workspace {
+            Some(ws) => {
+                let ws_str = ws.to_string_lossy();
+                self.conn.query_row(
+                    r"SELECT COUNT(*) FROM conversations c
+                      LEFT JOIN workspaces w ON c.workspace_id = w.id
+                      WHERE w.path = ?",
+                    params![ws_str],
+                    |row| row.get(0),
+                )
+            }
+            None => self
+                .conn
+                .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0)),
+        }
+        .with_context(|| "counting conversations")
+    }
+
+    fn map_conversation_with_count(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<(Conversation, usize)> {
+        let conv = Conversation {
+            id: Some(row.get(0)?),
+            agent_slug: row.get(1)?,
+            workspace: row
+                .get::<_, Option<String>>(2)?
+                .map(|p| Path::new(&p).to_path_buf()),
+            external_id: row.get(3)?,
+            title: row.get(4)?,
+            source_path: Path::new(&row.get::<_, String>(5)?).to_path_buf(),
+            started_at: row.get(6)?,
+            ended_at: row.get(7)?,
+            approx_tokens: row.get(8)?,
+            metadata_json: row
+                .get::<_, Option<String>>(9)?
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
+            messages: Vec::new(),
+        };
+        let msg_count: i64 = row.get(10)?;
+        Ok((conv, msg_count as usize))
+    }
+
     pub fn fetch_messages(&self, conversation_id: i64) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, idx, role, author, created_at, content, extra_json FROM messages WHERE conversation_id = ? ORDER BY idx",

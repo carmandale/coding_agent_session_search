@@ -394,6 +394,15 @@ pub enum Commands {
         #[arg(long, value_enum, default_value_t = TimelineGrouping::Hour)]
         group_by: TimelineGrouping,
     },
+    /// Show all agent sessions in current repository (TUI)
+    Sessions {
+        /// Filter to a specific workspace path
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Override data dir (matches index --data-dir)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -1424,13 +1433,16 @@ async fn execute_cli(
     }
 
     // Block TUI in non-TTY contexts unless TUI_HEADLESS is set (for testing)
-    if matches!(command, Commands::Tui { .. })
+    if matches!(command, Commands::Tui { .. } | Commands::Sessions { .. })
         && !stdout_is_tty
         && std::env::var("TUI_HEADLESS").is_err()
     {
         return Err(CliError::usage(
-            "No subcommand provided; in non-TTY contexts TUI is disabled.",
-            Some("Use an explicit subcommand, e.g., `cass search --json ...` or `cass --robot-help`.".to_string()),
+            "TUI commands require an interactive terminal.",
+            Some(
+                "Run in a TTY, or use `cass search --json ...` for non-interactive output."
+                    .to_string(),
+            ),
         ));
     }
 
@@ -1722,6 +1734,12 @@ async fn execute_cli(
                 } => {
                     run_expand(&path, line, context, json)?;
                 }
+                Commands::Sessions {
+                    workspace,
+                    data_dir,
+                } => {
+                    run_sessions(workspace.as_deref(), &data_dir, cli.db.clone())?;
+                }
                 Commands::Timeline {
                     since,
                     until,
@@ -1901,6 +1919,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Export { .. }) => "export".to_string(),
         Some(Commands::Expand { .. }) => "expand".to_string(),
         Some(Commands::Timeline { .. }) => "timeline".to_string(),
+        Some(Commands::Sessions { .. }) => "sessions".to_string(),
         None => "(default)".to_string(),
     }
 }
@@ -6702,4 +6721,21 @@ fn parse_datetime_flexible(s: &str) -> Option<i64> {
             None
         }
     }
+}
+
+fn run_sessions(
+    workspace: Option<&Path>,
+    data_dir: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+) -> CliResult<()> {
+    let data_dir = data_dir.clone().unwrap_or_else(default_data_dir);
+    let db = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+
+    ui::sessions::run_sessions_tui(workspace, &data_dir, &db).map_err(|e| CliError {
+        code: 9,
+        kind: "tui",
+        message: format!("sessions tui failed: {e}"),
+        hint: None,
+        retryable: false,
+    })
 }
