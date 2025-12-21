@@ -119,8 +119,8 @@ impl SessionsState {
                     let agent_match = s.agent_slug.to_lowercase().contains(&query);
                     let date_match = s
                         .started_at
-                        .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
-                        .map(|dt| dt.format("%Y-%m-%d").to_string().contains(&query))
+                    .and_then(|ts| DateTime::<Utc>::from_timestamp(ts / 1000, 0))
+                    .map(|dt| dt.format("%Y-%m-%d").to_string().contains(&query))
                         .unwrap_or(false);
                     title_match || agent_match || date_match
                 })
@@ -578,7 +578,7 @@ fn render_list_view(f: &mut Frame, state: &mut SessionsState) {
             .map(|session| {
                 let time_str = session
                     .started_at
-                    .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
+                    .and_then(|ts| DateTime::<Utc>::from_timestamp(ts / 1000, 0))
                     .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_else(|| "Unknown".to_string());
 
