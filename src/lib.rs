@@ -4,7 +4,6 @@ pub mod export;
 pub mod indexer;
 pub mod model;
 pub mod search;
-pub mod sources;
 pub mod storage;
 pub mod ui;
 pub mod update_check;
@@ -230,9 +229,6 @@ pub enum Commands {
         /// Highlight matching terms in output (uses **bold** markers in text, <mark> in HTML)
         #[arg(long)]
         highlight: bool,
-        /// Filter by source: 'local', 'remote', 'all', or a specific source hostname
-        #[arg(long)]
-        source: Option<String>,
     },
     /// Show statistics about indexed data
     Stats {
@@ -242,12 +238,6 @@ pub enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
-        /// Filter by source: 'local', 'remote', 'all', or a specific source hostname
-        #[arg(long)]
-        source: Option<String>,
-        /// Show breakdown by source
-        #[arg(long)]
-        by_source: bool,
     },
     /// Output diagnostic information for troubleshooting
     Diag {
@@ -403,128 +393,15 @@ pub enum Commands {
         /// Group by: hour, day, or none
         #[arg(long, value_enum, default_value_t = TimelineGrouping::Hour)]
         group_by: TimelineGrouping,
-        /// Filter by source: 'local', 'remote', 'all', or a specific source hostname
-        #[arg(long)]
-        source: Option<String>,
     },
-    /// Manage remote sources (P5.x)
-    #[command(subcommand)]
-    Sources(SourcesCommand),
-}
-
-/// Subcommands for managing remote sources (P5.x)
-#[derive(Subcommand, Debug, Clone)]
-pub enum SourcesCommand {
-    /// List configured sources
-    List {
-        /// Show detailed information
-        #[arg(long, short)]
-        verbose: bool,
-        /// Output as JSON
+    /// Show all agent sessions in current repository (TUI)
+    Sessions {
+        /// Filter to a specific workspace path
         #[arg(long)]
-        json: bool,
-    },
-    /// Add a new remote source
-    Add {
-        /// Source URL (e.g., user@host or ssh://user@host)
-        url: String,
-        /// Friendly name for this source (becomes source_id)
+        workspace: Option<PathBuf>,
+        /// Override data dir (matches index --data-dir)
         #[arg(long)]
-        name: Option<String>,
-        /// Use preset paths for platform (macos-defaults, linux-defaults)
-        #[arg(long)]
-        preset: Option<String>,
-        /// Paths to sync (can be specified multiple times)
-        #[arg(long = "path", short = 'p')]
-        paths: Vec<String>,
-        /// Skip connectivity test
-        #[arg(long)]
-        no_test: bool,
-    },
-    /// Remove a configured source
-    Remove {
-        /// Name of source to remove
-        name: String,
-        /// Also delete synced session data from index
-        #[arg(long)]
-        purge: bool,
-        /// Skip confirmation prompt
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
-    /// Diagnose source connectivity and configuration issues
-    Doctor {
-        /// Check only specific source (defaults to all)
-        #[arg(long, short)]
-        source: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Synchronize sessions from remote sources
-    Sync {
-        /// Sync only specific source(s)
-        #[arg(long, short)]
-        source: Option<Vec<String>>,
-        /// Don't re-index after sync
-        #[arg(long)]
-        no_index: bool,
-        /// Show detailed transfer information
-        #[arg(long, short)]
-        verbose: bool,
-        /// Dry run - show what would be synced without actually syncing
-        #[arg(long)]
-        dry_run: bool,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Manage path mappings for a source (P6.3)
-    #[command(subcommand)]
-    Mappings(MappingsAction),
-}
-
-/// Subcommands for managing path mappings (P6.3)
-#[derive(Subcommand, Debug, Clone)]
-pub enum MappingsAction {
-    /// List path mappings for a source
-    List {
-        /// Source name
-        source: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Add a path mapping
-    Add {
-        /// Source name
-        source: String,
-        /// Remote path prefix to match
-        #[arg(long)]
-        from: String,
-        /// Local path prefix to replace with
-        #[arg(long)]
-        to: String,
-        /// Only apply to specific agents (comma-separated)
-        #[arg(long, value_delimiter = ',')]
-        agents: Option<Vec<String>>,
-    },
-    /// Remove a path mapping by index
-    Remove {
-        /// Source name
-        source: String,
-        /// Index of mapping to remove (from list output, 0-based)
-        index: usize,
-    },
-    /// Test how a path would be rewritten
-    Test {
-        /// Source name
-        source: String,
-        /// Path to test
-        path: String,
-        /// Optional agent to simulate (for agent-specific rules)
-        #[arg(long)]
-        agent: Option<String>,
+        data_dir: Option<PathBuf>,
     },
 }
 
@@ -1556,13 +1433,16 @@ async fn execute_cli(
     }
 
     // Block TUI in non-TTY contexts unless TUI_HEADLESS is set (for testing)
-    if matches!(command, Commands::Tui { .. })
+    if matches!(command, Commands::Tui { .. } | Commands::Sessions { .. })
         && !stdout_is_tty
         && std::env::var("TUI_HEADLESS").is_err()
     {
         return Err(CliError::usage(
-            "No subcommand provided; in non-TTY contexts TUI is disabled.",
-            Some("Use an explicit subcommand, e.g., `cass search --json ...` or `cass --robot-help`.".to_string()),
+            "TUI commands require an interactive terminal.",
+            Some(
+                "Run in a TTY, or use `cass search --json ...` for non-interactive output."
+                    .to_string(),
+            ),
         ));
     }
 
@@ -1717,7 +1597,6 @@ async fn execute_cli(
                     dry_run,
                     timeout,
                     highlight,
-                    source,
                 } => {
                     run_cli_search(
                         &query,
@@ -1752,22 +1631,10 @@ async fn execute_cli(
                         dry_run,
                         timeout,
                         highlight,
-                        source,
                     )?;
                 }
-                Commands::Stats {
-                    data_dir,
-                    json,
-                    source,
-                    by_source,
-                } => {
-                    run_stats(
-                        &data_dir,
-                        cli.db.clone(),
-                        json,
-                        source.as_deref(),
-                        by_source,
-                    )?;
+                Commands::Stats { data_dir, json } => {
+                    run_stats(&data_dir, cli.db.clone(), json)?;
                 }
                 Commands::Diag {
                     data_dir,
@@ -1867,6 +1734,12 @@ async fn execute_cli(
                 } => {
                     run_expand(&path, line, context, json)?;
                 }
+                Commands::Sessions {
+                    workspace,
+                    data_dir,
+                } => {
+                    run_sessions(workspace.as_deref(), &data_dir, cli.db.clone())?;
+                }
                 Commands::Timeline {
                     since,
                     until,
@@ -1875,7 +1748,6 @@ async fn execute_cli(
                     data_dir,
                     json,
                     group_by,
-                    source,
                 } => {
                     run_timeline(
                         since.as_deref(),
@@ -1886,11 +1758,7 @@ async fn execute_cli(
                         cli.db.clone(),
                         json,
                         group_by,
-                        source,
                     )?;
-                }
-                Commands::Sources(subcmd) => {
-                    run_sources_command(subcmd)?;
                 }
                 _ => {}
             }
@@ -2051,7 +1919,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Export { .. }) => "export".to_string(),
         Some(Commands::Expand { .. }) => "expand".to_string(),
         Some(Commands::Timeline { .. }) => "timeline".to_string(),
-        Some(Commands::Sources(..)) => "sources".to_string(),
+        Some(Commands::Sessions { .. }) => "sessions".to_string(),
         None => "(default)".to_string(),
     }
 }
@@ -2282,8 +2150,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --offset N        Pagination offset (default: 0)".to_string(),
             "    --json | --robot  JSON output for automation".to_string(),
             "    --fields F1,F2    Select specific fields in hits (reduces token usage)".to_string(),
-            "                      Presets: minimal (path,line,agent), summary (+title,score), provenance (source_id,origin_kind,origin_host)".to_string(),
-            "                      Fields: score,agent,workspace,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host".to_string(),
+            "                      Presets: minimal (path,line,agent), summary (+title,score)".to_string(),
+            "                      Fields: score,agent,workspace,source_path,snippet,content,title,created_at,line_number,match_type".to_string(),
             "    --max-content-length N  Truncate content/snippet/title to N chars (UTF-8 safe, adds '...')".to_string(),
             "                            Adds *_truncated: true indicator for each truncated field".to_string(),
             "    --today           Filter to today only".to_string(),
@@ -2674,11 +2542,9 @@ fn run_cli_search(
     dry_run: bool,
     timeout_ms: Option<u64>,
     highlight: bool,
-    source: Option<String>,
 ) -> CliResult<()> {
     use crate::search::query::{QueryExplanation, SearchClient, SearchFilters};
     use crate::search::tantivy::index_dir;
-    use crate::sources::provenance::SourceFilter;
     use std::collections::HashSet;
 
     // Start timing for robot_meta elapsed_ms
@@ -2722,11 +2588,6 @@ fn run_cli_search(
     }
     filters.created_from = time_filter.since;
     filters.created_to = time_filter.until;
-
-    // Apply source filter (P3.1)
-    if let Some(ref source_str) = source {
-        filters.source_filter = SourceFilter::parse(source_str);
-    }
 
     // Apply cursor overrides (base64-encoded JSON { "offset": usize, "limit": usize })
     let mut limit_val = *limit;
@@ -3123,12 +2984,6 @@ fn expand_field_presets(fields: &Option<Vec<String>>) -> Option<Vec<String>> {
                     "title".to_string(),
                     "score".to_string(),
                 ],
-                // Provenance preset (P3.4) - add source origin info to results
-                "provenance" => vec![
-                    "source_id".to_string(),
-                    "origin_kind".to_string(),
-                    "origin_host".to_string(),
-                ],
                 "*" | "all" => vec![], // Empty means include all - handled specially
                 other => vec![other.to_string()],
             })
@@ -3159,10 +3014,6 @@ fn filter_hit_fields(
                 "created_at",
                 "line_number",
                 "match_type",
-                // Provenance fields (P3.4)
-                "source_id",
-                "origin_kind",
-                "origin_host",
             ];
 
             for field in field_list {
@@ -3285,7 +3136,7 @@ fn output_robot_results(
     timed_out: bool,
     timeout_ms: Option<u64>,
 ) -> CliResult<()> {
-    // Expand presets (minimal, summary, provenance, all, *)
+    // Expand presets (minimal, summary, all, *)
     let resolved_fields = expand_field_presets(fields);
 
     // Filter hits to requested fields, then apply content truncation
@@ -3619,10 +3470,7 @@ fn run_stats(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
     json: bool,
-    source: Option<&str>,
-    by_source: bool,
 ) -> CliResult<()> {
-    use crate::sources::provenance::SourceFilter;
     use rusqlite::Connection;
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
@@ -3649,141 +3497,56 @@ fn run_stats(
         retryable: false,
     })?;
 
-    // Parse source filter (P3.7)
-    let source_filter = source.map(SourceFilter::parse);
+    // Get counts and statistics
+    let conversation_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+        .unwrap_or(0);
+    let message_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .unwrap_or(0);
 
-    // Build WHERE clause for source filtering
-    let (source_where, source_param): (String, Option<String>) = match &source_filter {
-        None | Some(SourceFilter::All) => (String::new(), None),
-        Some(SourceFilter::Local) => (" WHERE c.source_id = 'local'".to_string(), None),
-        Some(SourceFilter::Remote) => (" WHERE c.source_id != 'local'".to_string(), None),
-        Some(SourceFilter::SourceId(id)) => {
-            (" WHERE c.source_id = ?".to_string(), Some(id.clone()))
-        }
-    };
-
-    // Get counts and statistics with source filter
-    let conversation_count: i64 = if let Some(ref param) = source_param {
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM conversations c{source_where}"),
-            [param],
-            |r| r.get(0),
+    // Get per-agent breakdown (need to JOIN with agents table)
+    let mut agent_stmt = conn
+        .prepare(
+            "SELECT a.slug, COUNT(*) FROM conversations c JOIN agents a ON c.agent_id = a.id GROUP BY a.slug ORDER BY COUNT(*) DESC"
         )
-    } else {
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM conversations c{source_where}"),
+        .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
+    let agent_rows: Vec<(String, i64)> = agent_stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?
+        .filter_map(std::result::Result::ok)
+        .collect();
+
+    // Get workspace breakdown (top 10, need to JOIN with workspaces table)
+    let mut ws_stmt = conn
+        .prepare(
+            "SELECT w.path, COUNT(*) FROM conversations c JOIN workspaces w ON c.workspace_id = w.id GROUP BY w.path ORDER BY COUNT(*) DESC LIMIT 10"
+        )
+        .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
+    let ws_rows: Vec<(String, i64)> = ws_stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?
+        .filter_map(std::result::Result::ok)
+        .collect();
+
+    // Get date range
+    let oldest: Option<i64> = conn
+        .query_row(
+            "SELECT MIN(started_at) FROM conversations WHERE started_at IS NOT NULL",
             [],
             |r| r.get(0),
         )
-    }
-    .unwrap_or(0);
-
-    let message_count: i64 = if let Some(ref param) = source_param {
-        conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id{source_where}"
-            ),
-            [param],
-            |r| r.get(0),
-        )
-    } else {
-        conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id{source_where}"
-            ),
+        .ok();
+    let newest: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(started_at) FROM conversations WHERE started_at IS NOT NULL",
             [],
             |r| r.get(0),
         )
-    }
-    .unwrap_or(0);
-
-    // Get per-agent breakdown with source filter
-    let agent_sql = format!(
-        "SELECT a.slug, COUNT(*) FROM conversations c JOIN agents a ON c.agent_id = a.id{source_where} GROUP BY a.slug ORDER BY COUNT(*) DESC"
-    );
-    let agent_rows: Vec<(String, i64)> = if let Some(ref param) = source_param {
-        let mut stmt = conn
-            .prepare(&agent_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([param], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .collect()
-    } else {
-        let mut stmt = conn
-            .prepare(&agent_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-            .map_err(|e| CliError::unknown(format!("query: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .collect()
-    };
-
-    // Get workspace breakdown with source filter (top 10)
-    let ws_sql = format!(
-        "SELECT w.path, COUNT(*) FROM conversations c JOIN workspaces w ON c.workspace_id = w.id{source_where} GROUP BY w.path ORDER BY COUNT(*) DESC LIMIT 10"
-    );
-    let ws_rows: Vec<(String, i64)> = if let Some(ref param) = source_param {
-        let mut stmt = conn
-            .prepare(&ws_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([param], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .collect()
-    } else {
-        let mut stmt = conn
-            .prepare(&ws_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-            .map_err(|e| CliError::unknown(format!("query: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .collect()
-    };
-
-    // Get date range with source filter
-    let date_sql = format!(
-        "SELECT MIN(started_at), MAX(started_at) FROM conversations c{source_where} WHERE started_at IS NOT NULL"
-    );
-    let (oldest, newest): (Option<i64>, Option<i64>) = if let Some(ref param) = source_param {
-        conn.query_row(&date_sql, [param], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap_or((None, None))
-    } else {
-        conn.query_row(&date_sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap_or((None, None))
-    };
-
-    // Get per-source breakdown if requested (P3.7)
-    let source_rows: Vec<(String, i64, i64)> = if by_source {
-        let mut stmt = conn
-            .prepare(
-                "SELECT c.source_id, COUNT(DISTINCT c.id) as convs, COUNT(m.id) as msgs
-             FROM conversations c
-             LEFT JOIN messages m ON m.conversation_id = c.id
-             GROUP BY c.source_id
-             ORDER BY convs DESC",
-            )
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        })
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .collect()
-    } else {
-        Vec::new()
-    };
+        .ok();
 
     if json {
-        let mut payload = serde_json::json!({
+        let payload = serde_json::json!({
             "conversations": conversation_count,
             "messages": message_count,
             "by_agent": agent_rows.iter().map(|(a, c)| serde_json::json!({"agent": a, "count": c})).collect::<Vec<_>>(),
@@ -3794,55 +3557,15 @@ fn run_stats(
             },
             "db_path": db_path.display().to_string(),
         });
-
-        // Add source filter info if specified (P3.7)
-        if let Some(ref filter) = source_filter {
-            payload["source_filter"] = serde_json::json!(filter.to_string());
-        }
-
-        // Add by_source breakdown if requested (P3.7)
-        if by_source && !source_rows.is_empty() {
-            payload["by_source"] = serde_json::json!(
-                source_rows
-                    .iter()
-                    .map(|(s, convs, msgs)| {
-                        serde_json::json!({
-                            "source_id": s,
-                            "conversations": convs,
-                            "messages": msgs
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            );
-        }
-
         println!(
             "{}",
             serde_json::to_string_pretty(&payload).unwrap_or_default()
         );
     } else {
-        // Header with source filter indicator
-        let title = if let Some(ref filter) = source_filter {
-            format!("CASS Index Statistics (source: {})", filter)
-        } else {
-            "CASS Index Statistics".to_string()
-        };
-        println!("{title}");
-        println!("{}", "=".repeat(title.len()));
+        println!("CASS Index Statistics");
+        println!("=====================");
         println!("Database: {}", db_path.display());
         println!();
-
-        // Show by_source breakdown if requested (P3.7)
-        if by_source && !source_rows.is_empty() {
-            println!("By Source:");
-            println!("  {:20} {:>10} {:>12}", "Source", "Convs", "Messages");
-            println!("  {}", "-".repeat(44));
-            for (src, convs, msgs) in &source_rows {
-                println!("  {:20} {:>10} {:>12}", src, convs, msgs);
-            }
-            println!();
-        }
-
         println!("Totals:");
         println!("  Conversations: {conversation_count}");
         println!("  Messages: {message_count}");
@@ -4905,6 +4628,7 @@ fn run_capabilities(json: bool) -> CliResult<()> {
             "cursor".to_string(),
             "chatgpt".to_string(),
             "pi_agent".to_string(),
+            "codebuff".to_string(),
         ],
         limits: CapabilitiesLimits {
             max_limit: 10000,
@@ -5244,10 +4968,7 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
                             "snippet": { "type": ["string", "null"] },
                             "score": { "type": ["number", "null"] },
                             "created_at": { "type": ["integer", "string", "null"] },
-                            "match_type": { "type": ["string", "null"] },
-                            "source_id": { "type": "string", "description": "Source identifier (e.g., 'local', 'work-laptop')" },
-                            "origin_kind": { "type": "string", "description": "Origin kind ('local' or 'ssh')" },
-                            "origin_host": { "type": ["string", "null"], "description": "Host label for remote sources" }
+                            "match_type": { "type": ["string", "null"] }
                         }
                     }
                 },
@@ -6725,15 +6446,10 @@ fn run_timeline(
     db_override: Option<PathBuf>,
     json: bool,
     group_by: TimelineGrouping,
-    source: Option<String>,
 ) -> CliResult<()> {
-    use crate::sources::provenance::SourceFilter;
     use chrono::{Local, TimeZone, Utc};
     use rusqlite::Connection;
     use std::collections::HashMap;
-
-    // Parse source filter (P3.2)
-    let source_filter = source.as_ref().map(|s| SourceFilter::parse(s));
 
     let data_root = data_dir.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_root.join("agent_search.db"));
@@ -6772,11 +6488,9 @@ fn run_timeline(
     };
 
     let mut sql = String::from(
-        "SELECT c.id, a.slug as agent, c.title, c.started_at, c.ended_at, c.source_path,
-                COUNT(m.id) as message_count, c.source_id, c.origin_host, s.kind as origin_kind
+        "SELECT c.id, c.agent, c.title, c.started_at, c.ended_at, c.source_path,
+                COUNT(m.id) as message_count
          FROM conversations c
-         JOIN agents a ON c.agent_id = a.id
-         LEFT JOIN sources s ON c.source_id = s.id
          LEFT JOIN messages m ON m.conversation_id = c.id
          WHERE c.started_at >= ?1 AND c.started_at <= ?2",
     );
@@ -6784,7 +6498,7 @@ fn run_timeline(
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(start_ts), Box::new(end_ts)];
 
     if !agents.is_empty() {
-        sql.push_str(" AND a.slug IN (");
+        sql.push_str(" AND c.agent IN (");
         for (i, agent) in agents.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");
@@ -6793,25 +6507,6 @@ fn run_timeline(
             params.push(Box::new(agent.clone()));
         }
         sql.push(')');
-    }
-
-    // Source filter (P3.2)
-    if let Some(ref filter) = source_filter {
-        match filter {
-            SourceFilter::All => {
-                // No filtering needed
-            }
-            SourceFilter::Local => {
-                sql.push_str(" AND c.source_id = 'local'");
-            }
-            SourceFilter::Remote => {
-                sql.push_str(" AND c.source_id != 'local'");
-            }
-            SourceFilter::SourceId(id) => {
-                sql.push_str(&format!(" AND c.source_id = ?{}", params.len() + 1));
-                params.push(Box::new(id.clone()));
-            }
-        }
     }
 
     sql.push_str(" GROUP BY c.id ORDER BY c.started_at DESC");
@@ -6829,16 +6524,13 @@ fn run_timeline(
     let rows = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok((
-                row.get::<_, i64>(0)?,            // id
-                row.get::<_, String>(1)?,         // agent
-                row.get::<_, Option<String>>(2)?, // title
-                row.get::<_, i64>(3)?,            // started_at
-                row.get::<_, Option<i64>>(4)?,    // ended_at
-                row.get::<_, String>(5)?,         // source_path
-                row.get::<_, i64>(6)?,            // message_count
-                row.get::<_, String>(7)?,         // source_id (P3.2)
-                row.get::<_, Option<String>>(8)?, // origin_host (P3.5)
-                row.get::<_, Option<String>>(9)?, // origin_kind (P3.5)
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })
         .map_err(|e| CliError {
@@ -6850,18 +6542,8 @@ fn run_timeline(
         })?;
 
     #[allow(clippy::type_complexity)]
-    let mut sessions: Vec<(
-        i64,
-        String,
-        Option<String>,
-        i64,
-        Option<i64>,
-        String,
-        i64,
-        String,
-        Option<String>,
-        Option<String>,
-    )> = Vec::new();
+    let mut sessions: Vec<(i64, String, Option<String>, i64, Option<i64>, String, i64)> =
+        Vec::new();
     for r in rows.flatten() {
         sessions.push(r);
     }
@@ -6871,34 +6553,15 @@ fn run_timeline(
             TimelineGrouping::None => {
                 let items: Vec<serde_json::Value> = sessions
                     .iter()
-                    .map(
-                        |(
-                            id,
-                            agent,
-                            title,
-                            started,
-                            ended,
-                            path,
-                            msg_count,
-                            source_id,
-                            origin_host,
-                            origin_kind,
-                        )| {
-                            let duration = ended.map(|e| e - started);
-                            // Use "local" as default origin_kind if not in DB (backward compat)
-                            let kind = origin_kind.as_deref().unwrap_or("local");
-                            serde_json::json!({
-                                "id": id, "agent": agent, "title": title,
-                                "started_at": started, "ended_at": ended,
-                                "duration_seconds": duration, "source_path": path,
-                                "message_count": msg_count,
-                                // Provenance fields (P3.5)
-                                "source_id": source_id,
-                                "origin_kind": kind,
-                                "origin_host": origin_host,
-                            })
-                        },
-                    )
+                    .map(|(id, agent, title, started, ended, path, msg_count)| {
+                        let duration = ended.map(|e| e - started);
+                        serde_json::json!({
+                            "id": id, "agent": agent, "title": title,
+                            "started_at": started, "ended_at": ended,
+                            "duration_seconds": duration, "source_path": path,
+                            "message_count": msg_count,
+                        })
+                    })
                     .collect();
                 serde_json::json!({
                     "range": { "start": start_ts, "end": end_ts },
@@ -6908,19 +6571,7 @@ fn run_timeline(
             }
             TimelineGrouping::Hour | TimelineGrouping::Day => {
                 let mut groups: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-                for (
-                    id,
-                    agent,
-                    title,
-                    started,
-                    ended,
-                    path,
-                    msg_count,
-                    source_id,
-                    origin_host,
-                    origin_kind,
-                ) in &sessions
-                {
+                for (id, agent, title, started, ended, path, msg_count) in &sessions {
                     let dt = Utc
                         .timestamp_opt(*started, 0)
                         .single()
@@ -6930,16 +6581,10 @@ fn run_timeline(
                         TimelineGrouping::Day => dt.format("%Y-%m-%d").to_string(),
                         _ => unreachable!(),
                     };
-                    // Use "local" as default origin_kind if not in DB (backward compat)
-                    let kind = origin_kind.as_deref().unwrap_or("local");
                     groups.entry(key).or_default().push(serde_json::json!({
                         "id": id, "agent": agent, "title": title,
                         "started_at": started, "ended_at": ended,
                         "source_path": path, "message_count": msg_count,
-                        // Provenance fields (P3.5)
-                        "source_id": source_id,
-                        "origin_kind": kind,
-                        "origin_host": origin_host,
                     }));
                 }
                 serde_json::json!({
@@ -6977,19 +6622,7 @@ fn run_timeline(
         }
 
         let mut current_group = String::new();
-        for (
-            _id,
-            agent,
-            title,
-            started,
-            ended,
-            _path,
-            msg_count,
-            source_id,
-            origin_host,
-            _origin_kind,
-        ) in &sessions
-        {
+        for (_id, agent, title, started, ended, _path, msg_count) in &sessions {
             let dt = Utc
                 .timestamp_opt(*started, 0)
                 .single()
@@ -7024,1370 +6657,22 @@ fn run_timeline(
                 "gemini" => "🔵",
                 "amp" => "🟡",
                 "cursor" => "⚪",
-                "pi_agent" => "🟠",
                 _ => "⚫",
             };
 
-            // Source badge for remote sessions (P3.2, P3.5)
-            // Prefer origin_host if available, otherwise use source_id
-            let source_badge = if source_id != "local" {
-                let label = origin_host.as_deref().unwrap_or(source_id.as_str());
-                format!(" [{}]", label)
-            } else {
-                String::new()
-            };
-
             println!(
-                "     {} {} {:>5} │ {:>3} msgs │ {}{}",
+                "     {} {} {:>5} │ {:>3} msgs │ {}",
                 dt.format("%H:%M"),
                 agent_icon,
                 duration.as_deref().unwrap_or(""),
                 msg_count,
-                title_preview,
-                source_badge
+                title_preview
             );
         }
 
         println!("\n{}", "─".repeat(70));
         println!("   Total: {} sessions\n", sessions.len());
     }
-    Ok(())
-}
-
-/// Handle sources subcommands (P5.x)
-fn run_sources_command(cmd: SourcesCommand) -> CliResult<()> {
-    match cmd {
-        SourcesCommand::List { verbose, json } => {
-            run_sources_list(verbose, json)?;
-        }
-        SourcesCommand::Add {
-            url,
-            name,
-            preset,
-            paths,
-            no_test,
-        } => {
-            run_sources_add(&url, name, preset, paths, no_test)?;
-        }
-        SourcesCommand::Remove { name, purge, yes } => {
-            run_sources_remove(&name, purge, yes)?;
-        }
-        SourcesCommand::Doctor { source, json } => {
-            run_sources_doctor(source.as_deref(), json)?;
-        }
-        SourcesCommand::Sync {
-            source,
-            no_index,
-            verbose,
-            dry_run,
-            json,
-        } => {
-            run_sources_sync(source, no_index, verbose, dry_run, json)?;
-        }
-        SourcesCommand::Mappings(action) => {
-            run_mappings_command(action)?;
-        }
-    }
-    Ok(())
-}
-
-/// List configured sources (P5.3)
-fn run_sources_list(verbose: bool, json: bool) -> CliResult<()> {
-    use crate::sources::config::SourcesConfig;
-
-    let config = SourcesConfig::load().map_err(|e| CliError {
-        code: 9,
-        kind: "config",
-        message: format!("Failed to load sources config: {e}"),
-        hint: Some("Run 'cass sources add' to configure a source".into()),
-        retryable: false,
-    })?;
-
-    // Get config path for display
-    let config_path = SourcesConfig::config_path()
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "unknown".into());
-
-    if json {
-        let sources_json: Vec<serde_json::Value> = config
-            .sources
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "name": s.name,
-                    "type": s.source_type.as_str(),
-                    "host": s.host,
-                    "paths": s.paths,
-                    "sync_schedule": s.sync_schedule.to_string(),
-                    "platform": s.platform.map(|p| p.to_string()),
-                })
-            })
-            .collect();
-
-        let output = serde_json::json!({
-            "config_path": config_path,
-            "sources": sources_json,
-            "total": config.sources.len(),
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).unwrap_or_default()
-        );
-    } else {
-        println!("CASS Sources Configuration");
-        println!("===========================");
-        println!("Config: {config_path}");
-        println!();
-
-        if config.sources.is_empty() {
-            println!("No sources configured.");
-            println!();
-            println!("To add a source, run:");
-            println!("  cass sources add user@hostname --preset macos-defaults");
-            return Ok(());
-        }
-
-        if verbose {
-            // Verbose output with full details
-            for source in &config.sources {
-                println!("Source: {}", source.name);
-                println!("  Type: {}", source.source_type);
-                if let Some(ref host) = source.host {
-                    println!("  Host: {host}");
-                }
-                println!("  Schedule: {}", source.sync_schedule);
-                if let Some(platform) = source.platform {
-                    println!("  Platform: {platform}");
-                }
-                if !source.paths.is_empty() {
-                    println!("  Paths:");
-                    for path in &source.paths {
-                        println!("    - {path}");
-                    }
-                }
-                if !source.path_mappings.is_empty() {
-                    println!("  Path Mappings:");
-                    for mapping in &source.path_mappings {
-                        if let Some(agents) = &mapping.agents {
-                            println!(
-                                "    {} -> {} (agents: {})",
-                                mapping.from,
-                                mapping.to,
-                                agents.join(", ")
-                            );
-                        } else {
-                            println!("    {} -> {}", mapping.from, mapping.to);
-                        }
-                    }
-                }
-                println!();
-            }
-        } else {
-            // Table output
-            println!("  {:15} {:8} {:30} {:>5}", "NAME", "TYPE", "HOST", "PATHS");
-            println!("  {}", "-".repeat(62));
-            for source in &config.sources {
-                let host = source.host.as_deref().unwrap_or("-");
-                let host_truncated = if host.len() > 30 {
-                    format!("{}...", &host[..27])
-                } else {
-                    host.to_string()
-                };
-                println!(
-                    "  {:15} {:8} {:30} {:>5}",
-                    source.name,
-                    source.source_type.as_str(),
-                    host_truncated,
-                    source.paths.len()
-                );
-            }
-            println!();
-        }
-
-        println!("Total: {} source(s)", config.sources.len());
-    }
-
-    Ok(())
-}
-
-/// Add a new remote source (P5.2)
-fn run_sources_add(
-    url: &str,
-    name: Option<String>,
-    preset: Option<String>,
-    paths_arg: Vec<String>,
-    no_test: bool,
-) -> CliResult<()> {
-    use crate::sources::config::{Platform, SourceDefinition, SourcesConfig, get_preset_paths};
-    use crate::sources::provenance::SourceKind;
-
-    // Parse URL to extract host
-    let (host, source_id) = parse_source_url(url, name.as_deref())?;
-
-    // Determine paths: preset, explicit args, or error
-    let paths = if let Some(ref preset_name) = preset {
-        get_preset_paths(preset_name).map_err(|e| CliError {
-            code: 10,
-            kind: "config",
-            message: format!("Invalid preset: {e}"),
-            hint: Some("Valid presets: macos-defaults, linux-defaults".into()),
-            retryable: false,
-        })?
-    } else if !paths_arg.is_empty() {
-        paths_arg
-    } else {
-        return Err(CliError {
-            code: 10,
-            kind: "config",
-            message: "No paths specified".into(),
-            hint: Some("Use --preset macos-defaults or --path <path> to specify paths".into()),
-            retryable: false,
-        });
-    };
-
-    // Test SSH connectivity unless --no-test
-    if !no_test {
-        println!("Testing SSH connectivity to {host}...");
-        test_ssh_connectivity(&host)?;
-        println!("  Connected successfully");
-    }
-
-    // Load existing config
-    let mut config = SourcesConfig::load().map_err(|e| CliError {
-        code: 9,
-        kind: "config",
-        message: format!("Failed to load sources config: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    // Check for duplicate
-    if config.sources.iter().any(|s| s.name == source_id) {
-        return Err(CliError {
-            code: 10,
-            kind: "config",
-            message: format!("Source '{source_id}' already exists"),
-            hint: Some("Use a different --name or remove the existing source first".into()),
-            retryable: false,
-        });
-    }
-
-    // Determine platform from preset
-    let platform = preset.as_ref().and_then(|p| {
-        if p.contains("macos") {
-            Some(Platform::Macos)
-        } else if p.contains("linux") {
-            Some(Platform::Linux)
-        } else {
-            None
-        }
-    });
-
-    // Create source definition
-    let source = SourceDefinition {
-        name: source_id.clone(),
-        source_type: SourceKind::Ssh,
-        host: Some(host.clone()),
-        paths: paths.clone(),
-        platform,
-        ..Default::default()
-    };
-
-    // Add and save
-    config.add_source(source).map_err(|e| CliError {
-        code: 10,
-        kind: "config",
-        message: format!("Failed to add source: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    config.save().map_err(|e| CliError {
-        code: 11,
-        kind: "config",
-        message: format!("Failed to save config: {e}"),
-        hint: Some("Check file permissions on config directory".into()),
-        retryable: false,
-    })?;
-
-    // Success output
-    let config_path = SourcesConfig::config_path()
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "~/.config/cass/sources.toml".into());
-
-    println!();
-    println!("Added source '{source_id}'");
-    println!("  Host: {host}");
-    println!("  Paths: {} path(s)", paths.len());
-    println!("  Config: {config_path}");
-    println!();
-    println!("Next steps:");
-    println!("  cass sources sync {source_id}   # Fetch sessions from this source");
-    println!("  cass sources list               # View all configured sources");
-
-    Ok(())
-}
-
-/// Parse source URL and extract host and source_id.
-/// Accepts formats: user@host, ssh://user@host
-fn parse_source_url(url: &str, name: Option<&str>) -> Result<(String, String), CliError> {
-    // Strip ssh:// prefix if present
-    let host = url.strip_prefix("ssh://").unwrap_or(url);
-
-    // Validate URL contains @
-    if !host.contains('@') {
-        return Err(CliError {
-            code: 10,
-            kind: "config",
-            message: "Invalid URL format: missing username".into(),
-            hint: Some("Use format: user@hostname (e.g., user@laptop.local)".into()),
-            retryable: false,
-        });
-    }
-
-    // Generate source_id from hostname if not provided
-    let source_id = if let Some(n) = name {
-        n.to_string()
-    } else {
-        // Extract hostname part (after @)
-        let hostname_part = host.split('@').nth(1).unwrap_or(host);
-        // Take first segment before any dots
-        hostname_part
-            .split('.')
-            .next()
-            .unwrap_or(hostname_part)
-            .to_string()
-    };
-
-    Ok((host.to_string(), source_id))
-}
-
-/// Test SSH connectivity to a host.
-fn test_ssh_connectivity(host: &str) -> CliResult<()> {
-    let output = std::process::Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            host,
-            "echo",
-            "ok",
-        ])
-        .output()
-        .map_err(|e| CliError {
-            code: 12,
-            kind: "ssh",
-            message: format!("Failed to run ssh command: {e}"),
-            hint: Some("Ensure ssh is installed and in PATH".into()),
-            retryable: false,
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError {
-            code: 12,
-            kind: "ssh",
-            message: format!("SSH connection failed to {host}"),
-            hint: Some(format!(
-                "Error: {}. Ensure SSH key is set up for this host.",
-                stderr.trim()
-            )),
-            retryable: true,
-        });
-    }
-
-    Ok(())
-}
-
-/// Remove a configured source (P5.7)
-fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<()> {
-    use crate::sources::config::SourcesConfig;
-
-    // Load existing config
-    let mut config = SourcesConfig::load().map_err(|e| CliError {
-        code: 9,
-        kind: "config",
-        message: format!("Failed to load sources config: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    // Check source exists
-    if !config.sources.iter().any(|s| s.name == name) {
-        return Err(CliError {
-            code: 13,
-            kind: "not_found",
-            message: format!("Source '{name}' not found"),
-            hint: Some("Run 'cass sources list' to see configured sources".into()),
-            retryable: false,
-        });
-    }
-
-    // Confirmation prompt
-    if !skip_confirm {
-        let msg = if purge {
-            format!(
-                "Remove source '{name}' and delete indexed data? This cannot be undone. [y/N]: "
-            )
-        } else {
-            format!("Remove source '{name}' from configuration? [y/N]: ")
-        };
-        print!("{msg}");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| CliError {
-                code: 14,
-                kind: "io",
-                message: format!("Failed to read input: {e}"),
-                hint: None,
-                retryable: false,
-            })?;
-
-        let input = input.trim().to_lowercase();
-        if input != "y" && input != "yes" {
-            println!("Cancelled.");
-            return Ok(());
-        }
-    }
-
-    // Remove from config
-    config.remove_source(name);
-    config.save().map_err(|e| CliError {
-        code: 11,
-        kind: "config",
-        message: format!("Failed to save config: {e}"),
-        hint: Some("Check file permissions on config directory".into()),
-        retryable: false,
-    })?;
-
-    println!("Removed '{name}' from configuration.");
-
-    // Handle purge
-    if purge {
-        // Find and remove synced data directory
-        // Respect XDG_DATA_HOME first (important for testing and Linux users)
-        let data_dir = std::env::var("XDG_DATA_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(dirs::data_local_dir);
-
-        if let Some(data_dir) = data_dir {
-            let source_dir = data_dir.join("cass").join("remotes").join(name);
-            if source_dir.exists() {
-                std::fs::remove_dir_all(&source_dir).map_err(|e| CliError {
-                    code: 15,
-                    kind: "io",
-                    message: format!("Failed to delete synced data: {e}"),
-                    hint: None,
-                    retryable: false,
-                })?;
-                println!("Deleted synced data at {}", source_dir.display());
-            }
-        }
-        println!("Note: Run 'cass reindex' to remove entries from the search index.");
-    }
-
-    Ok(())
-}
-
-/// Diagnostic check result for sources doctor command (P5.6)
-#[derive(serde::Serialize)]
-struct DiagnosticCheck {
-    name: String,
-    status: String, // "pass", "warn", "fail"
-    message: String,
-    remediation: Option<String>,
-}
-
-/// Aggregated diagnostics for a single source (P5.6)
-#[derive(serde::Serialize)]
-struct SourceDiagnostics {
-    source_id: String,
-    checks: Vec<DiagnosticCheck>,
-    passed: usize,
-    warnings: usize,
-    failed: usize,
-}
-
-/// Diagnose source connectivity and configuration issues (P5.6)
-fn run_sources_doctor(source_filter: Option<&str>, json_output: bool) -> CliResult<()> {
-    use crate::sources::config::SourcesConfig;
-    use colored::Colorize;
-
-    let config = SourcesConfig::load().map_err(|e| CliError {
-        code: 9,
-        kind: "config",
-        message: format!("Failed to load sources config: {e}"),
-        hint: Some("Run 'cass sources add' to configure a source".into()),
-        retryable: false,
-    })?;
-
-    if config.sources.is_empty() {
-        if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "error": "No sources configured",
-                    "sources": []
-                })
-            );
-        } else {
-            println!("No remote sources configured.");
-            println!("Run 'cass sources add <url>' to add one.");
-        }
-        return Ok(());
-    }
-
-    // Filter sources if specified
-    let sources_to_check: Vec<_> = config
-        .sources
-        .iter()
-        .filter(|s| source_filter.is_none() || source_filter == Some(s.name.as_str()))
-        .collect();
-
-    if sources_to_check.is_empty() {
-        return Err(CliError {
-            code: 13,
-            kind: "not_found",
-            message: format!("Source '{}' not found", source_filter.unwrap_or("unknown")),
-            hint: Some("Run 'cass sources list' to see configured sources".into()),
-            retryable: false,
-        });
-    }
-
-    let mut all_diagnostics = Vec::new();
-
-    for source in sources_to_check {
-        let mut checks = Vec::new();
-
-        // Check 1: SSH connectivity
-        let host = source.host.as_deref().unwrap_or("unknown");
-        let ssh_check = check_ssh_connectivity(host);
-        checks.push(ssh_check);
-
-        // Check 2: rsync availability on remote
-        let rsync_check = check_rsync_available(host);
-        checks.push(rsync_check);
-
-        // Check 3: Remote paths exist
-        for path in &source.paths {
-            let path_check = check_remote_path(host, path);
-            checks.push(path_check);
-        }
-
-        // Check 4: Local storage writable
-        let storage_check = check_local_storage(&source.name);
-        checks.push(storage_check);
-
-        // Compute summary
-        let passed = checks.iter().filter(|c| c.status == "pass").count();
-        let warnings = checks.iter().filter(|c| c.status == "warn").count();
-        let failed = checks.iter().filter(|c| c.status == "fail").count();
-
-        all_diagnostics.push(SourceDiagnostics {
-            source_id: source.name.clone(),
-            checks,
-            passed,
-            warnings,
-            failed,
-        });
-    }
-
-    // Output results
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&all_diagnostics).unwrap()
-        );
-    } else {
-        for diag in &all_diagnostics {
-            println!();
-            println!("{}", format!("Checking source: {}", diag.source_id).bold());
-            println!();
-
-            for check in &diag.checks {
-                let icon = match check.status.as_str() {
-                    "pass" => "✓".green(),
-                    "warn" => "⚠".yellow(),
-                    "fail" => "✗".red(),
-                    _ => "?".normal(),
-                };
-                let name_styled = match check.status.as_str() {
-                    "pass" => check.name.green(),
-                    "warn" => check.name.yellow(),
-                    "fail" => check.name.red(),
-                    _ => check.name.normal(),
-                };
-                println!("  {} {}", icon, name_styled);
-                println!("    {}", check.message.dimmed());
-                if let Some(ref hint) = check.remediation {
-                    println!("    {}: {}", "Hint".cyan(), hint);
-                }
-            }
-
-            println!();
-            println!(
-                "Summary: {} passed, {} warnings, {} failed",
-                diag.passed.to_string().green(),
-                diag.warnings.to_string().yellow(),
-                diag.failed.to_string().red()
-            );
-        }
-    }
-
-    // Set exit code based on results
-    let total_failed: usize = all_diagnostics.iter().map(|d| d.failed).sum();
-    if total_failed > 0 {
-        std::process::exit(1);
-    }
-
-    Ok(())
-}
-
-/// Check SSH connectivity to a host
-fn check_ssh_connectivity(host: &str) -> DiagnosticCheck {
-    let output = std::process::Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            host,
-            "true",
-        ])
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => DiagnosticCheck {
-            name: "SSH Connectivity".into(),
-            status: "pass".into(),
-            message: format!("Connected to {} successfully", host),
-            remediation: None,
-        },
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let remediation = if stderr.contains("Permission denied") {
-                Some("Ensure SSH key is added to remote authorized_keys".into())
-            } else if stderr.contains("Connection refused") {
-                Some("Verify SSH server is running on remote host".into())
-            } else if stderr.contains("Could not resolve") {
-                Some("Check hostname is correct and DNS resolves".into())
-            } else {
-                Some("Check SSH configuration and network connectivity".into())
-            };
-            DiagnosticCheck {
-                name: "SSH Connectivity".into(),
-                status: "fail".into(),
-                message: stderr.trim().to_string(),
-                remediation,
-            }
-        }
-        Err(e) => DiagnosticCheck {
-            name: "SSH Connectivity".into(),
-            status: "fail".into(),
-            message: format!("Failed to run ssh: {}", e),
-            remediation: Some("Ensure SSH client is installed and in PATH".into()),
-        },
-    }
-}
-
-/// Check rsync availability on remote
-fn check_rsync_available(host: &str) -> DiagnosticCheck {
-    let output = std::process::Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "BatchMode=yes",
-            host,
-            "rsync",
-            "--version",
-        ])
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let version = stdout
-                .lines()
-                .next()
-                .unwrap_or("version unknown")
-                .to_string();
-            DiagnosticCheck {
-                name: "rsync Available".into(),
-                status: "pass".into(),
-                message: version,
-                remediation: None,
-            }
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            DiagnosticCheck {
-                name: "rsync Available".into(),
-                status: "fail".into(),
-                message: format!("rsync not found: {}", stderr.trim()),
-                remediation: Some("Install rsync on the remote host".into()),
-            }
-        }
-        Err(e) => DiagnosticCheck {
-            name: "rsync Available".into(),
-            status: "warn".into(),
-            message: format!("Could not check rsync: {}", e),
-            remediation: Some("SSH connectivity may have failed".into()),
-        },
-    }
-}
-
-fn sh_quote(value: &str) -> String {
-    if value.is_empty() {
-        "''".to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\"'\"'"))
-    }
-}
-
-/// Check if a remote path exists
-fn check_remote_path(host: &str, path: &str) -> DiagnosticCheck {
-    let quoted = sh_quote(path);
-    let cmd = format!("test -d {quoted} && ls -1 {quoted} | wc -l");
-    let output = std::process::Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "BatchMode=yes",
-            host,
-            "sh",
-            "-c",
-            &cmd,
-        ])
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let count = String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .parse::<usize>()
-                .unwrap_or(0);
-            DiagnosticCheck {
-                name: format!("Remote Path: {}", path),
-                status: if count > 0 { "pass" } else { "warn" }.into(),
-                message: if count > 0 {
-                    format!("Path exists, {} items found", count)
-                } else {
-                    "Path exists but is empty".into()
-                },
-                remediation: if count == 0 {
-                    Some("No agent sessions on this machine yet".into())
-                } else {
-                    None
-                },
-            }
-        }
-        Ok(_) => DiagnosticCheck {
-            name: format!("Remote Path: {}", path),
-            status: "fail".into(),
-            message: "Path does not exist".into(),
-            remediation: Some("Remove this path or create it on the remote".into()),
-        },
-        Err(e) => DiagnosticCheck {
-            name: format!("Remote Path: {}", path),
-            status: "warn".into(),
-            message: format!("Could not check path: {}", e),
-            remediation: Some("SSH connectivity may have failed".into()),
-        },
-    }
-}
-
-/// Check if local storage directory is writable
-fn check_local_storage(source_name: &str) -> DiagnosticCheck {
-    if let Some(data_dir) = dirs::data_local_dir() {
-        let source_dir = data_dir.join("cass").join("remotes").join(source_name);
-
-        // Try to create the directory if it doesn't exist
-        if !source_dir.exists() {
-            if std::fs::create_dir_all(&source_dir).is_ok() {
-                return DiagnosticCheck {
-                    name: "Local Storage".into(),
-                    status: "pass".into(),
-                    message: format!("{} is writable", source_dir.display()),
-                    remediation: None,
-                };
-            } else {
-                return DiagnosticCheck {
-                    name: "Local Storage".into(),
-                    status: "fail".into(),
-                    message: format!("Cannot create {}", source_dir.display()),
-                    remediation: Some("Check file permissions on data directory".into()),
-                };
-            }
-        }
-
-        // Directory exists, check if writable
-        let test_file = source_dir.join(".doctor_test");
-        if std::fs::write(&test_file, b"test").is_ok() {
-            let _ = std::fs::remove_file(&test_file);
-            DiagnosticCheck {
-                name: "Local Storage".into(),
-                status: "pass".into(),
-                message: format!("{} is writable", source_dir.display()),
-                remediation: None,
-            }
-        } else {
-            DiagnosticCheck {
-                name: "Local Storage".into(),
-                status: "fail".into(),
-                message: format!("{} is not writable", source_dir.display()),
-                remediation: Some("Check file permissions on data directory".into()),
-            }
-        }
-    } else {
-        DiagnosticCheck {
-            name: "Local Storage".into(),
-            status: "fail".into(),
-            message: "Could not determine local data directory".into(),
-            remediation: Some("Set XDG_DATA_HOME or HOME environment variable".into()),
-        }
-    }
-}
-
-/// Sync sessions from remote sources (P5.5)
-fn run_sources_sync(
-    source_filter: Option<Vec<String>>,
-    no_index: bool,
-    verbose: bool,
-    dry_run: bool,
-    json_output: bool,
-) -> CliResult<()> {
-    use crate::sources::config::SourcesConfig;
-    use crate::sources::sync::{SyncEngine, SyncStatus};
-    use colored::Colorize;
-
-    let config = SourcesConfig::load().map_err(|e| CliError {
-        code: 9,
-        kind: "config",
-        message: format!("Failed to load sources config: {e}"),
-        hint: Some("Run 'cass sources add' to configure a source".into()),
-        retryable: false,
-    })?;
-
-    // Filter to remote sources only
-    let remote_sources: Vec<_> = config.remote_sources().collect();
-
-    if remote_sources.is_empty() {
-        if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "status": "no_sources",
-                    "message": "No remote sources configured"
-                })
-            );
-        } else {
-            println!(
-                "{}",
-                "No remote sources configured. Run 'cass sources add' first.".yellow()
-            );
-        }
-        return Ok(());
-    }
-
-    // Filter to specified sources if provided
-    let sources_to_sync: Vec<_> = if let Some(ref names) = source_filter {
-        remote_sources
-            .into_iter()
-            .filter(|s| names.contains(&s.name))
-            .collect()
-    } else {
-        remote_sources
-    };
-
-    if sources_to_sync.is_empty() {
-        if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "status": "no_match",
-                    "message": "No sources match the filter"
-                })
-            );
-        } else {
-            println!("{}", "No sources match the specified filter.".yellow());
-        }
-        return Ok(());
-    }
-
-    // Get data directory for sync engine and status
-    // Respect XDG_DATA_HOME first (important for testing and Linux users)
-    let data_dir = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .map(|p| PathBuf::from(p).join("cass"))
-        .or_else(|| dirs::data_local_dir().map(|d| d.join("cass")))
-        .ok_or_else(|| CliError {
-            code: 9,
-            kind: "config",
-            message: "Could not determine data directory".into(),
-            hint: Some("Set XDG_DATA_HOME or HOME environment variable".into()),
-            retryable: false,
-        })?;
-
-    // Create sync engine
-    let engine = SyncEngine::new(&data_dir);
-
-    // Load existing sync status
-    let mut status = SyncStatus::load(&data_dir).unwrap_or_default();
-
-    if dry_run && !json_output {
-        println!("{}", "DRY RUN - no changes will be made".cyan().bold());
-        println!();
-    }
-
-    let mut all_reports = Vec::new();
-    let mut total_files = 0u64;
-    let mut total_bytes = 0u64;
-
-    for source in &sources_to_sync {
-        if !json_output {
-            println!(
-                "{} {}...",
-                "Syncing".cyan().bold(),
-                source.name.white().bold()
-            );
-        }
-
-        if dry_run {
-            // In dry run, just show what would be synced
-            if !json_output {
-                for path in &source.paths {
-                    println!("  {} {}", "Would sync:".dimmed(), path);
-                }
-                println!();
-            }
-            continue;
-        }
-
-        // Perform actual sync
-        let report = match engine.sync_source(source) {
-            Ok(r) => r,
-            Err(e) => {
-                if json_output {
-                    all_reports.push(serde_json::json!({
-                        "source": source.name,
-                        "status": "error",
-                        "error": e.to_string()
-                    }));
-                } else {
-                    println!("  {} {}", "Error:".red().bold(), e.to_string().red());
-                }
-                continue;
-            }
-        };
-
-        // Update status
-        status.update(&source.name, &report);
-
-        // Print results
-        if json_output {
-            all_reports.push(serde_json::json!({
-                "source": source.name,
-                "status": if report.all_succeeded { "success" } else { "partial" },
-                "method": report.method.to_string(),
-                "paths": report.path_results.iter().map(|r| serde_json::json!({
-                    "path": r.remote_path,
-                    "success": r.success,
-                    "files": r.files_transferred,
-                    "bytes": r.bytes_transferred,
-                    "error": r.error,
-                })).collect::<Vec<_>>(),
-                "total_files": report.total_files(),
-                "total_bytes": report.total_bytes(),
-                "duration_ms": report.total_duration_ms,
-            }));
-        } else {
-            for result in &report.path_results {
-                if result.success {
-                    if verbose || result.files_transferred > 0 {
-                        println!(
-                            "  {}: {} files ({} bytes)",
-                            result.remote_path.dimmed(),
-                            result.files_transferred.to_string().green(),
-                            format_bytes(result.bytes_transferred)
-                        );
-                    } else {
-                        println!(
-                            "  {}: {}",
-                            result.remote_path.dimmed(),
-                            "up to date".green()
-                        );
-                    }
-                } else {
-                    println!(
-                        "  {}: {}",
-                        result.remote_path.dimmed(),
-                        result.error.as_deref().unwrap_or("failed").red()
-                    );
-                }
-            }
-            println!(
-                "  {} {} files, {}",
-                "Total:".dimmed(),
-                report.total_files(),
-                format_bytes(report.total_bytes())
-            );
-            println!();
-        }
-
-        total_files += report.total_files();
-        total_bytes += report.total_bytes();
-    }
-
-    // Save sync status
-    if !dry_run && let Err(e) = status.save(&data_dir) {
-        tracing::warn!("Failed to save sync status: {}", e);
-    }
-
-    // Output summary
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": "complete",
-                "dry_run": dry_run,
-                "sources": all_reports,
-                "total_files": total_files,
-                "total_bytes": total_bytes,
-                "will_reindex": !no_index && !dry_run,
-            }))
-            .unwrap_or_default()
-        );
-    }
-
-    // Trigger re-index if requested
-    if !no_index && !dry_run && total_files > 0 {
-        if !json_output {
-            println!(
-                "{} {} new files...",
-                "Re-indexing".cyan().bold(),
-                total_files
-            );
-        }
-
-        // Call indexer to include synced sessions
-        let progress = if json_output {
-            ProgressResolved::None
-        } else if std::io::stdout().is_terminal() {
-            ProgressResolved::Bars
-        } else {
-            ProgressResolved::Plain
-        };
-
-        run_index_with_data(
-            None,           // db_override (uses data_dir default)
-            false,          // full
-            false,          // force_rebuild
-            false,          // watch
-            None,           // watch_once
-            Some(data_dir), // data_dir
-            progress,
-            json_output,
-            None, // idempotency_key
-        )?;
-    }
-
-    Ok(())
-}
-
-/// Handle mappings subcommands (P6.3)
-fn run_mappings_command(action: MappingsAction) -> CliResult<()> {
-    match action {
-        MappingsAction::List { source, json } => {
-            run_mappings_list(&source, json)?;
-        }
-        MappingsAction::Add {
-            source,
-            from,
-            to,
-            agents,
-        } => {
-            run_mappings_add(&source, &from, &to, agents)?;
-        }
-        MappingsAction::Remove { source, index } => {
-            run_mappings_remove(&source, index)?;
-        }
-        MappingsAction::Test {
-            source,
-            path,
-            agent,
-        } => {
-            run_mappings_test(&source, &path, agent.as_deref())?;
-        }
-    }
-    Ok(())
-}
-
-/// List path mappings for a source (P6.3)
-fn run_mappings_list(source_name: &str, json_output: bool) -> CliResult<()> {
-    use crate::sources::config::SourcesConfig;
-
-    let config = SourcesConfig::load().map_err(|e| CliError {
-        code: 9,
-        kind: "config",
-        message: format!("Failed to load sources config: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    let source = config.find_source(source_name).ok_or_else(|| CliError {
-        code: 12,
-        kind: "source",
-        message: format!("Source '{}' not found", source_name),
-        hint: Some("Use 'cass sources list' to see available sources".into()),
-        retryable: false,
-    })?;
-
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "source": source_name,
-                "mappings": source.path_mappings,
-            }))
-            .unwrap_or_default()
-        );
-    } else {
-        println!("Path mappings for source '{}':", source_name);
-        println!();
-
-        if source.path_mappings.is_empty() {
-            println!("  No path mappings configured.");
-            println!();
-            println!("Add mappings with:");
-            println!(
-                "  cass sources mappings add {} --from /remote/path --to /local/path",
-                source_name
-            );
-        } else {
-            for (idx, mapping) in source.path_mappings.iter().enumerate() {
-                println!("  [{}] {} → {}", idx, mapping.from, mapping.to);
-                if let Some(ref agents) = mapping.agents {
-                    println!("      agents: {}", agents.join(", "));
-                }
-            }
-        }
-        println!();
-    }
-
-    Ok(())
-}
-
-/// Add a path mapping to a source (P6.3)
-fn run_mappings_add(
-    source_name: &str,
-    from: &str,
-    to: &str,
-    agents: Option<Vec<String>>,
-) -> CliResult<()> {
-    use crate::sources::config::{PathMapping, SourcesConfig};
-
-    let mut config = SourcesConfig::load().map_err(|e| CliError {
-        code: 9,
-        kind: "config",
-        message: format!("Failed to load sources config: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    let source = config
-        .find_source_mut(source_name)
-        .ok_or_else(|| CliError {
-            code: 12,
-            kind: "source",
-            message: format!("Source '{}' not found", source_name),
-            hint: Some("Use 'cass sources list' to see available sources".into()),
-            retryable: false,
-        })?;
-
-    // Create the mapping
-    let mapping = if let Some(agent_list) = agents {
-        PathMapping::with_agents(from, to, agent_list)
-    } else {
-        PathMapping::new(from, to)
-    };
-
-    // Check for duplicates
-    let already_exists = source
-        .path_mappings
-        .iter()
-        .any(|m| m.from == mapping.from && m.to == mapping.to && m.agents == mapping.agents);
-
-    if already_exists {
-        return Err(CliError {
-            code: 13,
-            kind: "mapping",
-            message: "This mapping already exists".into(),
-            hint: None,
-            retryable: false,
-        });
-    }
-
-    source.path_mappings.push(mapping.clone());
-
-    config.save().map_err(|e| CliError {
-        code: 11,
-        kind: "config",
-        message: format!("Failed to save config: {e}"),
-        hint: Some("Check file permissions on config directory".into()),
-        retryable: false,
-    })?;
-
-    println!("Added mapping to source '{}':", source_name);
-    println!("  {} → {}", mapping.from, mapping.to);
-    if let Some(agents) = &mapping.agents {
-        println!("  agents: {}", agents.join(", "));
-    }
-    println!();
-    println!("Test with:");
-    println!("  cass sources mappings test {} {}", source_name, from);
-
-    Ok(())
-}
-
-/// Remove a path mapping from a source (P6.3)
-fn run_mappings_remove(source_name: &str, index: usize) -> CliResult<()> {
-    use crate::sources::config::SourcesConfig;
-
-    let mut config = SourcesConfig::load().map_err(|e| CliError {
-        code: 9,
-        kind: "config",
-        message: format!("Failed to load sources config: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    let source = config
-        .find_source_mut(source_name)
-        .ok_or_else(|| CliError {
-            code: 12,
-            kind: "source",
-            message: format!("Source '{}' not found", source_name),
-            hint: Some("Use 'cass sources list' to see available sources".into()),
-            retryable: false,
-        })?;
-
-    if index >= source.path_mappings.len() {
-        return Err(CliError {
-            code: 14,
-            kind: "mapping",
-            message: format!(
-                "Invalid index {}. Source has {} mapping(s).",
-                index,
-                source.path_mappings.len()
-            ),
-            hint: Some("Use 'cass sources mappings list' to see valid indices".into()),
-            retryable: false,
-        });
-    }
-
-    let removed = source.path_mappings.remove(index);
-
-    config.save().map_err(|e| CliError {
-        code: 11,
-        kind: "config",
-        message: format!("Failed to save config: {e}"),
-        hint: Some("Check file permissions on config directory".into()),
-        retryable: false,
-    })?;
-
-    println!("Removed mapping from source '{}':", source_name);
-    println!("  {} → {}", removed.from, removed.to);
-
-    Ok(())
-}
-
-/// Test how a path would be rewritten for a source (P6.3)
-fn run_mappings_test(source_name: &str, path: &str, agent: Option<&str>) -> CliResult<()> {
-    use crate::sources::config::{PathMapping, SourcesConfig};
-    use colored::Colorize;
-
-    let config = SourcesConfig::load().map_err(|e| CliError {
-        code: 9,
-        kind: "config",
-        message: format!("Failed to load sources config: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    let source = config.find_source(source_name).ok_or_else(|| CliError {
-        code: 12,
-        kind: "source",
-        message: format!("Source '{}' not found", source_name),
-        hint: Some("Use 'cass sources list' to see available sources".into()),
-        retryable: false,
-    })?;
-
-    // Find the matching mapping
-    let mut matching_mapping = None;
-    let rewritten = source.rewrite_path_for_agent(path, agent);
-
-    // Find which rule matched (if any)
-    if rewritten != path {
-        // Find the longest matching prefix
-        let mut best_match: Option<&PathMapping> = None;
-        for mapping in &source.path_mappings {
-            if !mapping.applies_to_agent(agent) {
-                continue;
-            }
-            if path.starts_with(&mapping.from)
-                && (best_match.is_none()
-                    || mapping.from.len() > best_match.as_ref().unwrap().from.len())
-            {
-                best_match = Some(mapping);
-            }
-        }
-        matching_mapping = best_match;
-    }
-
-    println!();
-    println!("Input:  {}", path);
-    println!("Output: {}", rewritten);
-
-    if let Some(mapping) = matching_mapping {
-        println!("Rule:   {} → {}", mapping.from, mapping.to);
-        if let Some(ref agents) = mapping.agents {
-            println!("        agents: {}", agents.join(", "));
-        }
-        println!("Status: {} mapped", "✓".green());
-    } else if rewritten == path {
-        println!("Status: {} no matching rule", "✗".yellow());
-
-        if !source.path_mappings.is_empty() {
-            println!();
-            println!("Available rules:");
-            for mapping in &source.path_mappings {
-                println!("  {} → {}", mapping.from, mapping.to);
-                if let Some(ref agents) = mapping.agents {
-                    println!("    agents: {}", agents.join(", "));
-                }
-            }
-        }
-    }
-
-    if let Some(a) = agent {
-        println!();
-        println!("(Tested with agent: {})", a);
-    }
-    println!();
-
     Ok(())
 }
 
@@ -8436,4 +6721,21 @@ fn parse_datetime_flexible(s: &str) -> Option<i64> {
             None
         }
     }
+}
+
+fn run_sessions(
+    workspace: Option<&Path>,
+    data_dir: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+) -> CliResult<()> {
+    let data_dir = data_dir.clone().unwrap_or_else(default_data_dir);
+    let db = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+
+    ui::sessions::run_sessions_tui(workspace, &data_dir, &db).map_err(|e| CliError {
+        code: 9,
+        kind: "tui",
+        message: format!("sessions tui failed: {e}"),
+        hint: None,
+        retryable: false,
+    })
 }

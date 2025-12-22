@@ -11,14 +11,12 @@ use notify::{RecursiveMode, Watcher, recommended_watcher};
 
 use crate::connectors::NormalizedConversation;
 use crate::connectors::{
-    Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
-    claude_code::ClaudeCodeConnector, cline::ClineConnector, codex::CodexConnector,
-    cursor::CursorConnector, gemini::GeminiConnector, opencode::OpenCodeConnector,
-    pi_agent::PiAgentConnector,
+    Connector, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
+    claude_code::ClaudeCodeConnector, cline::ClineConnector, codebuff::CodebuffConnector,
+    codex::CodexConnector, cursor::CursorConnector, gemini::GeminiConnector,
+    opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
 };
 use crate::search::tantivy::{TantivyIndex, index_dir};
-use crate::sources::config::Platform;
-use crate::sources::provenance::Origin;
 use crate::storage::sqlite::SqliteStorage;
 
 #[derive(Debug, Clone)]
@@ -130,13 +128,28 @@ pub fn run_index(
         }
     }
 
+    // Define connector factories for parallel execution
+    // Each tuple: (name, factory_fn) where factory_fn creates a fresh Connector
+    #[allow(clippy::type_complexity)]
+    let connector_factories: Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> = vec![
+        ("codex", || Box::new(CodexConnector::new())),
+        ("cline", || Box::new(ClineConnector::new())),
+        ("gemini", || Box::new(GeminiConnector::new())),
+        ("claude", || Box::new(ClaudeCodeConnector::new())),
+        ("opencode", || Box::new(OpenCodeConnector::new())),
+        ("amp", || Box::new(AmpConnector::new())),
+        ("aider", || Box::new(AiderConnector::new())),
+        ("cursor", || Box::new(CursorConnector::new())),
+        ("chatgpt", || Box::new(ChatGptConnector::new())),
+        ("pi_agent", || Box::new(PiAgentConnector::new())),
+        ("codebuff", || Box::new(CodebuffConnector::new())),
+    ];
+
     // Run connector detection and scanning in parallel using rayon
     use rayon::prelude::*;
 
     let progress_ref = opts.progress.as_ref();
     let data_dir = opts.data_dir.clone();
-
-    let connector_factories = get_connector_factories();
 
     let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>)> = connector_factories
         .into_par_iter()
@@ -156,16 +169,13 @@ pub fn run_index(
                 }
             }
 
-            let ctx = crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
+            let ctx = crate::connectors::ScanContext {
+                data_root: data_dir.clone(),
+                since_ts,
+            };
 
             match conn.scan(&ctx) {
-                Ok(mut convs) => {
-                    // Inject local provenance into all conversations from local scan (P2.2)
-                    let local_origin = Origin::local();
-                    for conv in &mut convs {
-                        inject_provenance(conv, &local_origin);
-                    }
-
+                Ok(convs) => {
                     if let Some(p) = progress_ref {
                         p.total.fetch_add(convs.len(), Ordering::Relaxed);
                     }
@@ -219,24 +229,26 @@ pub fn run_index(
         let storage = Arc::new(Mutex::new(storage));
         let t_index = Arc::new(Mutex::new(t_index));
 
-        // Detect roots once for the watcher setup
-        let watch_roots = detect_watch_roots();
-
         watch_sources(
             opts.watch_once_paths.clone(),
-            watch_roots.clone(),
             event_channel,
-            move |paths, roots, is_rebuild| {
+            move |paths, is_rebuild| {
                 if is_rebuild {
+                    // For full rebuild, we effectively restart the index process
+                    // But here we just trigger a re-scan of all roots
+                    // For simplicity, we can't easily recurse into run_index (lock issues)
+                    // So we emulate a re-scan by passing all watch roots and clearing since_ts logic
+                    // Or we can just call reindex_paths with all roots and a flag to ignore ts?
+                    // reindex_paths uses classify_paths which uses mtime.
+                    // To force reindex, we might need to clear watch state.
                     if let Ok(mut g) = state.lock() {
                         g.clear();
                         let _ = save_watch_state(&opts_clone.data_dir, &g);
                     }
-                    // For rebuild, trigger reindex on all active roots
-                    let all_root_paths: Vec<PathBuf> = roots.iter().map(|(_, p)| p.clone()).collect();
+                    // Pass all watch roots
+                    let roots = watch_roots();
                     let _ = reindex_paths(
                         &opts_clone,
-                        all_root_paths,
                         roots,
                         state.clone(),
                         storage.clone(),
@@ -247,7 +259,6 @@ pub fn run_index(
                     let _ = reindex_paths(
                         &opts_clone,
                         paths,
-                        roots,
                         state.clone(),
                         storage.clone(),
                         t_index.clone(),
@@ -276,69 +287,14 @@ fn ingest_batch(
     Ok(())
 }
 
-/// Get all available connector factories.
-#[allow(clippy::type_complexity)]
-pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> {
-    vec![
-        ("codex", || Box::new(CodexConnector::new())),
-        ("cline", || Box::new(ClineConnector::new())),
-        ("gemini", || Box::new(GeminiConnector::new())),
-        ("claude", || Box::new(ClaudeCodeConnector::new())),
-        ("opencode", || Box::new(OpenCodeConnector::new())),
-        ("amp", || Box::new(AmpConnector::new())),
-        ("aider", || Box::new(AiderConnector::new())),
-        ("cursor", || Box::new(CursorConnector::new())),
-        ("chatgpt", || Box::new(ChatGptConnector::new())),
-        ("pi_agent", || Box::new(PiAgentConnector::new())),
-    ]
-}
-
-/// Detect all active roots for watching/scanning.
-fn detect_watch_roots() -> Vec<(ConnectorKind, PathBuf)> {
-    let factories = get_connector_factories();
-    let mut roots = Vec::new();
-    
-    for (name, factory) in factories {
-        if let Some(kind) = ConnectorKind::from_slug(name) {
-            let conn = factory();
-            let detection = conn.detect();
-            if detection.detected {
-                for root in detection.root_paths {
-                    roots.push((kind, root));
-                }
-            }
-        }
-    }
-    roots
-}
-
-impl ConnectorKind {
-    fn from_slug(slug: &str) -> Option<Self> {
-        match slug {
-            "codex" => Some(Self::Codex),
-            "cline" => Some(Self::Cline),
-            "gemini" => Some(Self::Gemini),
-            "claude" => Some(Self::Claude),
-            "amp" => Some(Self::Amp),
-            "opencode" => Some(Self::OpenCode),
-            "aider" => Some(Self::Aider),
-            "cursor" => Some(Self::Cursor),
-            "chatgpt" => Some(Self::ChatGpt),
-            "pi_agent" => Some(Self::PiAgent),
-            _ => None,
-        }
-    }
-}
-
-fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, PathBuf)], bool) + Send + 'static>(
+fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
     watch_once_paths: Option<Vec<PathBuf>>,
-    roots: Vec<(ConnectorKind, PathBuf)>,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     callback: F,
 ) -> Result<()> {
     if let Some(paths) = watch_once_paths {
         if !paths.is_empty() {
-            callback(paths, &roots, false);
+            callback(paths, false);
         }
         return Ok(());
     }
@@ -352,13 +308,8 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, PathBuf)], bool) + Send +
         }
     })?;
 
-    // Watch all detected roots
-    for (_, dir) in &roots {
-        if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
-            tracing::warn!("failed to watch {}: {}", dir.display(), e);
-        } else {
-            tracing::info!("watching {}", dir.display());
-        }
+    for dir in watch_roots() {
+        let _ = watcher.watch(&dir, RecursiveMode::Recursive);
     }
 
     let debounce = Duration::from_secs(2);
@@ -376,7 +327,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, PathBuf)], bool) + Send +
                     }
                     IndexerEvent::Command(cmd) => match cmd {
                         ReindexCommand::Full => {
-                            callback(vec![], &roots, true);
+                            callback(vec![], true);
                         }
                     },
                 },
@@ -386,8 +337,8 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, PathBuf)], bool) + Send +
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(first_event.unwrap_or(now));
             if elapsed >= max_wait {
-                callback(std::mem::take(&mut pending), &roots, false);
-                first_event = None; // Reset debounce
+                callback(std::mem::take(&mut pending), false);
+                first_event = None;
                 continue;
             }
 
@@ -402,15 +353,15 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, PathBuf)], bool) + Send +
                             // Flush pending first? Or discard?
                             // Let's flush pending then do full.
                             if !pending.is_empty() {
-                                callback(std::mem::take(&mut pending), &roots, false);
+                                callback(std::mem::take(&mut pending), false);
                             }
-                            callback(vec![], &roots, true);
+                            callback(vec![], true);
                             first_event = None; // Reset debounce
                         }
                     },
                 },
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    callback(std::mem::take(&mut pending), &roots, false);
+                    callback(std::mem::take(&mut pending), false);
                     first_event = None;
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -418,6 +369,55 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, PathBuf)], bool) + Send +
         }
     }
     Ok(())
+}
+
+fn watch_roots() -> Vec<PathBuf> {
+    let mut roots = vec![
+        std::env::var("CODEX_HOME").map_or_else(
+            |_| dirs::home_dir().unwrap_or_default().join(".codex/sessions"),
+            PathBuf::from,
+        ),
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".config/Code/User/globalStorage/saoudrizwan.claude-dev"),
+        dirs::home_dir().unwrap_or_default().join(".gemini/tmp"),
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".claude/projects"),
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".config/Code/User/globalStorage/sourcegraph.amp"),
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("amp"),
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(".opencode"),
+        dirs::home_dir().unwrap_or_default().join(".opencode"),
+    ];
+
+    // Cursor IDE chat storage
+    if let Some(cursor_base) = crate::connectors::cursor::CursorConnector::app_support_dir() {
+        roots.push(cursor_base);
+    }
+
+    // ChatGPT desktop (macOS)
+    if let Some(chat_base) = crate::connectors::chatgpt::ChatGptConnector::app_support_dir() {
+        roots.push(chat_base);
+    }
+
+    // Aider keeps history alongside the current workspace
+    roots.push(std::env::current_dir().unwrap_or_default());
+
+    // Codebuff (manicode) stores sessions in ~/.config/manicode/projects
+    // Note: Codebuff uses Linux-style XDG path even on macOS
+    roots.push(
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config/manicode/projects"),
+    );
+
+    roots
 }
 
 fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
@@ -441,16 +441,19 @@ fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
 fn reindex_paths(
     opts: &IndexOptions,
     paths: Vec<PathBuf>,
-    roots: &[(ConnectorKind, PathBuf)],
     state: Arc<Mutex<HashMap<ConnectorKind, i64>>>,
     storage: Arc<Mutex<SqliteStorage>>,
     t_index: Arc<Mutex<TantivyIndex>>,
     force_full: bool,
 ) -> Result<()> {
-    // DO NOT lock storage/index here for the whole duration.
-    // We only need them for the ingest phase, not the scan phase.
+    let mut storage = storage
+        .lock()
+        .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+    let mut t_index = t_index
+        .lock()
+        .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
 
-    let triggers = classify_paths(paths, roots);
+    let triggers = classify_paths(paths);
     if triggers.is_empty() {
         return Ok(());
     }
@@ -466,7 +469,7 @@ fn reindex_paths(
             ConnectorKind::Aider => Box::new(AiderConnector::new()),
             ConnectorKind::Cursor => Box::new(CursorConnector::new()),
             ConnectorKind::ChatGpt => Box::new(ChatGptConnector::new()),
-            ConnectorKind::PiAgent => Box::new(PiAgentConnector::new()),
+            ConnectorKind::Codebuff => Box::new(CodebuffConnector::new()),
         };
         let detect = conn.detect();
         if !detect.detected {
@@ -490,16 +493,11 @@ fn reindex_paths(
                 .or_else(|| ts.map(|v| v.saturating_sub(1)))
                 .map(|v| v.saturating_sub(1))
         };
-        let ctx = crate::connectors::ScanContext::local_default(opts.data_dir.clone(), since_ts);
-        
-        // SCAN PHASE: IO-heavy, no locks held
-        let mut convs = conn.scan(&ctx)?;
-
-        // Inject local provenance into all conversations (P2.2)
-        let local_origin = Origin::local();
-        for conv in &mut convs {
-            inject_provenance(conv, &local_origin);
-        }
+        let ctx = crate::connectors::ScanContext {
+            data_root: opts.data_dir.clone(),
+            since_ts,
+        };
+        let convs = conn.scan(&ctx)?;
 
         // Update total and phase to indexing
         if let Some(p) = &opts.progress {
@@ -508,21 +506,11 @@ fn reindex_paths(
         }
 
         tracing::info!(?kind, conversations = convs.len(), since_ts, "watch_scan");
+        ingest_batch(&mut storage, &mut t_index, &convs, &opts.progress)?;
 
-        // INGEST PHASE: Acquire locks briefly
-        {
-            let mut storage = storage
-                .lock()
-                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-            let mut t_index = t_index
-                .lock()
-                .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
-
-            ingest_batch(&mut storage, &mut t_index, &convs, &opts.progress)?;
-
-            // Commit to Tantivy immediately to ensure index consistency before advancing watch state.
-            t_index.commit()?;
-        }
+        // Commit to Tantivy immediately to ensure index consistency before advancing watch state.
+        // This prevents a state where we think we've indexed up to T, but the index is stale.
+        t_index.commit()?;
 
         if let Some(ts_val) = ts {
             let mut guard = state
@@ -553,7 +541,7 @@ enum ConnectorKind {
     Aider,
     Cursor,
     ChatGpt,
-    PiAgent,
+    Codebuff,
 }
 
 fn state_path(data_dir: &Path) -> PathBuf {
@@ -580,7 +568,7 @@ fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Res
     Ok(())
 }
 
-fn classify_paths(paths: Vec<PathBuf>, roots: &[(ConnectorKind, PathBuf)]) -> Vec<(ConnectorKind, Option<i64>)> {
+fn classify_paths(paths: Vec<PathBuf>) -> Vec<(ConnectorKind, Option<i64>)> {
     let mut map: HashMap<ConnectorKind, Option<i64>> = HashMap::new();
     for p in paths {
         if let Ok(meta) = std::fs::metadata(&p)
@@ -588,17 +576,36 @@ fn classify_paths(paths: Vec<PathBuf>, roots: &[(ConnectorKind, PathBuf)]) -> Ve
             && let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH)
         {
             let ts = Some(dur.as_millis() as i64);
-            
-            // Check against known roots (dynamic classification)
-            let kind = roots.iter().find_map(|(k, root)| {
-                if p.starts_with(root) {
-                    Some(*k)
+            let s = p.to_string_lossy().replace('\\', "/");
+            let tag =
+                if s.contains(".codex") || s.contains("codex/sessions") || s.contains("rollout-") {
+                    Some(ConnectorKind::Codex)
+                } else if s.contains("saoudrizwan.claude-dev") || s.contains("cline") {
+                    Some(ConnectorKind::Cline)
+                } else if s.contains(".gemini/tmp") {
+                    Some(ConnectorKind::Gemini)
+                } else if s.contains(".claude/projects")
+                    || s.ends_with(".claude")
+                    || s.ends_with(".claude.json")
+                {
+                    Some(ConnectorKind::Claude)
+                } else if s.contains("sourcegraph.amp") || s.contains("/amp/") {
+                    Some(ConnectorKind::Amp)
+                } else if s.contains(".opencode") || s.contains("/opencode/") {
+                    Some(ConnectorKind::OpenCode)
+                } else if s.contains(".aider.chat.history.md") {
+                    Some(ConnectorKind::Aider)
+                } else if s.contains("Cursor/User") || s.contains("cursor/User") {
+                    Some(ConnectorKind::Cursor)
+                } else if s.contains("com.openai.chat") || s.contains("conversations-") {
+                    Some(ConnectorKind::ChatGpt)
+                } else if s.contains("manicode/projects") || s.contains("chat-messages.json") {
+                    Some(ConnectorKind::Codebuff)
                 } else {
                     None
-                }
-            });
+                };
 
-            if let Some(kind) = kind {
+            if let Some(kind) = tag {
                 let entry = map.entry(kind).or_insert(None);
                 *entry = match (*entry, ts) {
                     (Some(prev), Some(cur)) => Some(prev.max(cur)),
@@ -611,196 +618,6 @@ fn classify_paths(paths: Vec<PathBuf>, roots: &[(ConnectorKind, PathBuf)]) -> Ve
     map.into_iter().collect()
 }
 
-/// Build a list of scan roots for multi-root indexing.
-///
-/// This function collects both:
-/// 1. Local default roots (from watch_roots() or standard locations)
-/// 2. Remote mirror roots (from registered sources in the database)
-///
-/// Part of P2.2 - Indexer multi-root orchestration.
-pub fn build_scan_roots(storage: &SqliteStorage, data_dir: &Path) -> Vec<ScanRoot> {
-    let mut roots = Vec::new();
-
-    // Add local default root with local provenance
-    // We create a single "local" root that encompasses all local paths.
-    // Connectors will use their own default detection logic when given an empty scan_roots.
-    // For explicit multi-root support, we add the local root.
-    roots.push(ScanRoot::local(data_dir.to_path_buf()));
-
-    // Add remote mirror roots from registered sources
-    if let Ok(sources) = storage.list_sources() {
-        for source in sources {
-            // Skip local source - already handled above
-            if !source.kind.is_remote() {
-                continue;
-            }
-
-            // Remote mirror directory: data_dir/remotes/<source_id>/mirror
-            let mirror_path = data_dir.join("remotes").join(&source.id).join("mirror");
-
-            if mirror_path.exists() {
-                let origin = Origin {
-                    source_id: source.id.clone(),
-                    kind: source.kind,
-                    host: source.host_label.clone(),
-                };
-
-                // Parse platform from source
-                let platform =
-                    source
-                        .platform
-                        .as_deref()
-                        .and_then(|p| match p.to_lowercase().as_str() {
-                            "macos" => Some(Platform::Macos),
-                            "linux" => Some(Platform::Linux),
-                            "windows" => Some(Platform::Windows),
-                            _ => None,
-                        });
-
-                // Parse workspace rewrites from config_json
-                // Format: array of {from, to, agents?} objects
-                let workspace_rewrites = source
-                    .config_json
-                    .as_ref()
-                    .and_then(|cfg| cfg.get("path_mappings"))
-                    .and_then(|arr| arr.as_array())
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|item| {
-                                let from = item.get("from")?.as_str()?.to_string();
-                                let to = item.get("to")?.as_str()?.to_string();
-                                let agents = item.get("agents").and_then(|a| {
-                                    a.as_array().map(|arr| {
-                                        arr.iter()
-                                            .filter_map(|v| v.as_str().map(String::from))
-                                            .collect()
-                                    })
-                                });
-                                Some(crate::sources::config::PathMapping { from, to, agents })
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-
-                let mut scan_root = ScanRoot::remote(mirror_path, origin, platform);
-                scan_root.workspace_rewrites = workspace_rewrites;
-
-                roots.push(scan_root);
-
-                tracing::debug!(
-                    source_id = %source.id,
-                    kind = ?source.kind,
-                    host = ?source.host_label,
-                    "added_remote_scan_root"
-                );
-            }
-        }
-    }
-
-    roots
-}
-
-/// Inject provenance metadata into a conversation from a scan root's origin.
-///
-/// This adds the `cass.origin` field to the conversation's metadata JSON
-/// so that persistence can extract and store the source_id.
-///
-/// Part of P2.2 - provenance injection.
-fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
-    // Ensure metadata is an object
-    if !conv.metadata.is_object() {
-        conv.metadata = serde_json::json!({});
-    }
-
-    // Add cass.origin provenance
-    if let Some(obj) = conv.metadata.as_object_mut() {
-        obj.insert(
-            "cass".to_string(),
-            serde_json::json!({
-                "origin": {
-                    "source_id": origin.source_id,
-                    "kind": origin.kind.as_str(),
-                    "host": origin.host
-                }
-            }),
-        );
-    }
-}
-
-/// Apply workspace path rewriting to a conversation.
-///
-/// This rewrites workspace paths from remote formats to local equivalents
-/// at ingest time, ensuring that workspace filters work consistently
-/// across local and remote sources.
-///
-/// The original workspace path is preserved in metadata.cass.workspace_original
-/// for display/audit purposes.
-///
-/// Part of P6.2 - Apply path mappings at ingest time.
-pub fn apply_workspace_rewrite(
-    conv: &mut NormalizedConversation,
-    workspace_rewrites: &[crate::sources::config::PathMapping],
-) {
-    // Only apply if we have a workspace and rewrites
-    if workspace_rewrites.is_empty() {
-        return;
-    }
-
-    // Clone workspace upfront to avoid borrow issues
-    let original_workspace = match &conv.workspace {
-        Some(ws) => ws.to_string_lossy().to_string(),
-        None => return,
-    };
-
-    // Sort by prefix length descending for longest-prefix match
-    let mut mappings: Vec<_> = workspace_rewrites.iter().collect();
-    mappings.sort_by(|a, b| b.from.len().cmp(&a.from.len()));
-
-    // Try to apply a mapping
-    for mapping in mappings {
-        // Optionally filter by agent
-        if !mapping.applies_to_agent(Some(&conv.agent_slug)) {
-            continue;
-        }
-
-        if let Some(rewritten) = mapping.apply(&original_workspace) {
-            // Only proceed if the rewrite actually changed something
-            if rewritten != original_workspace {
-                // Store original in metadata
-                if !conv.metadata.is_object() {
-                    conv.metadata = serde_json::json!({});
-                }
-
-                if let Some(obj) = conv.metadata.as_object_mut() {
-                    // Get or create cass object
-                    let cass = obj
-                        .entry("cass".to_string())
-                        .or_insert_with(|| serde_json::json!({}));
-                    if let Some(cass_obj) = cass.as_object_mut() {
-                        cass_obj.insert(
-                            "workspace_original".to_string(),
-                            serde_json::Value::String(original_workspace.clone()),
-                        );
-                    }
-                }
-
-                // Update workspace to rewritten path
-                conv.workspace = Some(std::path::PathBuf::from(&rewritten));
-
-                tracing::debug!(
-                    original = %original_workspace,
-                    rewritten = %rewritten,
-                    agent = %conv.agent_slug,
-                    "workspace_rewritten"
-                );
-            }
-            // Stop after first match (longest prefix already matched)
-            return;
-        }
-    }
-}
-
 pub mod persist {
     use anyhow::Result;
 
@@ -809,36 +626,8 @@ pub mod persist {
     use crate::search::tantivy::TantivyIndex;
     use crate::storage::sqlite::{InsertOutcome, SqliteStorage};
 
-    /// Extract provenance (source_id, origin_host) from conversation metadata.
-    ///
-    /// Looks for `metadata.cass.origin` object with source_id and host fields.
-    /// Returns ("local", None) if no provenance is found.
-    fn extract_provenance(metadata: &serde_json::Value) -> (String, Option<String>) {
-        let source_id = metadata
-            .get("cass")
-            .and_then(|c| c.get("origin"))
-            .and_then(|o| o.get("source_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("local")
-            .to_string();
-
-        let origin_host = metadata
-            .get("cass")
-            .and_then(|c| c.get("origin"))
-            .and_then(|o| o.get("host"))
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        (source_id, origin_host)
-    }
-
     /// Convert a NormalizedConversation to the internal Conversation type for SQLite storage.
-    ///
-    /// Extracts provenance from `metadata.cass.origin` if present, otherwise defaults to local.
     pub fn map_to_internal(conv: &NormalizedConversation) -> Conversation {
-        // Extract provenance from metadata (P2.2)
-        let (source_id, origin_host) = extract_provenance(&conv.metadata);
-
         Conversation {
             id: None,
             agent_slug: conv.agent_slug.clone(),
@@ -875,8 +664,6 @@ pub mod persist {
                         .collect(),
                 })
                 .collect(),
-            source_id,
-            origin_host,
         }
     }
 
@@ -936,7 +723,6 @@ pub mod persist {
 mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage};
-    use crate::sources::provenance::SourceKind;
     use rusqlite::Connection;
     use serial_test::serial;
     use tempfile::TempDir;
@@ -1015,8 +801,6 @@ mod tests {
                             snippets: Vec::new(),
                         })
                         .collect(),
-                    source_id: "local".to_string(),
-                    origin_host: None,
                 },
             )
             .unwrap();
@@ -1034,7 +818,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(msg_count, 0);
-        assert_eq!(storage.schema_version().unwrap(), 5);
+        assert_eq!(storage.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -1093,17 +877,8 @@ mod tests {
         std::fs::create_dir_all(chatgpt.parent().unwrap()).unwrap();
         std::fs::write(&chatgpt, "{}").unwrap();
 
-        // roots are needed for classify_paths now
-        let roots = vec![
-            (ConnectorKind::Codex, tmp.path().join(".codex")),
-            (ConnectorKind::Claude, tmp.path().join("project")),
-            (ConnectorKind::Aider, tmp.path().join("repo")),
-            (ConnectorKind::Cursor, tmp.path().join("Cursor/User")),
-            (ConnectorKind::ChatGpt, tmp.path().join("Library/Application Support/com.openai.chat")),
-        ];
-
         let paths = vec![codex.clone(), claude.clone(), aider, cursor, chatgpt];
-        let classified = classify_paths(paths, &roots);
+        let classified = classify_paths(paths);
 
         let kinds: std::collections::HashSet<_> = classified.iter().map(|(k, _)| *k).collect();
         assert!(kinds.contains(&ConnectorKind::Codex));
@@ -1144,8 +919,8 @@ mod tests {
         let prev = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
 
-        // Use xdg directly (not dirs::data_dir() which doesn't respect XDG_DATA_HOME on macOS)
-        let data_dir = xdg.join("amp");
+        // Use dirs::data_dir() to align with connector detection roots.
+        let data_dir = dirs::data_dir().unwrap().join("amp");
         std::fs::create_dir_all(&data_dir).unwrap();
 
         // Prepare amp fixture under data dir so detection + scan succeed.
@@ -1183,13 +958,9 @@ mod tests {
         let storage = std::sync::Arc::new(std::sync::Mutex::new(storage));
         let t_index = std::sync::Arc::new(std::sync::Mutex::new(t_index));
 
-        // Need roots for reindex_paths
-        let roots = vec![(ConnectorKind::Amp, amp_dir)];
-
         reindex_paths(
             &opts,
             vec![amp_file.clone()],
-            &roots,
             state.clone(),
             storage.clone(),
             t_index.clone(),
@@ -1253,9 +1024,8 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         let prev = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
 
-        // Prepare amp fixture using temp directory directly (not dirs::data_dir()
-        // which doesn't respect XDG_DATA_HOME on macOS)
-        let data_dir = xdg.join("amp");
+        // Prepare amp fixture
+        let data_dir = dirs::data_dir().unwrap().join("amp");
         std::fs::create_dir_all(&data_dir).unwrap();
         let amp_dir = data_dir.join("amp");
         std::fs::create_dir_all(&amp_dir).unwrap();
@@ -1295,7 +1065,6 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         reindex_paths(
             &opts,
             vec![amp_file],
-            &[(ConnectorKind::Amp, amp_dir)],
             state.clone(),
             storage.clone(),
             t_index.clone(),
@@ -1319,340 +1088,5 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         } else {
             unsafe { std::env::remove_var("XDG_DATA_HOME") };
         }
-    }
-
-    // P2.2 Tests: Multi-root orchestration and provenance injection
-
-    #[test]
-    fn inject_provenance_adds_cass_origin_to_metadata() {
-        let mut conv = norm_conv(Some("test"), vec![norm_msg(0, 100)]);
-        assert!(conv.metadata.get("cass").is_none());
-
-        let origin = Origin::local();
-        inject_provenance(&mut conv, &origin);
-
-        let cass = conv.metadata.get("cass").expect("cass field should exist");
-        let origin_obj = cass.get("origin").expect("origin should exist");
-        assert_eq!(origin_obj.get("source_id").unwrap().as_str(), Some("local"));
-        assert_eq!(origin_obj.get("kind").unwrap().as_str(), Some("local"));
-    }
-
-    #[test]
-    fn inject_provenance_handles_remote_origin() {
-        let mut conv = norm_conv(Some("test"), vec![norm_msg(0, 100)]);
-
-        let origin = Origin::remote_with_host("laptop", "user@laptop.local");
-        inject_provenance(&mut conv, &origin);
-
-        let cass = conv.metadata.get("cass").expect("cass field should exist");
-        let origin_obj = cass.get("origin").expect("origin should exist");
-        assert_eq!(
-            origin_obj.get("source_id").unwrap().as_str(),
-            Some("laptop")
-        );
-        assert_eq!(origin_obj.get("kind").unwrap().as_str(), Some("ssh"));
-        assert_eq!(
-            origin_obj.get("host").unwrap().as_str(),
-            Some("user@laptop.local")
-        );
-    }
-
-    #[test]
-    fn extract_provenance_returns_local_for_empty_metadata() {
-        let conv = persist::map_to_internal(&NormalizedConversation {
-            agent_slug: "test".into(),
-            external_id: None,
-            title: None,
-            workspace: None,
-            source_path: PathBuf::from("/test"),
-            started_at: None,
-            ended_at: None,
-            metadata: serde_json::json!({}),
-            messages: vec![],
-        });
-        assert_eq!(conv.source_id, "local");
-        assert!(conv.origin_host.is_none());
-    }
-
-    #[test]
-    fn extract_provenance_extracts_remote_origin() {
-        let metadata = serde_json::json!({
-            "cass": {
-                "origin": {
-                    "source_id": "laptop",
-                    "kind": "ssh",
-                    "host": "user@laptop.local"
-                }
-            }
-        });
-        let conv = persist::map_to_internal(&NormalizedConversation {
-            agent_slug: "test".into(),
-            external_id: None,
-            title: None,
-            workspace: None,
-            source_path: PathBuf::from("/test"),
-            started_at: None,
-            ended_at: None,
-            metadata,
-            messages: vec![],
-        });
-        assert_eq!(conv.source_id, "laptop");
-        assert_eq!(conv.origin_host, Some("user@laptop.local".to_string()));
-    }
-
-    #[test]
-    fn build_scan_roots_creates_local_root() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let db_path = data_dir.join("db.sqlite");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-
-        let roots = build_scan_roots(&storage, &data_dir);
-
-        // Should have at least the local root
-        assert!(!roots.is_empty());
-        assert_eq!(roots[0].origin.source_id, "local");
-        assert!(!roots[0].origin.is_remote());
-    }
-
-    #[test]
-    fn build_scan_roots_includes_remote_mirror_if_exists() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        // Create a remote source in the database
-        let db_path = data_dir.join("db.sqlite");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-
-        // Register a remote source
-        storage
-            .upsert_source(&crate::sources::provenance::Source {
-                id: "laptop".to_string(),
-                kind: SourceKind::Ssh,
-                host_label: Some("user@laptop.local".to_string()),
-                machine_id: None,
-                platform: Some("linux".to_string()),
-                config_json: None,
-                created_at: None,
-                updated_at: None,
-            })
-            .unwrap();
-
-        // Create the mirror directory
-        let mirror_dir = data_dir.join("remotes").join("laptop").join("mirror");
-        std::fs::create_dir_all(&mirror_dir).unwrap();
-
-        let roots = build_scan_roots(&storage, &data_dir);
-
-        // Should have local root + remote root
-        assert_eq!(roots.len(), 2);
-
-        // Find the remote root
-        let remote_root = roots.iter().find(|r| r.origin.source_id == "laptop");
-        assert!(remote_root.is_some());
-        let remote_root = remote_root.unwrap();
-        assert!(remote_root.origin.is_remote());
-        assert_eq!(
-            remote_root.origin.host,
-            Some("user@laptop.local".to_string())
-        );
-        assert_eq!(remote_root.platform, Some(Platform::Linux));
-    }
-
-    #[test]
-    fn build_scan_roots_skips_nonexistent_mirror() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let db_path = data_dir.join("db.sqlite");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-
-        // Register a remote source but don't create mirror directory
-        storage
-            .upsert_source(&crate::sources::provenance::Source {
-                id: "nonexistent".to_string(),
-                kind: SourceKind::Ssh,
-                host_label: Some("user@host".to_string()),
-                machine_id: None,
-                platform: None,
-                config_json: None,
-                created_at: None,
-                updated_at: None,
-            })
-            .unwrap();
-
-        let roots = build_scan_roots(&storage, &data_dir);
-
-        // Should only have local root (remote skipped because mirror doesn't exist)
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].origin.source_id, "local");
-    }
-
-    #[test]
-    fn apply_workspace_rewrite_no_rewrites() {
-        let mut conv = norm_conv(None, vec![norm_msg(0, 1000)]);
-        conv.workspace = Some(PathBuf::from("/home/user/projects/app"));
-
-        apply_workspace_rewrite(&mut conv, &[]);
-
-        // Workspace unchanged when no rewrites
-        assert_eq!(
-            conv.workspace,
-            Some(PathBuf::from("/home/user/projects/app"))
-        );
-        // No workspace_original in metadata
-        assert!(
-            conv.metadata
-                .get("cass")
-                .and_then(|c| c.get("workspace_original"))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn apply_workspace_rewrite_no_workspace() {
-        let mut conv = norm_conv(None, vec![norm_msg(0, 1000)]);
-        conv.workspace = None;
-
-        let mappings = vec![crate::sources::config::PathMapping::new(
-            "/home/user",
-            "/Users/me",
-        )];
-
-        apply_workspace_rewrite(&mut conv, &mappings);
-
-        // Still None
-        assert!(conv.workspace.is_none());
-    }
-
-    #[test]
-    fn apply_workspace_rewrite_applies_mapping() {
-        let mut conv = norm_conv(None, vec![norm_msg(0, 1000)]);
-        conv.workspace = Some(PathBuf::from("/home/user/projects/app"));
-
-        let mappings = vec![crate::sources::config::PathMapping::new(
-            "/home/user",
-            "/Users/me",
-        )];
-
-        apply_workspace_rewrite(&mut conv, &mappings);
-
-        // Workspace rewritten
-        assert_eq!(
-            conv.workspace,
-            Some(PathBuf::from("/Users/me/projects/app"))
-        );
-
-        // Original stored in metadata
-        let workspace_original = conv
-            .metadata
-            .get("cass")
-            .and_then(|c| c.get("workspace_original"))
-            .and_then(|v| v.as_str());
-        assert_eq!(workspace_original, Some("/home/user/projects/app"));
-    }
-
-    #[test]
-    fn apply_workspace_rewrite_longest_prefix_match() {
-        let mut conv = norm_conv(None, vec![norm_msg(0, 1000)]);
-        conv.workspace = Some(PathBuf::from("/home/user/projects/special/app"));
-
-        let mappings = vec![
-            crate::sources::config::PathMapping::new("/home/user", "/Users/me"),
-            crate::sources::config::PathMapping::new(
-                "/home/user/projects/special",
-                "/Volumes/Special",
-            ),
-        ];
-
-        apply_workspace_rewrite(&mut conv, &mappings);
-
-        // Should use longer prefix match
-        assert_eq!(conv.workspace, Some(PathBuf::from("/Volumes/Special/app")));
-    }
-
-    #[test]
-    fn apply_workspace_rewrite_no_match() {
-        let mut conv = norm_conv(None, vec![norm_msg(0, 1000)]);
-        conv.workspace = Some(PathBuf::from("/opt/other/path"));
-
-        let mappings = vec![crate::sources::config::PathMapping::new(
-            "/home/user",
-            "/Users/me",
-        )];
-
-        apply_workspace_rewrite(&mut conv, &mappings);
-
-        // Workspace unchanged - no matching prefix
-        assert_eq!(conv.workspace, Some(PathBuf::from("/opt/other/path")));
-        // No workspace_original since nothing was rewritten
-        assert!(
-            conv.metadata
-                .get("cass")
-                .and_then(|c| c.get("workspace_original"))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn apply_workspace_rewrite_with_agent_filter() {
-        // Test with agent filter
-        let mut conv = norm_conv(None, vec![norm_msg(0, 1000)]);
-        conv.agent_slug = "claude-code".to_string();
-        conv.workspace = Some(PathBuf::from("/home/user/projects/app"));
-
-        let mappings = vec![
-            crate::sources::config::PathMapping::new("/home/user", "/Users/me"),
-            crate::sources::config::PathMapping::with_agents(
-                "/home/user/projects",
-                "/Volumes/Work",
-                vec!["cursor".to_string()], // Only for cursor, not claude-code
-            ),
-        ];
-
-        apply_workspace_rewrite(&mut conv, &mappings);
-
-        // Should NOT use cursor-specific mapping, falls back to general
-        assert_eq!(
-            conv.workspace,
-            Some(PathBuf::from("/Users/me/projects/app"))
-        );
-    }
-
-    #[test]
-    fn apply_workspace_rewrite_preserves_existing_metadata() {
-        let mut conv = norm_conv(None, vec![norm_msg(0, 1000)]);
-        conv.workspace = Some(PathBuf::from("/home/user/app"));
-        conv.metadata = serde_json::json!({
-            "cass": {
-                "origin": {
-                    "source_id": "laptop",
-                    "kind": "ssh",
-                    "host": "user@laptop.local"
-                }
-            }
-        });
-
-        let mappings = vec![crate::sources::config::PathMapping::new(
-            "/home/user",
-            "/Users/me",
-        )];
-
-        apply_workspace_rewrite(&mut conv, &mappings);
-
-        // Origin preserved
-        assert_eq!(
-            conv.metadata["cass"]["origin"]["source_id"].as_str(),
-            Some("laptop")
-        );
-        // workspace_original added
-        assert_eq!(
-            conv.metadata["cass"]["workspace_original"].as_str(),
-            Some("/home/user/app")
-        );
     }
 }

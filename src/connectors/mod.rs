@@ -10,6 +10,7 @@ pub mod amp;
 pub mod chatgpt;
 pub mod claude_code;
 pub mod cline;
+pub mod codebuff;
 pub mod codex;
 pub mod cursor;
 pub mod gemini;
