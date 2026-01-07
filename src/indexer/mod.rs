@@ -170,7 +170,8 @@ pub fn run_index(
             }
 
             let ctx = crate::connectors::ScanContext {
-                data_root: data_dir.clone(),
+                data_dir: data_dir.clone(),
+                scan_roots: vec![],
                 since_ts,
             };
 
@@ -494,7 +495,8 @@ fn reindex_paths(
                 .map(|v| v.saturating_sub(1))
         };
         let ctx = crate::connectors::ScanContext {
-            data_root: opts.data_dir.clone(),
+            data_dir: opts.data_dir.clone(),
+            scan_roots: vec![],
             since_ts,
         };
         let convs = conn.scan(&ctx)?;
@@ -664,6 +666,8 @@ pub mod persist {
                         .collect(),
                 })
                 .collect(),
+            source_id: "local".to_string(),
+            origin_host: None,
         }
     }
 

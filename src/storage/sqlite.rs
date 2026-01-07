@@ -803,6 +803,8 @@ impl SqliteStorage {
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default(),
             messages: Vec::new(),
+            source_id: "local".to_string(),
+            origin_host: None,
         };
         let msg_count: i64 = row.get(10)?;
         Ok((conv, msg_count as usize))

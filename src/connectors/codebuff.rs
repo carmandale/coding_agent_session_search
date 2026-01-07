@@ -59,6 +59,7 @@ impl Connector for CodebuffConnector {
             DetectionResult {
                 detected: true,
                 evidence,
+                root_paths: vec![],
             }
         }
     }
@@ -67,12 +68,12 @@ impl Connector for CodebuffConnector {
         let mut convs = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
-        // Allow tests to override via ctx.data_root
-        let roots = if ctx
-            .data_root
+        // Allow tests to override via ctx.data_dir
+        let data_root = &ctx.data_dir;
+        let roots = if data_root
             .file_name()
             .is_some_and(|n| n.to_str().unwrap_or("").contains("manicode"))
-            || std::fs::read_dir(&ctx.data_root)
+            || std::fs::read_dir(data_root)
                 .map(|mut d| {
                     d.any(|e| {
                         e.ok().is_some_and(|e| {
@@ -84,7 +85,7 @@ impl Connector for CodebuffConnector {
                 })
                 .unwrap_or(false)
         {
-            vec![ctx.data_root.clone()]
+            vec![data_root.clone()]
         } else {
             Self::candidate_roots()
         };

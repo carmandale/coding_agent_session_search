@@ -637,6 +637,7 @@ impl Connector for OpenCodeConnector {
             return DetectionResult {
                 detected: true,
                 evidence: vec![format!("found OpenCode storage at {}", root.display())],
+                root_paths: vec![root],
             };
         }
         DetectionResult::not_found()
@@ -644,8 +645,9 @@ impl Connector for OpenCodeConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         // Determine storage root
-        let storage_root = if ctx.data_root.exists() && Self::is_valid_storage_dir(&ctx.data_root) {
-            ctx.data_root.clone()
+        let data_root = &ctx.data_dir;
+        let storage_root = if data_root.exists() && Self::is_valid_storage_dir(data_root) {
+            data_root.clone()
         } else if let Some(root) = Self::find_storage_root() {
             root
         } else {
