@@ -18,7 +18,8 @@ fn extract_workspace_from_content(messages: &[NormalizedMessage]) -> Option<Path
     // 2. Working directory: "Working directory: /path/to/project"
     // 3. Common project paths: /data/projects/X
 
-    for msg in messages {
+    // Limit to first 50 messages for performance
+    for msg in messages.iter().take(50) {
         // Try AGENTS.md pattern first (most reliable)
         // Pattern: "AGENTS.md instructions for /path/to/project"
         if let Some(idx) = msg.content.find("AGENTS.md instructions for ") {
@@ -58,21 +59,34 @@ fn extract_path_from_position(content: &str, start: usize) -> Option<PathBuf> {
     let rest = content.get(start..)?;
     let rest = rest.trim_start();
 
-    // Find the end of the path (whitespace, newline, or certain punctuation)
+    // Handle quoted paths
+    let (rest, delimiter) = if let Some(stripped) = rest.strip_prefix('"') {
+        (stripped, Some('"'))
+    } else if let Some(stripped) = rest.strip_prefix('\'') {
+        (stripped, Some('\''))
+    } else {
+        (rest, None)
+    };
+
+    // Find the end of the path (whitespace, newline, delimiter, or certain punctuation)
     let end = rest
         .find(|c: char| {
-            c.is_whitespace()
-                || c == '\n'
-                || c == '>'
-                || c == '"'
-                || c == '\''
-                || c == ')'
-                || c == ']'
-                || c == ','
+            if let Some(d) = delimiter {
+                c == d
+            } else {
+                c.is_whitespace()
+                    || c == '\n'
+                    || c == '>'
+                    || c == '"'
+                    || c == '\''
+                    || c == ')'
+                    || c == ']'
+                    || c == ','
+            }
         })
         .unwrap_or(rest.len());
 
-    let path_str = rest.get(..end)?.trim_end_matches(['/', ':', ']', ')']);
+    let path_str = rest.get(..end)?.trim_end_matches(['/', ':']);
 
     // Check for Unix absolute path OR Windows absolute path (C:\ or \\)
     let is_unix_abs = path_str.starts_with('/');
@@ -135,7 +149,7 @@ impl GeminiConnector {
     }
 
     fn root() -> PathBuf {
-        std::env::var("GEMINI_HOME").map_or_else(
+        dotenvy::var("GEMINI_HOME").map_or_else(
             |_| dirs::home_dir().unwrap_or_default().join(".gemini/tmp"),
             PathBuf::from,
         )
@@ -185,19 +199,27 @@ impl Connector for GeminiConnector {
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         // Use data_root only if it looks like a Gemini directory (for testing)
         // Otherwise use the default root
-        let root = if ctx
-            .data_dir
-            .file_name()
-            .is_some_and(|n| n.to_str().unwrap_or("").contains("gemini"))
-            || ctx.data_dir.join("chats").exists()
-            || fs::read_dir(&ctx.data_dir)
-                .map(|mut d| d.any(|e| e.ok().is_some_and(|e| e.path().join("chats").exists())))
-                .unwrap_or(false)
-        {
-            ctx.data_dir.clone()
-        } else {
-            Self::root()
+        let looks_like_root = |path: &PathBuf| {
+            path.file_name()
+                .is_some_and(|n| n.to_str().unwrap_or("").contains("gemini"))
+                || path.join("chats").exists()
+                || fs::read_dir(path)
+                    .map(|mut d| d.any(|e| e.ok().is_some_and(|e| e.path().join("chats").exists())))
+                    .unwrap_or(false)
         };
+        let root = if ctx.use_default_detection() {
+            if looks_like_root(&ctx.data_dir) {
+                ctx.data_dir.clone()
+            } else {
+                Self::root()
+            }
+        } else {
+            ctx.data_dir.clone()
+        };
+
+        if !ctx.use_default_detection() && !looks_like_root(&root) {
+            return Ok(Vec::new());
+        }
 
         if !root.exists() {
             return Ok(Vec::new());
@@ -291,9 +313,7 @@ impl Connector for GeminiConnector {
             }
 
             // Re-assign sequential indices after filtering
-            for (i, msg) in messages.iter_mut().enumerate() {
-                msg.idx = i as i64;
-            }
+            super::reindex_messages(&mut messages);
 
             if messages.is_empty() {
                 continue;
@@ -384,6 +404,20 @@ mod tests {
         let content = "Working directory: /data/projects/foo/";
         let path = extract_path_from_position(content, 19);
         assert_eq!(path, Some(PathBuf::from("/data/projects/foo")));
+    }
+
+    #[test]
+    fn extract_path_handles_quoted_path_start() {
+        let content = "Working directory: \"/data/projects/foo\"";
+        let path = extract_path_from_position(content, 19);
+        assert_eq!(path, Some(PathBuf::from("/data/projects/foo")));
+    }
+
+    #[test]
+    fn extract_path_handles_quoted_path_with_brackets() {
+        let content = "Working directory: \"/data/projects/[foo]\"";
+        let path = extract_path_from_position(content, 19);
+        assert_eq!(path, Some(PathBuf::from("/data/projects/[foo]")));
     }
 
     #[test]

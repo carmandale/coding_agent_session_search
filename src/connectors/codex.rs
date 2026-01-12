@@ -22,15 +22,24 @@ impl CodexConnector {
     }
 
     fn home() -> PathBuf {
-        std::env::var("CODEX_HOME").map_or_else(
+        dotenvy::var("CODEX_HOME").map_or_else(
             |_| dirs::home_dir().unwrap_or_default().join(".codex"),
             PathBuf::from,
         )
     }
 
+    fn sessions_dir(home: &Path) -> PathBuf {
+        let sessions = home.join("sessions");
+        if sessions.exists() {
+            sessions
+        } else {
+            home.to_path_buf()
+        }
+    }
+
     fn rollout_files(root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
-        let sessions = root.join("sessions");
+        let sessions = Self::sessions_dir(root);
         if !sessions.exists() {
             return out;
         }
@@ -52,11 +61,13 @@ impl CodexConnector {
 impl Connector for CodexConnector {
     fn detect(&self) -> DetectionResult {
         let home = Self::home();
-        if home.join("sessions").exists() {
+        // Check for actual sessions directory, not just home existing
+        let sessions = home.join("sessions");
+        if sessions.exists() && sessions.is_dir() {
             DetectionResult {
                 detected: true,
-                evidence: vec![format!("found {}", home.display())],
-                root_paths: vec![home],
+                evidence: vec![format!("found {}", sessions.display())],
+                root_paths: vec![sessions],
             }
         } else {
             DetectionResult::not_found()
@@ -72,19 +83,39 @@ impl Connector for CodexConnector {
             .to_str()
             .map(|s| s.contains(".codex") || s.ends_with("/codex") || s.ends_with("\\codex"))
             .unwrap_or(false);
-        let home = if is_codex_dir {
-            ctx.data_dir.clone()
-        } else {
-            Self::home()
+        let looks_like_root = |path: &PathBuf| {
+            path.to_str()
+                .map(|s| s.contains(".codex") || s.contains("codex"))
+                .unwrap_or(false)
+                || path.join("sessions").exists()
         };
+        let mut home = if ctx.use_default_detection() {
+            if is_codex_dir {
+                ctx.data_dir.clone()
+            } else {
+                Self::home()
+            }
+        } else {
+            if !looks_like_root(&ctx.data_dir) {
+                return Ok(Vec::new());
+            }
+            ctx.data_dir.clone()
+        };
+        if home.is_file() {
+            home = home.parent().unwrap_or(&home).to_path_buf();
+        }
         let files = Self::rollout_files(&home);
         let mut convs = Vec::new();
 
         for file in files {
             let source_path = file.clone();
+            // Skip files not modified since last scan (incremental indexing)
+            if !crate::connectors::file_modified_since(&file, ctx.since_ts) {
+                continue;
+            }
             // Use relative path from sessions dir as external_id for uniqueness
             // e.g., "2025/11/20/rollout-1" instead of just "rollout-1"
-            let sessions_dir = home.join("sessions");
+            let sessions_dir = Self::sessions_dir(&home);
             let external_id = source_path
                 .strip_prefix(&sessions_dir)
                 .ok()
@@ -227,9 +258,7 @@ impl Connector for CodexConnector {
                     }
                 }
                 // Re-assign sequential indices after filtering
-                for (i, msg) in messages.iter_mut().enumerate() {
-                    msg.idx = i as i64;
-                }
+                super::reindex_messages(&mut messages);
             } else if ext == Some("json") {
                 let content = fs::read_to_string(&file)
                     .with_context(|| format!("read rollout {}", file.display()))?;
@@ -282,9 +311,7 @@ impl Connector for CodexConnector {
                     }
                 }
                 // Re-assign sequential indices after filtering
-                for (i, msg) in messages.iter_mut().enumerate() {
-                    msg.idx = i as i64;
-                }
+                super::reindex_messages(&mut messages);
             }
 
             if messages.is_empty() {
@@ -332,9 +359,9 @@ impl Connector for CodexConnector {
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
     use std::fs;
     use tempfile::TempDir;
-    use serial_test::serial;
 
     // =====================================================
     // Constructor Tests

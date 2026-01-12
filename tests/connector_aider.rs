@@ -1,5 +1,5 @@
 use coding_agent_search::connectors::aider::AiderConnector;
-use coding_agent_search::connectors::{Connector, ScanContext};
+use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot};
 use serial_test::serial;
 use std::fs;
 use std::path::PathBuf;
@@ -104,7 +104,7 @@ fn aider_sets_source_path() {
 #[test]
 fn aider_sets_external_id_from_filename() {
     let tmp = TempDir::new().unwrap();
-    create_aider_fixture(&tmp, ".aider.chat.history.md", "> Test\n\nResponse\n");
+    let path = create_aider_fixture(&tmp, ".aider.chat.history.md", "> Test\n\nResponse\n");
 
     let conn = AiderConnector::new();
     let ctx = ScanContext {
@@ -117,7 +117,7 @@ fn aider_sets_external_id_from_filename() {
     assert_eq!(convs.len(), 1);
     assert_eq!(
         convs[0].external_id,
-        Some(".aider.chat.history.md".to_string())
+        Some(path.to_string_lossy().to_string())
     );
 }
 
@@ -859,9 +859,11 @@ fn aider_message_snippets_empty() {
 #[test]
 fn aider_nonexistent_directory() {
     let conn = AiderConnector::new();
+    let nonexistent = PathBuf::from("/nonexistent/path/that/does/not/exist");
     let ctx = ScanContext {
-        data_dir: PathBuf::from("/nonexistent/path/that/does/not/exist"),
-        scan_roots: Vec::new(),
+        data_dir: nonexistent.clone(),
+        // Provide explicit scan_roots to disable default detection fallback to CWD/home
+        scan_roots: vec![ScanRoot::local(nonexistent)],
         since_ts: None,
     };
     let convs = conn.scan(&ctx).expect("scan");

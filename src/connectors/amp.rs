@@ -23,7 +23,7 @@ impl AmpConnector {
     fn cache_root() -> PathBuf {
         // Check XDG_DATA_HOME first (important for testing and cross-platform consistency)
         // Note: dirs::data_dir() on macOS ignores XDG_DATA_HOME
-        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if let Ok(xdg) = dotenvy::var("XDG_DATA_HOME") {
             return PathBuf::from(xdg).join("amp");
         }
         dirs::data_dir()
@@ -77,18 +77,26 @@ impl Connector for AmpConnector {
         let mut convs = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
+        let looks_like_root = |path: &PathBuf| {
+            path.file_name()
+                .is_some_and(|n| n.to_str().unwrap_or("").contains("amp"))
+                || std::fs::read_dir(path)
+                    .map(|mut d| d.any(|e| e.ok().is_some_and(|e| is_amp_log_file(&e.path()))))
+                    .unwrap_or(false)
+        };
+
         // allow tests to override via ctx.data_dir
-        let roots = if ctx
-            .data_dir
-            .file_name()
-            .is_some_and(|n| n.to_str().unwrap_or("").contains("amp"))
-            || std::fs::read_dir(&ctx.data_dir)
-                .map(|mut d| d.any(|e| e.ok().is_some_and(|e| is_amp_log_file(&e.path()))))
-                .unwrap_or(false)
-        {
-            vec![ctx.data_dir.clone()]
+        let roots = if ctx.use_default_detection() {
+            if looks_like_root(&ctx.data_dir) {
+                vec![ctx.data_dir.clone()]
+            } else {
+                Self::candidate_roots()
+            }
         } else {
-            Self::candidate_roots()
+            if !looks_like_root(&ctx.data_dir) {
+                return Ok(Vec::new());
+            }
+            vec![ctx.data_dir.clone()]
         };
 
         for root in roots {
@@ -104,10 +112,10 @@ impl Connector for AmpConnector {
                 if !is_amp_log_file(path) {
                     continue;
                 }
-                // Skip files not modified since last scan (incremental indexing)
-                if !crate::connectors::file_modified_since(path, ctx.since_ts) {
-                    continue;
-                }
+                // NOTE: We intentionally skip the file_modified_since() check for Amp.
+                // Amp does not update file mtime when new messages are added to a thread,
+                // so mtime-based incremental indexing would miss new messages.
+                // This means Amp files are always re-read, but correctness is preserved.
                 let text = match std::fs::read_to_string(path) {
                     Ok(t) => t,
                     Err(_) => continue,
@@ -202,22 +210,23 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
             .and_then(|v| v.as_str())
             .unwrap_or("agent")
             .to_string();
-        let content = m
-            .get("content")
-            .or_else(|| m.get("text"))
-            .or_else(|| m.get("body"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+
+        // Handle content as either string or array of content blocks
+        let content = extract_content_value(m.get("content"))
+            .or_else(|| extract_content_value(m.get("text")))
+            .or_else(|| extract_content_value(m.get("body")))
+            .unwrap_or_default();
 
         if content.trim().is_empty() {
             continue;
         }
 
         // Use parse_timestamp to handle both i64 milliseconds and ISO-8601 strings
+        // Also check sentAt which Amp uses
         let created_at = m
             .get("created_at")
             .or_else(|| m.get("createdAt"))
+            .or_else(|| m.get("sentAt"))
             .or_else(|| m.get("timestamp"))
             .or_else(|| m.get("ts"))
             .and_then(crate::connectors::parse_timestamp);
@@ -244,11 +253,21 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
     }
 
     // Re-assign indices after filtering to maintain sequential order
-    for (i, msg) in out.iter_mut().enumerate() {
-        msg.idx = i as i64;
-    }
+    super::reindex_messages(&mut out);
 
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// Extract text content from a value that may be a string or an array of content blocks.
+/// Uses the shared flatten_content helper for consistent handling across all connectors.
+fn extract_content_value(val: Option<&Value>) -> Option<String> {
+    let val = val?;
+    let result = crate::connectors::flatten_content(val);
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 fn infer_workspace(val: &Value) -> Option<PathBuf> {
@@ -267,11 +286,45 @@ fn is_amp_log_file(path: &std::path::Path) -> bool {
     }
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
         let stem_lower = stem.to_ascii_lowercase();
-        return stem_lower.contains("thread")
+        // Match known patterns: thread, conversation, chat
+        if stem_lower.contains("thread")
             || stem_lower.contains("conversation")
-            || stem_lower.contains("chat");
+            || stem_lower.contains("chat")
+        {
+            return true;
+        }
+        // Match Amp's T-{uuid}.json format (e.g., T-01872a67-152b-46af-a1af-4de6fce3d2b3.json)
+        if stem_lower.starts_with("t-") && looks_like_uuid(&stem[2..]) {
+            return true;
+        }
+    }
+    // Also match any .json file in a "threads" directory
+    if let Some(parent) = path.parent()
+        && let Some(dir_name) = parent.file_name().and_then(|n| n.to_str())
+        && dir_name == "threads"
+    {
+        return true;
     }
     false
+}
+
+/// Check if a string looks like a UUID (8-4-4-4-12 hex pattern)
+fn looks_like_uuid(s: &str) -> bool {
+    // UUID format: 8-4-4-4-12 (32 hex chars + 4 dashes = 36 chars)
+    if s.len() != 36 {
+        return false;
+    }
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    let expected_lens = [8, 4, 4, 4, 12];
+    for (part, &expected_len) in parts.iter().zip(expected_lens.iter()) {
+        if part.len() != expected_len || !part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -336,6 +389,53 @@ mod tests {
         assert!(!is_amp_log_file(std::path::Path::new("config.json")));
         assert!(!is_amp_log_file(std::path::Path::new("settings.json")));
         assert!(!is_amp_log_file(std::path::Path::new("data.json")));
+    }
+
+    #[test]
+    fn is_amp_log_file_matches_uuid_format() {
+        // Amp stores files as T-{uuid}.json
+        assert!(is_amp_log_file(std::path::Path::new(
+            "T-01872a67-152b-46af-a1af-4de6fce3d2b3.json"
+        )));
+        assert!(is_amp_log_file(std::path::Path::new(
+            "t-abcdef12-3456-7890-abcd-ef1234567890.json"
+        )));
+    }
+
+    #[test]
+    fn is_amp_log_file_rejects_invalid_uuid() {
+        // T- prefix but not a valid UUID
+        assert!(!is_amp_log_file(std::path::Path::new("T-not-a-uuid.json")));
+        assert!(!is_amp_log_file(std::path::Path::new("T-12345.json")));
+    }
+
+    #[test]
+    fn is_amp_log_file_matches_threads_directory() {
+        // Any .json in a "threads" directory should match
+        assert!(is_amp_log_file(std::path::Path::new(
+            "/home/user/.local/share/amp/threads/random-file.json"
+        )));
+        assert!(is_amp_log_file(std::path::Path::new(
+            "threads/any-name.json"
+        )));
+    }
+
+    #[test]
+    fn looks_like_uuid_valid_uuids() {
+        assert!(looks_like_uuid("01872a67-152b-46af-a1af-4de6fce3d2b3"));
+        assert!(looks_like_uuid("abcdef12-3456-7890-abcd-ef1234567890"));
+        assert!(looks_like_uuid("00000000-0000-0000-0000-000000000000"));
+        assert!(looks_like_uuid("ABCDEF12-3456-7890-ABCD-EF1234567890"));
+    }
+
+    #[test]
+    fn looks_like_uuid_invalid() {
+        assert!(!looks_like_uuid("not-a-uuid"));
+        assert!(!looks_like_uuid("12345"));
+        assert!(!looks_like_uuid(""));
+        assert!(!looks_like_uuid("01872a67-152b-46af-a1af-4de6fce3d2b")); // too short
+        assert!(!looks_like_uuid("01872a67-152b-46af-a1af-4de6fce3d2b33")); // too long
+        assert!(!looks_like_uuid("0187zzzz-152b-46af-a1af-4de6fce3d2b3")); // non-hex
     }
 
     // =====================================================
@@ -502,7 +602,7 @@ mod tests {
             "messages": [{"role": "user", "content": "Test", "created_at": 1733000000}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].created_at, Some(1733000000));
+        assert_eq!(msgs[0].created_at, Some(1733000000000));
     }
 
     #[test]
@@ -511,7 +611,7 @@ mod tests {
             "messages": [{"role": "user", "content": "Test", "createdAt": 1733000001}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].created_at, Some(1733000001));
+        assert_eq!(msgs[0].created_at, Some(1733000001000));
     }
 
     #[test]
@@ -520,7 +620,7 @@ mod tests {
             "messages": [{"role": "user", "content": "Test", "timestamp": 1733000002}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].created_at, Some(1733000002));
+        assert_eq!(msgs[0].created_at, Some(1733000002000));
     }
 
     #[test]
@@ -529,7 +629,7 @@ mod tests {
             "messages": [{"role": "user", "content": "Test", "ts": 1733000003}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].created_at, Some(1733000003));
+        assert_eq!(msgs[0].created_at, Some(1733000003000));
     }
 
     #[test]
@@ -584,6 +684,49 @@ mod tests {
     fn extract_messages_returns_none_for_missing() {
         let val = json!({"title": "No messages"});
         assert!(extract_messages(&val, None).is_none());
+    }
+
+    #[test]
+    fn extract_messages_handles_content_array() {
+        // Amp can store content as an array of content blocks
+        let val = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Part one."},
+                    {"type": "text", "text": "Part two."}
+                ]
+            }]
+        });
+        let msgs = extract_messages(&val, None).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].content.contains("Part one"));
+        assert!(msgs[0].content.contains("Part two"));
+    }
+
+    #[test]
+    fn extract_messages_handles_string_array_content() {
+        // Content as array of plain strings
+        let val = json!({
+            "messages": [{
+                "role": "user",
+                "content": ["Hello", "World"]
+            }]
+        });
+        let msgs = extract_messages(&val, None).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].content.contains("Hello"));
+        assert!(msgs[0].content.contains("World"));
+    }
+
+    #[test]
+    fn extract_messages_parses_sent_at() {
+        // Amp uses sentAt for message timestamps
+        let val = json!({
+            "messages": [{"role": "user", "content": "Test", "sentAt": 1733000005}]
+        });
+        let msgs = extract_messages(&val, None).unwrap();
+        assert_eq!(msgs[0].created_at, Some(1733000005000));
     }
 
     // =====================================================
@@ -742,8 +885,8 @@ mod tests {
         let ctx = ScanContext::local_default(amp_dir.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
-        assert_eq!(convs[0].started_at, Some(1733000000));
-        assert_eq!(convs[0].ended_at, Some(1733000100));
+        assert_eq!(convs[0].started_at, Some(1733000000000));
+        assert_eq!(convs[0].ended_at, Some(1733000100000));
     }
 
     #[test]

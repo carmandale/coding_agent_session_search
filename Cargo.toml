@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.1.36"
+version = "0.1.55"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -41,7 +41,7 @@ crossterm = "*"
 dirs = "*"
 walkdir = "*"
 glob = "*"
-base64 = "*"
+base64 = "0.22"
 chrono = "*"
 semver = "*"
 tracing-appender = "*"
@@ -51,10 +51,30 @@ syntect = "*"
 itertools = "*"
 crc32fast = "*"
 unicode-normalization = "*"
+urlencoding = "*"
+half = "*"
+memmap2 = "*"
+fastembed = { version = "*", default-features = false, features = ["ort-download-binaries"] }
+wide = "0.7"  # Portable SIMD for P0 Opt 2: SIMD dot product
 
 # Crypto for ChatGPT encrypted conversations
 aes-gcm = "0.10"
 ring = "0.17"
+
+# SHA256 hashing for model verification
+sha2 = "*"
+hex = "*"
+
+# Interactive terminal prompts for setup wizard
+dialoguer = "*"
+
+# SFTP fallback for sync when rsync is unavailable
+ssh2 = "*"
+argon2 = "*"
+hkdf = "*"
+zeroize = { version = "*", features = ["derive"] }
+flate2 = "*"
+rand = "*"
 
 # macOS keychain access (optional, for ChatGPT decryption)
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -71,6 +91,10 @@ insta = { version = "*", features = ["yaml", "json"] }
 criterion = "*"
 once_cell = "*"
 serial_test = "*"
+proptest = "*"
+serde_yaml = "0.9.34"
+rand = "*"
+rand_chacha = "*"
 
 [[bin]]
 name = "cass"
@@ -82,6 +106,13 @@ codegen-units = 1
 strip = true
 panic = "abort"
 opt-level = "z"
+
+# Optimized build with symbols for profiling (perf/flamegraphs).
+# Usage: RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
 
 [workspace.metadata.dist]
 targets = ["x86_64-unknown-linux-gnu"]

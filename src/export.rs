@@ -116,7 +116,7 @@ fn get_code_block_delimiter(content: &str) -> String {
         }
     }
     max_backticks = max_backticks.max(current);
-    
+
     let needed = (max_backticks + 1).max(3);
     "`".repeat(needed)
 }
@@ -149,7 +149,10 @@ fn export_markdown(hits: &[SearchHit], options: &ExportOptions) -> String {
         output.push_str("| Field | Value |\n");
         output.push_str("|-------|-------|\n");
         output.push_str(&format!("| Agent | {} |\n", escape_markdown(&hit.agent)));
-        output.push_str(&format!("| Workspace | `{}` |\n", hit.workspace.replace('`', "")));
+        output.push_str(&format!(
+            "| Workspace | `{}` |\n",
+            escape_markdown(&hit.workspace.replace('`', ""))
+        ));
 
         if options.include_score {
             output.push_str(&format!("| Score | {:.2} |\n", hit.score));
@@ -171,7 +174,10 @@ fn export_markdown(hits: &[SearchHit], options: &ExportOptions) -> String {
             } else {
                 hit.source_path.clone()
             };
-            output.push_str(&format!("| Source | `{}` |\n", path_display.replace('`', "")));
+            output.push_str(&format!(
+                "| Source | `{}` |\n",
+                escape_markdown(&path_display.replace('`', ""))
+            ));
 
             if let Some(line) = hit.line_number {
                 output.push_str(&format!("| Line | {line} |\n"));
@@ -321,7 +327,9 @@ fn export_plain_text(hits: &[SearchHit], options: &ExportOptions) -> String {
     output
 }
 
-/// Truncate text to max length (in characters), adding ellipsis if needed
+/// Truncate text to max length (in characters), adding ellipsis if needed.
+///
+/// When max_len <= 3, truncates without ellipsis to avoid exceeding max_len.
 fn truncate_text(text: &str, max_len: usize) -> String {
     if max_len == 0 {
         return text.to_string();
@@ -332,7 +340,12 @@ fn truncate_text(text: &str, max_len: usize) -> String {
         return text.to_string();
     }
 
-    let mut truncated: String = text.chars().take(max_len.saturating_sub(3)).collect();
+    // For very small max_len (≤3), truncate without ellipsis to avoid exceeding limit
+    if max_len <= 3 {
+        return text.chars().take(max_len).collect();
+    }
+
+    let mut truncated: String = text.chars().take(max_len - 3).collect();
     truncated.push_str("...");
     truncated
 }
@@ -380,6 +393,12 @@ mod tests {
         assert_eq!(truncate_text("short", 100), "short");
         assert_eq!(truncate_text("this is long text", 10), "this is...");
         assert_eq!(truncate_text("any", 0), "any");
+
+        // Edge case: very small max_len should not exceed limit
+        assert_eq!(truncate_text("hello", 3), "hel"); // No ellipsis for max_len <= 3
+        assert_eq!(truncate_text("hello", 2), "he");
+        assert_eq!(truncate_text("hello", 1), "h");
+        assert_eq!(truncate_text("hello", 4), "h..."); // max_len > 3 gets ellipsis
     }
 
     #[test]
@@ -422,13 +441,13 @@ mod tests {
         hit.title = "[Link](javascript:alert(1))".to_string();
         hit.agent = "agent|pipe".to_string();
         hit.content = "Contains ``` backticks".to_string();
-        
+
         let options = ExportOptions {
             include_content: true,
             ..ExportOptions::default()
         };
         let output = export_markdown(&[hit], &options);
-        
+
         assert!(output.contains("\\[Link\\](javascript:alert(1))"));
         assert!(output.contains("agent\\|pipe"));
         // Should use 4 backticks because content has 3

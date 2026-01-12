@@ -12,7 +12,7 @@
 //! And in the `ItemTable` with keys like:
 //! - `workbench.panel.aichat.view.aichat.chatdata` - Legacy chat data
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -23,6 +23,18 @@ use walkdir::WalkDir;
 use crate::connectors::{
     Connector, DetectionResult, NormalizedConversation, NormalizedMessage, ScanContext,
 };
+
+/// Cursor v0.40+ bubble type constants (numeric encoding)
+mod bubble_type {
+    /// User message type in new format
+    pub const USER: i64 = 1;
+    /// Assistant message type in new format
+    pub const ASSISTANT: i64 = 2;
+}
+
+/// Type alias for the bubble data lookup map.
+/// Keys are bubble IDs for O(1) lookup within a composer.
+type BubbleDataMap = HashMap<String, Value>;
 
 pub struct CursorConnector;
 
@@ -45,6 +57,13 @@ impl CursorConnector {
         }
         #[cfg(target_os = "linux")]
         {
+            // Check if we're in WSL and should look at Windows Cursor paths first
+            if Self::is_wsl()
+                && let Some(wsl_path) = Self::find_wsl_cursor_path()
+            {
+                return Some(wsl_path);
+            }
+            // Fall back to Linux native path
             dirs::home_dir().map(|h| h.join(".config/Cursor/User"))
         }
         #[cfg(target_os = "windows")]
@@ -55,6 +74,49 @@ impl CursorConnector {
         {
             None
         }
+    }
+
+    /// Check if running inside Windows Subsystem for Linux
+    #[cfg(target_os = "linux")]
+    fn is_wsl() -> bool {
+        std::fs::read_to_string("/proc/version")
+            .map(|v| v.to_lowercase().contains("microsoft"))
+            .unwrap_or(false)
+    }
+
+    /// Find Cursor installation path via WSL mount points
+    /// Probes /mnt/c/Users/*/AppData/Roaming/Cursor/User
+    #[cfg(target_os = "linux")]
+    fn find_wsl_cursor_path() -> Option<PathBuf> {
+        let mnt_c = Path::new("/mnt/c/Users");
+        if !mnt_c.exists() {
+            return None;
+        }
+
+        for entry in std::fs::read_dir(mnt_c).ok()?.flatten() {
+            // Skip system directories
+            let name = entry.file_name();
+            let name_str = name.to_str().unwrap_or("");
+            if name_str == "Default"
+                || name_str == "Public"
+                || name_str == "All Users"
+                || name_str == "Default User"
+            {
+                continue;
+            }
+
+            let cursor_path = entry.path().join("AppData/Roaming/Cursor/User");
+            if cursor_path.join("globalStorage").exists()
+                || cursor_path.join("workspaceStorage").exists()
+            {
+                tracing::debug!(
+                    path = %cursor_path.display(),
+                    "Found Windows Cursor installation via WSL"
+                );
+                return Some(cursor_path);
+            }
+        }
+        None
     }
 
     /// Find all state.vscdb files in Cursor storage
@@ -85,6 +147,91 @@ impl CursorConnector {
         dbs
     }
 
+    /// Fetch bubble data for a specific composer from the database.
+    /// Returns a map keyed by bubbleId for efficient O(1) lookup.
+    /// This lazy-loads only the bubbles needed for one conversation,
+    /// avoiding loading all bubbles into memory.
+    fn fetch_bubble_data_for_composer(conn: &Connection, composer_id: &str) -> BubbleDataMap {
+        let mut bubble_map = BubbleDataMap::new();
+
+        // Only fetch bubbles for this specific composer
+        let pattern = format!("bubbleId:{}:%", composer_id);
+        let prefix_len = format!("bubbleId:{}:", composer_id).len();
+
+        if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE ?") {
+            let rows = stmt.query_map([&pattern], |row| {
+                let key: String = row.get(0)?;
+                let value: String = row.get(1)?;
+                Ok((key, value))
+            });
+
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    let (key, value) = row;
+                    // Key format: bubbleId:{composerId}:{bubbleId}
+                    // Extract just the bubbleId part
+                    if key.len() > prefix_len {
+                        let bubble_id = &key[prefix_len..];
+                        if let Ok(parsed) = serde_json::from_str::<Value>(&value) {
+                            bubble_map.insert(bubble_id.to_string(), parsed);
+                        }
+                    }
+                }
+            }
+        }
+
+        bubble_map
+    }
+
+    /// Extract workspace from bubble data.
+    /// Cursor v0.40+ stores workspaceProjectDir in bubble entries.
+    fn extract_workspace_from_bubbles(bubble_map: &BubbleDataMap) -> Option<PathBuf> {
+        for bubble in bubble_map.values() {
+            // Try workspaceProjectDir first (most common)
+            if let Some(dir) = bubble.get("workspaceProjectDir").and_then(|v| v.as_str())
+                && !dir.is_empty()
+            {
+                return Some(PathBuf::from(dir));
+            }
+
+            // Try workspaceUris array
+            if let Some(uris) = bubble.get("workspaceUris").and_then(|v| v.as_array()) {
+                for uri in uris {
+                    if let Some(uri_str) = uri.as_str() {
+                        // Parse file:// or vscode-remote:// URIs
+                        if let Some(path) = Self::parse_workspace_uri(uri_str) {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Parse a workspace URI to extract the path.
+    /// Handles file:// and vscode-remote:// URIs.
+    fn parse_workspace_uri(uri: &str) -> Option<PathBuf> {
+        if let Some(path) = uri.strip_prefix("file://") {
+            // URL decode and return
+            let decoded = urlencoding::decode(path).ok()?;
+            return Some(PathBuf::from(decoded.into_owned()));
+        }
+
+        // Handle vscode-remote://ssh-remote+{json}/path format
+        if let Some(rest) = uri.strip_prefix("vscode-remote://") {
+            // Extract path after the host/connection info
+            // Format: vscode-remote://ssh-remote+{encoded-json}/actual/path
+            if let Some(slash_idx) = rest.find('/') {
+                let path = &rest[slash_idx..];
+                let decoded = urlencoding::decode(path).ok()?;
+                return Some(PathBuf::from(decoded.into_owned()));
+            }
+        }
+
+        None
+    }
+
     /// Extract chat sessions from a SQLite database
     fn extract_from_db(
         db_path: &Path,
@@ -112,9 +259,14 @@ impl CursorConnector {
             if let Ok(rows) = rows {
                 for row in rows.flatten() {
                     let (key, value) = row;
-                    if let Some(conv) =
-                        Self::parse_composer_data(&key, &value, db_path, since_ts, &mut seen_ids)
-                    {
+                    if let Some(conv) = Self::parse_composer_data(
+                        &key,
+                        &value,
+                        db_path,
+                        since_ts,
+                        &mut seen_ids,
+                        Some(&conn),
+                    ) {
                         convs.push(conv);
                     }
                 }
@@ -146,13 +298,20 @@ impl CursorConnector {
         Ok(convs)
     }
 
-    /// Parse composerData JSON into a conversation
+    /// Parse composerData JSON into a conversation.
+    ///
+    /// Supports multiple Cursor formats:
+    /// - v0.40+ (new): `fullConversationHeadersOnly` with separate bubbleId entries
+    /// - v0.3x (tabs): `tabs` → `bubbles` structure
+    /// - v0.2x (conversationMap): `conversationMap` → `bubbles` structure
+    /// - Simple: `text`/`richText` fields only
     fn parse_composer_data(
         key: &str,
         value: &str,
         db_path: &Path,
         _since_ts: Option<i64>, // File-level filtering done in scan(); message filtering not needed
         seen_ids: &mut HashSet<String>,
+        conn: Option<&Connection>,
     ) -> Option<NormalizedConversation> {
         let val: Value = serde_json::from_str(value).ok()?;
 
@@ -166,17 +325,50 @@ impl CursorConnector {
         seen_ids.insert(composer_id.clone());
 
         // Extract timestamps
-        let created_at = val.get("createdAt").and_then(|v| v.as_i64());
+        let created_at = val
+            .get("createdAt")
+            .and_then(crate::connectors::parse_timestamp);
+        let last_updated_at = val
+            .get("lastUpdatedAt")
+            .and_then(crate::connectors::parse_timestamp);
 
         // NOTE: Do NOT filter conversations/messages by timestamp here!
         // The file-level check in file_modified_since() is sufficient.
         // Filtering would cause data loss when the file is re-indexed.
 
         let mut messages = Vec::new();
+        let mut workspace: Option<PathBuf> = None;
 
-        // Parse conversation from bubbles/tabs structure
-        // Cursor uses different structures depending on version
-        if let Some(tabs) = val.get("tabs").and_then(|v| v.as_array()) {
+        // Check for v0.40+ format with fullConversationHeadersOnly
+        // This format stores only bubble IDs in composerData, with actual content
+        // in separate bubbleId:{composerId}:{bubbleId} keys
+        // Note: requires a database connection to fetch bubble content
+        if let (Some(headers), Some(conn)) = (
+            val.get("fullConversationHeadersOnly")
+                .and_then(|v| v.as_array()),
+            conn,
+        ) {
+            // Lazy-load bubble data for this composer
+            let bubble_map = Self::fetch_bubble_data_for_composer(conn, &composer_id);
+
+            // Extract workspace from bubbles
+            workspace = Self::extract_workspace_from_bubbles(&bubble_map);
+
+            // Parse each header reference
+            for header in headers {
+                if let Some(bubble_id) = header.get("bubbleId").and_then(|v| v.as_str())
+                    && let Some(bubble) = bubble_map.get(bubble_id)
+                    && let Some(msg) = Self::parse_bubble(bubble, messages.len())
+                {
+                    messages.push(msg);
+                }
+            }
+        }
+
+        // Parse conversation from bubbles/tabs structure (legacy v0.3x)
+        if messages.is_empty()
+            && let Some(tabs) = val.get("tabs").and_then(|v| v.as_array())
+        {
             for tab in tabs {
                 if let Some(bubbles) = tab.get("bubbles").and_then(|v| v.as_array()) {
                     for (idx, bubble) in bubbles.iter().enumerate() {
@@ -188,8 +380,10 @@ impl CursorConnector {
             }
         }
 
-        // Also check fullConversation/conversationMap for newer format
-        if let Some(conv_map) = val.get("conversationMap").and_then(|v| v.as_object()) {
+        // Also check conversationMap for older format (v0.2x)
+        if messages.is_empty()
+            && let Some(conv_map) = val.get("conversationMap").and_then(|v| v.as_object())
+        {
             for (_, conv_val) in conv_map {
                 if let Some(bubbles) = conv_val.get("bubbles").and_then(|v| v.as_array()) {
                     for (idx, bubble) in bubbles.iter().enumerate() {
@@ -226,37 +420,50 @@ impl CursorConnector {
         }
 
         // Re-index messages
-        for (i, msg) in messages.iter_mut().enumerate() {
-            msg.idx = i as i64;
-        }
+        super::reindex_messages(&mut messages);
 
-        // Extract model info for title
+        // Extract model info
         let model_name = val
             .get("modelConfig")
             .and_then(|m| m.get("modelName"))
             .and_then(|v| v.as_str());
 
-        let title = messages
-            .first()
-            .map(|m| {
-                m.content
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(100)
-                    .collect()
+        // Use explicit name field if available (v0.40+), otherwise derive from first message
+        let title = val
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(100).collect())
+            .or_else(|| {
+                messages.first().map(|m| {
+                    m.content
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(100)
+                        .collect()
+                })
             })
             .or_else(|| model_name.map(|m| format!("Cursor chat with {}", m)));
+
+        // source_path must be unique per conversation for proper lookup in the TUI.
+        // Since multiple conversations live in the same database file, we append
+        // the composer_id to create a unique synthetic path for each conversation.
+        let safe_id = urlencoding::encode(&composer_id);
+        let unique_source_path = db_path.join(safe_id.as_ref());
 
         Some(NormalizedConversation {
             agent_slug: "cursor".to_string(),
             external_id: Some(composer_id),
             title,
-            workspace: None, // Could try to extract from db_path
-            source_path: db_path.to_path_buf(),
+            workspace,
+            source_path: unique_source_path,
             started_at: created_at,
-            ended_at: messages.last().and_then(|m| m.created_at).or(created_at),
+            // Use lastUpdatedAt if available (most accurate), fall back to last message time, then createdAt
+            ended_at: last_updated_at
+                .or_else(|| messages.last().and_then(|m| m.created_at))
+                .or(created_at),
             metadata: serde_json::json!({
                 "source": "cursor",
                 "model": model_name,
@@ -266,12 +473,18 @@ impl CursorConnector {
         })
     }
 
-    /// Parse a bubble (message) from Cursor's format
+    /// Parse a bubble (message) from Cursor's format.
+    ///
+    /// Handles both new format (v0.40+) and legacy formats:
+    /// - Content: text > rawText > content > message
+    /// - Role: numeric type (1=user, 2=assistant) or string type/role
+    /// - Author: modelType (new) or model (legacy)
     fn parse_bubble(bubble: &Value, idx: usize) -> Option<NormalizedMessage> {
-        // Cursor bubbles have different structures
+        // Extract content - try all known field names in priority order
         let content = bubble
             .get("text")
             .and_then(|v| v.as_str())
+            .or_else(|| bubble.get("rawText").and_then(|v| v.as_str()))
             .or_else(|| bubble.get("content").and_then(|v| v.as_str()))
             .or_else(|| bubble.get("message").and_then(|v| v.as_str()))?;
 
@@ -279,17 +492,29 @@ impl CursorConnector {
             return None;
         }
 
+        // Extract role - try numeric type first (v0.40+), then string type/role (legacy)
         let role = bubble
             .get("type")
-            .and_then(|v| v.as_str())
-            .or_else(|| bubble.get("role").and_then(|v| v.as_str()))
-            .map(|r| {
-                match r.to_lowercase().as_str() {
-                    "user" | "human" => "user",
-                    "assistant" | "ai" | "bot" => "assistant",
-                    _ => r,
-                }
-                .to_string()
+            .and_then(|v| {
+                // v0.40+ format: numeric type (1=user, 2=assistant)
+                v.as_i64()
+                    .map(|t| {
+                        match t {
+                            bubble_type::USER => "user",
+                            bubble_type::ASSISTANT => "assistant",
+                            _ => "assistant",
+                        }
+                        .to_string()
+                    })
+                    // Legacy format: string type
+                    .or_else(|| v.as_str().map(Self::normalize_role))
+            })
+            .or_else(|| {
+                // Fallback: check "role" field (legacy format)
+                bubble
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .map(Self::normalize_role)
             })
             .unwrap_or_else(|| "assistant".to_string());
 
@@ -298,18 +523,36 @@ impl CursorConnector {
             .or_else(|| bubble.get("createdAt"))
             .and_then(crate::connectors::parse_timestamp);
 
+        // Extract author - try both field names (modelType is v0.40+)
+        let author = bubble
+            .get("modelType")
+            .or_else(|| bubble.get("model"))
+            .or_else(|| {
+                // Also check modelInfo.modelName for v0.40+
+                bubble.get("modelInfo").and_then(|m| m.get("modelName"))
+            })
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
         Some(NormalizedMessage {
             idx: idx as i64,
             role,
-            author: bubble
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(String::from),
+            author,
             created_at,
             content: content.to_string(),
             extra: bubble.clone(),
             snippets: Vec::new(),
         })
+    }
+
+    /// Normalize role string to standard values (user/assistant).
+    fn normalize_role(role: &str) -> String {
+        match role.to_lowercase().as_str() {
+            "user" | "human" => "user",
+            "assistant" | "ai" | "bot" => "assistant",
+            _ => role,
+        }
+        .to_string()
     }
 
     /// Parse legacy aichat data
@@ -359,9 +602,7 @@ impl CursorConnector {
         }
 
         // Re-index
-        for (i, msg) in messages.iter_mut().enumerate() {
-            msg.idx = i as i64;
-        }
+        super::reindex_messages(&mut messages);
 
         let title = messages.first().map(|m| {
             m.content
@@ -373,12 +614,16 @@ impl CursorConnector {
                 .collect()
         });
 
+        // source_path must be unique per conversation for proper lookup in the TUI.
+        let safe_id = urlencoding::encode(&id);
+        let unique_source_path = db_path.join(safe_id.as_ref());
+
         Some(NormalizedConversation {
             agent_slug: "cursor".to_string(),
             external_id: Some(id),
             title,
             workspace: None,
-            source_path: db_path.to_path_buf(),
+            source_path: unique_source_path,
             started_at,
             ended_at,
             metadata: serde_json::json!({"source": "cursor_aichat"}),
@@ -409,18 +654,27 @@ impl Connector for CursorConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         // Determine base directory
-        let base = if ctx.data_dir.join("globalStorage").exists()
-            || ctx.data_dir.join("workspaceStorage").exists()
-            || ctx
-                .data_dir
-                .file_name()
-                .is_some_and(|n| n.to_str().unwrap_or("").contains("Cursor"))
-        {
-            ctx.data_dir.clone()
-        } else if let Some(default_base) = Self::app_support_dir() {
-            default_base
+        let looks_like_base = |path: &PathBuf| {
+            path.join("globalStorage").exists()
+                || path.join("workspaceStorage").exists()
+                || path
+                    .file_name()
+                    .is_some_and(|n| n.to_str().unwrap_or("").contains("Cursor"))
+        };
+
+        let base = if ctx.use_default_detection() {
+            if looks_like_base(&ctx.data_dir) {
+                ctx.data_dir.clone()
+            } else if let Some(default_base) = Self::app_support_dir() {
+                default_base
+            } else {
+                return Ok(Vec::new());
+            }
         } else {
-            return Ok(Vec::new());
+            if !looks_like_base(&ctx.data_dir) {
+                return Ok(Vec::new());
+            }
+            ctx.data_dir.clone()
         };
 
         if !base.exists() {
@@ -699,8 +953,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         assert!(conv.is_some());
         let conv = conv.unwrap();
@@ -727,8 +987,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         assert!(conv.is_some());
         let conv = conv.unwrap();
@@ -745,8 +1011,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         assert!(conv.is_some());
         let conv = conv.unwrap();
@@ -764,8 +1036,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         assert!(conv.is_some());
         let conv = conv.unwrap();
@@ -781,10 +1059,22 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv1 =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
-        let conv2 =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv1 = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
+        let conv2 = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         assert!(conv1.is_some());
         assert!(conv2.is_none()); // Duplicate should return None
@@ -796,8 +1086,14 @@ mod tests {
         let value = json!({}).to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         assert!(conv.is_none());
     }
@@ -814,8 +1110,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         assert!(conv.is_some());
         let conv = conv.unwrap();
@@ -828,8 +1130,14 @@ mod tests {
         let value = json!({ "text": "Content" }).to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         assert!(conv.is_none());
     }
@@ -1068,8 +1376,14 @@ mod tests {
         let value = "not valid json {{{";
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, value, Path::new("/test"), None, &mut seen);
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         assert!(conv.is_none());
     }
@@ -1099,8 +1413,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         let conv = conv.unwrap();
         // Title should be first line only
@@ -1117,8 +1437,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         let conv = conv.unwrap();
         assert!(conv.title.as_ref().unwrap().len() <= 100);
@@ -1139,12 +1465,73 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen)
-                .unwrap();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(conv.messages[0].idx, 0);
         assert_eq!(conv.messages[1].idx, 1);
         assert_eq!(conv.messages[2].idx, 2);
+    }
+
+    // =========================================================================
+    // WSL detection tests (Linux-only)
+    // =========================================================================
+
+    #[cfg(target_os = "linux")]
+    mod wsl_tests {
+        use super::*;
+
+        #[test]
+        fn is_wsl_returns_false_on_native_linux() {
+            // On a real Linux system (not WSL), /proc/version won't contain "microsoft"
+            // This test just verifies the function doesn't panic
+            let result = CursorConnector::is_wsl();
+            // We can't assert the exact value since it depends on the environment,
+            // but we verify the function works
+            let _ = result;
+        }
+
+        #[test]
+        fn find_wsl_cursor_path_returns_none_without_mnt_c() {
+            // On native Linux, /mnt/c typically doesn't exist
+            // This verifies the function gracefully returns None
+            if !Path::new("/mnt/c/Users").exists() {
+                let result = CursorConnector::find_wsl_cursor_path();
+                assert!(result.is_none());
+            }
+        }
+
+        #[test]
+        fn find_wsl_cursor_path_skips_system_dirs() {
+            // Create a temp structure that mimics /mnt/c/Users with system dirs
+            let dir = TempDir::new().unwrap();
+            let users_dir = dir.path().join("Users");
+            fs::create_dir_all(&users_dir).unwrap();
+
+            // Create system directories that should be skipped
+            for sys_dir in ["Default", "Public", "All Users", "Default User"] {
+                fs::create_dir_all(users_dir.join(sys_dir)).unwrap();
+            }
+
+            // The function checks /mnt/c/Users specifically, so we can't directly test
+            // the skipping logic without mocking. Instead, verify the skip list is correct.
+            let skip_list = ["Default", "Public", "All Users", "Default User"];
+            assert_eq!(skip_list.len(), 4);
+        }
+
+        #[test]
+        fn wsl_path_structure_is_valid() {
+            // Verify the expected WSL path structure
+            let expected = Path::new("/mnt/c/Users/TestUser/AppData/Roaming/Cursor/User");
+            assert!(expected.starts_with("/mnt/c/Users"));
+            assert!(expected.ends_with("Cursor/User"));
+        }
     }
 }

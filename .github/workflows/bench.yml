@@ -1,0 +1,27 @@
+# .github/workflows/bench.yml
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  benchmark:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # For comparing with main
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Run benchmarks
+        run: cargo bench --bench index_perf --bench runtime_perf --bench search_perf
+        # Note: --save-baseline logic would go here if using criterion with persistent storage
+      
+      # In a real setup, we would compare these results against main.
+      # For now, we ensure they run without error.
