@@ -3,10 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
 
 use crate::connectors::NormalizedConversation;
@@ -16,7 +17,7 @@ use crate::connectors::{
     cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
     opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
 };
-use crate::search::tantivy::{TantivyIndex, index_dir};
+use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
 use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{Origin, Source};
 use crate::sources::sync::path_to_safe_dirname;
@@ -60,6 +61,493 @@ pub struct IndexOptions {
     pub progress: Option<Arc<IndexingProgress>>,
 }
 
+// =============================================================================
+// Streaming Indexing (Opt 8.2)
+// =============================================================================
+
+/// Message type for streaming indexing channel.
+///
+/// Producers (connector scan threads) send batches of conversations through
+/// the channel. The consumer (main indexing thread) receives and ingests them.
+pub enum IndexMessage {
+    /// A batch of conversations from a connector scan.
+    Batch {
+        /// Connector name (e.g., "claude", "codex")
+        connector_name: &'static str,
+        /// Scanned conversations
+        conversations: Vec<NormalizedConversation>,
+        /// Whether this connector was newly discovered
+        is_discovered: bool,
+    },
+    /// A scan error occurred (non-fatal, logged but continues)
+    ScanError {
+        connector_name: &'static str,
+        error: String,
+    },
+    /// Producer has finished scanning
+    Done { connector_name: &'static str },
+}
+
+/// Default channel buffer size for streaming indexing.
+/// Balances memory usage with throughput - too small causes producer stalls,
+/// too large defeats the purpose of backpressure.
+const STREAMING_CHANNEL_SIZE: usize = 32;
+
+/// Check if streaming indexing is enabled via environment variable.
+///
+/// Set `CASS_STREAMING_INDEX=0` to disable streaming and use batch mode.
+/// Streaming is enabled by default.
+pub fn streaming_index_enabled() -> bool {
+    dotenvy::var("CASS_STREAMING_INDEX")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// Spawn a producer thread that scans a connector and sends batches through the channel.
+///
+/// Each connector runs in its own thread, scanning local and remote roots.
+/// Conversations are sent through the channel as they're discovered, providing
+/// backpressure when the consumer (indexer) falls behind.
+fn spawn_connector_producer(
+    name: &'static str,
+    factory: fn() -> Box<dyn Connector + Send>,
+    tx: Sender<IndexMessage>,
+    data_dir: PathBuf,
+    remote_roots: Vec<ScanRoot>,
+    since_ts: Option<i64>,
+    progress: Option<Arc<IndexingProgress>>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let conn = factory();
+        let detect = conn.detect();
+        let was_detected = detect.detected;
+        let mut is_discovered = false;
+
+        if detect.detected {
+            // Update discovered agents count immediately when detected
+            if let Some(p) = &progress {
+                p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+            }
+            is_discovered = true;
+
+            // Scan local sources
+            let ctx = crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
+            match conn.scan(&ctx) {
+                Ok(mut local_convs) => {
+                    // Inject local provenance
+                    let local_origin = Origin::local();
+                    for conv in &mut local_convs {
+                        inject_provenance(conv, &local_origin);
+                    }
+
+                    if !local_convs.is_empty() {
+                        // Send batch through channel (blocking if full - backpressure!)
+                        let _ = tx.send(IndexMessage::Batch {
+                            connector_name: name,
+                            conversations: local_convs,
+                            is_discovered,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(connector = name, "local scan failed: {}", e);
+                    let _ = tx.send(IndexMessage::ScanError {
+                        connector_name: name,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        // Scan remote sources
+        for root in &remote_roots {
+            let ctx = crate::connectors::ScanContext::with_roots(
+                root.path.clone(),
+                vec![root.clone()],
+                since_ts,
+            );
+            match conn.scan(&ctx) {
+                Ok(mut remote_convs) => {
+                    for conv in &mut remote_convs {
+                        inject_provenance(conv, &root.origin);
+                        apply_workspace_rewrite(conv, &root.workspace_rewrites);
+                    }
+
+                    // Check if discovered via remote scan
+                    if !was_detected && !remote_convs.is_empty() && !is_discovered {
+                        if let Some(p) = &progress {
+                            p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+                        }
+                        is_discovered = true;
+                    }
+
+                    if !remote_convs.is_empty() {
+                        let _ = tx.send(IndexMessage::Batch {
+                            connector_name: name,
+                            conversations: remote_convs,
+                            is_discovered,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        connector = name,
+                        root = %root.path.display(),
+                        "remote scan failed: {}", e
+                    );
+                }
+            }
+        }
+
+        // Mark this connector as scanned for discovery progress
+        if let Some(p) = &progress {
+            p.current.fetch_add(1, Ordering::Relaxed);
+        }
+
+        tracing::info!(
+            connector = name,
+            discovered = is_discovered,
+            "streaming_scan_complete"
+        );
+
+        // Signal completion
+        let _ = tx.send(IndexMessage::Done {
+            connector_name: name,
+        });
+    })
+}
+
+/// Run the streaming indexing consumer.
+///
+/// Receives batches from producer threads and ingests them into storage.
+/// Processes batches as they arrive, providing early feedback and reducing
+/// peak memory usage compared to batch collection.
+fn run_streaming_consumer(
+    rx: Receiver<IndexMessage>,
+    num_producers: usize,
+    storage: &mut SqliteStorage,
+    t_index: &mut TantivyIndex,
+    progress: &Option<Arc<IndexingProgress>>,
+    needs_rebuild: bool,
+) -> Result<Vec<String>> {
+    let mut active_producers = num_producers;
+    let mut discovered_names: Vec<String> = Vec::new();
+    let mut total_conversations = 0usize;
+    let mut switched_to_indexing = false;
+
+    loop {
+        match rx.recv() {
+            Ok(IndexMessage::Batch {
+                connector_name,
+                conversations,
+                is_discovered,
+            }) => {
+                let batch_size = conversations.len();
+                total_conversations += batch_size;
+
+                // Switch to indexing phase on first batch (reset total/current for accurate progress)
+                if !switched_to_indexing {
+                    if let Some(p) = progress {
+                        p.phase.store(2, Ordering::Relaxed); // Indexing
+                        p.total.store(0, Ordering::Relaxed); // Reset - will accumulate as batches arrive
+                        p.current.store(0, Ordering::Relaxed);
+                    }
+                    switched_to_indexing = true;
+                }
+
+                // Update progress total (we learn about sizes as batches arrive)
+                if let Some(p) = progress {
+                    p.total.fetch_add(batch_size, Ordering::Relaxed);
+                }
+
+                // Track discovered agent names
+                if is_discovered && !discovered_names.contains(&connector_name.to_string()) {
+                    discovered_names.push(connector_name.to_string());
+                }
+
+                // Ingest the batch
+                ingest_batch(storage, t_index, &conversations, progress, needs_rebuild)?;
+
+                tracing::info!(
+                    connector = connector_name,
+                    conversations = batch_size,
+                    "streaming_ingest"
+                );
+            }
+            Ok(IndexMessage::ScanError {
+                connector_name,
+                error,
+            }) => {
+                tracing::warn!(
+                    connector = connector_name,
+                    error = %error,
+                    "streaming_scan_error"
+                );
+                // Continue processing - scan errors are non-fatal
+            }
+            Ok(IndexMessage::Done { connector_name }) => {
+                active_producers -= 1;
+                tracing::debug!(
+                    connector = connector_name,
+                    remaining = active_producers,
+                    "streaming_producer_done"
+                );
+                if active_producers == 0 {
+                    break;
+                }
+            }
+            Err(_) => {
+                // Channel closed unexpectedly
+                tracing::warn!("streaming channel closed unexpectedly");
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        total_conversations,
+        discovered = discovered_names.len(),
+        "streaming_indexing_complete"
+    );
+
+    Ok(discovered_names)
+}
+
+/// Run indexing using streaming architecture with backpressure.
+///
+/// This spawns producer threads for each connector that send batches through
+/// a bounded channel. The consumer receives and ingests batches as they arrive,
+/// providing backpressure when indexing falls behind scanning.
+fn run_streaming_index(
+    storage: &mut SqliteStorage,
+    t_index: &mut TantivyIndex,
+    opts: &IndexOptions,
+    since_ts: Option<i64>,
+    needs_rebuild: bool,
+    remote_roots: Vec<ScanRoot>,
+) -> Result<()> {
+    let connector_factories = get_connector_factories();
+    let num_connectors = connector_factories.len();
+
+    // Set up progress tracking
+    if let Some(p) = &opts.progress {
+        p.phase.store(1, Ordering::Relaxed); // Scanning
+        p.total.store(num_connectors, Ordering::Relaxed);
+        p.current.store(0, Ordering::Relaxed);
+        p.discovered_agents.store(0, Ordering::Relaxed);
+        if let Ok(mut names) = p.discovered_agent_names.lock() {
+            names.clear();
+        }
+    }
+
+    // Create bounded channel for backpressure
+    let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
+
+    // Spawn producer threads for each connector
+    let handles: Vec<JoinHandle<()>> = connector_factories
+        .into_iter()
+        .map(|(name, factory)| {
+            spawn_connector_producer(
+                name,
+                factory,
+                tx.clone(),
+                opts.data_dir.clone(),
+                remote_roots.clone(),
+                since_ts,
+                opts.progress.clone(),
+            )
+        })
+        .collect();
+
+    // Drop our copy of the sender so channel closes when all producers finish
+    drop(tx);
+
+    // Run consumer on main thread
+    let discovered_names = run_streaming_consumer(
+        rx,
+        num_connectors,
+        storage,
+        t_index,
+        &opts.progress,
+        needs_rebuild,
+    )?;
+
+    // Wait for all producer threads to complete
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    // Update discovered agent names in progress tracker
+    if let Some(p) = &opts.progress
+        && let Ok(mut names) = p.discovered_agent_names.lock()
+    {
+        names.extend(discovered_names);
+    }
+
+    Ok(())
+}
+
+/// Run indexing using original batch collection architecture.
+///
+/// This uses rayon's par_iter to scan all connectors in parallel, collecting
+/// all conversations into memory before ingesting. This is the fallback when
+/// streaming is disabled via CASS_STREAMING_INDEX=0.
+fn run_batch_index(
+    storage: &mut SqliteStorage,
+    t_index: &mut TantivyIndex,
+    opts: &IndexOptions,
+    since_ts: Option<i64>,
+    needs_rebuild: bool,
+    remote_roots: Vec<ScanRoot>,
+) -> Result<()> {
+    let connector_factories = get_connector_factories();
+
+    // First pass: Scan all to get counts if we have progress tracker
+    // Use parallel iteration for faster agent discovery
+    if let Some(p) = &opts.progress {
+        p.phase.store(1, Ordering::Relaxed); // Scanning
+        // Track connector scan progress during discovery.
+        p.total.store(connector_factories.len(), Ordering::Relaxed);
+        p.current.store(0, Ordering::Relaxed);
+        p.discovered_agents.store(0, Ordering::Relaxed);
+        if let Ok(mut names) = p.discovered_agent_names.lock() {
+            names.clear();
+        }
+    }
+
+    // Run connector detection and scanning in parallel using rayon
+    // Optimization 2.2: Eliminate mutex lock contention on discovered_agent_names
+    // by collecting names after the parallel phase instead of locking inside par_iter.
+    use rayon::prelude::*;
+
+    let progress_ref = opts.progress.as_ref();
+    let data_dir = opts.data_dir.clone();
+
+    // Return type includes whether agent was discovered (for post-parallel name collection)
+    let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>, bool)> =
+        connector_factories
+            .into_par_iter()
+            .filter_map(|(name, factory)| {
+                let conn = factory();
+                let detect = conn.detect();
+                let was_detected = detect.detected;
+                let mut convs = Vec::new();
+                let mut is_discovered = false;
+
+                if detect.detected {
+                    // Update discovered agents count immediately when detected
+                    // This gives fast UI feedback during the discovery phase
+                    // Note: AtomicUsize has no contention, only the mutex was problematic
+                    if let Some(p) = progress_ref {
+                        p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+                    }
+                    is_discovered = true;
+
+                    let ctx =
+                        crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
+                    match conn.scan(&ctx) {
+                        Ok(mut local_convs) => {
+                            let local_origin = Origin::local();
+                            for conv in &mut local_convs {
+                                inject_provenance(conv, &local_origin);
+                            }
+                            convs.extend(local_convs);
+                        }
+                        Err(e) => {
+                            // Note: agent was counted as discovered but scan failed
+                            // This is acceptable as detection succeeded (agent exists)
+                            tracing::warn!("scan failed for {}: {}", name, e);
+                        }
+                    }
+                }
+
+                if !remote_roots.is_empty() {
+                    for root in &remote_roots {
+                        let ctx = crate::connectors::ScanContext::with_roots(
+                            root.path.clone(),
+                            vec![root.clone()],
+                            since_ts,
+                        );
+                        match conn.scan(&ctx) {
+                            Ok(mut remote_convs) => {
+                                for conv in &mut remote_convs {
+                                    inject_provenance(conv, &root.origin);
+                                    apply_workspace_rewrite(conv, &root.workspace_rewrites);
+                                }
+                                convs.extend(remote_convs);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    connector = name,
+                                    root = %root.path.display(),
+                                    "remote scan failed: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Agent discovered via remote scan (wasn't detected locally but has conversations)
+                if !was_detected && !convs.is_empty() {
+                    if let Some(p) = progress_ref {
+                        p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+                    }
+                    is_discovered = true;
+                }
+
+                // Mark this connector as scanned for discovery progress.
+                if let Some(p) = progress_ref {
+                    p.current.fetch_add(1, Ordering::Relaxed);
+                }
+
+                if convs.is_empty() && !is_discovered {
+                    return None;
+                }
+
+                tracing::info!(
+                    connector = name,
+                    conversations = convs.len(),
+                    discovered = is_discovered,
+                    "batch_scan_complete"
+                );
+                Some((name, convs, is_discovered))
+            })
+            .collect();
+
+    // Post-parallel phase: collect discovered agent names with single mutex lock
+    // This eliminates O(connectors) mutex acquisitions during parallel execution
+    if let Some(p) = &opts.progress {
+        let discovered_names: Vec<&str> = pending_batches
+            .iter()
+            .filter(|(_, _, discovered)| *discovered)
+            .map(|(name, _, _)| *name)
+            .collect();
+
+        if let Ok(mut names) = p.discovered_agent_names.lock() {
+            names.extend(discovered_names.into_iter().map(String::from));
+        }
+
+        let total_conversations: usize = pending_batches
+            .iter()
+            .map(|(_, convs, _)| convs.len())
+            .sum();
+        p.phase.store(2, Ordering::Relaxed); // Indexing
+        p.total.store(total_conversations, Ordering::Relaxed);
+        p.current.store(0, Ordering::Relaxed);
+    }
+
+    for (name, convs, _discovered) in pending_batches {
+        ingest_batch(storage, t_index, &convs, &opts.progress, needs_rebuild)?;
+        tracing::info!(
+            connector = name,
+            conversations = convs.len(),
+            "batch_ingest"
+        );
+    }
+
+    Ok(())
+}
+
 pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
@@ -77,10 +565,9 @@ pub fn run_index(
             .and_then(|json| {
                 json.get("schema_hash")
                     .and_then(|v| v.as_str())
-                    .map(String::from)
+                    .map(schema_hash_matches)
             })
-            .as_deref()
-            == Some(crate::search::tantivy::SCHEMA_HASH);
+            .unwrap_or(false);
 
     // Treat missing schema hash as rebuild (open_or_create will wipe/recreate).
     let mut needs_rebuild =
@@ -110,6 +597,7 @@ pub fn run_index(
     if opts.full {
         reset_storage(&mut storage)?;
         t_index.delete_all()?;
+        t_index.commit()?;
     }
 
     // Get last scan timestamp for incremental indexing.
@@ -133,22 +621,11 @@ pub fn run_index(
     // Record scan start time before scanning
     let scan_start_ts = SqliteStorage::now_millis();
 
-    let connector_factories = get_connector_factories();
-
-    // First pass: Scan all to get counts if we have progress tracker
-    // Use parallel iteration for faster agent discovery
-    if let Some(p) = &opts.progress {
-        p.phase.store(1, Ordering::Relaxed); // Scanning
-        // Track connector scan progress during discovery.
-        p.total.store(connector_factories.len(), Ordering::Relaxed);
-        p.current.store(0, Ordering::Relaxed);
-        p.discovered_agents.store(0, Ordering::Relaxed);
-        if let Ok(mut names) = p.discovered_agent_names.lock() {
-            names.clear();
-        }
-        if let Ok(mut last_error) = p.last_error.lock() {
-            *last_error = None;
-        }
+    // Reset progress error state
+    if let Some(p) = &opts.progress
+        && let Ok(mut last_error) = p.last_error.lock()
+    {
+        *last_error = None;
     }
 
     // Keep sources table in sync with sources.toml for provenance integrity.
@@ -161,118 +638,27 @@ pub fn run_index(
         .cloned()
         .collect();
 
-    // Run connector detection and scanning in parallel using rayon
-    use rayon::prelude::*;
-
-    let progress_ref = opts.progress.as_ref();
-    let data_dir = opts.data_dir.clone();
-
-    let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>)> = connector_factories
-        .into_par_iter()
-        .filter_map(|(name, factory)| {
-            let conn = factory();
-            let detect = conn.detect();
-            let was_detected = detect.detected;
-            let mut convs = Vec::new();
-
-            if detect.detected {
-                // Update discovered agents count immediately when detected
-                // This gives fast UI feedback during the discovery phase
-                if let Some(p) = progress_ref {
-                    p.discovered_agents.fetch_add(1, Ordering::Relaxed);
-                    if let Ok(mut names) = p.discovered_agent_names.lock() {
-                        names.push(name.to_string());
-                    }
-                }
-
-                let ctx = crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
-                match conn.scan(&ctx) {
-                    Ok(mut local_convs) => {
-                        let local_origin = Origin::local();
-                        for conv in &mut local_convs {
-                            inject_provenance(conv, &local_origin);
-                        }
-                        convs.extend(local_convs);
-                    }
-                    Err(e) => {
-                        // Note: agent was counted as discovered but scan failed
-                        // This is acceptable as detection succeeded (agent exists)
-                        tracing::warn!("scan failed for {}: {}", name, e);
-                    }
-                }
-            }
-
-            if !remote_roots.is_empty() {
-                for root in &remote_roots {
-                    let ctx = crate::connectors::ScanContext::with_roots(
-                        root.path.clone(),
-                        vec![root.clone()],
-                        since_ts,
-                    );
-                    match conn.scan(&ctx) {
-                        Ok(mut remote_convs) => {
-                            for conv in &mut remote_convs {
-                                inject_provenance(conv, &root.origin);
-                                apply_workspace_rewrite(conv, &root.workspace_rewrites);
-                            }
-                            convs.extend(remote_convs);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                connector = name,
-                                root = %root.path.display(),
-                                "remote scan failed: {e}"
-                            );
-                        }
-                    }
-                }
-            }
-
-            if !was_detected && let Some(p) = progress_ref {
-                p.discovered_agents.fetch_add(1, Ordering::Relaxed);
-                if let Ok(mut names) = p.discovered_agent_names.lock() {
-                    names.push(name.to_string());
-                }
-            }
-
-            // Mark this connector as scanned for discovery progress.
-            if let Some(p) = progress_ref {
-                p.current.fetch_add(1, Ordering::Relaxed);
-            }
-
-            if convs.is_empty() {
-                return None;
-            }
-
-            tracing::info!(
-                connector = name,
-                conversations = convs.len(),
-                "parallel_scan_complete"
-            );
-            Some((name, convs))
-        })
-        .collect();
-
-    if let Some(p) = &opts.progress {
-        let total_conversations: usize = pending_batches.iter().map(|(_, convs)| convs.len()).sum();
-        p.phase.store(2, Ordering::Relaxed); // Indexing
-        p.total.store(total_conversations, Ordering::Relaxed);
-        p.current.store(0, Ordering::Relaxed);
-    }
-
-    for (name, convs) in pending_batches {
-        ingest_batch(
+    // Choose between streaming indexing (Opt 8.2) and batch indexing
+    if streaming_index_enabled() {
+        tracing::info!("using streaming indexing (Opt 8.2)");
+        run_streaming_index(
             &mut storage,
             &mut t_index,
-            &convs,
-            &opts.progress,
+            &opts,
+            since_ts,
             needs_rebuild,
+            remote_roots.clone(),
         )?;
-        tracing::info!(
-            connector = name,
-            conversations = convs.len(),
-            "connector_ingest"
-        );
+    } else {
+        tracing::info!("using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)");
+        run_batch_index(
+            &mut storage,
+            &mut t_index,
+            &opts,
+            since_ts,
+            needs_rebuild,
+            remote_roots.clone(),
+        )?;
     }
 
     t_index.commit()?;
@@ -296,7 +682,8 @@ pub fn run_index(
         let t_index = Arc::new(Mutex::new(t_index));
 
         // Detect roots once for the watcher setup
-        let watch_roots = detect_watch_roots();
+        // Includes both local detected roots and all remote mirror roots
+        let watch_roots = build_watch_roots(remote_roots.clone());
 
         watch_sources(
             opts.watch_once_paths.clone(),
@@ -310,7 +697,7 @@ pub fn run_index(
                     }
                     // For rebuild, trigger reindex on all active roots
                     let all_root_paths: Vec<PathBuf> =
-                        roots.iter().map(|(_, p)| p.clone()).collect();
+                        roots.iter().map(|(_, root)| root.path.clone()).collect();
                     let _ = reindex_paths(
                         &opts_clone,
                         all_root_paths,
@@ -375,21 +762,35 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
 }
 
 /// Detect all active roots for watching/scanning.
-fn detect_watch_roots() -> Vec<(ConnectorKind, PathBuf)> {
+///
+/// Includes:
+/// 1. Local roots detected by connectors
+/// 2. Remote mirror roots (assigned to ALL connectors since we don't know the mapping)
+fn build_watch_roots(remote_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind, ScanRoot)> {
     let factories = get_connector_factories();
     let mut roots = Vec::new();
+    let mut all_kinds = Vec::new();
 
     for (name, factory) in factories {
         if let Some(kind) = ConnectorKind::from_slug(name) {
+            all_kinds.push(kind);
             let conn = factory();
             let detection = conn.detect();
             if detection.detected {
-                for root in detection.root_paths {
-                    roots.push((kind, root));
+                for root_path in detection.root_paths {
+                    roots.push((kind, ScanRoot::local(root_path)));
                 }
             }
         }
     }
+
+    // Add remote roots for ALL connectors
+    for remote_root in remote_roots {
+        for kind in &all_kinds {
+            roots.push((*kind, remote_root.clone()));
+        }
+    }
+
     roots
 }
 
@@ -432,9 +833,9 @@ impl ConnectorKind {
     }
 }
 
-fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, PathBuf)], bool) + Send + 'static>(
+fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send + 'static>(
     watch_once_paths: Option<Vec<PathBuf>>,
-    roots: Vec<(ConnectorKind, PathBuf)>,
+    roots: Vec<(ConnectorKind, ScanRoot)>,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     callback: F,
 ) -> Result<()> {
@@ -455,11 +856,11 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, PathBuf)], bool) + Send +
     })?;
 
     // Watch all detected roots
-    for (_, dir) in &roots {
-        if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
-            tracing::warn!("failed to watch {}: {}", dir.display(), e);
+    for (_, root) in &roots {
+        if let Err(e) = watcher.watch(&root.path, RecursiveMode::Recursive) {
+            tracing::warn!("failed to watch {}: {}", root.path.display(), e);
         } else {
-            tracing::info!("watching {}", dir.display());
+            tracing::info!("watching {}", root.path.display());
         }
     }
 
@@ -535,6 +936,7 @@ fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
          DELETE FROM workspaces;
          DELETE FROM tags;
          DELETE FROM conversation_tags;
+         DELETE FROM meta WHERE key = 'last_scan_ts';
          COMMIT;",
     )?;
     Ok(())
@@ -543,7 +945,7 @@ fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
 fn reindex_paths(
     opts: &IndexOptions,
     paths: Vec<PathBuf>,
-    roots: &[(ConnectorKind, PathBuf)],
+    roots: &[(ConnectorKind, ScanRoot)],
     state: Arc<Mutex<HashMap<ConnectorKind, i64>>>,
     storage: Arc<Mutex<SqliteStorage>>,
     t_index: Arc<Mutex<TantivyIndex>>,
@@ -557,10 +959,13 @@ fn reindex_paths(
         return Ok(());
     }
 
-    for (kind, ts) in triggers {
+    for (kind, root, ts) in triggers {
         let conn = kind.create_connector();
         let detect = conn.detect();
-        if !detect.detected {
+        if !detect.detected && root.origin.source_id == "local" {
+            // For local roots, if detection fails (e.g. root deleted), skip.
+            // For remote roots, detection might fail but we should still try scanning
+            // if it's a brute-force attempt.
             continue;
         }
 
@@ -581,15 +986,32 @@ fn reindex_paths(
                 .or_else(|| ts.map(|v| v.saturating_sub(1)))
                 .map(|v| v.saturating_sub(1))
         };
-        let ctx = crate::connectors::ScanContext::local_default(opts.data_dir.clone(), since_ts);
+
+        // Use explicit root context
+        let ctx = crate::connectors::ScanContext::with_roots(
+            root.path.clone(),
+            vec![root.clone()],
+            since_ts,
+        );
 
         // SCAN PHASE: IO-heavy, no locks held
-        let mut convs = conn.scan(&ctx)?;
+        let mut convs = match conn.scan(&ctx) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    "watch scan failed for {:?} at {}: {}",
+                    kind,
+                    root.path.display(),
+                    e
+                );
+                Vec::new()
+            }
+        };
 
-        // Inject local provenance into all conversations (P2.2)
-        let local_origin = Origin::local();
+        // Provenance injection and path rewriting
         for conv in &mut convs {
-            inject_provenance(conv, &local_origin);
+            inject_provenance(conv, &root.origin);
+            apply_workspace_rewrite(conv, &root.workspace_rewrites);
         }
 
         // Update total and phase to indexing
@@ -675,9 +1097,10 @@ fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Res
 
 fn classify_paths(
     paths: Vec<PathBuf>,
-    roots: &[(ConnectorKind, PathBuf)],
-) -> Vec<(ConnectorKind, Option<i64>)> {
-    let mut map: HashMap<ConnectorKind, Option<i64>> = HashMap::new();
+    roots: &[(ConnectorKind, ScanRoot)],
+) -> Vec<(ConnectorKind, ScanRoot, Option<i64>)> {
+    let mut batch_map: HashMap<(ConnectorKind, PathBuf), (ScanRoot, Option<i64>)> = HashMap::new();
+
     for p in paths {
         if let Ok(meta) = std::fs::metadata(&p)
             && let Ok(time) = meta.modified()
@@ -685,24 +1108,26 @@ fn classify_paths(
         {
             let ts = Some(dur.as_millis() as i64);
 
-            // Check against known roots (dynamic classification)
-            let kind = roots.iter().find_map(
-                |(k, root)| {
-                    if p.starts_with(root) { Some(*k) } else { None }
-                },
-            );
-
-            if let Some(kind) = kind {
-                let entry = map.entry(kind).or_insert(None);
-                *entry = match (*entry, ts) {
-                    (Some(prev), Some(cur)) => Some(prev.max(cur)),
-                    (None, Some(cur)) => Some(cur),
-                    _ => *entry,
-                };
+            // Find ALL matching roots
+            for (kind, root) in roots {
+                if p.starts_with(&root.path) {
+                    let key = (*kind, root.path.clone());
+                    let entry = batch_map.entry(key).or_insert((root.clone(), None));
+                    // Update TS
+                    entry.1 = match (entry.1, ts) {
+                        (Some(prev), Some(cur)) => Some(prev.max(cur)),
+                        (None, Some(cur)) => Some(cur),
+                        _ => entry.1,
+                    };
+                }
             }
         }
     }
-    map.into_iter().collect()
+
+    batch_map
+        .into_iter()
+        .map(|((kind, _), (root, ts))| (kind, root, ts))
+        .collect()
 }
 
 fn sync_sources_config_to_db(storage: &SqliteStorage) {
@@ -1021,7 +1446,7 @@ pub mod persist {
     use crate::connectors::NormalizedConversation;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
     use crate::search::tantivy::TantivyIndex;
-    use crate::storage::sqlite::{InsertOutcome, SqliteStorage};
+    use crate::storage::sqlite::{IndexingCache, InsertOutcome, SqliteStorage};
 
     /// Extract provenance (source_id, origin_host) from conversation metadata.
     ///
@@ -1137,6 +1562,9 @@ pub mod persist {
 
     /// Persist multiple conversations in a single database transaction for better performance.
     /// This reduces SQLite transaction overhead when indexing many conversations at once.
+    ///
+    /// Uses `IndexingCache` (Opt 7.2) to prevent N+1 queries for agent/workspace IDs.
+    /// Set `CASS_SQLITE_CACHE=0` to disable caching for debugging.
     pub fn persist_conversations_batched(
         storage: &mut SqliteStorage,
         t_index: &mut TantivyIndex,
@@ -1146,6 +1574,9 @@ pub mod persist {
         if convs.is_empty() {
             return Ok(());
         }
+
+        let cache_enabled = IndexingCache::is_enabled();
+        let mut cache = IndexingCache::new();
 
         // Prepare data for batched insert: (agent_id, workspace_id, Conversation)
         let mut prepared: Vec<(i64, Option<i64>, Conversation)> = Vec::with_capacity(convs.len());
@@ -1158,16 +1589,38 @@ pub mod persist {
                 version: None,
                 kind: AgentKind::Cli,
             };
-            let agent_id = storage.ensure_agent(&agent)?;
+
+            let agent_id = if cache_enabled {
+                cache.get_or_insert_agent(storage, &agent)?
+            } else {
+                storage.ensure_agent(&agent)?
+            };
 
             let workspace_id = if let Some(ws) = &conv.workspace {
-                Some(storage.ensure_workspace(ws, None)?)
+                if cache_enabled {
+                    Some(cache.get_or_insert_workspace(storage, ws, None)?)
+                } else {
+                    Some(storage.ensure_workspace(ws, None)?)
+                }
             } else {
                 None
             };
 
             let internal_conv = map_to_internal(conv);
             prepared.push((agent_id, workspace_id, internal_conv));
+        }
+
+        // Log cache statistics if enabled
+        if cache_enabled {
+            let (hits, misses, hit_rate) = cache.stats();
+            tracing::debug!(
+                hits,
+                misses,
+                hit_rate = format!("{:.1}%", hit_rate * 100.0),
+                agents = cache.agent_count(),
+                workspaces = cache.workspace_count(),
+                "IndexingCache stats"
+            );
         }
 
         // Build references for the batched call
@@ -1340,7 +1793,10 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(msg_count, 0);
-        assert_eq!(storage.schema_version().unwrap(), 5);
+        assert_eq!(
+            storage.schema_version().unwrap(),
+            crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -1401,28 +1857,42 @@ mod tests {
 
         // roots are needed for classify_paths now
         let roots = vec![
-            (ConnectorKind::Codex, tmp.path().join(".codex")),
-            (ConnectorKind::Claude, tmp.path().join("project")),
-            (ConnectorKind::Aider, tmp.path().join("repo")),
-            (ConnectorKind::Cursor, tmp.path().join("Cursor/User")),
+            (
+                ConnectorKind::Codex,
+                ScanRoot::local(tmp.path().join(".codex")),
+            ),
+            (
+                ConnectorKind::Claude,
+                ScanRoot::local(tmp.path().join("project")),
+            ),
+            (
+                ConnectorKind::Aider,
+                ScanRoot::local(tmp.path().join("repo")),
+            ),
+            (
+                ConnectorKind::Cursor,
+                ScanRoot::local(tmp.path().join("Cursor/User")),
+            ),
             (
                 ConnectorKind::ChatGpt,
-                tmp.path()
-                    .join("Library/Application Support/com.openai.chat"),
+                ScanRoot::local(
+                    tmp.path()
+                        .join("Library/Application Support/com.openai.chat"),
+                ),
             ),
         ];
 
         let paths = vec![codex.clone(), claude.clone(), aider, cursor, chatgpt];
         let classified = classify_paths(paths, &roots);
 
-        let kinds: std::collections::HashSet<_> = classified.iter().map(|(k, _)| *k).collect();
+        let kinds: std::collections::HashSet<_> = classified.iter().map(|(k, _, _)| *k).collect();
         assert!(kinds.contains(&ConnectorKind::Codex));
         assert!(kinds.contains(&ConnectorKind::Claude));
         assert!(kinds.contains(&ConnectorKind::Aider));
         assert!(kinds.contains(&ConnectorKind::Cursor));
         assert!(kinds.contains(&ConnectorKind::ChatGpt));
 
-        for (_, ts) in classified {
+        for (_, _, ts) in classified {
             assert!(ts.is_some(), "mtime should be captured");
         }
     }
@@ -1494,7 +1964,7 @@ mod tests {
         let t_index = std::sync::Arc::new(std::sync::Mutex::new(t_index));
 
         // Need roots for reindex_paths
-        let roots = vec![(ConnectorKind::Amp, amp_dir)];
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
 
         reindex_paths(
             &opts,
@@ -1605,7 +2075,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         reindex_paths(
             &opts,
             vec![amp_file],
-            &[(ConnectorKind::Amp, amp_dir)],
+            &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
             state.clone(),
             storage.clone(),
             t_index.clone(),

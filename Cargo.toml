@@ -23,6 +23,7 @@ console = "*"
 colored = "*"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
+rmp-serde = "1"  # MessagePack for binary metadata serialization (Opt 3.1)
 toml = "*"
 directories = "*"
 which = "*"
@@ -35,6 +36,8 @@ rayon = "*"
 crossbeam-channel = "*"
 parking_lot = "*"
 lru = "*"
+fxhash = "*"  # Fast non-cryptographic hashing for cache keys (P1 Opt 1.3)
+regex = "*"
 reqwest = { version = "*", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 ratatui = { version = "*", features = ["crossterm"] }
 crossterm = "*"
@@ -42,7 +45,7 @@ dirs = "*"
 walkdir = "*"
 glob = "*"
 base64 = "0.22"
-chrono = "*"
+chrono = { version = "*", features = ["serde"] }
 semver = "*"
 tracing-appender = "*"
 strsim = "0.11.1"
@@ -56,6 +59,7 @@ half = "*"
 memmap2 = "*"
 fastembed = { version = "*", default-features = false, features = ["ort-download-binaries"] }
 wide = "0.7"  # Portable SIMD for P0 Opt 2: SIMD dot product
+arrayvec = "*"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 
 # Crypto for ChatGPT encrypted conversations
 aes-gcm = "0.10"
@@ -74,11 +78,19 @@ argon2 = "*"
 hkdf = "*"
 zeroize = { version = "*", features = ["derive"] }
 flate2 = "*"
-rand = "*"
+rand = "0.8"  # Pin to 0.8.x for rand_core 0.6.x compatibility with argon2/aes-gcm
+
+# QR code generation (optional, for recovery secret QR codes)
+qrcode = { version = "*", optional = true }
+image = { version = "*", optional = true, default-features = false, features = ["png"] }
 
 # macOS keychain access (optional, for ChatGPT decryption)
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "2.11"
+
+[features]
+default = ["qr"]
+qr = ["dep:qrcode", "dep:image"]
 
 [build-dependencies]
 vergen = { version = "*", default-features = false, features = ["build", "cargo"] }
@@ -93,8 +105,8 @@ once_cell = "*"
 serial_test = "*"
 proptest = "*"
 serde_yaml = "0.9.34"
-rand = "*"
-rand_chacha = "*"
+rand = "0.8"  # Match main dependency version
+rand_chacha = "0.3"  # Compatible with rand 0.8.x
 
 [[bin]]
 name = "cass"

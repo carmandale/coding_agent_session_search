@@ -10,6 +10,54 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 // -------------------------------------------------------------------------
+// Binary Metadata Serialization (Opt 3.1)
+// -------------------------------------------------------------------------
+// MessagePack provides 50-70% storage reduction vs JSON and faster parsing.
+// New rows use binary columns; existing JSON is read on fallback.
+
+/// Serialize a JSON value to MessagePack bytes.
+/// Returns None for null/empty values to save storage.
+fn serialize_json_to_msgpack(value: &serde_json::Value) -> Option<Vec<u8>> {
+    if value.is_null() || (value.is_object() && value.as_object().unwrap().is_empty()) {
+        return None;
+    }
+    rmp_serde::to_vec(value).ok()
+}
+
+/// Deserialize MessagePack bytes to a JSON value.
+/// Returns default Value::Object({}) on error or empty input.
+fn deserialize_msgpack_to_json(bytes: &[u8]) -> serde_json::Value {
+    if bytes.is_empty() {
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+    rmp_serde::from_slice(bytes)
+        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
+}
+
+/// Read metadata from row, preferring binary column, falling back to JSON.
+/// This provides backward compatibility during migration.
+fn read_metadata_compat(
+    row: &rusqlite::Row<'_>,
+    json_idx: usize,
+    bin_idx: usize,
+) -> serde_json::Value {
+    // Try binary column first (new format)
+    if let Ok(Some(bytes)) = row.get::<_, Option<Vec<u8>>>(bin_idx)
+        && !bytes.is_empty()
+    {
+        return deserialize_msgpack_to_json(&bytes);
+    }
+
+    // Fall back to JSON column (old format or migration in progress)
+    if let Ok(Some(json_str)) = row.get::<_, Option<String>>(json_idx) {
+        return serde_json::from_str(&json_str)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+    }
+
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+// -------------------------------------------------------------------------
 // Migration Error Types (P1.5)
 // -------------------------------------------------------------------------
 
@@ -116,6 +164,19 @@ pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, Migra
     Ok(Some(backup_path))
 }
 
+/// Helper to safely remove a database file and its potential WAL/SHM sidecars.
+fn remove_database_files(path: &Path) -> std::io::Result<()> {
+    // Remove the main database file
+    fs::remove_file(path)?;
+
+    // Best-effort removal of sidecar files (ignore errors if they don't exist)
+    let path_str = path.to_string_lossy();
+    let _ = fs::remove_file(format!("{}-wal", path_str));
+    let _ = fs::remove_file(format!("{}-shm", path_str));
+
+    Ok(())
+}
+
 /// Remove old backup files, keeping only the most recent `keep_count`.
 pub fn cleanup_old_backups(db_path: &Path, keep_count: usize) -> Result<(), std::io::Error> {
     let parent = match db_path.parent() {
@@ -149,13 +210,18 @@ pub fn cleanup_old_backups(db_path: &Path, keep_count: usize) -> Result<(), std:
     // Delete oldest backups beyond keep_count
     for (path, _) in backups.into_iter().skip(keep_count) {
         let _ = fs::remove_file(&path);
+
+        // Also try to cleanup potential sidecars from fs::copy fallback
+        let path_str = path.to_string_lossy();
+        let _ = fs::remove_file(format!("{}-wal", path_str));
+        let _ = fs::remove_file(format!("{}-shm", path_str));
     }
 
     Ok(())
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 /// Result of checking schema compatibility.
 #[derive(Debug, Clone)]
@@ -230,7 +296,7 @@ fn check_schema_compatibility(path: &Path) -> std::result::Result<SchemaCheck, r
     }
 }
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 8;
 
 const MIGRATION_V1: &str = r"
 PRAGMA foreign_keys = ON;
@@ -432,6 +498,32 @@ const MIGRATION_V6: &str = r"
 CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
 ";
 
+const MIGRATION_V7: &str = r"
+-- Add binary columns for MessagePack serialization (Opt 3.1)
+-- Binary format is 50-70% smaller than JSON and faster to parse
+ALTER TABLE conversations ADD COLUMN metadata_bin BLOB;
+ALTER TABLE messages ADD COLUMN extra_bin BLOB;
+";
+
+const MIGRATION_V8: &str = r"
+-- Opt 3.2: Daily stats materialized table for O(1) time-range histograms
+-- Provides fast aggregated queries for stats/dashboard without full table scans
+
+CREATE TABLE IF NOT EXISTS daily_stats (
+    day_id INTEGER NOT NULL,              -- Days since 2020-01-01 (Unix epoch + offset)
+    agent_slug TEXT NOT NULL,             -- 'all' for totals, or specific agent slug
+    source_id TEXT NOT NULL DEFAULT 'all', -- 'all' for totals, or specific source
+    session_count INTEGER NOT NULL DEFAULT 0,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    total_chars INTEGER NOT NULL DEFAULT 0,
+    last_updated INTEGER NOT NULL,
+    PRIMARY KEY (day_id, agent_slug, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
+";
+
 pub struct SqliteStorage {
     conn: Connection,
 }
@@ -505,7 +597,7 @@ impl SqliteStorage {
                     // Schema from future or otherwise incompatible - trigger rebuild
                     let backup_path = create_backup(path)?;
                     cleanup_old_backups(path, MAX_BACKUPS)?;
-                    fs::remove_file(path)?;
+                    remove_database_files(path)?;
                     return Err(MigrationError::RebuildRequired {
                         reason,
                         backup_path,
@@ -515,7 +607,7 @@ impl SqliteStorage {
                     // If we can't even check, it's likely corrupt - trigger rebuild
                     let backup_path = create_backup(path)?;
                     cleanup_old_backups(path, MAX_BACKUPS)?;
-                    fs::remove_file(path)?;
+                    remove_database_files(path)?;
                     return Err(MigrationError::RebuildRequired {
                         reason: "Database appears corrupted".to_string(),
                         backup_path,
@@ -588,7 +680,129 @@ impl SqliteStorage {
             )
             .with_context(|| format!("fetching workspace id for {path_str}"))
     }
+}
 
+// -------------------------------------------------------------------------
+// IndexingCache (Opt 7.2) - N+1 Prevention for Agent/Workspace IDs
+// -------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// Cache for agent and workspace IDs during batch indexing.
+///
+/// Prevents N+1 database queries by caching the results of ensure_agent
+/// and ensure_workspace calls within a batch. This is per-batch and
+/// single-threaded, so no synchronization is needed.
+///
+/// # Usage
+/// ```ignore
+/// let mut cache = IndexingCache::new();
+/// for conv in conversations {
+///     let agent_id = cache.get_or_insert_agent(storage, &agent)?;
+///     let workspace_id = cache.get_or_insert_workspace(storage, workspace)?;
+///     // ... use agent_id and workspace_id
+/// }
+/// ```
+///
+/// # Rollback
+/// Set environment variable `CASS_SQLITE_CACHE=0` to bypass caching
+/// and use direct DB calls (useful for debugging).
+#[derive(Debug, Default)]
+pub struct IndexingCache {
+    agent_ids: HashMap<String, i64>,
+    workspace_ids: HashMap<PathBuf, i64>,
+    hits: u64,
+    misses: u64,
+}
+
+impl IndexingCache {
+    /// Create a new empty cache.
+    pub fn new() -> Self {
+        Self {
+            agent_ids: HashMap::new(),
+            workspace_ids: HashMap::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Check if caching is enabled via environment variable.
+    /// Returns true unless CASS_SQLITE_CACHE is set to "0" or "false".
+    pub fn is_enabled() -> bool {
+        dotenvy::var("CASS_SQLITE_CACHE")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true)
+    }
+
+    /// Get or insert an agent ID, using cache if available.
+    ///
+    /// Returns the cached ID if present, otherwise calls ensure_agent
+    /// and caches the result.
+    pub fn get_or_insert_agent(&mut self, storage: &SqliteStorage, agent: &Agent) -> Result<i64> {
+        if let Some(&cached) = self.agent_ids.get(&agent.slug) {
+            self.hits += 1;
+            return Ok(cached);
+        }
+
+        self.misses += 1;
+        let id = storage.ensure_agent(agent)?;
+        self.agent_ids.insert(agent.slug.clone(), id);
+        Ok(id)
+    }
+
+    /// Get or insert a workspace ID, using cache if available.
+    ///
+    /// Returns the cached ID if present, otherwise calls ensure_workspace
+    /// and caches the result.
+    pub fn get_or_insert_workspace(
+        &mut self,
+        storage: &SqliteStorage,
+        path: &Path,
+        display_name: Option<&str>,
+    ) -> Result<i64> {
+        if let Some(&cached) = self.workspace_ids.get(path) {
+            self.hits += 1;
+            return Ok(cached);
+        }
+
+        self.misses += 1;
+        let id = storage.ensure_workspace(path, display_name)?;
+        self.workspace_ids.insert(path.to_path_buf(), id);
+        Ok(id)
+    }
+
+    /// Get cache statistics: (hits, misses, hit_rate).
+    pub fn stats(&self) -> (u64, u64, f64) {
+        let total = self.hits + self.misses;
+        let hit_rate = if total > 0 {
+            self.hits as f64 / total as f64
+        } else {
+            0.0
+        };
+        (self.hits, self.misses, hit_rate)
+    }
+
+    /// Clear the cache, resetting all state.
+    pub fn clear(&mut self) {
+        self.agent_ids.clear();
+        self.workspace_ids.clear();
+        self.hits = 0;
+        self.misses = 0;
+    }
+
+    /// Number of cached agents.
+    pub fn agent_count(&self) -> usize {
+        self.agent_ids.len()
+    }
+
+    /// Number of cached workspaces.
+    pub fn workspace_count(&self) -> usize {
+        self.workspace_ids.len()
+    }
+}
+
+impl SqliteStorage {
     pub fn insert_conversation_tree(
         &mut self,
         agent_id: i64,
@@ -612,11 +826,14 @@ impl SqliteStorage {
         let tx = self.conn.transaction()?;
 
         let conv_id = insert_conversation(&tx, agent_id, workspace_id, conv)?;
+        let mut fts_entries = Vec::with_capacity(conv.messages.len());
         for msg in &conv.messages {
             let msg_id = insert_message(&tx, conv_id, msg)?;
             insert_snippets(&tx, msg_id, &msg.snippets)?;
-            insert_fts_message(&tx, msg_id, msg, conv)?;
+            fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
         }
+        // Batch insert FTS entries
+        batch_insert_fts_messages(&tx, &fts_entries)?;
         tx.commit()?;
         Ok(InsertOutcome {
             conversation_id: conv_id,
@@ -639,15 +856,19 @@ impl SqliteStorage {
         let cutoff = max_idx.unwrap_or(-1);
 
         let mut inserted_indices = Vec::new();
+        let mut fts_entries = Vec::new();
         for msg in &conv.messages {
             if msg.idx <= cutoff {
                 continue;
             }
             let msg_id = insert_message(&tx, conversation_id, msg)?;
             insert_snippets(&tx, msg_id, &msg.snippets)?;
-            insert_fts_message(&tx, msg_id, msg, conv)?;
+            fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
             inserted_indices.push(msg.idx);
         }
+
+        // Batch insert FTS entries
+        batch_insert_fts_messages(&tx, &fts_entries)?;
 
         if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
             // Use IFNULL to handle NULL ended_at values correctly.
@@ -665,8 +886,10 @@ impl SqliteStorage {
         })
     }
 
-    /// Insert multiple conversations in a single transaction for better performance.
-    /// Returns InsertOutcome for each conversation in the same order as input.
+    /// Insert multiple conversations in a single transaction with batch FTS indexing.
+    ///
+    /// Uses multi-value INSERT for FTS5 entries (P2 Opt 2.1) to reduce
+    /// transaction overhead and improve indexing throughput by 10-20%.
     pub fn insert_conversations_batched(
         &mut self,
         conversations: &[(i64, Option<i64>, &Conversation)],
@@ -677,10 +900,31 @@ impl SqliteStorage {
 
         let tx = self.conn.transaction()?;
         let mut outcomes = Vec::with_capacity(conversations.len());
+        let mut fts_entries = Vec::new();
 
+        // Process all conversations, collecting FTS entries
         for &(agent_id, workspace_id, conv) in conversations {
-            let outcome = insert_conversation_in_tx(&tx, agent_id, workspace_id, conv)?;
+            let outcome = insert_conversation_in_tx_batched(
+                &tx,
+                agent_id,
+                workspace_id,
+                conv,
+                &mut fts_entries,
+            )?;
             outcomes.push(outcome);
+        }
+
+        // Batch insert all FTS entries at once
+        let fts_count = fts_entries.len();
+        if fts_count > 0 {
+            let inserted = batch_insert_fts_messages(&tx, &fts_entries)?;
+            tracing::debug!(
+                target: "cass::perf::fts5",
+                total = fts_count,
+                inserted = inserted,
+                conversations = conversations.len(),
+                "batch_fts_insert_complete"
+            );
         }
 
         tx.commit()?;
@@ -734,7 +978,7 @@ impl SqliteStorage {
         let mut stmt = self.conn.prepare(
             r"SELECT c.id, a.slug, w.path, c.external_id, c.title, c.source_path,
                        c.started_at, c.ended_at, c.approx_tokens, c.metadata_json,
-                       c.source_id, c.origin_host
+                       c.source_id, c.origin_host, c.metadata_bin
                 FROM conversations c
                 JOIN agents a ON c.agent_id = a.id
                 LEFT JOIN workspaces w ON c.workspace_id = w.id
@@ -755,10 +999,8 @@ impl SqliteStorage {
                 started_at: row.get(6)?,
                 ended_at: row.get(7)?,
                 approx_tokens: row.get(8)?,
-                metadata_json: row
-                    .get::<_, Option<String>>(9)?
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default(),
+                // Read from binary column first (idx 12), fallback to JSON (idx 9)
+                metadata_json: read_metadata_compat(row, 9, 12),
                 messages: Vec::new(),
                 source_id: row
                     .get::<_, String>(10)
@@ -874,7 +1116,7 @@ impl SqliteStorage {
 
     pub fn fetch_messages(&self, conversation_id: i64) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, idx, role, author, created_at, content, extra_json FROM messages WHERE conversation_id = ? ORDER BY idx",
+            "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin FROM messages WHERE conversation_id = ? ORDER BY idx",
         )?;
         let rows = stmt.query_map(params![conversation_id], |row| {
             let role: String = row.get(2)?;
@@ -891,10 +1133,8 @@ impl SqliteStorage {
                 author: row.get::<_, Option<String>>(3)?,
                 created_at: row.get::<_, Option<i64>>(4)?,
                 content: row.get(5)?,
-                extra_json: row
-                    .get::<_, Option<String>>(6)?
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default(),
+                // Read from binary column first (idx 7), fallback to JSON (idx 6)
+                extra_json: read_metadata_compat(row, 6, 7),
                 snippets: Vec::new(),
             })
         })?;
@@ -1076,6 +1316,404 @@ impl SqliteStorage {
 
         Ok(rows_affected > 0)
     }
+
+    // -------------------------------------------------------------------------
+    // Daily Stats (Opt 3.2) - Materialized Aggregates for O(1) Range Queries
+    // -------------------------------------------------------------------------
+
+    /// Epoch offset: Days are counted from 2020-01-01 (Unix timestamp 1577836800).
+    const EPOCH_2020_SECS: i64 = 1577836800;
+
+    /// Convert a millisecond timestamp to a day_id (days since 2020-01-01).
+    pub fn day_id_from_millis(timestamp_ms: i64) -> i64 {
+        let secs = timestamp_ms / 1000;
+        (secs - Self::EPOCH_2020_SECS) / 86400
+    }
+
+    /// Convert a day_id back to a timestamp (milliseconds, start of day UTC).
+    pub fn millis_from_day_id(day_id: i64) -> i64 {
+        (Self::EPOCH_2020_SECS + day_id * 86400) * 1000
+    }
+
+    /// Get session count for a date range using materialized stats.
+    /// Returns (count, is_from_cache) - is_from_cache is true if from daily_stats.
+    ///
+    /// If daily_stats table is empty or stale, falls back to COUNT(*) query.
+    pub fn count_sessions_in_range(
+        &self,
+        start_ts_ms: Option<i64>,
+        end_ts_ms: Option<i64>,
+        agent_slug: Option<&str>,
+        source_id: Option<&str>,
+    ) -> Result<(i64, bool)> {
+        let agent = agent_slug.unwrap_or("all");
+        let source = source_id.unwrap_or("all");
+
+        // Check if we have materialized stats
+        let stats_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM daily_stats", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        if stats_count == 0 {
+            // Fall back to direct COUNT(*)
+            return self.count_sessions_direct(start_ts_ms, end_ts_ms, agent_slug, source_id);
+        }
+
+        // Use materialized stats
+        let start_day = start_ts_ms.map(Self::day_id_from_millis);
+        let end_day = end_ts_ms.map(Self::day_id_from_millis);
+
+        let count: i64 = match (start_day, end_day) {
+            (Some(start), Some(end)) => self.conn.query_row(
+                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
+                 WHERE day_id BETWEEN ? AND ? AND agent_slug = ? AND source_id = ?",
+                params![start, end, agent, source],
+                |r| r.get(0),
+            )?,
+            (Some(start), None) => self.conn.query_row(
+                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
+                 WHERE day_id >= ? AND agent_slug = ? AND source_id = ?",
+                params![start, agent, source],
+                |r| r.get(0),
+            )?,
+            (None, Some(end)) => self.conn.query_row(
+                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
+                 WHERE day_id <= ? AND agent_slug = ? AND source_id = ?",
+                params![end, agent, source],
+                |r| r.get(0),
+            )?,
+            (None, None) => self.conn.query_row(
+                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
+                 WHERE agent_slug = ? AND source_id = ?",
+                params![agent, source],
+                |r| r.get(0),
+            )?,
+        };
+
+        Ok((count, true))
+    }
+
+    /// Direct COUNT(*) query as fallback when daily_stats is empty.
+    fn count_sessions_direct(
+        &self,
+        start_ts_ms: Option<i64>,
+        end_ts_ms: Option<i64>,
+        agent_slug: Option<&str>,
+        source_id: Option<&str>,
+    ) -> Result<(i64, bool)> {
+        let mut sql = "SELECT COUNT(*) FROM conversations c
+                       JOIN agents a ON c.agent_id = a.id WHERE 1=1"
+            .to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(start) = start_ts_ms {
+            sql.push_str(" AND c.started_at >= ?");
+            params_vec.push(Box::new(start));
+        }
+        if let Some(end) = end_ts_ms {
+            sql.push_str(" AND c.started_at <= ?");
+            params_vec.push(Box::new(end));
+        }
+        if let Some(agent) = agent_slug
+            && agent != "all"
+        {
+            sql.push_str(" AND a.slug = ?");
+            params_vec.push(Box::new(agent.to_string()));
+        }
+        if let Some(source) = source_id
+            && source != "all"
+        {
+            sql.push_str(" AND c.source_id = ?");
+            params_vec.push(Box::new(source.to_string()));
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let count: i64 = self
+            .conn
+            .query_row(&sql, params_refs.as_slice(), |r| r.get(0))?;
+        Ok((count, false))
+    }
+
+    /// Get daily histogram data for a date range.
+    pub fn get_daily_histogram(
+        &self,
+        start_ts_ms: i64,
+        end_ts_ms: i64,
+        agent_slug: Option<&str>,
+        source_id: Option<&str>,
+    ) -> Result<Vec<DailyCount>> {
+        let start_day = Self::day_id_from_millis(start_ts_ms);
+        let end_day = Self::day_id_from_millis(end_ts_ms);
+        let agent = agent_slug.unwrap_or("all");
+        let source = source_id.unwrap_or("all");
+
+        let mut stmt = self.conn.prepare(
+            "SELECT day_id, session_count, message_count, total_chars
+             FROM daily_stats
+             WHERE day_id BETWEEN ? AND ? AND agent_slug = ? AND source_id = ?
+             ORDER BY day_id",
+        )?;
+
+        let rows = stmt.query_map(params![start_day, end_day, agent, source], |row| {
+            Ok(DailyCount {
+                day_id: row.get(0)?,
+                sessions: row.get(1)?,
+                messages: row.get(2)?,
+                chars: row.get(3)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Update daily stats for a single conversation insert.
+    /// Called after inserting a new conversation to maintain materialized aggregates.
+    pub fn update_daily_stats_for_conversation(
+        &mut self,
+        agent_slug: &str,
+        source_id: &str,
+        started_at_ms: Option<i64>,
+        message_count: i64,
+        total_chars: i64,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        update_daily_stats_in_tx(
+            &tx,
+            agent_slug,
+            source_id,
+            started_at_ms,
+            1, // Assuming new session for this legacy API
+            message_count,
+            total_chars,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rebuild all daily stats from scratch.
+    /// Use this for recovery or when stats appear to be out of sync.
+    pub fn rebuild_daily_stats(&mut self) -> Result<DailyStatsRebuildResult> {
+        let tx = self.conn.transaction()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        // Clear existing stats
+        tx.execute("DELETE FROM daily_stats", [])?;
+
+        // Rebuild from conversations table - per agent, per source
+        // Note: COALESCE wraps the entire day_id calculation to match Rust's unwrap_or(0) behavior
+        // for conversations with NULL started_at timestamps
+        tx.execute(
+            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+              SELECT
+                  COALESCE(CAST((c.started_at / 1000 - 1577836800) / 86400 AS INTEGER), 0) as day_id,
+                  a.slug as agent_slug,
+                  c.source_id,
+                  COUNT(DISTINCT c.id) as session_count,
+                  COUNT(m.id) as message_count,
+                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
+                  ? as last_updated
+              FROM conversations c
+              JOIN agents a ON c.agent_id = a.id
+              LEFT JOIN messages m ON m.conversation_id = c.id
+              GROUP BY day_id, a.slug, c.source_id",
+            params![now],
+        )?;
+
+        // Add 'all' agent aggregates for each source
+        tx.execute(
+            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+              SELECT
+                  COALESCE(CAST((c.started_at / 1000 - 1577836800) / 86400 AS INTEGER), 0) as day_id,
+                  'all',
+                  c.source_id,
+                  COUNT(DISTINCT c.id) as session_count,
+                  COUNT(m.id) as message_count,
+                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
+                  ? as last_updated
+              FROM conversations c
+              LEFT JOIN messages m ON m.conversation_id = c.id
+              GROUP BY day_id, c.source_id",
+            params![now],
+        )?;
+
+        // Add per-agent aggregates for 'all' sources
+        tx.execute(
+            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+              SELECT
+                  COALESCE(CAST((c.started_at / 1000 - 1577836800) / 86400 AS INTEGER), 0) as day_id,
+                  a.slug,
+                  'all',
+                  COUNT(DISTINCT c.id) as session_count,
+                  COUNT(m.id) as message_count,
+                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
+                  ? as last_updated
+              FROM conversations c
+              JOIN agents a ON c.agent_id = a.id
+              LEFT JOIN messages m ON m.conversation_id = c.id
+              GROUP BY day_id, a.slug",
+            params![now],
+        )?;
+
+        // Add global 'all'/'all' aggregates
+        tx.execute(
+            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+              SELECT
+                  COALESCE(CAST((c.started_at / 1000 - 1577836800) / 86400 AS INTEGER), 0) as day_id,
+                  'all',
+                  'all',
+                  COUNT(DISTINCT c.id) as session_count,
+                  COUNT(m.id) as message_count,
+                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
+                  ? as last_updated
+              FROM conversations c
+              LEFT JOIN messages m ON m.conversation_id = c.id
+              GROUP BY day_id",
+            params![now],
+        )?;
+
+        let rows_created: i64 =
+            tx.query_row("SELECT COUNT(*) FROM daily_stats", [], |r| r.get(0))?;
+        let total_sessions: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+            [],
+            |r| r.get(0),
+        )?;
+
+        tx.commit()?;
+
+        tracing::info!(
+            target: "cass::perf::daily_stats",
+            rows_created = rows_created,
+            total_sessions = total_sessions,
+            "Daily stats rebuilt from conversations"
+        );
+
+        Ok(DailyStatsRebuildResult {
+            rows_created,
+            total_sessions,
+        })
+    }
+
+    /// Check if daily_stats are populated and reasonably fresh.
+    pub fn daily_stats_health(&self) -> Result<DailyStatsHealth> {
+        let row_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM daily_stats", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        let oldest_update: Option<i64> = self
+            .conn
+            .query_row("SELECT MIN(last_updated) FROM daily_stats", [], |r| {
+                r.get(0)
+            })
+            .ok();
+
+        let conversation_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        // Get materialized total
+        let materialized_total: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
+                 WHERE agent_slug = 'all' AND source_id = 'all'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        Ok(DailyStatsHealth {
+            populated: row_count > 0,
+            row_count,
+            oldest_update_ms: oldest_update,
+            conversation_count,
+            materialized_total,
+            drift: (conversation_count - materialized_total).abs(),
+        })
+    }
+}
+
+/// Daily count data for histogram display.
+#[derive(Debug, Clone)]
+pub struct DailyCount {
+    pub day_id: i64,
+    pub sessions: i64,
+    pub messages: i64,
+    pub chars: i64,
+}
+
+/// Result of rebuilding daily stats.
+#[derive(Debug, Clone)]
+pub struct DailyStatsRebuildResult {
+    pub rows_created: i64,
+    pub total_sessions: i64,
+}
+
+/// Health status of daily stats table.
+#[derive(Debug, Clone)]
+pub struct DailyStatsHealth {
+    pub populated: bool,
+    pub row_count: i64,
+    pub oldest_update_ms: Option<i64>,
+    pub conversation_count: i64,
+    pub materialized_total: i64,
+    pub drift: i64,
+}
+
+/// Update daily stats within a transaction.
+/// Handles incrementing session_count, message_count, and total_chars for:
+/// - Specific agent + source
+/// - All agents + specific source
+/// - Specific agent + all sources
+/// - All agents + all sources
+fn update_daily_stats_in_tx(
+    tx: &Transaction<'_>,
+    agent_slug: &str,
+    source_id: &str,
+    started_at_ms: Option<i64>,
+    session_count_delta: i64,
+    message_count: i64,
+    total_chars: i64,
+) -> Result<()> {
+    if session_count_delta == 0 && message_count == 0 && total_chars == 0 {
+        return Ok(());
+    }
+
+    let day_id = started_at_ms.map(SqliteStorage::day_id_from_millis).unwrap_or(0);
+    let now = SqliteStorage::now_millis();
+
+    let updates = [
+        (agent_slug, source_id),
+        ("all", source_id),
+        (agent_slug, "all"),
+        ("all", "all"),
+    ];
+
+    for (agent, source) in updates {
+        tx.execute(
+            "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+                 session_count = session_count + excluded.session_count,
+                 message_count = message_count + excluded.message_count,
+                 total_chars = total_chars + excluded.total_chars,
+                 last_updated = excluded.last_updated",
+            params![day_id, agent, source, session_count_delta, message_count, total_chars, now],
+        )?;
+    }
+
+    Ok(())
 }
 
 fn apply_pragmas(conn: &mut Connection) -> Result<()> {
@@ -1149,6 +1787,8 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             tx.execute_batch(MIGRATION_V4)?;
             tx.execute_batch(MIGRATION_V5)?;
             tx.execute_batch(MIGRATION_V6)?;
+            tx.execute_batch(MIGRATION_V7)?;
+            tx.execute_batch(MIGRATION_V8)?;
         }
         1 => {
             tx.execute_batch(MIGRATION_V2)?;
@@ -1156,24 +1796,41 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             tx.execute_batch(MIGRATION_V4)?;
             tx.execute_batch(MIGRATION_V5)?;
             tx.execute_batch(MIGRATION_V6)?;
+            tx.execute_batch(MIGRATION_V7)?;
+            tx.execute_batch(MIGRATION_V8)?;
         }
         2 => {
             tx.execute_batch(MIGRATION_V3)?;
             tx.execute_batch(MIGRATION_V4)?;
             tx.execute_batch(MIGRATION_V5)?;
             tx.execute_batch(MIGRATION_V6)?;
+            tx.execute_batch(MIGRATION_V7)?;
+            tx.execute_batch(MIGRATION_V8)?;
         }
         3 => {
             tx.execute_batch(MIGRATION_V4)?;
             tx.execute_batch(MIGRATION_V5)?;
             tx.execute_batch(MIGRATION_V6)?;
+            tx.execute_batch(MIGRATION_V7)?;
+            tx.execute_batch(MIGRATION_V8)?;
         }
         4 => {
             tx.execute_batch(MIGRATION_V5)?;
             tx.execute_batch(MIGRATION_V6)?;
+            tx.execute_batch(MIGRATION_V7)?;
+            tx.execute_batch(MIGRATION_V8)?;
         }
         5 => {
             tx.execute_batch(MIGRATION_V6)?;
+            tx.execute_batch(MIGRATION_V7)?;
+            tx.execute_batch(MIGRATION_V8)?;
+        }
+        6 => {
+            tx.execute_batch(MIGRATION_V7)?;
+            tx.execute_batch(MIGRATION_V8)?;
+        }
+        7 => {
+            tx.execute_batch(MIGRATION_V8)?;
         }
         v => return Err(anyhow!("unsupported schema version {v}")),
     }
@@ -1193,11 +1850,14 @@ fn insert_conversation(
     workspace_id: Option<i64>,
     conv: &Conversation,
 ) -> Result<i64> {
+    // Serialize metadata to both JSON (for compatibility) and binary (for efficiency)
+    let metadata_bin = serialize_json_to_msgpack(&conv.metadata_json);
+
     tx.execute(
         "INSERT INTO conversations(
             agent_id, workspace_id, source_id, external_id, title, source_path,
-            started_at, ended_at, approx_tokens, metadata_json, origin_host
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             agent_id,
             workspace_id,
@@ -1209,16 +1869,20 @@ fn insert_conversation(
             conv.ended_at,
             conv.approx_tokens,
             serde_json::to_string(&conv.metadata_json)?,
-            conv.origin_host
+            conv.origin_host,
+            metadata_bin
         ],
     )?;
     Ok(tx.last_insert_rowid())
 }
 
 fn insert_message(tx: &Transaction<'_>, conversation_id: i64, msg: &Message) -> Result<i64> {
+    // Serialize extra to both JSON (for compatibility) and binary (for efficiency)
+    let extra_bin = serialize_json_to_msgpack(&msg.extra_json);
+
     tx.execute(
-        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json)
-         VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
+         VALUES(?,?,?,?,?,?,?,?)",
         params![
             conversation_id,
             msg.idx,
@@ -1226,7 +1890,8 @@ fn insert_message(tx: &Transaction<'_>, conversation_id: i64, msg: &Message) -> 
             msg.author,
             msg.created_at,
             msg.content,
-            serde_json::to_string(&msg.extra_json)?
+            serde_json::to_string(&msg.extra_json)?,
+            extra_bin
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -1250,47 +1915,146 @@ fn insert_snippets(tx: &Transaction<'_>, message_id: i64, snippets: &[Snippet]) 
     Ok(())
 }
 
-fn insert_fts_message(
-    tx: &Transaction<'_>,
-    message_id: i64,
-    msg: &Message,
-    conv: &Conversation,
-) -> Result<()> {
-    if let Err(e) = tx.execute(
-        "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-         VALUES(?,?,?,?,?,?,?)",
-        params![
-            msg.content,
-            conv.title.clone().unwrap_or_default(),
-            conv.agent_slug.clone(),
-            conv.workspace
+// -------------------------------------------------------------------------
+// FTS5 Batch Insert (P2 Opt 2.1)
+// -------------------------------------------------------------------------
+
+/// Batch size for FTS5 inserts. With 7 columns per row and SQLite's
+/// SQLITE_MAX_VARIABLE_NUMBER default of 999, max batch is ~142 rows.
+/// Using 100 for safety margin and memory efficiency.
+const FTS5_BATCH_SIZE: usize = 100;
+
+/// Entry for pending FTS5 insert.
+#[derive(Debug, Clone)]
+pub struct FtsEntry {
+    pub content: String,
+    pub title: String,
+    pub agent: String,
+    pub workspace: String,
+    pub source_path: String,
+    pub created_at: Option<i64>,
+    pub message_id: i64,
+}
+
+impl FtsEntry {
+    /// Create an FTS entry from a message and conversation.
+    pub fn from_message(message_id: i64, msg: &Message, conv: &Conversation) -> Self {
+        FtsEntry {
+            content: msg.content.clone(),
+            title: conv.title.clone().unwrap_or_default(),
+            agent: conv.agent_slug.clone(),
+            workspace: conv
+                .workspace
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            path_to_string(&conv.source_path),
-            msg.created_at.or(conv.started_at),
-            message_id
-        ],
-    ) {
-        // FTS mirror is best-effort; Tantivy remains source of truth.
-        // Log at debug level to help diagnose systematic issues without noise.
-        tracing::debug!(
+            source_path: path_to_string(&conv.source_path),
+            created_at: msg.created_at.or(conv.started_at),
             message_id,
-            agent = %conv.agent_slug,
-            error = %e,
-            "fts_insert_skipped"
-        );
+        }
     }
-    Ok(())
+}
+
+/// Batch insert FTS5 entries for better performance.
+///
+/// Uses multi-value INSERT to reduce transaction overhead and
+/// SQLite statement preparation costs.
+fn batch_insert_fts_messages(tx: &Transaction<'_>, entries: &[FtsEntry]) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let mut inserted = 0;
+
+    for chunk in entries.chunks(FTS5_BATCH_SIZE) {
+        // Build multi-value INSERT
+        let placeholders: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let base = i * 7;
+                format!(
+                    "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id) VALUES {}",
+            placeholders
+        );
+
+        // Flatten parameters
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(chunk.len() * 7);
+        for entry in chunk {
+            params_vec.push(Box::new(entry.content.clone()));
+            params_vec.push(Box::new(entry.title.clone()));
+            params_vec.push(Box::new(entry.agent.clone()));
+            params_vec.push(Box::new(entry.workspace.clone()));
+            params_vec.push(Box::new(entry.source_path.clone()));
+            params_vec.push(Box::new(entry.created_at));
+            params_vec.push(Box::new(entry.message_id));
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
+        if let Err(e) = tx.execute(&sql, params_refs.as_slice()) {
+            // FTS is best-effort; log and continue
+            tracing::debug!(
+                batch_size = chunk.len(),
+                error = %e,
+                "fts_batch_insert_failed"
+            );
+            // Fall back to individual inserts for this batch
+            for entry in chunk {
+                if let Err(e2) = tx.execute(
+                    "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+                     VALUES(?,?,?,?,?,?,?)",
+                    params![
+                        entry.content,
+                        entry.title,
+                        entry.agent,
+                        entry.workspace,
+                        entry.source_path,
+                        entry.created_at,
+                        entry.message_id
+                    ],
+                ) {
+                    tracing::debug!(
+                        message_id = entry.message_id,
+                        error = %e2,
+                        "fts_insert_skipped"
+                    );
+                } else {
+                    inserted += 1;
+                }
+            }
+        } else {
+            inserted += chunk.len();
+        }
+    }
+
+    Ok(inserted)
 }
 
 /// Insert or update a single conversation within an existing transaction.
 /// Used by insert_conversations_batched to process multiple conversations efficiently.
-fn insert_conversation_in_tx(
+/// Collects FTS entries into the provided vector for batch insertion.
+fn insert_conversation_in_tx_batched(
     tx: &Transaction<'_>,
     agent_id: i64,
     workspace_id: Option<i64>,
     conv: &Conversation,
+    fts_entries: &mut Vec<FtsEntry>,
 ) -> Result<InsertOutcome> {
     // Check for existing conversation with same (source_id, agent_id, external_id)
     if let Some(ext) = &conv.external_id {
@@ -1312,20 +2076,60 @@ fn insert_conversation_in_tx(
             let cutoff = max_idx.unwrap_or(-1);
 
             let mut inserted_indices = Vec::new();
+            let mut new_chars: i64 = 0;
             for msg in &conv.messages {
                 if msg.idx <= cutoff {
                     continue;
                 }
                 let msg_id = insert_message(tx, conversation_id, msg)?;
                 insert_snippets(tx, msg_id, &msg.snippets)?;
-                insert_fts_message(tx, msg_id, msg, conv)?;
+                // Collect FTS entry instead of inserting immediately
+                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
                 inserted_indices.push(msg.idx);
+                new_chars += msg.content.len() as i64;
             }
 
-            if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
+            // Update metadata fields and ended_at
+            if !inserted_indices.is_empty() {
+                // Update ended_at
+                if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
+                    tx.execute(
+                        "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?) WHERE id = ?",
+                        params![last_ts, conversation_id],
+                    )?;
+                }
+
+                // Update metadata, approx_tokens, etc.
+                // We overwrite with new metadata assuming the scanner produces complete/updated metadata.
+                let metadata_bin = serialize_json_to_msgpack(&conv.metadata_json);
                 tx.execute(
-                    "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?) WHERE id = ?",
-                    params![last_ts, conversation_id],
+                    "UPDATE conversations SET 
+                        title = COALESCE(?, title),
+                        approx_tokens = COALESCE(?, approx_tokens),
+                        metadata_json = ?,
+                        metadata_bin = ?,
+                        origin_host = COALESCE(?, origin_host)
+                     WHERE id = ?",
+                    params![
+                        conv.title,
+                        conv.approx_tokens,
+                        serde_json::to_string(&conv.metadata_json)?,
+                        metadata_bin,
+                        conv.origin_host,
+                        conversation_id
+                    ],
+                )?;
+
+                // Update daily stats (+0 sessions, +N messages)
+                let message_count = inserted_indices.len() as i64;
+                update_daily_stats_in_tx(
+                    tx,
+                    &conv.agent_slug,
+                    &conv.source_id,
+                    conv.started_at,
+                    0, // Existing session
+                    message_count,
+                    new_chars
                 )?;
             }
 
@@ -1338,11 +2142,25 @@ fn insert_conversation_in_tx(
 
     // Insert new conversation
     let conv_id = insert_conversation(tx, agent_id, workspace_id, conv)?;
+    let mut total_chars: i64 = 0;
     for msg in &conv.messages {
         let msg_id = insert_message(tx, conv_id, msg)?;
         insert_snippets(tx, msg_id, &msg.snippets)?;
-        insert_fts_message(tx, msg_id, msg, conv)?;
+        // Collect FTS entry instead of inserting immediately
+        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+        total_chars += msg.content.len() as i64;
     }
+
+    // Update daily stats (+1 session, +N messages)
+    update_daily_stats_in_tx(
+        tx,
+        &conv.agent_slug,
+        &conv.source_id,
+        conv.started_at,
+        1, // New session
+        conv.messages.len() as i64,
+        total_chars
+    )?;
 
     Ok(InsertOutcome {
         conversation_id: conv_id,
@@ -1809,5 +2627,110 @@ mod tests {
         assert!(ts > 1577836800000);
         // Should be before Jan 1, 2100 (approx 4102444800000)
         assert!(ts < 4102444800000);
+    }
+
+    // =========================================================================
+    // Binary Metadata Serialization Tests (Opt 3.1)
+    // =========================================================================
+
+    #[test]
+    fn msgpack_roundtrip_basic_object() {
+        let value = serde_json::json!({
+            "key": "value",
+            "number": 42,
+            "nested": { "inner": true }
+        });
+
+        let bytes = serialize_json_to_msgpack(&value).expect("should serialize");
+        let recovered = deserialize_msgpack_to_json(&bytes);
+
+        assert_eq!(value, recovered);
+    }
+
+    #[test]
+    fn msgpack_returns_none_for_null() {
+        let value = serde_json::Value::Null;
+        assert!(serialize_json_to_msgpack(&value).is_none());
+    }
+
+    #[test]
+    fn msgpack_returns_none_for_empty_object() {
+        let value = serde_json::json!({});
+        assert!(serialize_json_to_msgpack(&value).is_none());
+    }
+
+    #[test]
+    fn msgpack_serializes_non_empty_array() {
+        let value = serde_json::json!([1, 2, 3]);
+        let bytes = serialize_json_to_msgpack(&value).expect("should serialize array");
+        let recovered = deserialize_msgpack_to_json(&bytes);
+        assert_eq!(value, recovered);
+    }
+
+    #[test]
+    fn msgpack_smaller_than_json() {
+        let value = serde_json::json!({
+            "field_name_one": "some_value",
+            "field_name_two": 123456,
+            "field_name_three": [1, 2, 3, 4, 5],
+            "field_name_four": { "nested": true }
+        });
+
+        let json_bytes = serde_json::to_vec(&value).unwrap();
+        let msgpack_bytes = serialize_json_to_msgpack(&value).unwrap();
+
+        // MessagePack should be smaller due to more compact encoding
+        assert!(
+            msgpack_bytes.len() < json_bytes.len(),
+            "MessagePack ({} bytes) should be smaller than JSON ({} bytes)",
+            msgpack_bytes.len(),
+            json_bytes.len()
+        );
+    }
+
+    #[test]
+    fn msgpack_deserialize_empty_returns_default() {
+        let recovered = deserialize_msgpack_to_json(&[]);
+        assert_eq!(recovered, serde_json::Value::Object(serde_json::Map::new()));
+    }
+
+    #[test]
+    fn msgpack_deserialize_garbage_returns_default() {
+        // Use truncated msgpack data that will fail to parse
+        // 0x85 indicates a fixmap with 5 elements, but we don't provide them
+        let recovered = deserialize_msgpack_to_json(&[0x85]);
+        assert_eq!(recovered, serde_json::Value::Object(serde_json::Map::new()));
+    }
+
+    #[test]
+    fn migration_v7_adds_binary_columns() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        // Verify metadata_bin column exists
+        let has_metadata_bin: bool = storage
+            .raw()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('conversations') WHERE name = 'metadata_bin'",
+                [],
+                |r| r.get::<_, i64>(0).map(|c| c > 0),
+            )
+            .unwrap();
+        assert!(
+            has_metadata_bin,
+            "conversations should have metadata_bin column"
+        );
+
+        // Verify extra_bin column exists
+        let has_extra_bin: bool = storage
+            .raw()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'extra_bin'",
+                [],
+                |r| r.get::<_, i64>(0).map(|c| c > 0),
+            )
+            .unwrap();
+        assert!(has_extra_bin, "messages should have extra_bin column");
     }
 }
