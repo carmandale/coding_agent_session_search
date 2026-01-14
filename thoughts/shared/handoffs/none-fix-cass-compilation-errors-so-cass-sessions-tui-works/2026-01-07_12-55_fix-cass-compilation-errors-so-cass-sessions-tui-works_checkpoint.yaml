@@ -1,0 +1,90 @@
+---
+schema_version: 1.0.0
+mode: checkpoint
+date: 2026-01-07T12:55:00.000Z
+session: none-fix-cass-compilation-errors-so-cass-sessions-tui-works
+session_id: 03ab71e1
+primary_bead: none
+outcome: PARTIAL_PLUS
+---
+
+goal: Fix cass compilation errors so `cass sessions` TUI works
+now: "Diagnosed that `cass sessions` command exists but does nothing; Discovered installed binary is v0.1.35 but `sessions.rs` TUI was added AFTER that release; Found root cause: **Bad merge at `bc52629`** lost critical code including:; `pub mod sources;` declaration in `src/lib.rs`; `src/search/vector_index.rs` module reference (though file never existed); Multiple `--source` CLI arguments; `SourcesCommand` subcommand; Confirmed 624 sessions exist in DB for PfizerOutdoCancerV2 workspace"
+done_this_session:
+  - task: Diagnosed that `cass sessions` command exists but does nothing
+    files: []
+  - task: Discovered installed binary is v0.1.35 but `sessions.rs` TUI was added AFTER that release
+    files: []
+  - task: "Found root cause: **Bad merge at `bc52629`** lost critical code including:"
+    files: []
+  - task: "`pub mod sources;` declaration in `src/lib.rs`"
+    files: []
+  - task: "`src/search/vector_index.rs` module reference (though file never existed)"
+    files: []
+  - task: Multiple `--source` CLI arguments
+    files: []
+  - task: "`SourcesCommand` subcommand"
+    files: []
+  - task: Confirmed 624 sessions exist in DB for PfizerOutdoCancerV2 workspace
+    files: []
+next:
+  - Fix the bad merge - restore lost code from parent commit `0766143`
+  - Verify compilation passes with `cargo check`
+  - Build and install with `cargo install --path .`
+  - Test `cass sessions` TUI works
+blockers:
+  - Need to carefully restore `sources` module without losing new `sessions.rs` functionality
+  - "`vector_index.rs` was never created - was this intentional WIP or should it be removed from mod.rs?"
+decisions:
+  Decision: Reasoning
+  Restore from merge parent `0766143`: This commit has `pub mod sources;` and other code lost in the bad merge
+  Need to carefully merge, not just reset: The merge also brought in `sessions.rs` which we need to keep
+worked:
+  - Merge commit `bc52629` ("Merge swarm/opencode-connector-bwx into main") caused significant code loss
+  - The `sources` module provides provenance/filtering functionality used throughout codebase
+  - "`vector_index.rs` is declared in `mod.rs` but file doesn't exist even in parent - may be WIP"
+files:
+  modified:
+    - File
+    - src/lib.rs
+    - src/search/mod.rs
+    - src/connectors/mod.rs
+    - src/storage/sqlite.rs
+    - src/ui/tui.rs
+metadata:
+  migrated_from: 2026-01-07-1255.md
+  migration_timestamp: 2026-01-14T18:58:02.280Z
+  original_format: checkpoint
+  files_changed:
+    File: Change
+    src/lib.rs: Lost `pub mod sources;` and CLI args in bad merge
+    src/search/mod.rs: References `vector_index` module that doesn't exist
+    src/connectors/mod.rs: References `crate::sources::*` that's now missing
+    src/storage/sqlite.rs: References `crate::sources::provenance::*`
+    src/ui/tui.rs: Multiple references to `crate::sources::provenance::SourceFilter`
+  resume_prompt: |-
+    ---
+    Continue working on: Fix cass compilation errors so `cass sessions` TUI works
+
+    Context:
+    - Bad merge at `bc52629` lost the `sources` module declaration and other code
+    - Parent commit `0766143` has the correct `src/lib.rs` with `pub mod sources;`
+    - The `sources/` directory exists with files but isn't declared in lib.rs
+    - `vector_index.rs` is declared but doesn't exist (even in parent)
+
+    Current state:
+    - `cargo check` fails with ~24 errors
+    - Main issues: missing `sources` module, missing `vector_index` module
+    - Need to restore code from `0766143` while keeping `sessions.rs` additions
+
+    Next steps:
+    1. Add `pub mod sources;` back to `src/lib.rs`
+    2. Remove or comment out `pub mod vector_index;` from `src/search/mod.rs`
+    3. Restore lost CLI args (`--source`, `--by-source`, `SourcesCommand`)
+    4. Run `cargo check` to verify
+    5. `cargo install --path .` to install fixed version
+
+    Key decisions already made:
+    - Will restore from merge parent, not reset (need to preserve sessions.rs)
+    - The `sources` module is required - many files depend on it
+    ---
