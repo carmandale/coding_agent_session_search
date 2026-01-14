@@ -28,6 +28,7 @@ use chrono::Utc;
 use rand::{rngs::OsRng, RngCore};
 use std::path::Path;
 use tracing::info;
+use zeroize::Zeroize;
 
 /// Recovery secret entropy (256 bits = 32 bytes)
 const RECOVERY_SECRET_BYTES: usize = 32;
@@ -36,12 +37,22 @@ const RECOVERY_SECRET_BYTES: usize = 32;
 ///
 /// Contains high-entropy random bytes that can be used to derive
 /// a key encryption key (KEK) via HKDF-SHA256.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RecoverySecret {
     /// Raw secret bytes (zeroized on drop)
     bytes: Vec<u8>,
     /// Base64url-encoded secret (for QR code and text file)
     encoded: String,
+}
+
+impl std::fmt::Debug for RecoverySecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact sensitive data to prevent accidental logging
+        f.debug_struct("RecoverySecret")
+            .field("entropy_bits", &self.entropy_bits())
+            .field("encoded", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl RecoverySecret {
@@ -98,10 +109,15 @@ impl RecoverySecret {
 
 impl Drop for RecoverySecret {
     fn drop(&mut self) {
-        // Zeroize secret bytes
-        for byte in &mut self.bytes {
-            *byte = 0;
+        // Use zeroize crate for secure erasure (prevents compiler optimization)
+        self.bytes.zeroize();
+        // SAFETY: Zeroize encoded string by replacing with zeros then clearing
+        // This ensures the base64-encoded secret doesn't linger in memory
+        unsafe {
+            let encoded_bytes = self.encoded.as_bytes_mut();
+            encoded_bytes.zeroize();
         }
+        self.encoded.clear();
     }
 }
 
@@ -109,12 +125,26 @@ impl Drop for RecoverySecret {
 pub struct RecoveryArtifacts {
     /// The recovery secret
     pub secret: RecoverySecret,
-    /// Content for recovery-secret.txt
+    /// Content for recovery-secret.txt (contains secret, zeroized on drop)
     pub secret_text: String,
     /// PNG image bytes for qr-code.png
     pub qr_png: Vec<u8>,
     /// SVG markup for qr-code.svg
     pub qr_svg: String,
+}
+
+impl Drop for RecoveryArtifacts {
+    fn drop(&mut self) {
+        // Zeroize secret_text which contains the encoded secret
+        // SAFETY: Same as RecoverySecret::drop - zeroize string contents
+        unsafe {
+            let text_bytes = self.secret_text.as_bytes_mut();
+            text_bytes.zeroize();
+        }
+        self.secret_text.clear();
+        // Note: secret field has its own Drop impl that zeroizes it
+        // qr_png and qr_svg don't contain plaintext secret (encoded in QR)
+    }
 }
 
 impl RecoveryArtifacts {
