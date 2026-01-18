@@ -690,7 +690,7 @@ pub fn run_index(
             watch_roots.clone(),
             event_channel,
             move |paths, roots, is_rebuild| {
-                if is_rebuild {
+                let result = if is_rebuild {
                     if let Ok(mut g) = state.lock() {
                         g.clear();
                         let _ = save_watch_state(&opts_clone.data_dir, &g);
@@ -698,7 +698,7 @@ pub fn run_index(
                     // For rebuild, trigger reindex on all active roots
                     let all_root_paths: Vec<PathBuf> =
                         roots.iter().map(|(_, root)| root.path.clone()).collect();
-                    let _ = reindex_paths(
+                    reindex_paths(
                         &opts_clone,
                         all_root_paths,
                         roots,
@@ -706,9 +706,9 @@ pub fn run_index(
                         storage.clone(),
                         t_index.clone(),
                         true,
-                    );
+                    )
                 } else {
-                    let _ = reindex_paths(
+                    reindex_paths(
                         &opts_clone,
                         paths,
                         roots,
@@ -716,7 +716,18 @@ pub fn run_index(
                         storage.clone(),
                         t_index.clone(),
                         false,
-                    );
+                    )
+                };
+
+                // Log errors instead of silently discarding them
+                if let Err(e) = result {
+                    tracing::error!("watch reindex failed: {}", e);
+                    // Store error in progress for TUI visibility
+                    if let Some(p) = &opts_clone.progress
+                        && let Ok(mut guard) = p.last_error.lock()
+                    {
+                        *guard = Some(format!("reindex failed: {}", e));
+                    }
                 }
             },
         )?;
@@ -866,12 +877,17 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
 
     let debounce = Duration::from_secs(2);
     let max_wait = Duration::from_secs(5);
+    // Periodic heartbeat: even if FSEvents stops delivering, do a full scan periodically.
+    // This works around macOS FSEvents bugs (e.g., Dropbox folders, too many watchers).
+    let heartbeat_interval = Duration::from_secs(300); // 5 minutes
+    let mut last_heartbeat = std::time::Instant::now();
     let mut pending: Vec<PathBuf> = Vec::new();
     let mut first_event: Option<std::time::Instant> = None;
 
     loop {
         if pending.is_empty() {
-            match rx.recv() {
+            // Use timeout instead of blocking recv to support heartbeat
+            match rx.recv_timeout(heartbeat_interval) {
                 Ok(event) => match event {
                     IndexerEvent::Notify(paths) => {
                         pending.extend(paths);
@@ -880,10 +896,23 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
                     IndexerEvent::Command(cmd) => match cmd {
                         ReindexCommand::Full => {
                             callback(vec![], &roots, true);
+                            last_heartbeat = std::time::Instant::now();
                         }
                     },
                 },
-                Err(_) => break, // Channel closed
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // Heartbeat: do incremental scan of all roots even without events
+                    let now = std::time::Instant::now();
+                    if now.duration_since(last_heartbeat) >= heartbeat_interval {
+                        tracing::info!("heartbeat: triggering periodic incremental scan");
+                        let all_root_paths: Vec<PathBuf> =
+                            roots.iter().map(|(_, root)| root.path.clone()).collect();
+                        callback(all_root_paths, &roots, false);
+                        last_heartbeat = now;
+                    }
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break, // Channel closed
             }
         } else {
             let now = std::time::Instant::now();
@@ -958,6 +987,9 @@ fn reindex_paths(
     if triggers.is_empty() {
         return Ok(());
     }
+
+    // Track if we did any successful commits so we can update last_scan_ts
+    let mut did_commit = false;
 
     for (kind, root, ts) in triggers {
         let conn = kind.create_connector();
@@ -1035,6 +1067,7 @@ fn reindex_paths(
 
             // Commit to Tantivy immediately to ensure index consistency before advancing watch state.
             t_index.commit()?;
+            did_commit = true;
         }
 
         if let Some(ts_val) = ts {
@@ -1050,6 +1083,13 @@ fn reindex_paths(
     // Reset phase to idle if progress exists
     if let Some(p) = &opts.progress {
         p.phase.store(0, Ordering::Relaxed);
+    }
+
+    // Update last_scan_ts in SQLite so cass health reports correct freshness
+    if did_commit && let Ok(mut storage) = storage.lock() {
+        let _ = storage
+            .set_last_scan_ts(SqliteStorage::now_millis())
+            .inspect_err(|e| tracing::warn!("failed to update last_scan_ts: {}", e));
     }
 
     Ok(())

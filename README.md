@@ -2391,6 +2391,50 @@ Update check state is stored in the data directory:
 
 - **Reset TUI state**: Run `cass tui --reset-state` (or press `Ctrl+Shift+Del` in the TUI) to delete `tui_state.json` and restore defaults.
 
+- **Index lock error** (`LockFailure(LockBusy, ...)`): Another process holds the index lock. This typically happens when:
+  - The watcher daemon is running (expected behavior—use `cass health` instead of `cass index`)
+  - A previous process crashed leaving stale lock files
+  
+  **Quick diagnosis:**
+  ```bash
+  # Check status (always works, even with watcher running)
+  cass health --json
+  
+  # See if watcher is running
+  ps aux | grep 'cass index --watch'
+  ```
+  
+  **Full reset procedure (macOS with launchd):**
+  ```bash
+  # 1. Stop the watcher (prevents auto-restart)
+  launchctl unload ~/Library/LaunchAgents/com.cass.index-watch.plist
+  
+  # 2. Remove stale lock files
+  rm -f ~/Library/Application\ Support/com.coding-agent-search.coding-agent-search/index/v6/.tantivy-*.lock
+  
+  # 3. Run manual index
+  cass index
+  
+  # 4. Restart the watcher
+  launchctl load ~/Library/LaunchAgents/com.cass.index-watch.plist
+  ```
+  
+  **Linux (systemd):**
+  ```bash
+  systemctl --user stop cass-watcher
+  rm -f ~/.local/share/coding-agent-search/index/v6/.tantivy-*.lock
+  cass index
+  systemctl --user start cass-watcher
+  ```
+  
+  **Manual watcher (no service manager):**
+  ```bash
+  pkill -f 'cass index --watch'
+  rm -f <data-dir>/index/v6/.tantivy-*.lock
+  cass index
+  cass index --watch &
+  ```
+
 
 
 ## 🧪 Developer Workflow

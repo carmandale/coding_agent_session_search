@@ -1,0 +1,35 @@
+---
+schema_version: "1.0.0"
+mode: checkpoint
+date: 2026-01-18T07:56:00Z
+session: "cass-watcher-fix"
+outcome: "SUCCEEDED"
+---
+
+goal: "Fix cass watcher not updating index - index was showing 26+ hours stale despite watcher running"
+
+now: "All fixes deployed and verified working. Watcher now updates index reliably with 5-min heartbeat fallback."
+
+done_this_session:
+  - "Diagnosed watcher silently discarding errors via `let _ = reindex_paths(...)`"
+  - "Added error logging for reindex_paths failures"
+  - "Added 5-minute heartbeat timer to handle FSEvents failures on macOS"
+  - "Fixed missing `last_scan_ts` update in watch mode - watcher was committing to Tantivy but not updating SQLite meta table"
+  - "Verified fix with real file creation test and heartbeat timing test"
+  - "Fixed unrelated clippy lint (div_ceil)"
+
+findings:
+  - "macOS FSEvents is unreliable with Dropbox folders - produces `f2d_purge_events_for_device_up_to_event_id_rpc() failed: 5` errors"
+  - "Watcher was updating watch_state.json and SQLite but not calling storage.set_last_scan_ts()"
+  - "cass health reads last_indexed_at from SQLite meta table, not Tantivy"
+
+files:
+  - "src/indexer/mod.rs - error logging, heartbeat timer, last_scan_ts fix"
+  - "src/pages/key_management.rs - div_ceil clippy fix"
+  - "README.md - added index lock troubleshooting docs"
+
+test: "Created test files in pi-agent sessions dir, verified watcher detected and indexed them. Waited 5 min to verify heartbeat triggers periodic scan."
+
+git:
+  branch: "main"
+  status: "uncommitted changes in src/indexer/mod.rs, src/pages/key_management.rs"
