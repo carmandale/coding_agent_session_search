@@ -60,11 +60,12 @@ impl PiAgentConnector {
         if !sessions.exists() {
             return out;
         }
-        for entry in WalkDir::new(sessions).into_iter().flatten() {
+        for entry in WalkDir::new(sessions).follow_links(true).into_iter().flatten() {
             if entry.file_type().is_file() {
                 let name = entry.file_name().to_str().unwrap_or("");
                 // Pi-agent session files are named <timestamp>_<uuid>.jsonl
-                if name.ends_with(".jsonl") && name.contains('_') {
+                // Also accept plain <uuid>.jsonl for Clawdbot compatibility
+                if name.ends_with(".jsonl") {
                     out.push(entry.path().to_path_buf());
                 }
             }

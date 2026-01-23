@@ -1171,11 +1171,19 @@ impl SqliteStorage {
     }
 
     /// Set the timestamp of the last successful scan (milliseconds since epoch).
+    ///
+    /// This also triggers a WAL checkpoint to ensure durability - without this,
+    /// the timestamp could be lost if the process is killed before the WAL is
+    /// checkpointed (WAL mode with synchronous=NORMAL doesn't guarantee durability
+    /// on unclean shutdown).
     pub fn set_last_scan_ts(&mut self, ts: i64) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('last_scan_ts', ?)",
             params![ts.to_string()],
         )?;
+        // Checkpoint WAL to ensure durability - PASSIVE won't block readers/writers
+        // but ensures the timestamp survives process termination
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
         Ok(())
     }
 

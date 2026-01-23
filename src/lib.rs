@@ -2292,7 +2292,7 @@ fn state_meta_json(data_dir: &Path, db_path: &Path, stale_threshold: u64) -> ser
             .unwrap_or(0);
         last_indexed_at = conn
             .query_row(
-                "SELECT value FROM meta WHERE key = 'last_indexed_at'",
+                "SELECT value FROM meta WHERE key = 'last_scan_ts'",
                 [],
                 |r| r.get::<_, String>(0),
             )
@@ -4789,7 +4789,7 @@ fn run_status(
         // Get last indexed timestamp from meta table
         last_indexed_at = conn
             .query_row(
-                "SELECT value FROM meta WHERE key = 'last_indexed_at'",
+                "SELECT value FROM meta WHERE key = 'last_scan_ts'",
                 [],
                 |r| r.get::<_, String>(0),
             )
