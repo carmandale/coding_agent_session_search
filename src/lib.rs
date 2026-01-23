@@ -8942,11 +8942,13 @@ fn run_timeline(
 
     let mut sql = String::from(
         "SELECT c.id, a.slug as agent, c.title, c.started_at, c.ended_at, c.source_path,
-                COUNT(m.id) as message_count, c.source_id, c.origin_host, s.kind as origin_kind
+                COUNT(m.id) as message_count, c.source_id, c.origin_host, s.kind as origin_kind,
+                w.path as workspace
          FROM conversations c
          JOIN agents a ON c.agent_id = a.id
          LEFT JOIN sources s ON c.source_id = s.id
          LEFT JOIN messages m ON m.conversation_id = c.id
+         LEFT JOIN workspaces w ON c.workspace_id = w.id
          WHERE c.started_at >= ?1 AND c.started_at <= ?2",
     );
 
@@ -9008,6 +9010,7 @@ fn run_timeline(
                 row.get::<_, String>(7)?,         // source_id (P3.2)
                 row.get::<_, Option<String>>(8)?, // origin_host (P3.5)
                 row.get::<_, Option<String>>(9)?, // origin_kind (P3.5)
+                row.get::<_, Option<String>>(10)?, // workspace
             ))
         })
         .map_err(|e| CliError {
@@ -9028,6 +9031,7 @@ fn run_timeline(
         String,
         i64,
         String,
+        Option<String>,
         Option<String>,
         Option<String>,
     )> = Vec::new();
@@ -9052,6 +9056,7 @@ fn run_timeline(
                             source_id,
                             origin_host,
                             origin_kind,
+                            workspace,
                         )| {
                             let duration = ended.map(|e| e - started);
                             // Use "local" as default origin_kind if not in DB (backward compat)
@@ -9061,6 +9066,7 @@ fn run_timeline(
                                 "started_at": started, "ended_at": ended,
                                 "duration_seconds": duration, "source_path": path,
                                 "message_count": msg_count,
+                                "workspace": workspace,
                                 // Provenance fields (P3.5)
                                 "source_id": source_id,
                                 "origin_kind": kind,
@@ -9088,6 +9094,7 @@ fn run_timeline(
                     source_id,
                     origin_host,
                     origin_kind,
+                    workspace,
                 ) in &sessions
                 {
                     let dt = Utc
@@ -9105,6 +9112,7 @@ fn run_timeline(
                         "id": id, "agent": agent, "title": title,
                         "started_at": started, "ended_at": ended,
                         "source_path": path, "message_count": msg_count,
+                        "workspace": workspace,
                         // Provenance fields (P3.5)
                         "source_id": source_id,
                         "origin_kind": kind,
@@ -9157,6 +9165,7 @@ fn run_timeline(
             source_id,
             origin_host,
             _origin_kind,
+            _workspace,
         ) in &sessions
         {
             let dt = Utc
