@@ -2,7 +2,7 @@
 
 **Session:** 001-docsplans2026-01-23-fix-timeline-missing-workspace-planmd
 **Started:** 2026-01-23
-**Status:** In Progress
+**Status:** ✅ COMPLETE - All tasks verified and pushed
 
 ## Overview
 Add missing workspace field to `cass timeline` JSON output. The database stores workspace correctly but the timeline query doesn't JOIN the workspaces table, causing all output to show null.
@@ -88,4 +88,23 @@ All manual tests passed:
 - ✅ Existing tests pass (1145 tests passed, 1 pre-existing unrelated failure)
 - ✅ No performance regression (single additional LEFT JOIN)
 
-### READY FOR COMMIT
+### Git Commits (2026-01-23)
+
+All changes committed and pushed to origin:
+
+1. **6681a7f** - `fix: add workspace field to timeline JSON output`
+   - All 6 code changes in src/lib.rs
+   - SQL query, row extraction, tuple type, JSON output (both modes), non-JSON
+
+2. **83e1b5a** - `docs: add plan and session notes for timeline workspace fix`
+   - Design plan documentation
+   - Session scratchpad with implementation tracking
+   - Manual verification results
+
+3. **91b3209** - `chore: sync beads after repo ID migration`
+   - Updated repo ID from 2e0a2a0d to cc1c2b5a
+   - Synced beads state
+
+### ✅ SESSION COMPLETE
+
+All tasks completed, verified, committed, and pushed to origin/main.

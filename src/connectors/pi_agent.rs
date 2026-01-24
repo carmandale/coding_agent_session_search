@@ -529,16 +529,18 @@ mod tests {
     }
 
     #[test]
-    fn session_files_ignores_files_without_underscore() {
+    fn session_files_accepts_files_without_underscore() {
+        // Changed: Originally required underscore (timestamp_uuid.jsonl pattern)
+        // Now accepts any .jsonl for Clawdbot compatibility (plain uuid.jsonl)
         let dir = TempDir::new().unwrap();
         let sessions = dir.path().join("sessions");
         fs::create_dir_all(&sessions).unwrap();
 
-        // Missing underscore between timestamp and uuid
+        // Plain .jsonl without underscore - now accepted for Clawdbot
         fs::write(sessions.join("2025-12-01.jsonl"), "{}").unwrap();
 
         let files = PiAgentConnector::session_files(dir.path());
-        assert_eq!(files.len(), 0);
+        assert_eq!(files.len(), 1);
     }
 
     #[test]

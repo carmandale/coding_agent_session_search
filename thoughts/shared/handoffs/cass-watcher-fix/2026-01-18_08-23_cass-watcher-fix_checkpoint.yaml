@@ -1,0 +1,17 @@
+---
+schema_version: "1.0.0"
+mode: checkpoint
+date: 2026-01-18T08:23:30.090Z
+session: "cass-watcher-fix"
+outcome: "<TODO>"
+---
+
+goal: "<TODO>"
+now: "<TODO>"
+
+# Optional fields (YAML)
+# done_this_session:, next:, blockers:, questions:, decisions:, findings:, worked:, failed:, files:, test:, git:
+git:
+  branch: "main"
+  commit: "7d6015c11e19da27aaeb4faaa7bbefe61897c9bb"
+  remote: "https://github.com/carmandale/coding_agent_session_search.git"
