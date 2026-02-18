@@ -866,6 +866,13 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
         }
     })?;
 
+    // Startup banner for debugging - ensures logs aren't empty
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        roots_count = roots.len(),
+        "cass watcher starting"
+    );
+    
     // Watch all detected roots
     for (_, root) in &roots {
         if let Err(e) = watcher.watch(&root.path, RecursiveMode::Recursive) {
@@ -881,6 +888,11 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
     // This works around macOS FSEvents bugs (e.g., Dropbox folders, too many watchers).
     let heartbeat_interval = Duration::from_secs(300); // 5 minutes
     let mut last_heartbeat = std::time::Instant::now();
+    // Full scan interval: bypass timestamps entirely to catch any missed sessions.
+    // This is the nuclear option for when incremental scans miss files due to
+    // FSEvents bugs, timestamp drift, or other edge cases.
+    let full_scan_interval = Duration::from_secs(1800); // 30 minutes
+    let mut last_full_scan = std::time::Instant::now();
     let mut pending: Vec<PathBuf> = Vec::new();
     let mut first_event: Option<std::time::Instant> = None;
 
@@ -896,14 +908,25 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
                     IndexerEvent::Command(cmd) => match cmd {
                         ReindexCommand::Full => {
                             callback(vec![], &roots, true);
-                            last_heartbeat = std::time::Instant::now();
+                            let now = std::time::Instant::now();
+                            last_heartbeat = now;
+                            last_full_scan = now; // Reset full scan timer too
                         }
                     },
                 },
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     // Heartbeat: do incremental scan of all roots even without events
                     let now = std::time::Instant::now();
-                    if now.duration_since(last_heartbeat) >= heartbeat_interval {
+                    
+                    // Check if it's time for a full scan (ignores timestamps, catches everything)
+                    if now.duration_since(last_full_scan) >= full_scan_interval {
+                        tracing::info!("heartbeat: triggering periodic FULL scan (30 min interval)");
+                        let all_root_paths: Vec<PathBuf> =
+                            roots.iter().map(|(_, root)| root.path.clone()).collect();
+                        callback(all_root_paths, &roots, true); // force_full=true
+                        last_full_scan = now;
+                        last_heartbeat = now; // Also reset incremental timer
+                    } else if now.duration_since(last_heartbeat) >= heartbeat_interval {
                         tracing::info!("heartbeat: triggering periodic incremental scan");
                         let all_root_paths: Vec<PathBuf> =
                             roots.iter().map(|(_, root)| root.path.clone()).collect();
