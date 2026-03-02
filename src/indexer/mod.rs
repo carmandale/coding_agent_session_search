@@ -1014,7 +1014,7 @@ fn reindex_paths(
     // Track if we did any successful commits so we can update last_scan_ts
     let mut did_commit = false;
 
-    for (kind, root, ts) in triggers {
+    for (kind, root, _ts) in triggers {
         let conn = kind.create_connector();
         let detect = conn.detect();
         if !detect.detected && root.origin.source_id == "local" {
@@ -1029,6 +1029,12 @@ fn reindex_paths(
             p.phase.store(1, Ordering::Relaxed);
         }
 
+        // Capture scan-start time BEFORE scanning so the next cycle's since_ts
+        // covers the entire scan window. Using file mtime caused a race: files
+        // modified during the scan but with mtime before the saved watch state
+        // would be skipped on the next cycle.
+        let scan_start = SqliteStorage::now_millis();
+
         let since_ts = if force_full {
             None
         } else {
@@ -1038,7 +1044,6 @@ fn reindex_paths(
             guard
                 .get(&kind)
                 .copied()
-                .or_else(|| ts.map(|v| v.saturating_sub(1)))
                 .map(|v| v.saturating_sub(1))
         };
 
@@ -1077,28 +1082,51 @@ fn reindex_paths(
 
         tracing::info!(?kind, conversations = convs.len(), since_ts, "watch_scan");
 
-        // INGEST PHASE: Acquire locks briefly
-        {
-            let mut storage = storage
+        // INGEST PHASE: Acquire locks briefly.
+        // Only advance watch state on successful ingest+commit. If either fails
+        // (e.g. Tantivy LockBusy from another process), the watch state stays
+        // unchanged so these files will be retried on the next scan cycle.
+        let ingest_ok = {
+            let storage_lock = storage
                 .lock()
                 .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-            let mut t_index = t_index
+            let t_index_lock = t_index
                 .lock()
                 .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
+            let mut storage = storage_lock;
+            let mut t_index = t_index_lock;
 
-            ingest_batch(&mut storage, &mut t_index, &convs, &opts.progress, false)?;
+            match ingest_batch(&mut storage, &mut t_index, &convs, &opts.progress, false)
+                .and_then(|()| t_index.commit())
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        ?kind,
+                        error = %e,
+                        conversations = convs.len(),
+                        "ingest/commit failed, watch state NOT advanced — will retry next cycle"
+                    );
+                    if let Some(p) = &opts.progress
+                        && let Ok(mut guard) = p.last_error.lock()
+                    {
+                        *guard = Some(format!("ingest failed for {:?}: {}", kind, e));
+                    }
+                    false
+                }
+            }
+        };
 
-            // Commit to Tantivy immediately to ensure index consistency before advancing watch state.
-            t_index.commit()?;
+        if ingest_ok {
             did_commit = true;
-        }
-
-        if let Some(ts_val) = ts {
+            // Advance watch state to scan-start time (not file mtime) so the
+            // next incremental scan covers the full window including any files
+            // that were modified during this scan.
             let mut guard = state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-            let entry = guard.entry(kind).or_insert(ts_val);
-            *entry = (*entry).max(ts_val);
+            let entry = guard.entry(kind).or_insert(scan_start);
+            *entry = (*entry).max(scan_start);
             save_watch_state(&opts.data_dir, &guard)?;
         }
     }
