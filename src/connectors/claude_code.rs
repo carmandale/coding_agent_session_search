@@ -316,11 +316,34 @@ impl Connector for ClaudeCodeConnector {
 
             convs.push(NormalizedConversation {
                 agent_slug: "claude_code".into(),
-                external_id: entry
-                    .path()
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(std::string::ToString::to_string),
+                external_id: {
+                    // For subagent files, include the parent session UUID to avoid
+                    // dedup collisions when the same agent ID (filename) appears in
+                    // multiple session directories.
+                    let fname = entry
+                        .path()
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    let is_subagent = entry
+                        .path()
+                        .components()
+                        .any(|c| c.as_os_str().to_str().is_some_and(|s| s == "subagents"));
+                    if is_subagent {
+                        // Use session_uuid/subagents/filename as external_id
+                        // e.g. "3a27c9ab-.../subagents/agent-a0f386b.jsonl"
+                        entry
+                            .path()
+                            .parent() // subagents/
+                            .and_then(|p| p.parent()) // session-uuid/
+                            .and_then(|p| p.file_name())
+                            .and_then(|uuid| uuid.to_str())
+                            .map(|uuid| format!("{uuid}/subagents/{fname}"))
+                            .or_else(|| Some(fname.to_string()))
+                    } else {
+                        Some(fname.to_string())
+                    }
+                },
                 title,
                 workspace, // Now populated from cwd field!
                 source_path: entry.path().to_path_buf(),
@@ -1181,5 +1204,72 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 3);
+    }
+
+    // =========================================================================
+    // Subagent dedup tests
+    // =========================================================================
+
+    #[test]
+    fn subagent_external_id_includes_session_uuid() {
+        // Same agent filename under different session UUIDs should get distinct
+        // external_ids to avoid UNIQUE constraint collisions.
+        let dir = TempDir::new().unwrap();
+        let projects_dir = dir.path().join(".claude").join("projects");
+
+        let uuid_a = "aaaa-1111";
+        let uuid_b = "bbbb-2222";
+        let agent_file = "agent-abc123.jsonl";
+
+        for uuid in [uuid_a, uuid_b] {
+            let subdir = projects_dir.join(uuid).join("subagents");
+            fs::create_dir_all(&subdir).unwrap();
+            let content = format!(
+                r#"{{"type":"user","message":{{"role":"user","content":"from {uuid}"}}}}"#,
+            );
+            fs::write(subdir.join(agent_file), content).unwrap();
+        }
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(projects_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 2, "Both subagent files should be discovered");
+
+        let ids: Vec<_> = convs
+            .iter()
+            .map(|c| c.external_id.as_deref().unwrap())
+            .collect();
+        assert_ne!(ids[0], ids[1], "external_ids must differ");
+        assert!(
+            ids.iter().any(|id| id.contains(uuid_a)),
+            "One id should contain session UUID A"
+        );
+        assert!(
+            ids.iter().any(|id| id.contains(uuid_b)),
+            "One id should contain session UUID B"
+        );
+    }
+
+    #[test]
+    fn non_subagent_external_id_is_just_filename() {
+        // Regular (non-subagent) files should keep filename-only external_id.
+        let dir = TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        let session_file = claude_dir.join("my-session.jsonl");
+        let content = r#"{"type":"user","message":{"role":"user","content":"Test"}}"#;
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(
+            convs[0].external_id,
+            Some("my-session.jsonl".to_string()),
+            "Non-subagent files should use just the filename"
+        );
     }
 }
