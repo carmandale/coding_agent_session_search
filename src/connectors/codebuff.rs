@@ -177,6 +177,28 @@ impl Connector for CodebuffConnector {
 
         Ok(convs)
     }
+
+    fn count_disk_files(&self) -> Option<usize> {
+        let detection = self.detect();
+        if !detection.detected {
+            return Some(0);
+        }
+        let mut count = 0usize;
+        for root in &detection.root_paths {
+            // Count directories that contain chat-messages.json
+            for entry in WalkDir::new(root).into_iter().flatten() {
+                if entry.file_type().is_file()
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|n| n == "chat-messages.json")
+                {
+                    count += 1;
+                }
+            }
+        }
+        Some(count)
+    }
 }
 
 /// Extract messages from Codebuff chat-messages.json format.

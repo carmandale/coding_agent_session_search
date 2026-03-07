@@ -404,6 +404,18 @@ impl Connector for GeminiConnector {
 
         Ok(convs)
     }
+
+    fn count_disk_files(&self) -> Option<usize> {
+        let detection = self.detect();
+        if !detection.detected {
+            return Some(0);
+        }
+        let mut count = 0usize;
+        for root in &detection.root_paths {
+            count += Self::session_files(root).len();
+        }
+        Some(count)
+    }
 }
 
 #[cfg(test)]

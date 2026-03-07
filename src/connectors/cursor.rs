@@ -711,6 +711,19 @@ impl Connector for CursorConnector {
 
         Ok(all_convs)
     }
+
+    fn count_disk_files(&self) -> Option<usize> {
+        // Cursor uses SQLite databases where one DB file contains many conversations.
+        // Disk file count is not comparable to conversation count.
+        None
+    }
+
+    fn reconciliation_notes(&self) -> Option<String> {
+        Some(
+            "Cursor uses SQLite databases; file count is not comparable to conversation count"
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(test)]

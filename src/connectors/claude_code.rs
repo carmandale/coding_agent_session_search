@@ -370,6 +370,33 @@ impl Connector for ClaudeCodeConnector {
 
         Ok(convs)
     }
+
+    fn count_disk_files(&self) -> Option<usize> {
+        let detection = self.detect();
+        if !detection.detected {
+            return Some(0);
+        }
+        let mut count = 0usize;
+        for root in &detection.root_paths {
+            for entry in WalkDir::new(root).into_iter().flatten() {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let ext = entry.path().extension().and_then(|s| s.to_str());
+                if ext == Some("jsonl") || ext == Some("json") || ext == Some("claude") {
+                    count += 1;
+                }
+            }
+        }
+        Some(count)
+    }
+
+    fn reconciliation_notes(&self) -> Option<String> {
+        Some(
+            "Progress-only subagent files with no user/assistant content are intentionally skipped"
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(test)]

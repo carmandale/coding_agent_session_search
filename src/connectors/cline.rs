@@ -284,6 +284,35 @@ impl Connector for ClineConnector {
 
         Ok(convs)
     }
+
+    fn count_disk_files(&self) -> Option<usize> {
+        let detection = self.detect();
+        if !detection.detected {
+            return Some(0);
+        }
+        let mut count = 0usize;
+        for root in &detection.root_paths {
+            if !root.exists() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                // Count task dirs that contain ui_messages.json or api_conversation_history.json
+                if path.join("ui_messages.json").exists()
+                    || path.join("api_conversation_history.json").exists()
+                {
+                    count += 1;
+                }
+            }
+        }
+        Some(count)
+    }
 }
 
 #[cfg(test)]

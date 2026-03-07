@@ -263,6 +263,31 @@ impl Connector for OpenCodeConnector {
 
         Ok(convs)
     }
+
+    fn count_disk_files(&self) -> Option<usize> {
+        let detection = self.detect();
+        if !detection.detected {
+            return Some(0);
+        }
+        let mut count = 0usize;
+        for root in &detection.root_paths {
+            let session_dir = root.join("session");
+            if !session_dir.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&session_dir).into_iter().flatten() {
+                if entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext == "json")
+                {
+                    count += 1;
+                }
+            }
+        }
+        Some(count)
+    }
 }
 
 /// Check if a directory looks like OpenCode storage

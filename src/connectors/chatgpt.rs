@@ -563,6 +563,29 @@ impl Connector for ChatGptConnector {
 
         Ok(all_convs)
     }
+
+    fn count_disk_files(&self) -> Option<usize> {
+        let detection = self.detect();
+        if !detection.detected {
+            return Some(0);
+        }
+        let mut count = 0usize;
+        for root in &detection.root_paths {
+            let conv_dirs = Self::find_conversation_dirs(root);
+            for (dir_path, _is_encrypted) in conv_dirs {
+                for entry in WalkDir::new(&dir_path).max_depth(1).into_iter().flatten() {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let ext = entry.path().extension().and_then(|s| s.to_str());
+                    if ext == Some("json") || ext == Some("data") {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Some(count)
+    }
 }
 
 #[cfg(test)]

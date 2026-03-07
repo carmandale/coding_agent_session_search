@@ -161,6 +161,32 @@ impl Connector for FactoryConnector {
 
         Ok(convs)
     }
+
+    fn count_disk_files(&self) -> Option<usize> {
+        let detection = self.detect();
+        if !detection.detected {
+            return Some(0);
+        }
+        let mut count = 0usize;
+        for root in &detection.root_paths {
+            for entry in WalkDir::new(root).into_iter().flatten() {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                if entry.path().extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                    count += 1;
+                }
+            }
+        }
+        Some(count)
+    }
+
+    fn reconciliation_notes(&self) -> Option<String> {
+        Some(
+            "Some files contain only session_start with no messages — these are intentionally skipped"
+                .to_string(),
+        )
+    }
 }
 
 /// Check if a directory looks like Factory storage

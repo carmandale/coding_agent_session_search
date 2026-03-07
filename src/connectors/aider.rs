@@ -222,6 +222,15 @@ impl Connector for AiderConnector {
         }
         Ok(conversations)
     }
+
+    fn count_disk_files(&self) -> Option<usize> {
+        let detection = self.detect();
+        if !detection.detected {
+            return Some(0);
+        }
+        let root_refs: Vec<&Path> = detection.root_paths.iter().map(|r| r.as_path()).collect();
+        Some(Self::find_chat_files(&root_refs).len())
+    }
 }
 
 impl Default for AiderConnector {

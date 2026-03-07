@@ -410,6 +410,19 @@ pub struct NormalizedSnippet {
 pub trait Connector {
     fn detect(&self) -> DetectionResult;
     fn scan(&self, ctx: &ScanContext) -> anyhow::Result<Vec<NormalizedConversation>>;
+
+    /// Count session files on disk without parsing.
+    /// Used by `cass doctor` for disk-vs-DB reconciliation.
+    /// Must mirror the file-selection logic of `scan()`.
+    /// Returns `None` if disk-file counting is not meaningful for this connector
+    /// (e.g., Cursor uses SQLite where 1 file ≠ 1 conversation).
+    fn count_disk_files(&self) -> Option<usize>;
+
+    /// Optional contextual notes for reconciliation output.
+    /// E.g., "Some files contain only session_start with no messages"
+    fn reconciliation_notes(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Re-assign sequential indices to messages starting from 0.
