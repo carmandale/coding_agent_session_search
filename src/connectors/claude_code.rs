@@ -79,6 +79,7 @@ impl Connector for ClaudeCodeConnector {
 
         let mut convs = Vec::new();
         let mut file_count = 0;
+        let mut skip_count = 0u32;
         for entry in WalkDir::new(&root).into_iter().flatten() {
             if !entry.file_type().is_file() {
                 continue;
@@ -255,8 +256,21 @@ impl Connector for ClaudeCodeConnector {
                 super::reindex_messages(&mut messages);
             }
             if messages.is_empty() {
-                if file_count <= 3 {
-                    tracing::debug!(path = %entry.path().display(), "claude_code no messages extracted");
+                skip_count += 1;
+                if skip_count <= 10 {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        connector = "claude_code",
+                        reason = "no_parseable_messages",
+                        "skipping session file with no user/assistant content"
+                    );
+                } else {
+                    tracing::debug!(
+                        path = %entry.path().display(),
+                        connector = "claude_code",
+                        reason = "no_parseable_messages",
+                        "skipping session file with no user/assistant content"
+                    );
                 }
                 continue;
             }
@@ -319,6 +333,16 @@ impl Connector for ClaudeCodeConnector {
                 }),
                 messages,
             });
+        }
+
+        if skip_count > 0 {
+            tracing::info!(
+                connector = "claude_code",
+                skipped = skip_count,
+                indexed = convs.len(),
+                total_files = file_count,
+                "scan complete"
+            );
         }
 
         Ok(convs)

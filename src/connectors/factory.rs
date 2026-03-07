@@ -105,6 +105,7 @@ impl Connector for FactoryConnector {
         }
 
         let mut convs = Vec::new();
+        let mut skip_count = 0u32;
 
         for entry in WalkDir::new(&root).into_iter().flatten() {
             if !entry.file_type().is_file() {
@@ -124,11 +125,38 @@ impl Connector for FactoryConnector {
 
             match parse_factory_session(path) {
                 Ok(Some(conv)) => convs.push(conv),
-                Ok(None) => {}
+                Ok(None) => {
+                    skip_count += 1;
+                    if skip_count <= 10 {
+                        tracing::warn!(
+                            path = %path.display(),
+                            connector = "factory",
+                            reason = "no_parseable_messages",
+                            "skipping session file with no user/assistant content"
+                        );
+                    }
+                }
                 Err(e) => {
-                    tracing::debug!(path = %path.display(), error = %e, "factory parse error");
+                    skip_count += 1;
+                    if skip_count <= 10 {
+                        tracing::warn!(
+                            path = %path.display(),
+                            connector = "factory",
+                            reason = "parse_error",
+                            "skipping session file due to parse error: {e}"
+                        );
+                    }
                 }
             }
+        }
+
+        if skip_count > 0 {
+            tracing::info!(
+                connector = "factory",
+                skipped = skip_count,
+                indexed = convs.len(),
+                "scan complete"
+            );
         }
 
         Ok(convs)

@@ -227,18 +227,30 @@ impl Connector for GeminiConnector {
 
         let files = Self::session_files(&root);
         let mut convs = Vec::new();
+        let mut skip_count = 0u32;
 
-        for file in files {
+        for file in &files {
             // Skip files not modified since last scan (incremental indexing)
-            if !crate::connectors::file_modified_since(&file, ctx.since_ts) {
+            if !crate::connectors::file_modified_since(file, ctx.since_ts) {
                 continue;
             }
-            let content = fs::read_to_string(&file)
+            let content = fs::read_to_string(file)
                 .with_context(|| format!("read session {}", file.display()))?;
 
             let val: Value = match serde_json::from_str(&content) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    skip_count += 1;
+                    if skip_count <= 10 {
+                        tracing::warn!(
+                            path = %file.display(),
+                            connector = "gemini",
+                            reason = "invalid_json",
+                            "skipping session file with invalid JSON"
+                        );
+                    }
+                    continue;
+                }
             };
 
             // Extract session metadata
@@ -321,6 +333,15 @@ impl Connector for GeminiConnector {
             super::reindex_messages(&mut messages);
 
             if messages.is_empty() {
+                skip_count += 1;
+                if skip_count <= 10 {
+                    tracing::warn!(
+                        path = %file.display(),
+                        connector = "gemini",
+                        reason = "no_parseable_messages",
+                        "skipping session file with no user/assistant content"
+                    );
+                }
                 continue;
             }
 
@@ -369,6 +390,16 @@ impl Connector for GeminiConnector {
                 }),
                 messages,
             });
+        }
+
+        if skip_count > 0 {
+            tracing::info!(
+                connector = "gemini",
+                skipped = skip_count,
+                indexed = convs.len(),
+                total_files = files.len(),
+                "scan complete"
+            );
         }
 
         Ok(convs)
