@@ -50,6 +50,13 @@ impl Connector for ClaudeCodeConnector {
                 || path
                     .file_name()
                     .is_some_and(|n| n.to_str().unwrap_or("").contains("claude"))
+                // Handle the watcher path where root IS ~/.claude/projects:
+                // file_name() = "projects" doesn't contain "claude", but
+                // parent dir (~/.claude) does.
+                || path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .is_some_and(|n| n.to_str().unwrap_or("").contains("claude"))
         };
         let mut root = if ctx.use_default_detection() {
             if looks_like_root(&ctx.data_dir) {
@@ -902,6 +909,158 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.contains("Claude extension"));
     }
+
+    // =========================================================================
+    // Subagent session tests (spec 003 - index gaps)
+    // =========================================================================
+
+    #[test]
+    fn scan_discovers_subagent_sessions() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        let session_dir = claude_dir.join("parent-session-uuid");
+        let subagent_dir = session_dir.join("subagents");
+        fs::create_dir_all(&subagent_dir).unwrap();
+
+        // Parent session
+        let parent_file = claude_dir.join("parent-session-uuid.jsonl");
+        let parent_content = r#"{"type":"user","cwd":"/projects/myapp","sessionId":"sess-parent","message":{"role":"user","content":"Help me fix bugs"}}
+{"type":"assistant","message":{"role":"assistant","content":"I'll help you fix those bugs."}}"#;
+        fs::write(&parent_file, parent_content).unwrap();
+
+        // Standard subagent (has type fields on each line)
+        let subagent_file = subagent_dir.join("agent-a1234567890abcdef.jsonl");
+        let subagent_content = r#"{"type":"user","cwd":"/projects/myapp","sessionId":"sess-sub1","agentId":"a1234567890abcdef","message":{"role":"user","content":"Run the tests"}}
+{"type":"assistant","sessionId":"sess-sub1","message":{"role":"assistant","content":"Running tests now...","model":"claude-3-opus"}}
+{"type":"progress","message":"Running cargo test"}
+{"type":"user","message":{"role":"user","content":"What were the results?"}}
+{"type":"assistant","message":{"role":"assistant","content":"All 42 tests passed."}}"#;
+        fs::write(&subagent_file, subagent_content).unwrap();
+
+        // Compact subagent (2 lines, also has type fields)
+        let compact_file = subagent_dir.join("agent-acompact-abcdef1234.jsonl");
+        let compact_content = r#"{"type":"user","slug":"test-slug","agentId":"acompact-abcdef1234","sessionId":"sess-compact","cwd":"/projects/myapp","message":{"role":"user","content":"Summarize the changes"}}
+{"type":"assistant","slug":"test-slug","agentId":"acompact-abcdef1234","sessionId":"sess-compact","message":{"role":"assistant","model":"claude-3-opus","content":"Here is a summary of the changes."}}"#;
+        fs::write(&compact_file, compact_content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        // Should find all 3 files: parent + standard subagent + compact subagent
+        assert_eq!(
+            convs.len(),
+            3,
+            "Expected 3 conversations (parent + 2 subagents), got {}. Paths: {:?}",
+            convs.len(),
+            convs
+                .iter()
+                .map(|c| c.source_path.display().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        // Verify subagent files have messages
+        let subagent_convs: Vec<_> = convs
+            .iter()
+            .filter(|c| c.source_path.to_string_lossy().contains("subagents"))
+            .collect();
+        assert_eq!(subagent_convs.len(), 2, "Expected 2 subagent conversations");
+
+        // Standard subagent should have 4 messages (2 user + 2 assistant, progress filtered)
+        let standard = subagent_convs
+            .iter()
+            .find(|c| {
+                c.source_path
+                    .to_string_lossy()
+                    .contains("agent-a1234567890abcdef")
+            })
+            .expect("Standard subagent not found");
+        assert_eq!(
+            standard.messages.len(),
+            4,
+            "Standard subagent should have 4 user/assistant messages"
+        );
+
+        // Compact subagent should have 2 messages (1 user + 1 assistant)
+        let compact = subagent_convs
+            .iter()
+            .find(|c| c.source_path.to_string_lossy().contains("agent-acompact"))
+            .expect("Compact subagent not found");
+        assert_eq!(
+            compact.messages.len(),
+            2,
+            "Compact subagent should have 2 messages"
+        );
+    }
+
+    #[test]
+    fn scan_via_with_roots_finds_claude_projects() {
+        // Regression test: the watcher uses ScanContext::with_roots() which sets
+        // use_default_detection()=false. The looks_like_root check must still
+        // recognize the actual Claude projects root (e.g., ~/.claude/projects).
+        let dir = TempDir::new().unwrap();
+        // Simulate the actual Claude structure: ~/.claude/projects
+        let claude_dir = dir.path().join(".claude");
+        let projects_dir = claude_dir.join("projects");
+        fs::create_dir_all(&projects_dir).unwrap();
+
+        let session_file = projects_dir.join("session.jsonl");
+        let content =
+            r#"{"type":"user","message":{"role":"user","content":"Test from watcher path"}}"#;
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+
+        // Simulate watcher path: ScanContext::with_roots where data_dir = ~/.claude/projects
+        // This is exactly what build_watch_roots produces from detect().root_paths
+        let ctx = ScanContext::with_roots(
+            projects_dir.clone(),
+            vec![crate::connectors::ScanRoot::local(projects_dir.clone())],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+
+        // This should NOT return empty - the watcher needs to be able to scan
+        assert!(
+            !convs.is_empty(),
+            "Watcher path (with_roots) must find Claude sessions in the projects directory"
+        );
+    }
+
+    #[test]
+    fn looks_like_root_recognizes_projects_subdir() {
+        // The Claude root is ~/.claude/projects. The looks_like_root check must
+        // recognize this as a valid root even though:
+        // - path.join("projects") = ~/.claude/projects/projects → doesn't exist
+        // - file_name() = "projects" → doesn't contain "claude"
+        // It SHOULD work because parent dir contains "claude".
+        let dir = TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        let projects_dir = claude_dir.join("projects");
+        fs::create_dir_all(&projects_dir).unwrap();
+
+        let session_file = projects_dir.join("session.jsonl");
+        let content = r#"{"type":"user","message":{"role":"user","content":"Test"}}"#;
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::with_roots(
+            projects_dir.clone(),
+            vec![crate::connectors::ScanRoot::local(projects_dir.clone())],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(
+            convs.len(),
+            1,
+            "Should recognize .claude/projects as valid root"
+        );
+    }
+
+    // =========================================================================
+    // External ID tests
+    // =========================================================================
 
     #[test]
     fn scan_sets_external_id_from_filename() {
