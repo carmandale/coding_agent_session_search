@@ -1,3 +1,6 @@
+<!-- Codex Review: APPROVED after 4 rounds | model: gpt-5.3-codex | date: 2026-03-07 -->
+<!-- Status: REVISED -->
+<!-- Revisions: R1 threshold wording unified to warn-only diagnostic (was inconsistent warn/fail) -->
 ---
 title: "Add disk-vs-DB reconciliation check to cass doctor"
 date: 2026-03-07
@@ -24,7 +27,7 @@ For each file-based connector, `cass doctor` must:
 1. Count the total session files on disk (using the connector's own root detection and file enumeration logic)
 2. Count the sessions in the DB for that agent
 3. Report the delta: `disk_files - db_entries`
-4. Flag as `warn` if delta > 0 (files on disk not in DB), `fail` if delta > threshold (configurable, default 10)
+4. Flag as `warn` if delta > 0 (files on disk not in DB). The threshold (configurable via `--reconciliation-threshold`, default 10) determines the severity label in human output but does NOT affect exit code in this PR — all reconciliation findings are diagnostic `warn` at most
 
 ### R2: JSON output with per-connector breakdown
 

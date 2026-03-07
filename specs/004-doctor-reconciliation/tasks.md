@@ -1,3 +1,6 @@
+<!-- Codex Review: APPROVED after 4 rounds | model: gpt-5.3-codex | date: 2026-03-07 -->
+<!-- Status: RECONCILED -->
+<!-- Revisions: Reconciled with Codex-approved plan: per-connector counting specification updated, test plan expanded, threshold/notes/cursor-skip tasks added -->
 ---
 title: "Tasks: cass doctor reconciliation"
 date: 2026-03-07
@@ -6,73 +9,111 @@ bead: coding_agent_session_search-2gxp
 
 # Tasks: Disk-vs-DB Reconciliation in `cass doctor`
 
-## Phase 1: Trait Extension
+## Phase 1: Trait Extension + Per-Connector Implementations
 
-- [ ] **1.1 Add `count_disk_files()` to `Connector` trait**
-  - Add default implementation in `src/connectors/mod.rs`
-  - Default walks `detect().root_paths` counting all files
-  - Add `file_extensions()` helper method returning `Option<&[&str]>` for filtering (default: None = all files)
-  - Write unit test: default impl counts files in temp dir
+- [ ] **1.1 Add `count_disk_files()` and `reconciliation_notes()` to `Connector` trait**
+  - `count_disk_files(&self) -> Option<usize>` — required method (no default body)
+  - `reconciliation_notes(&self) -> Option<String>` — default returns `None`
   - Files: `src/connectors/mod.rs`
 
-- [ ] **1.2 Override for Claude Code connector**
-  - Count `.jsonl` and `.json` files in detected roots
-  - Exclude `.settings.json` pattern
-  - Walk subdirectories (projects + subagents)
-  - Write test: counts match expected for fixture directory
+- [ ] **1.2 Claude Code `count_disk_files()`**
+  - Count files with `.jsonl`, `.json`, `.claude` extensions via `WalkDir` on detected roots
+  - Override `reconciliation_notes()`: "Progress-only subagent files with no user/assistant content are intentionally skipped"
+  - Test: temp dir with mixed extensions → correct count
   - Files: `src/connectors/claude_code.rs`
 
-- [ ] **1.3 Override for Gemini connector**
-  - Delegate to existing `session_files(root).len()`
-  - Write test: count matches `session_files` output
+- [ ] **1.3 Gemini `count_disk_files()`**
+  - Delegate to `Some(Self::session_files(root).len())`
+  - Test: temp dir with session.json in chats/ subdirs → correct count
   - Files: `src/connectors/gemini.rs`
 
-- [ ] **1.4 Override for Factory connector**
+- [ ] **1.4 Factory `count_disk_files()`**
   - Count `.jsonl` files, skip `.settings.json`
-  - Write test with fixture directory
+  - Override `reconciliation_notes()`: "Some files contain only session_start with no messages — these are intentionally skipped"
+  - Test: temp dir with .jsonl + .settings.json → only .jsonl counted
   - Files: `src/connectors/factory.rs`
 
-- [ ] **1.5 Override for Cursor connector**
-  - Count workspace SQLite DB files (Cursor uses SQLite, not JSONL)
-  - Write test with fixture directory
-  - Files: `src/connectors/cursor.rs`
+- [ ] **1.5 Codex `count_disk_files()`**
+  - Delegate to `Some(Self::rollout_files(root).len())` — matches `rollout-*.jsonl|json` in `sessions/`
+  - Test: temp dir with rollout-*.jsonl + other files → only rollouts counted
+  - Files: `src/connectors/codex.rs`
 
-- [ ] **1.6 Override for ChatGPT connector**
-  - Count `.json` conversation export files
-  - Write test with fixture directory
+- [ ] **1.6 Pi-Agent `count_disk_files()`**
+  - Delegate to `Some(Self::session_files(root).len())`
+  - Test: temp dir with timestamp_uuid.jsonl files → correct count
+  - Files: `src/connectors/pi_agent.rs`
+
+- [ ] **1.7 ChatGPT `count_disk_files()`**
+  - Count `.json` and `.data` extensions
+  - Test: temp dir with .json + .data + .txt → only json/data counted
   - Files: `src/connectors/chatgpt.rs`
 
-- [ ] **1.7 Verify default impl works for remaining connectors**
-  - Aider, Amp, Cline, Codebuff, Codex, OpenCode, Pi-Agent
-  - Write one representative test: default `count_disk_files()` on a connector with temp fixtures
-  - Files: `src/connectors/mod.rs` (test)
+- [ ] **1.8 Aider `count_disk_files()`**
+  - Count files named `.aider.chat.history.md` — bounded to CWD + env override, no recursive walk
+  - Test: temp dir with history file → count = 1 (or 0 if not present)
+  - Files: `src/connectors/aider.rs`
+
+- [ ] **1.9 Amp `count_disk_files()`**
+  - Count files passing `is_amp_log_file()` (thread/conversation/chat stems, T-{uuid}.json, any .json in threads/)
+  - Test: temp dir with matching + non-matching files → correct count
+  - Files: `src/connectors/amp.rs`
+
+- [ ] **1.10 Cline `count_disk_files()`**
+  - Count task directories containing `ui_messages.json` or `api_conversation_history.json`
+  - Test: temp dir with task dirs → count = number of dirs with messages
+  - Files: `src/connectors/cline.rs`
+
+- [ ] **1.11 Codebuff `count_disk_files()`**
+  - Count directories containing `chat-messages.json`
+  - Test: temp dir with workspace dirs → correct count
+  - Files: `src/connectors/codebuff.rs`
+
+- [ ] **1.12 OpenCode `count_disk_files()`**
+  - Count `session/{projectID}/{sessionID}.json` files in session/ subdir
+  - Test: temp dir with session structure → correct count
+  - Files: `src/connectors/opencode.rs`
+
+- [ ] **1.13 Cursor `count_disk_files()`**
+  - Return `None` (non-comparable: SQLite DB ≠ conversation count)
+  - Override `reconciliation_notes()`: "Cursor uses SQLite databases; file count is not comparable to conversation count"
+  - Test: verify `count_disk_files()` returns `None`
+  - Files: `src/connectors/cursor.rs`
 
 ## Phase 2: Doctor Integration
 
-- [ ] **2.1 Add `db_count_for_agent()` helper**
+- [ ] **2.1 Add `--reconciliation-threshold` CLI arg**
+  - Add to `Doctor` variant in `Commands` enum, default 10
+  - Thread through to `run_doctor()`
+  - Files: `src/lib.rs`
+
+- [ ] **2.2 Add `db_count_for_agent()` helper**
   - Query `SELECT COUNT(*) FROM conversations c JOIN agents a ON c.agent_id = a.id WHERE a.slug = ?1`
   - Handle missing agent gracefully (return 0)
-  - Write unit test with in-memory DB
+  - Handle DB errors gracefully (return 0 + note)
+  - Test: in-memory DB with known counts → correct results
   - Files: `src/lib.rs`
 
-- [ ] **2.2 Add reconciliation check to `run_doctor()`**
-  - Instantiate all 12 connectors
-  - Call `count_disk_files()` + `db_count_for_agent()` for each
-  - Compute delta and status: `pass` (delta=0), `warn` (delta 1-10), `fail` (delta >10)
-  - Skip reconciliation if DB is not OK (`db_ok == false`)
-  - Add timing measurement for the reconciliation block
+- [ ] **2.3 Add reconciliation check to `run_doctor()`**
+  - Reuse `indexer::get_connector_factories()` — no hardcoded connector list
+  - Slug mapping: `"claude" → "claude_code"`, all others identity
+  - Read-only SQLite connection for DB queries
+  - Only run if `db_ok == true`
+  - Compute signed `i64` delta for each connector
+  - Status: `"pass"` (delta=0), `"warn"` (delta≠0), `"skip"` (cursor/non-comparable)
+  - Add `above_threshold: true` flag when delta > threshold
+  - Measure elapsed_ms for the reconciliation block
   - Files: `src/lib.rs`
 
-- [ ] **2.3 JSON output integration**
+- [ ] **2.4 JSON output integration**
   - Add `reconciliation` object to existing JSON payload
-  - Structure: `{ balanced: bool, elapsed_ms: u64, connectors: [{ agent, disk_files, db_entries, delta, status }] }`
+  - Schema: `{ balanced: bool, elapsed_ms: u64, threshold: u64, connectors: [{ agent, disk_files, db_entries, delta, status, above_threshold?, notes? }] }`
   - Only include connectors where `detect()` returned true (skip uninstalled agents)
   - Files: `src/lib.rs`
 
-- [ ] **2.4 Human-readable output**
-  - Add reconciliation to the check list using existing `Check` pattern
-  - Summary line: "All N connectors balanced" or "M connectors have gaps"
-  - Detail lines: per-connector breakdown only when status is `warn` or `fail`
+- [ ] **2.5 Human-readable output**
+  - Add reconciliation to check list using existing `Check` pattern
+  - Summary: "N connectors balanced, M skipped" or "N connectors have gaps, M skipped"
+  - Detail lines: per-connector breakdown with delta and notes, only for warn/skip
   - Files: `src/lib.rs`
 
 ## Phase 3: Verification
@@ -84,15 +125,14 @@ bead: coding_agent_session_search-2gxp
 
 - [ ] **3.2 Full test suite**
   - `cargo test`
-  - All new tests from Phase 1 + 2 pass
-  - No regressions in existing tests
+  - All new per-connector tests pass
+  - No regressions in existing 1151+ tests
 
-- [ ] **3.3 Integration test**
-  - Run `cass doctor --json` and verify `reconciliation` key exists
-  - Run `cass doctor --verbose` and verify reconciliation line appears
-  - Files: manual verification or integration test
+- [ ] **3.3 Integration verification**
+  - `cass doctor --json` → verify `reconciliation` key exists with expected schema
+  - `cass doctor --verbose` → verify reconciliation line appears in human output
+  - `cass doctor --json --reconciliation-threshold 0` → verify `above_threshold: true` on any connector with delta > 0
 
 - [ ] **3.4 Performance validation**
-  - `cass doctor --json` completes in <10s total (existing checks + reconciliation)
-  - Reconciliation block alone completes in <5s
-  - Files: check `elapsed_ms` in JSON output
+  - `cass doctor --json` completes in <10s total
+  - Reconciliation `elapsed_ms` in JSON output < 5000
