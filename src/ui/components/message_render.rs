@@ -151,7 +151,11 @@ pub fn render_inline_markdown_line(
 
 /// Parse message content and render with beautiful formatting.
 /// Handles code blocks, tool calls, JSON, and highlights search terms.
-pub fn parse_message_content(content: &str, query: &str, palette: ThemePalette) -> Vec<Line<'static>> {
+pub fn parse_message_content(
+    content: &str,
+    query: &str,
+    palette: ThemePalette,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut in_code_block = false;
     let mut code_lang: Option<String> = None;

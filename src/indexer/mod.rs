@@ -13,9 +13,9 @@ use notify::{RecursiveMode, Watcher, recommended_watcher};
 use crate::connectors::NormalizedConversation;
 use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
-    claude_code::ClaudeCodeConnector, cline::ClineConnector, codebuff::CodebuffConnector, codex::CodexConnector,
-    cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
-    opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
+    claude_code::ClaudeCodeConnector, cline::ClineConnector, codebuff::CodebuffConnector,
+    codex::CodexConnector, cursor::CursorConnector, factory::FactoryConnector,
+    gemini::GeminiConnector, opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
 };
 use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
 use crate::sources::config::{Platform, SourcesConfig};
@@ -872,7 +872,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
         roots_count = roots.len(),
         "cass watcher starting"
     );
-    
+
     // Watch all detected roots
     for (_, root) in &roots {
         if let Err(e) = watcher.watch(&root.path, RecursiveMode::Recursive) {
@@ -917,10 +917,12 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     // Heartbeat: do incremental scan of all roots even without events
                     let now = std::time::Instant::now();
-                    
+
                     // Check if it's time for a full scan (ignores timestamps, catches everything)
                     if now.duration_since(last_full_scan) >= full_scan_interval {
-                        tracing::info!("heartbeat: triggering periodic FULL scan (30 min interval)");
+                        tracing::info!(
+                            "heartbeat: triggering periodic FULL scan (30 min interval)"
+                        );
                         let all_root_paths: Vec<PathBuf> =
                             roots.iter().map(|(_, root)| root.path.clone()).collect();
                         callback(all_root_paths, &roots, true); // force_full=true
@@ -1041,10 +1043,7 @@ fn reindex_paths(
             let guard = state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-            guard
-                .get(&kind)
-                .copied()
-                .map(|v| v.saturating_sub(1))
+            guard.get(&kind).copied().map(|v| v.saturating_sub(1))
         };
 
         // Use explicit root context

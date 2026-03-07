@@ -59,7 +59,11 @@ struct SessionsState {
 }
 
 impl SessionsState {
-    fn new(sessions: Vec<SessionInfo>, current_workspace: Option<PathBuf>, db_path: PathBuf) -> Self {
+    fn new(
+        sessions: Vec<SessionInfo>,
+        current_workspace: Option<PathBuf>,
+        db_path: PathBuf,
+    ) -> Self {
         let sessions_by_agent = Self::group_and_sort_sessions(&sessions);
 
         let mut state = ListState::default();
@@ -119,8 +123,8 @@ impl SessionsState {
                     let agent_match = s.agent_slug.to_lowercase().contains(&query);
                     let date_match = s
                         .started_at
-                    .and_then(|ts| DateTime::<Utc>::from_timestamp(ts / 1000, 0))
-                    .map(|dt| dt.format("%Y-%m-%d").to_string().contains(&query))
+                        .and_then(|ts| DateTime::<Utc>::from_timestamp(ts / 1000, 0))
+                        .map(|dt| dt.format("%Y-%m-%d").to_string().contains(&query))
                         .unwrap_or(false);
                     title_match || agent_match || date_match
                 })
@@ -228,8 +232,11 @@ impl SessionsState {
 
     fn refresh_sessions(&mut self) -> Result<()> {
         let storage = SqliteStorage::open(&self.db_path)?;
-        let conversations_with_counts =
-            storage.list_conversations_for_workspace(self.current_workspace.as_deref(), 10000, 0)?;
+        let conversations_with_counts = storage.list_conversations_for_workspace(
+            self.current_workspace.as_deref(),
+            10000,
+            0,
+        )?;
 
         self.all_sessions = conversations_with_counts
             .into_iter()
@@ -304,10 +311,16 @@ pub fn run_sessions_tui(workspace: Option<&Path>, _data_dir: &Path, db_path: &Pa
                         state.scroll_detail(-1, content_height.saturating_mul(10));
                     }
                     (KeyCode::PageDown, _) | (KeyCode::Char(' '), _) => {
-                        state.scroll_detail(content_height as i16, content_height.saturating_mul(10));
+                        state.scroll_detail(
+                            content_height as i16,
+                            content_height.saturating_mul(10),
+                        );
                     }
                     (KeyCode::PageUp, _) => {
-                        state.scroll_detail(-(content_height as i16), content_height.saturating_mul(10));
+                        state.scroll_detail(
+                            -(content_height as i16),
+                            content_height.saturating_mul(10),
+                        );
                     }
                     (KeyCode::Home, _) | (KeyCode::Char('g'), _) => {
                         state.detail_scroll = 0;

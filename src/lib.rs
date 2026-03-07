@@ -9000,16 +9000,16 @@ fn run_timeline(
     let rows = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok((
-                row.get::<_, i64>(0)?,            // id
-                row.get::<_, String>(1)?,         // agent
-                row.get::<_, Option<String>>(2)?, // title
-                row.get::<_, i64>(3)?,            // started_at
-                row.get::<_, Option<i64>>(4)?,    // ended_at
-                row.get::<_, String>(5)?,         // source_path
-                row.get::<_, i64>(6)?,            // message_count
-                row.get::<_, String>(7)?,         // source_id (P3.2)
-                row.get::<_, Option<String>>(8)?, // origin_host (P3.5)
-                row.get::<_, Option<String>>(9)?, // origin_kind (P3.5)
+                row.get::<_, i64>(0)?,             // id
+                row.get::<_, String>(1)?,          // agent
+                row.get::<_, Option<String>>(2)?,  // title
+                row.get::<_, i64>(3)?,             // started_at
+                row.get::<_, Option<i64>>(4)?,     // ended_at
+                row.get::<_, String>(5)?,          // source_path
+                row.get::<_, i64>(6)?,             // message_count
+                row.get::<_, String>(7)?,          // source_id (P3.2)
+                row.get::<_, Option<String>>(8)?,  // origin_host (P3.5)
+                row.get::<_, Option<String>>(9)?,  // origin_kind (P3.5)
                 row.get::<_, Option<String>>(10)?, // workspace
             ))
         })
