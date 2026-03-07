@@ -364,6 +364,11 @@ pub enum Commands {
         /// Force index rebuild even if index appears healthy
         #[arg(long)]
         force_rebuild: bool,
+        /// Threshold for reconciliation warnings (default: 10).
+        /// Deltas above this value are flagged with above_threshold in JSON output.
+        /// Reconciliation findings are diagnostic-only and do not affect exit code.
+        #[arg(long, default_value_t = 10)]
+        reconciliation_threshold: u64,
     },
     /// Find related sessions for a given source path
     Context {
@@ -2199,8 +2204,17 @@ async fn execute_cli(
                     fix,
                     verbose,
                     force_rebuild,
+                    reconciliation_threshold,
                 } => {
-                    run_doctor(&data_dir, cli.db.clone(), json, fix, verbose, force_rebuild)?;
+                    run_doctor(
+                        &data_dir,
+                        cli.db.clone(),
+                        json,
+                        fix,
+                        verbose,
+                        force_rebuild,
+                        reconciliation_threshold,
+                    )?;
                 }
                 Commands::Context {
                     path,
@@ -5412,6 +5426,7 @@ fn run_doctor(
     fix: bool,
     verbose: bool,
     force_rebuild: bool,
+    reconciliation_threshold: u64,
 ) -> CliResult<()> {
     use colored::*;
     use std::time::Instant;
@@ -5740,6 +5755,163 @@ fn run_doctor(
         );
     }
 
+    // 8. Per-connector disk-vs-DB reconciliation
+    //    Only run if DB is accessible (no point reconciling against a broken DB).
+    #[derive(serde::Serialize)]
+    struct ReconConnector {
+        agent: String,
+        disk_files: Option<usize>,
+        db_entries: usize,
+        delta: Option<i64>,
+        status: String, // "pass", "warn", "skip"
+        #[serde(skip_serializing_if = "Option::is_none")]
+        above_threshold: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
+    }
+
+    let mut recon_results: Vec<ReconConnector> = Vec::new();
+    let mut recon_elapsed_ms: u64 = 0;
+
+    if db_ok {
+        let recon_start = std::time::Instant::now();
+
+        // Open a read-only DB connection for reconciliation queries
+        let recon_conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        );
+
+        if let Ok(conn) = recon_conn {
+            // Slug mapping: factory key -> DB agent_slug
+            // "claude" factory key produces conversations with agent_slug "claude_code"
+            let slug_map: std::collections::HashMap<&str, &str> =
+                [("claude", "claude_code")].into_iter().collect();
+
+            for (factory_key, factory_fn) in crate::indexer::get_connector_factories() {
+                let connector = factory_fn();
+                let detection = connector.detect();
+                let db_slug = slug_map.get(factory_key).copied().unwrap_or(factory_key);
+
+                // Count disk files (None = non-comparable, e.g. Cursor)
+                let disk_files = if detection.detected {
+                    connector.count_disk_files()
+                } else {
+                    Some(0)
+                };
+
+                // Count DB entries for this agent
+                let db_entries: usize = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM conversations c \
+                         JOIN agents a ON c.agent_id = a.id \
+                         WHERE a.slug = ?1",
+                        [db_slug],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    .max(0) as usize;
+
+                // Compute delta and status
+                let (delta, status, above_threshold) = match disk_files {
+                    None => (None, "skip".to_string(), None),
+                    Some(disk) => {
+                        let d = disk as i64 - db_entries as i64;
+                        if d == 0 {
+                            (Some(d), "pass".to_string(), None)
+                        } else {
+                            let above = d.unsigned_abs() > reconciliation_threshold;
+                            (Some(d), "warn".to_string(), Some(above))
+                        }
+                    }
+                };
+
+                let notes = if disk_files.is_none() || delta.is_some_and(|d| d != 0) {
+                    connector.reconciliation_notes()
+                } else {
+                    None
+                };
+
+                // Only include connectors that are detected on disk OR have DB entries
+                if detection.detected || db_entries > 0 {
+                    recon_results.push(ReconConnector {
+                        agent: db_slug.to_string(),
+                        disk_files,
+                        db_entries,
+                        delta,
+                        status,
+                        above_threshold,
+                        notes,
+                    });
+                }
+            }
+        }
+
+        recon_elapsed_ms = recon_start.elapsed().as_millis() as u64;
+
+        // Add reconciliation as a check for human-readable output
+        let warn_count_recon = recon_results.iter().filter(|r| r.status == "warn").count();
+        let skip_count_recon = recon_results.iter().filter(|r| r.status == "skip").count();
+        let pass_count_recon = recon_results.iter().filter(|r| r.status == "pass").count();
+
+        if warn_count_recon == 0 {
+            add_check!(
+                "reconciliation",
+                "pass",
+                format!(
+                    "{} connectors balanced, {} skipped ({recon_elapsed_ms}ms)",
+                    pass_count_recon, skip_count_recon
+                ),
+                false
+            );
+        } else {
+            // Build detail lines for human output
+            let mut detail_parts: Vec<String> = Vec::new();
+            for r in &recon_results {
+                match r.status.as_str() {
+                    "warn" => {
+                        let d = r.delta.unwrap_or(0);
+                        let disk = r.disk_files.unwrap_or(0);
+                        let note_suffix = r
+                            .notes
+                            .as_ref()
+                            .map(|n| format!(" — {n}"))
+                            .unwrap_or_default();
+                        if d > 0 {
+                            detail_parts.push(format!(
+                                "    {}: {} on disk, {} in DB (delta: +{d}){note_suffix}",
+                                r.agent, disk, r.db_entries
+                            ));
+                        } else {
+                            detail_parts.push(format!(
+                                "    {}: {} on disk, {} in DB (delta: {d}){note_suffix}",
+                                r.agent, disk, r.db_entries
+                            ));
+                        }
+                    }
+                    "skip" => {
+                        let note_suffix = r
+                            .notes
+                            .as_ref()
+                            .map(|n| format!(" — {n}"))
+                            .unwrap_or_default();
+                        detail_parts.push(format!("    {}: skipped{note_suffix}", r.agent));
+                    }
+                    _ => {}
+                }
+            }
+            let detail = detail_parts.join("\n");
+            add_check!(
+                "reconciliation",
+                "warn",
+                format!(
+                    "{warn_count_recon} connectors have gaps, {skip_count_recon} skipped ({recon_elapsed_ms}ms)\n{detail}"
+                ),
+                false
+            );
+        }
+    }
+
     // Apply fix: rebuild index if needed
     if needs_rebuild {
         let stderr_is_tty = std::io::stderr().is_terminal();
@@ -5943,6 +6115,14 @@ fn run_doctor(
 
     // Output
     if json {
+        let recon_balanced = recon_results.iter().all(|r| r.status != "warn");
+        let reconciliation_json = serde_json::json!({
+            "balanced": recon_balanced,
+            "elapsed_ms": recon_elapsed_ms,
+            "threshold": reconciliation_threshold,
+            "connectors": recon_results,
+        });
+
         let payload = serde_json::json!({
             "healthy": fail_count == 0,
             "issues_found": issues_found,
@@ -5953,6 +6133,7 @@ fn run_doctor(
             "auto_fix_applied": auto_fix_applied,
             "auto_fix_actions": auto_fix_actions,
             "checks": checks,
+            "reconciliation": reconciliation_json,
             "_meta": {
                 "elapsed_ms": elapsed_ms,
                 "data_dir": data_dir.display().to_string(),

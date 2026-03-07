@@ -277,10 +277,7 @@ impl Connector for OpenCodeConnector {
             }
             for entry in WalkDir::new(&session_dir).into_iter().flatten() {
                 if entry.file_type().is_file()
-                    && entry
-                        .path()
-                        .extension()
-                        .is_some_and(|ext| ext == "json")
+                    && entry.path().extension().is_some_and(|ext| ext == "json")
                 {
                     count += 1;
                 }
