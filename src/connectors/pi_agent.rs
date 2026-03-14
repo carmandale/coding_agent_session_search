@@ -414,7 +414,9 @@ impl Connector for PiAgentConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::{ScanContext, ScanRoot};
     use serde_json::json;
+    use serial_test::serial;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -1137,5 +1139,172 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].messages[0].author, Some("gpt-4-turbo".to_string()));
+    }
+
+    // =====================================================
+    // Spec 005-watcher-cpu-spin: Regression Tests
+    // =====================================================
+
+    #[test]
+    #[serial]
+    fn detect_returns_sessions_dir_as_root() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("pi-agent");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        // SAFETY: Test runs in single-threaded context
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &home) };
+        let connector = PiAgentConnector::new();
+        let result = connector.detect();
+        unsafe { std::env::remove_var("PI_CODING_AGENT_DIR") };
+
+        assert!(result.detected);
+        // Root paths should be the sessions subdir, NOT the home dir
+        assert_eq!(result.root_paths.len(), 1);
+        assert_eq!(result.root_paths[0], sessions);
+        // Should NOT be the home dir (was the old broken behavior)
+        assert_ne!(result.root_paths[0], home);
+    }
+
+    #[test]
+    #[serial]
+    fn detect_returns_empty_roots_when_no_sessions() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("pi-agent-nosessions");
+        fs::create_dir_all(&home).unwrap();
+        // Do NOT create sessions subdir
+
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &home) };
+        let connector = PiAgentConnector::new();
+        let result = connector.detect();
+        unsafe { std::env::remove_var("PI_CODING_AGENT_DIR") };
+
+        // detected=true (home exists), but root_paths empty (no sessions dir)
+        assert!(result.detected);
+        assert!(result.root_paths.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn scan_with_explicit_sessions_root() {
+        // Simulates the watcher path: ScanContext::with_roots passes the sessions
+        // dir (from detect().root_paths) as data_dir. The scan must NOT return empty.
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("pi-agent");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        fs::write(
+            sessions.join("2025-12-01T10-00-00_uuid1.jsonl"),
+            r#"{"type":"message","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Hello from watcher"}}"#,
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &home) };
+        let connector = PiAgentConnector::new();
+        // Use with_roots — this is what the watcher does after detect() returns sessions
+        let ctx = ScanContext::with_roots(sessions.clone(), vec![ScanRoot::local(sessions)], None);
+        let convs = connector.scan(&ctx).unwrap();
+        unsafe { std::env::remove_var("PI_CODING_AGENT_DIR") };
+
+        // Must find the session — this is the regression that Codex caught
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "Hello from watcher");
+    }
+
+    #[test]
+    #[serial]
+    fn scan_with_custom_pi_home_explicit_root() {
+        // Simulates custom PI_CODING_AGENT_DIR=/tmp/foo with watcher explicit roots.
+        // The sessions path (/tmp/foo/sessions) must be accepted.
+        let dir = TempDir::new().unwrap();
+        let custom_home = dir.path().join("custom-agent-dir");
+        let sessions = custom_home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        fs::write(
+            sessions.join("2025-12-01T10-00-00_uuid1.jsonl"),
+            r#"{"type":"message","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Custom home"}}"#,
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &custom_home) };
+        let connector = PiAgentConnector::new();
+        let ctx = ScanContext::with_roots(sessions.clone(), vec![ScanRoot::local(sessions)], None);
+        let convs = connector.scan(&ctx).unwrap();
+        unsafe { std::env::remove_var("PI_CODING_AGENT_DIR") };
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "Custom home");
+    }
+
+    #[test]
+    #[serial]
+    fn scan_rejects_non_pi_sessions_via_explicit_roots() {
+        // Simulates remote root fanout: Codex's sessions dir is passed to PiAgent.
+        // PiAgent must reject it — it's not a Pi home.
+        let dir = TempDir::new().unwrap();
+        let codex_sessions = dir.path().join("codex-sessions");
+        fs::create_dir_all(&codex_sessions).unwrap();
+
+        // Write a file that would match PiAgent's .jsonl pattern
+        fs::write(
+            codex_sessions.join("2025-12-01T10-00-00_uuid1.jsonl"),
+            r#"{"type":"message","message":{"role":"user","content":"I am codex"}}"#,
+        )
+        .unwrap();
+
+        // Set PI_CODING_AGENT_DIR to something completely different
+        let pi_home = dir.path().join("real-pi-agent");
+        fs::create_dir_all(pi_home.join("sessions")).unwrap();
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &pi_home) };
+
+        let connector = PiAgentConnector::new();
+        let ctx = ScanContext::with_roots(
+            codex_sessions.clone(),
+            vec![ScanRoot::local(codex_sessions)],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+        unsafe { std::env::remove_var("PI_CODING_AGENT_DIR") };
+
+        // Must be empty — PiAgent should reject this non-Pi sessions dir
+        assert!(
+            convs.is_empty(),
+            "PiAgent should not index non-Pi sessions dirs (got {} convs)",
+            convs.len()
+        );
+    }
+
+    #[test]
+    fn session_files_respects_max_depth() {
+        // Verify max_depth(10) is in effect — files beyond depth 10 are not found
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions");
+        // Create a deeply nested path (12 levels deep)
+        let mut deep = sessions.clone();
+        for i in 0..12 {
+            deep = deep.join(format!("level{i}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deep.jsonl"), "{}").unwrap();
+
+        // Also create a file at reasonable depth (3 levels)
+        let shallow = sessions.join("project").join("workspace");
+        fs::create_dir_all(&shallow).unwrap();
+        fs::write(shallow.join("2025-12-01T10-00-00_uuid1.jsonl"), "{}").unwrap();
+
+        let files = PiAgentConnector::session_files(dir.path());
+        // Should find the shallow file but NOT the one at depth 12
+        assert_eq!(
+            files.len(),
+            1,
+            "max_depth should exclude files beyond depth 10"
+        );
+        assert!(
+            files[0].to_str().unwrap().contains("uuid1"),
+            "should find the shallow file"
+        );
     }
 }

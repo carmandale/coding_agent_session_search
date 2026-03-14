@@ -2625,4 +2625,125 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
             Some("/home/user/app")
         );
     }
+
+    // =====================================================
+    // Spec 005-watcher-cpu-spin: Regression Tests
+    // =====================================================
+
+    #[test]
+    fn shutdown_flag_breaks_reindex_loop() {
+        // Verify that setting the shutdown AtomicBool causes reindex_paths to exit early
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("shutdown_test");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let opts = IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            progress: None,
+            watch_once_paths: None,
+        };
+
+        let storage = SqliteStorage::open(&opts.db_path).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir).unwrap()).unwrap();
+        let state = Arc::new(Mutex::new(HashMap::new()));
+        let storage = Arc::new(Mutex::new(storage));
+        let t_index = Arc::new(Mutex::new(t_index));
+
+        // Create a shutdown flag that is ALREADY set
+        let shutdown = AtomicBool::new(true);
+
+        // Create roots with multiple connectors — if shutdown works, we should
+        // break before processing any of them
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+
+        let result = reindex_paths(
+            &opts,
+            vec![amp_dir.clone()],
+            &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
+            state.clone(),
+            storage.clone(),
+            t_index.clone(),
+            false,
+            &shutdown,
+        );
+
+        // Should succeed (early return, no error)
+        assert!(result.is_ok());
+
+        // Watch state should NOT be advanced (no connectors processed)
+        let loaded = load_watch_state(&data_dir);
+        assert!(
+            !loaded.contains_key(&ConnectorKind::Amp),
+            "watch state should not advance when shutdown flag is set"
+        );
+
+        drop(t_index);
+        drop(storage);
+        drop(state);
+    }
+
+    #[test]
+    fn heartbeat_file_is_written() {
+        // Verify the write_heartbeat function creates a file with a recent timestamp
+        let tmp = TempDir::new().unwrap();
+        let heartbeat_path = tmp.path().join("watcher-heartbeat");
+
+        write_heartbeat(&heartbeat_path);
+
+        assert!(heartbeat_path.exists(), "heartbeat file should be created");
+        let content = std::fs::read_to_string(&heartbeat_path).unwrap();
+        let ts: u64 = content
+            .trim()
+            .parse()
+            .expect("heartbeat should be a unix timestamp");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Heartbeat should be within 5 seconds of now
+        assert!(
+            now.abs_diff(ts) < 5,
+            "heartbeat timestamp {ts} should be within 5s of now {now}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_file_is_overwritten() {
+        // Verify repeated writes update the timestamp
+        let tmp = TempDir::new().unwrap();
+        let heartbeat_path = tmp.path().join("watcher-heartbeat");
+
+        write_heartbeat(&heartbeat_path);
+        let first = std::fs::read_to_string(&heartbeat_path).unwrap();
+
+        // Small sleep to ensure timestamp changes
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write_heartbeat(&heartbeat_path);
+        let second = std::fs::read_to_string(&heartbeat_path).unwrap();
+
+        let ts1: u64 = first.trim().parse().unwrap();
+        let ts2: u64 = second.trim().parse().unwrap();
+        assert!(
+            ts2 >= ts1,
+            "second heartbeat ({ts2}) should be >= first ({ts1})"
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_is_60_seconds() {
+        // Verify the heartbeat interval constant is 60s (reduced from 300s).
+        // This ensures SIGTERM is checked within 60s of the watchdog's 120s grace period.
+        // The constant is local to watch_sources, so we test by checking the source.
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains("let heartbeat_interval = Duration::from_secs(60)"),
+            "heartbeat_interval should be 60s (was 300s before fix)"
+        );
+    }
 }
