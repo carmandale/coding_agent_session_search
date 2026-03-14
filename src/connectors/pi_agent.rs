@@ -189,13 +189,17 @@ impl Connector for PiAgentConnector {
         };
 
         let mut home = if ctx.use_default_detection() {
-            if is_pi_path {
+            // For default detection: use the provided data_dir if it looks like
+            // a Pi home (has sessions subdir or name contains "pi"), or if it
+            // exactly matches the configured home. Otherwise fall back to the
+            // configured home. This supports both test temp dirs and production.
+            if is_pi_path || looks_like_root(&ctx.data_dir) {
                 ctx.data_dir.clone()
             } else {
                 pi_home
             }
         } else {
-            // For explicit roots: accept if it matches the configured Pi home
+            // For explicit roots (watcher): accept if it matches the configured Pi home
             // or sessions dir. The exact comparison prevents accepting unrelated
             // "sessions" directories from Codex/Factory via remote root fanout.
             if !looks_like_root(&ctx.data_dir) && !is_pi_path {
