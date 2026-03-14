@@ -9,3 +9,4 @@
 2026-03-14 08:35 | — | codex/gpt-5.3-codex | /codex-review | round 4 — VERDICT: REVISE (custom PI_CODING_AGENT_DIR still broken with path heuristic)
 2026-03-14 08:38 | — | codex/gpt-5.3-codex | /codex-review | round 5 — VERDICT: APPROVED (exact Self::home() comparison resolves all root acceptance issues)
 2026-03-14 09:00 | QuickLion | pi/claude-sonnet-4-20250514 | /implement | started — branch fix/watcher-cpu-spin
+2026-03-14 09:30 | QuickLion | pi/claude-sonnet-4-20250514 | /implement | completed — 5 commits, follow-up bead coding_agent_session_search-2hrs
