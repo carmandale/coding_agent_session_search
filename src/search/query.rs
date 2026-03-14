@@ -3488,7 +3488,8 @@ mod tests {
         let queries: Vec<String> = (0..100).map(|i| format!("query_{}", i)).collect();
 
         let handles: Vec<_> = (0..4)
-            .map(|_| {
+            .enumerate()
+            .map(|(i, _)| {
                 let interner = Arc::clone(&interner);
                 let queries = queries.clone();
 

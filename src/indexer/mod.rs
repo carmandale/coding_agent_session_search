@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -679,10 +679,26 @@ pub fn run_index(
     }
 
     if opts.watch || opts.watch_once_paths.is_some() {
+        // Register SIGTERM/SIGINT handler for graceful shutdown.
+        // This prevents tantivy index corruption when the process is killed.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        if opts.watch {
+            let _ = signal_hook::flag::register(
+                signal_hook::consts::SIGTERM,
+                Arc::clone(&shutdown),
+            );
+            let _ = signal_hook::flag::register(
+                signal_hook::consts::SIGINT,
+                Arc::clone(&shutdown),
+            );
+            tracing::info!("registered SIGTERM/SIGINT handlers for graceful shutdown");
+        }
+
         let opts_clone = opts.clone();
         let state = Arc::new(Mutex::new(load_watch_state(&opts.data_dir)));
         let storage = Arc::new(Mutex::new(storage));
         let t_index = Arc::new(Mutex::new(t_index));
+        let shutdown_for_callback = Arc::clone(&shutdown);
 
         // Detect roots once for the watcher setup
         // Includes both local detected roots and all remote mirror roots
@@ -692,6 +708,8 @@ pub fn run_index(
             opts.watch_once_paths.clone(),
             watch_roots.clone(),
             event_channel,
+            Arc::clone(&shutdown),
+            opts.data_dir.clone(),
             move |paths, roots, is_rebuild| {
                 let result = if is_rebuild {
                     if let Ok(mut g) = state.lock() {
@@ -709,6 +727,7 @@ pub fn run_index(
                         storage.clone(),
                         t_index.clone(),
                         true,
+                        &shutdown_for_callback,
                     )
                 } else {
                     reindex_paths(
@@ -719,6 +738,7 @@ pub fn run_index(
                         storage.clone(),
                         t_index.clone(),
                         false,
+                        &shutdown_for_callback,
                     )
                 };
 
@@ -847,10 +867,22 @@ impl ConnectorKind {
     }
 }
 
+/// Write a heartbeat timestamp to disk. The watchdog script checks this file's
+/// age to determine if the watcher event loop is alive.
+fn write_heartbeat(path: &Path) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = fs::write(path, ts.to_string());
+}
+
 fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send + 'static>(
     watch_once_paths: Option<Vec<PathBuf>>,
     roots: Vec<(ConnectorKind, ScanRoot)>,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
+    shutdown: Arc<AtomicBool>,
+    data_dir: PathBuf,
     callback: F,
 ) -> Result<()> {
     if let Some(paths) = watch_once_paths {
@@ -889,8 +921,11 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
     let max_wait = Duration::from_secs(5);
     // Periodic heartbeat: even if FSEvents stops delivering, do a full scan periodically.
     // This works around macOS FSEvents bugs (e.g., Dropbox folders, too many watchers).
-    let heartbeat_interval = Duration::from_secs(300); // 5 minutes
+    // Reduced from 300s to 60s so SIGTERM flag is checked within 60s (well within
+    // the watchdog's 120s SIGTERM→SIGKILL grace period).
+    let heartbeat_interval = Duration::from_secs(60);
     let mut last_heartbeat = std::time::Instant::now();
+    let heartbeat_path = data_dir.join("watcher-heartbeat");
     // Full scan interval: bypass timestamps entirely to catch any missed sessions.
     // This is the nuclear option for when incremental scans miss files due to
     // FSEvents bugs, timestamp drift, or other edge cases.
@@ -900,6 +935,15 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
     let mut first_event: Option<std::time::Instant> = None;
 
     loop {
+        // Check shutdown flag at the top of every iteration
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!("shutdown signal received, exiting watcher loop");
+            break;
+        }
+
+        // Write heartbeat — proves the event loop is alive
+        write_heartbeat(&heartbeat_path);
+
         if pending.is_empty() {
             // Use timeout instead of blocking recv to support heartbeat
             match rx.recv_timeout(heartbeat_interval) {
@@ -910,7 +954,9 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
                     }
                     IndexerEvent::Command(cmd) => match cmd {
                         ReindexCommand::Full => {
+                            write_heartbeat(&heartbeat_path);
                             callback(vec![], &roots, true);
+                            if shutdown.load(Ordering::Relaxed) { break; }
                             let now = std::time::Instant::now();
                             last_heartbeat = now;
                             last_full_scan = now; // Reset full scan timer too
@@ -928,14 +974,18 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
                         );
                         let all_root_paths: Vec<PathBuf> =
                             roots.iter().map(|(_, root)| root.path.clone()).collect();
+                        write_heartbeat(&heartbeat_path);
                         callback(all_root_paths, &roots, true); // force_full=true
+                        if shutdown.load(Ordering::Relaxed) { break; }
                         last_full_scan = now;
                         last_heartbeat = now; // Also reset incremental timer
                     } else if now.duration_since(last_heartbeat) >= heartbeat_interval {
                         tracing::info!("heartbeat: triggering periodic incremental scan");
                         let all_root_paths: Vec<PathBuf> =
                             roots.iter().map(|(_, root)| root.path.clone()).collect();
+                        write_heartbeat(&heartbeat_path);
                         callback(all_root_paths, &roots, false);
+                        if shutdown.load(Ordering::Relaxed) { break; }
                         last_heartbeat = now;
                     }
                     continue;
@@ -946,7 +996,9 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(first_event.unwrap_or(now));
             if elapsed >= max_wait {
+                write_heartbeat(&heartbeat_path);
                 callback(std::mem::take(&mut pending), &roots, false);
+                if shutdown.load(Ordering::Relaxed) { break; }
                 first_event = None; // Reset debounce
                 continue;
             }
@@ -959,18 +1011,23 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
                     IndexerEvent::Notify(paths) => pending.extend(paths),
                     IndexerEvent::Command(cmd) => match cmd {
                         ReindexCommand::Full => {
-                            // Flush pending first? Or discard?
-                            // Let's flush pending then do full.
+                            // Flush pending first, then do full.
                             if !pending.is_empty() {
+                                write_heartbeat(&heartbeat_path);
                                 callback(std::mem::take(&mut pending), &roots, false);
+                                if shutdown.load(Ordering::Relaxed) { break; }
                             }
+                            write_heartbeat(&heartbeat_path);
                             callback(vec![], &roots, true);
+                            if shutdown.load(Ordering::Relaxed) { break; }
                             first_event = None; // Reset debounce
                         }
                     },
                 },
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    write_heartbeat(&heartbeat_path);
                     callback(std::mem::take(&mut pending), &roots, false);
+                    if shutdown.load(Ordering::Relaxed) { break; }
                     first_event = None;
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -1007,6 +1064,7 @@ fn reindex_paths(
     storage: Arc<Mutex<SqliteStorage>>,
     t_index: Arc<Mutex<TantivyIndex>>,
     force_full: bool,
+    shutdown: &AtomicBool,
 ) -> Result<()> {
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
@@ -1020,6 +1078,12 @@ fn reindex_paths(
     let mut did_commit = false;
 
     for (kind, root, _ts) in triggers {
+        // Check shutdown flag between connector iterations (T11)
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!("shutdown signal received, breaking reindex loop");
+            break;
+        }
+
         let conn = kind.create_connector();
         let detect = conn.detect();
         if !detect.detected && root.origin.source_id == "local" {
@@ -1057,6 +1121,7 @@ fn reindex_paths(
         );
 
         // SCAN PHASE: IO-heavy, no locks held
+        let scan_timer = std::time::Instant::now();
         let mut convs = match conn.scan(&ctx) {
             Ok(c) => c,
             Err(e) => {
@@ -1069,6 +1134,18 @@ fn reindex_paths(
                 Vec::new()
             }
         };
+
+        // Log slow scans (T3: elapsed-time instrumentation)
+        let scan_elapsed = scan_timer.elapsed();
+        if scan_elapsed > Duration::from_secs(30) {
+            tracing::warn!(
+                ?kind,
+                elapsed_secs = scan_elapsed.as_secs(),
+                conversations = convs.len(),
+                path = %root.path.display(),
+                "slow_scan_detected"
+            );
+        }
 
         // Provenance injection and path rewriting
         for conv in &mut convs {
@@ -2059,6 +2136,7 @@ mod tests {
         // Need roots for reindex_paths
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
 
+        let no_shutdown = AtomicBool::new(false);
         reindex_paths(
             &opts,
             vec![amp_file.clone()],
@@ -2067,6 +2145,7 @@ mod tests {
             storage.clone(),
             t_index.clone(),
             false,
+            &no_shutdown,
         )
         .unwrap();
 
@@ -2165,6 +2244,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         let storage = Arc::new(Mutex::new(storage));
         let t_index = Arc::new(Mutex::new(t_index));
 
+        let no_shutdown = AtomicBool::new(false);
         reindex_paths(
             &opts,
             vec![amp_file],
@@ -2173,6 +2253,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
             storage.clone(),
             t_index.clone(),
             false,
+            &no_shutdown,
         )
         .unwrap();
 
