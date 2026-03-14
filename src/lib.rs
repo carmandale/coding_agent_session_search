@@ -5941,11 +5941,14 @@ fn run_doctor(
             let rebuild_handle = std::thread::Builder::new()
                 .name("tui-rebuild".into())
                 .spawn({
-                let progress = progress.clone();
-                let db_path = db_path.clone();
-                let data_dir = data_dir.clone();
-                move || rebuild_tantivy_from_db(&db_path, &data_dir, total_convs, Some(progress))
-            }).expect("failed to spawn tui-rebuild thread");
+                    let progress = progress.clone();
+                    let db_path = db_path.clone();
+                    let data_dir = data_dir.clone();
+                    move || {
+                        rebuild_tantivy_from_db(&db_path, &data_dir, total_convs, Some(progress))
+                    }
+                })
+                .expect("failed to spawn tui-rebuild thread");
 
             let rebuild_result = wait_with_progress(
                 rebuild_handle,
@@ -6050,16 +6053,17 @@ fn run_doctor(
                 let rebuild_handle = std::thread::Builder::new()
                     .name("tui-index-rebuild".into())
                     .spawn(move || {
-                    indexer::run_index(index_opts, None)
-                        .map(|_| 0usize)
-                        .map_err(|e| CliError {
-                            code: 5,
-                            kind: "doctor",
-                            message: format!("index rebuild failed: {e}"),
-                            hint: None,
-                            retryable: true,
-                        })
-                }).expect("failed to spawn tui-index-rebuild thread");
+                        indexer::run_index(index_opts, None)
+                            .map(|_| 0usize)
+                            .map_err(|e| CliError {
+                                code: 5,
+                                kind: "doctor",
+                                message: format!("index rebuild failed: {e}"),
+                                hint: None,
+                                retryable: true,
+                            })
+                    })
+                    .expect("failed to spawn tui-index-rebuild thread");
 
                 let rebuild_result = wait_with_progress(
                     rebuild_handle,
@@ -7688,29 +7692,30 @@ fn spawn_background_indexer(
     std::thread::Builder::new()
         .name("index-runner".into())
         .spawn(move || {
-        let db_path = db.unwrap_or_else(|| data_dir.join("agent_search.db"));
-        let opts = IndexOptions {
-            full: false,
-            force_rebuild: false,
-            watch: true,
-            watch_once_paths: read_watch_once_paths_env(),
-            db_path,
-            data_dir,
-            progress,
-        };
-        // Pass the receiver to run_index so it can listen for commands
-        if let Err(e) = indexer::run_index(opts, Some((tx_clone, rx))) {
-            warn!("Background indexer failed: {}", e);
-            if let Some(p) = progress_for_error {
-                if let Ok(mut last_error) = p.last_error.lock() {
-                    *last_error = Some(e.to_string());
+            let db_path = db.unwrap_or_else(|| data_dir.join("agent_search.db"));
+            let opts = IndexOptions {
+                full: false,
+                force_rebuild: false,
+                watch: true,
+                watch_once_paths: read_watch_once_paths_env(),
+                db_path,
+                data_dir,
+                progress,
+            };
+            // Pass the receiver to run_index so it can listen for commands
+            if let Err(e) = indexer::run_index(opts, Some((tx_clone, rx))) {
+                warn!("Background indexer failed: {}", e);
+                if let Some(p) = progress_for_error {
+                    if let Ok(mut last_error) = p.last_error.lock() {
+                        *last_error = Some(e.to_string());
+                    }
+                    p.phase.store(0, std::sync::atomic::Ordering::Relaxed);
+                    p.is_rebuilding
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                 }
-                p.phase.store(0, std::sync::atomic::Ordering::Relaxed);
-                p.is_rebuilding
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
             }
-        }
-    }).expect("failed to spawn index-runner thread");
+        })
+        .expect("failed to spawn index-runner thread");
     Some(tx)
 }
 

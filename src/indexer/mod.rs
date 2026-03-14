@@ -120,104 +120,104 @@ fn spawn_connector_producer(
     thread::Builder::new()
         .name(format!("connector-{name}"))
         .spawn(move || {
-        let conn = factory();
-        let detect = conn.detect();
-        let was_detected = detect.detected;
-        let mut is_discovered = false;
+            let conn = factory();
+            let detect = conn.detect();
+            let was_detected = detect.detected;
+            let mut is_discovered = false;
 
-        if detect.detected {
-            // Update discovered agents count immediately when detected
-            if let Some(p) = &progress {
-                p.discovered_agents.fetch_add(1, Ordering::Relaxed);
-            }
-            is_discovered = true;
-
-            // Scan local sources
-            let ctx = crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
-            match conn.scan(&ctx) {
-                Ok(mut local_convs) => {
-                    // Inject local provenance
-                    let local_origin = Origin::local();
-                    for conv in &mut local_convs {
-                        inject_provenance(conv, &local_origin);
-                    }
-
-                    if !local_convs.is_empty() {
-                        // Send batch through channel (blocking if full - backpressure!)
-                        let _ = tx.send(IndexMessage::Batch {
-                            connector_name: name,
-                            conversations: local_convs,
-                            is_discovered,
-                        });
-                    }
+            if detect.detected {
+                // Update discovered agents count immediately when detected
+                if let Some(p) = &progress {
+                    p.discovered_agents.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(e) => {
-                    tracing::warn!(connector = name, "local scan failed: {}", e);
-                    let _ = tx.send(IndexMessage::ScanError {
-                        connector_name: name,
-                        error: e.to_string(),
-                    });
-                }
-            }
-        }
+                is_discovered = true;
 
-        // Scan remote sources
-        for root in &remote_roots {
-            let ctx = crate::connectors::ScanContext::with_roots(
-                root.path.clone(),
-                vec![root.clone()],
-                since_ts,
-            );
-            match conn.scan(&ctx) {
-                Ok(mut remote_convs) => {
-                    for conv in &mut remote_convs {
-                        inject_provenance(conv, &root.origin);
-                        apply_workspace_rewrite(conv, &root.workspace_rewrites);
-                    }
-
-                    // Check if discovered via remote scan
-                    if !was_detected && !remote_convs.is_empty() && !is_discovered {
-                        if let Some(p) = &progress {
-                            p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+                // Scan local sources
+                let ctx = crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
+                match conn.scan(&ctx) {
+                    Ok(mut local_convs) => {
+                        // Inject local provenance
+                        let local_origin = Origin::local();
+                        for conv in &mut local_convs {
+                            inject_provenance(conv, &local_origin);
                         }
-                        is_discovered = true;
-                    }
 
-                    if !remote_convs.is_empty() {
-                        let _ = tx.send(IndexMessage::Batch {
+                        if !local_convs.is_empty() {
+                            // Send batch through channel (blocking if full - backpressure!)
+                            let _ = tx.send(IndexMessage::Batch {
+                                connector_name: name,
+                                conversations: local_convs,
+                                is_discovered,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(connector = name, "local scan failed: {}", e);
+                        let _ = tx.send(IndexMessage::ScanError {
                             connector_name: name,
-                            conversations: remote_convs,
-                            is_discovered,
+                            error: e.to_string(),
                         });
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        connector = name,
-                        root = %root.path.display(),
-                        "remote scan failed: {}", e
-                    );
+            }
+
+            // Scan remote sources
+            for root in &remote_roots {
+                let ctx = crate::connectors::ScanContext::with_roots(
+                    root.path.clone(),
+                    vec![root.clone()],
+                    since_ts,
+                );
+                match conn.scan(&ctx) {
+                    Ok(mut remote_convs) => {
+                        for conv in &mut remote_convs {
+                            inject_provenance(conv, &root.origin);
+                            apply_workspace_rewrite(conv, &root.workspace_rewrites);
+                        }
+
+                        // Check if discovered via remote scan
+                        if !was_detected && !remote_convs.is_empty() && !is_discovered {
+                            if let Some(p) = &progress {
+                                p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+                            }
+                            is_discovered = true;
+                        }
+
+                        if !remote_convs.is_empty() {
+                            let _ = tx.send(IndexMessage::Batch {
+                                connector_name: name,
+                                conversations: remote_convs,
+                                is_discovered,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            connector = name,
+                            root = %root.path.display(),
+                            "remote scan failed: {}", e
+                        );
+                    }
                 }
             }
-        }
 
-        // Mark this connector as scanned for discovery progress
-        if let Some(p) = &progress {
-            p.current.fetch_add(1, Ordering::Relaxed);
-        }
+            // Mark this connector as scanned for discovery progress
+            if let Some(p) = &progress {
+                p.current.fetch_add(1, Ordering::Relaxed);
+            }
 
-        tracing::info!(
-            connector = name,
-            discovered = is_discovered,
-            "streaming_scan_complete"
-        );
+            tracing::info!(
+                connector = name,
+                discovered = is_discovered,
+                "streaming_scan_complete"
+            );
 
-        // Signal completion
-        let _ = tx.send(IndexMessage::Done {
-            connector_name: name,
-        });
-    })
-    .expect("failed to spawn connector thread")
+            // Signal completion
+            let _ = tx.send(IndexMessage::Done {
+                connector_name: name,
+            });
+        })
+        .expect("failed to spawn connector thread")
 }
 
 /// Run the streaming indexing consumer.
@@ -683,14 +683,9 @@ pub fn run_index(
         // This prevents tantivy index corruption when the process is killed.
         let shutdown = Arc::new(AtomicBool::new(false));
         if opts.watch {
-            let _ = signal_hook::flag::register(
-                signal_hook::consts::SIGTERM,
-                Arc::clone(&shutdown),
-            );
-            let _ = signal_hook::flag::register(
-                signal_hook::consts::SIGINT,
-                Arc::clone(&shutdown),
-            );
+            let _ =
+                signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown));
+            let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown));
             tracing::info!("registered SIGTERM/SIGINT handlers for graceful shutdown");
         }
 
@@ -956,7 +951,9 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
                         ReindexCommand::Full => {
                             write_heartbeat(&heartbeat_path);
                             callback(vec![], &roots, true);
-                            if shutdown.load(Ordering::Relaxed) { break; }
+                            if shutdown.load(Ordering::Relaxed) {
+                                break;
+                            }
                             let now = std::time::Instant::now();
                             last_heartbeat = now;
                             last_full_scan = now; // Reset full scan timer too
@@ -976,7 +973,9 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
                             roots.iter().map(|(_, root)| root.path.clone()).collect();
                         write_heartbeat(&heartbeat_path);
                         callback(all_root_paths, &roots, true); // force_full=true
-                        if shutdown.load(Ordering::Relaxed) { break; }
+                        if shutdown.load(Ordering::Relaxed) {
+                            break;
+                        }
                         last_full_scan = now;
                         last_heartbeat = now; // Also reset incremental timer
                     } else if now.duration_since(last_heartbeat) >= heartbeat_interval {
@@ -985,7 +984,9 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
                             roots.iter().map(|(_, root)| root.path.clone()).collect();
                         write_heartbeat(&heartbeat_path);
                         callback(all_root_paths, &roots, false);
-                        if shutdown.load(Ordering::Relaxed) { break; }
+                        if shutdown.load(Ordering::Relaxed) {
+                            break;
+                        }
                         last_heartbeat = now;
                     }
                     continue;
@@ -998,7 +999,9 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
             if elapsed >= max_wait {
                 write_heartbeat(&heartbeat_path);
                 callback(std::mem::take(&mut pending), &roots, false);
-                if shutdown.load(Ordering::Relaxed) { break; }
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
                 first_event = None; // Reset debounce
                 continue;
             }
@@ -1015,11 +1018,15 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
                             if !pending.is_empty() {
                                 write_heartbeat(&heartbeat_path);
                                 callback(std::mem::take(&mut pending), &roots, false);
-                                if shutdown.load(Ordering::Relaxed) { break; }
+                                if shutdown.load(Ordering::Relaxed) {
+                                    break;
+                                }
                             }
                             write_heartbeat(&heartbeat_path);
                             callback(vec![], &roots, true);
-                            if shutdown.load(Ordering::Relaxed) { break; }
+                            if shutdown.load(Ordering::Relaxed) {
+                                break;
+                            }
                             first_event = None; // Reset debounce
                         }
                     },
@@ -1027,7 +1034,9 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     write_heartbeat(&heartbeat_path);
                     callback(std::mem::take(&mut pending), &roots, false);
-                    if shutdown.load(Ordering::Relaxed) { break; }
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
                     first_event = None;
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -1056,6 +1065,7 @@ fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reindex_paths(
     opts: &IndexOptions,
     paths: Vec<PathBuf>,

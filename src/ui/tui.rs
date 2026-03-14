@@ -4912,40 +4912,41 @@ pub fn run_tui(
                         std::thread::Builder::new()
                             .name("model-download".into())
                             .spawn(move || {
-                            let callback: Box<dyn Fn(DownloadProgress) + Send + Sync> =
-                                Box::new(move |progress| {
-                                    let _ = tx.send(progress);
-                                });
-                            let result = downloader.download(&manifest, Some(callback));
-                            // Send a final progress to indicate completion or failure
-                            match result {
-                                Ok(_) => {
-                                    let _ = tx_final.send(DownloadProgress {
-                                        current_file: "complete".to_string(),
-                                        file_index: total_files,
-                                        total_files,
-                                        file_bytes: total_size,
-                                        file_total: total_size,
-                                        total_bytes: total_size,
-                                        grand_total: total_size,
-                                        progress_pct: 100,
+                                let callback: Box<dyn Fn(DownloadProgress) + Send + Sync> =
+                                    Box::new(move |progress| {
+                                        let _ = tx.send(progress);
                                     });
+                                let result = downloader.download(&manifest, Some(callback));
+                                // Send a final progress to indicate completion or failure
+                                match result {
+                                    Ok(_) => {
+                                        let _ = tx_final.send(DownloadProgress {
+                                            current_file: "complete".to_string(),
+                                            file_index: total_files,
+                                            total_files,
+                                            file_bytes: total_size,
+                                            file_total: total_size,
+                                            total_bytes: total_size,
+                                            grand_total: total_size,
+                                            progress_pct: 100,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        // Send failure signal so UI can show error
+                                        let _ = tx_final.send(DownloadProgress {
+                                            current_file: format!("error:{e}"),
+                                            file_index: 0,
+                                            total_files: 0,
+                                            file_bytes: 0,
+                                            file_total: 0,
+                                            total_bytes: 0,
+                                            grand_total: total_size,
+                                            progress_pct: 0,
+                                        });
+                                    }
                                 }
-                                Err(e) => {
-                                    // Send failure signal so UI can show error
-                                    let _ = tx_final.send(DownloadProgress {
-                                        current_file: format!("error:{e}"),
-                                        file_index: 0,
-                                        total_files: 0,
-                                        file_bytes: 0,
-                                        file_total: 0,
-                                        total_bytes: 0,
-                                        grand_total: total_size,
-                                        progress_pct: 0,
-                                    });
-                                }
-                            }
-                        }).expect("failed to spawn model-download thread");
+                            })
+                            .expect("failed to spawn model-download thread");
 
                         // Update state to show download in progress
                         semantic_availability = SemanticAvailability::Downloading {
