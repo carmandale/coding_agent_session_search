@@ -419,10 +419,13 @@ pub fn spawn_update_check(
     current_version: String,
 ) -> std::sync::mpsc::Receiver<Option<UpdateInfo>> {
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = check_for_updates_sync(&current_version);
-        let _ = tx.send(result);
-    });
+    std::thread::Builder::new()
+        .name("update-checker".into())
+        .spawn(move || {
+            let result = check_for_updates_sync(&current_version);
+            let _ = tx.send(result);
+        })
+        .expect("failed to spawn update-checker thread");
     rx
 }
 

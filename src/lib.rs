@@ -5938,12 +5938,14 @@ fn run_doctor(
 
         if rebuild_from_db {
             let total_convs = db_conversations.unwrap_or(0);
-            let rebuild_handle = std::thread::spawn({
+            let rebuild_handle = std::thread::Builder::new()
+                .name("tui-rebuild".into())
+                .spawn({
                 let progress = progress.clone();
                 let db_path = db_path.clone();
                 let data_dir = data_dir.clone();
                 move || rebuild_tantivy_from_db(&db_path, &data_dir, total_convs, Some(progress))
-            });
+            }).expect("failed to spawn tui-rebuild thread");
 
             let rebuild_result = wait_with_progress(
                 rebuild_handle,
@@ -6045,7 +6047,9 @@ fn run_doctor(
                     progress: Some(progress.clone()),
                 };
 
-                let rebuild_handle = std::thread::spawn(move || {
+                let rebuild_handle = std::thread::Builder::new()
+                    .name("tui-index-rebuild".into())
+                    .spawn(move || {
                     indexer::run_index(index_opts, None)
                         .map(|_| 0usize)
                         .map_err(|e| CliError {
@@ -6055,7 +6059,7 @@ fn run_doctor(
                             hint: None,
                             retryable: true,
                         })
-                });
+                }).expect("failed to spawn tui-index-rebuild thread");
 
                 let rebuild_result = wait_with_progress(
                     rebuild_handle,
@@ -7681,7 +7685,9 @@ fn spawn_background_indexer(
     let (tx, rx) = crossbeam_channel::unbounded();
     let tx_clone = tx.clone();
     let progress_for_error = progress.clone();
-    std::thread::spawn(move || {
+    std::thread::Builder::new()
+        .name("index-runner".into())
+        .spawn(move || {
         let db_path = db.unwrap_or_else(|| data_dir.join("agent_search.db"));
         let opts = IndexOptions {
             full: false,
@@ -7704,7 +7710,7 @@ fn spawn_background_indexer(
                     .store(false, std::sync::atomic::Ordering::Relaxed);
             }
         }
-    });
+    }).expect("failed to spawn index-runner thread");
     Some(tx)
 }
 
@@ -7843,7 +7849,10 @@ fn run_index_with_data(
 
     // Run indexer in background thread so we can poll progress
     let opts_clone = opts.clone();
-    let index_handle = std::thread::spawn(move || indexer::run_index(opts_clone, None));
+    let index_handle = std::thread::Builder::new()
+        .name("index-watcher".into())
+        .spawn(move || indexer::run_index(opts_clone, None))
+        .expect("failed to spawn index-watcher thread");
 
     // Poll and display progress while indexer runs
     if show_progress {

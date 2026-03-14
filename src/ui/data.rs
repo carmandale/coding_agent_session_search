@@ -515,25 +515,35 @@ mod tests {
         // Spawn writers
         for t in 0..4 {
             let cache = Arc::clone(&cache);
-            handles.push(thread::spawn(move || {
-                for i in 0..250 {
-                    let id = t * 250 + i;
-                    let view = make_test_view(id);
-                    let source_path = format!("/test/path/{}.jsonl", id);
-                    cache.insert(&source_path, view);
-                }
-            }));
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("test-writer-{t}"))
+                    .spawn(move || {
+                        for i in 0..250 {
+                            let id = t * 250 + i;
+                            let view = make_test_view(id);
+                            let source_path = format!("/test/path/{}.jsonl", id);
+                            cache.insert(&source_path, view);
+                        }
+                    })
+                    .expect("failed to spawn test thread"),
+            );
         }
 
         // Spawn readers
-        for _ in 0..4 {
+        for t in 0..4 {
             let cache = Arc::clone(&cache);
-            handles.push(thread::spawn(move || {
-                for i in 0..1000 {
-                    let source_path = format!("/test/path/{}.jsonl", i);
-                    let _ = cache.get(&source_path);
-                }
-            }));
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("test-reader-{t}"))
+                    .spawn(move || {
+                        for i in 0..1000 {
+                            let source_path = format!("/test/path/{}.jsonl", i);
+                            let _ = cache.get(&source_path);
+                        }
+                    })
+                    .expect("failed to spawn test thread"),
+            );
         }
 
         for handle in handles {

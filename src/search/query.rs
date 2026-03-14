@@ -3492,13 +3492,15 @@ mod tests {
                 let interner = Arc::clone(&interner);
                 let queries = queries.clone();
 
-                thread::spawn(move || {
+                thread::Builder::new()
+                    .name(format!("test-interner-{i}"))
+                    .spawn(move || {
                     for _ in 0..10 {
                         for query in &queries {
                             let _ = interner.intern(query);
                         }
                     }
-                })
+                }).expect("failed to spawn test thread")
             })
             .collect();
 

@@ -4909,7 +4909,9 @@ pub fn run_tui(
                         let tx_final = tx.clone();
 
                         // Spawn download thread
-                        std::thread::spawn(move || {
+                        std::thread::Builder::new()
+                            .name("model-download".into())
+                            .spawn(move || {
                             let callback: Box<dyn Fn(DownloadProgress) + Send + Sync> =
                                 Box::new(move |progress| {
                                     let _ = tx.send(progress);
@@ -4943,7 +4945,7 @@ pub fn run_tui(
                                     });
                                 }
                             }
-                        });
+                        }).expect("failed to spawn model-download thread");
 
                         // Update state to show download in progress
                         semantic_availability = SemanticAvailability::Downloading {

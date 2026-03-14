@@ -117,7 +117,9 @@ fn spawn_connector_producer(
     since_ts: Option<i64>,
     progress: Option<Arc<IndexingProgress>>,
 ) -> JoinHandle<()> {
-    thread::spawn(move || {
+    thread::Builder::new()
+        .name(format!("connector-{name}"))
+        .spawn(move || {
         let conn = factory();
         let detect = conn.detect();
         let was_detected = detect.detected;
@@ -215,6 +217,7 @@ fn spawn_connector_producer(
             connector_name: name,
         });
     })
+    .expect("failed to spawn connector thread")
 }
 
 /// Run the streaming indexing consumer.
