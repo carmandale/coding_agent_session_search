@@ -62,6 +62,7 @@ impl PiAgentConnector {
         }
         for entry in WalkDir::new(sessions)
             .follow_links(true)
+            .max_depth(10)
             .into_iter()
             .flatten()
         {
@@ -148,11 +149,22 @@ impl PiAgentConnector {
 impl Connector for PiAgentConnector {
     fn detect(&self) -> DetectionResult {
         let home = Self::home();
-        if home.join("sessions").exists() {
+        let sessions = home.join("sessions");
+        if sessions.exists() {
             DetectionResult {
                 detected: true,
                 evidence: vec![format!("found {}", home.display())],
-                root_paths: vec![home],
+                // Return sessions dir as watch root — not the entire home dir.
+                // This avoids watching ~/.pi/agent/extensions/node_modules/ (19K+ files).
+                root_paths: vec![sessions],
+            }
+        } else if home.exists() {
+            // Home exists but sessions subdir doesn't yet — still detected,
+            // but no watch root (graceful degradation).
+            DetectionResult {
+                detected: true,
+                evidence: vec![format!("found {} (no sessions dir yet)", home.display())],
+                root_paths: vec![],
             }
         } else {
             DetectionResult::not_found()
@@ -160,14 +172,15 @@ impl Connector for PiAgentConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        // Use data_root if it looks like a pi-agent directory (for testing)
-        let is_pi_agent_dir = ctx
-            .data_dir
-            .to_str()
-            .map(|s| {
-                s.contains(".pi/agent") || s.ends_with("/pi-agent") || s.ends_with("\\pi-agent")
-            })
-            .unwrap_or(false);
+        let pi_home = Self::home();
+        let pi_sessions = Self::sessions_dir(&pi_home);
+
+        // Check if the provided data_dir is the Pi home or its sessions subdir.
+        // This replaces the old is_pi_agent_dir path-substring heuristic with
+        // an exact match against the configured home, honoring arbitrary
+        // PI_CODING_AGENT_DIR values.
+        let is_pi_path = ctx.data_dir == pi_home || ctx.data_dir == pi_sessions;
+
         let looks_like_root = |path: &PathBuf| {
             path.join("sessions").exists()
                 || path
@@ -176,13 +189,16 @@ impl Connector for PiAgentConnector {
         };
 
         let mut home = if ctx.use_default_detection() {
-            if is_pi_agent_dir {
+            if is_pi_path {
                 ctx.data_dir.clone()
             } else {
-                Self::home()
+                pi_home
             }
         } else {
-            if !looks_like_root(&ctx.data_dir) {
+            // For explicit roots: accept if it matches the configured Pi home
+            // or sessions dir. The exact comparison prevents accepting unrelated
+            // "sessions" directories from Codex/Factory via remote root fanout.
+            if !looks_like_root(&ctx.data_dir) && !is_pi_path {
                 return Ok(Vec::new());
             }
             ctx.data_dir.clone()
