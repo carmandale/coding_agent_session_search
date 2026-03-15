@@ -916,6 +916,11 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
         "cass watcher starting"
     );
 
+    // Write PID file so the watchdog can identify us reliably (no pgrep)
+    let pid_path = data_dir.join("watcher.pid");
+    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+    tracing::info!(pid = std::process::id(), path = %pid_path.display(), "wrote PID file");
+
     // Watch all detected roots
     for (_, root) in &roots {
         if let Err(e) = watcher.watch(&root.path, RecursiveMode::Recursive) {
@@ -1056,6 +1061,13 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
             }
         }
     }
+
+    // Clean up PID file on shutdown so watchdog knows we're gone
+    if pid_path.exists() {
+        let _ = std::fs::remove_file(&pid_path);
+        tracing::info!(path = %pid_path.display(), "removed PID file on shutdown");
+    }
+
     Ok(())
 }
 

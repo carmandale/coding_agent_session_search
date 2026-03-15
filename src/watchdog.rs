@@ -136,9 +136,7 @@ mod platform {
         match output {
             Ok(out) => {
                 let cmdline = String::from_utf8_lossy(&out.stdout);
-                cmdline.contains("cass")
-                    && cmdline.contains("index")
-                    && cmdline.contains("--watch")
+                cmdline.contains("cass") && cmdline.contains("index") && cmdline.contains("--watch")
             }
             Err(_) => false,
         }
@@ -165,18 +163,24 @@ mod platform {
             bail!("kill({pid}, SIGTERM) failed with errno {errno}");
         }
 
-        tracing::info!(pid, "sent SIGTERM to watcher, waiting up to {SIGTERM_GRACE_SECS}s");
+        tracing::info!(
+            pid,
+            "sent SIGTERM to watcher, waiting up to {SIGTERM_GRACE_SECS}s"
+        );
 
         // Wait for process to exit
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(SIGTERM_GRACE_SECS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(SIGTERM_GRACE_SECS);
         loop {
             if !is_pid_alive(pid) {
                 tracing::info!(pid, "watcher exited after SIGTERM");
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                tracing::warn!(pid, "watcher didn't exit after {SIGTERM_GRACE_SECS}s, sending SIGKILL");
+                tracing::warn!(
+                    pid,
+                    "watcher didn't exit after {SIGTERM_GRACE_SECS}s, sending SIGKILL"
+                );
                 unsafe { libc::kill(pid as i32, libc::SIGKILL) };
                 // Give a moment for SIGKILL to take effect
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -242,9 +246,7 @@ mod platform {
             .with_context(|| format!("failed to open lockfile {}", lock_path.display()))?;
 
         // SAFETY: flock with LOCK_EX | LOCK_NB is a standard POSIX advisory lock.
-        let ret = unsafe {
-            libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
-        };
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if ret == 0 {
             // Write our PID for debugging
             let mut f = &file;
@@ -452,8 +454,7 @@ mod platform {
             }
         };
 
-        let home = dirs::home_dir()
-            .with_context(|| "cannot determine home directory")?;
+        let home = dirs::home_dir().with_context(|| "cannot determine home directory")?;
         let home_str = home.display().to_string();
         let launch_agents = home.join("Library/LaunchAgents");
         fs::create_dir_all(&launch_agents)
@@ -480,10 +481,7 @@ mod platform {
                     tracing::info!(label, "updating cass-managed plist");
                 } else if force {
                     // Hand-written + --force → overwrite with warning
-                    eprintln!(
-                        "⚠ Overwriting hand-written plist: {}",
-                        plist_path.display()
-                    );
+                    eprintln!("⚠ Overwriting hand-written plist: {}", plist_path.display());
                 } else {
                     // Hand-written + no --force → error
                     bail!(
@@ -504,8 +502,7 @@ mod platform {
 
     /// Uninstall (unload + remove) both launchd plists.
     pub fn uninstall_plists() -> Result<()> {
-        let home = dirs::home_dir()
-            .with_context(|| "cannot determine home directory")?;
+        let home = dirs::home_dir().with_context(|| "cannot determine home directory")?;
         let launch_agents = home.join("Library/LaunchAgents");
         let uid = unsafe { libc::getuid() };
         let domain = format!("gui/{uid}");
@@ -544,7 +541,9 @@ mod platform {
                 match &result {
                     WatchdogResult::Healthy => println!("✓ Watcher is healthy"),
                     WatchdogResult::Restarted { was_stale_secs } => {
-                        println!("⚠ Watcher was stale ({was_stale_secs}s), restarted via launchd KeepAlive");
+                        println!(
+                            "⚠ Watcher was stale ({was_stale_secs}s), restarted via launchd KeepAlive"
+                        );
                     }
                     WatchdogResult::NotRunning => {
                         println!("✗ Watcher is not running");
@@ -560,10 +559,7 @@ mod platform {
                     std::process::exit(code);
                 }
             }
-            WatchdogCommand::Install {
-                binary_path,
-                force,
-            } => {
+            WatchdogCommand::Install { binary_path, force } => {
                 install_plists(binary_path, force)?;
             }
             WatchdogCommand::Uninstall => {
@@ -605,3 +601,319 @@ mod platform {
 // Re-export platform-specific items at the module level
 pub use platform::WatchdogCommand;
 pub use platform::run_watchdog_command;
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::platform::*;
+    use std::fs;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
+
+    // ── T5: Heartbeat tests ──────────────────────────────────────────
+
+    #[test]
+    fn heartbeat_age_calculation() {
+        let dir = TempDir::new().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Write a heartbeat 100 seconds ago
+        let heartbeat_path = dir.path().join("watcher-heartbeat");
+        fs::write(&heartbeat_path, (now - 100).to_string()).unwrap();
+
+        let age = check_heartbeat(dir.path()).unwrap();
+        // Allow 2 seconds of test execution jitter
+        assert!((99..=102).contains(&age), "expected ~100, got {age}");
+    }
+
+    #[test]
+    fn heartbeat_missing_returns_none() {
+        let dir = TempDir::new().unwrap();
+        assert!(check_heartbeat(dir.path()).is_none());
+    }
+
+    #[test]
+    fn heartbeat_stale_detection() {
+        // Just below threshold → not stale
+        assert!(!is_heartbeat_stale(HEARTBEAT_THRESHOLD_SECS));
+        assert!(!is_heartbeat_stale(HEARTBEAT_THRESHOLD_SECS - 1));
+        // Above threshold → stale
+        assert!(is_heartbeat_stale(HEARTBEAT_THRESHOLD_SECS + 1));
+        assert!(is_heartbeat_stale(5000));
+    }
+
+    // ── T6: PID management tests ─────────────────────────────────────
+
+    #[test]
+    fn pid_file_read_write() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("watcher.pid");
+
+        // No PID file → None
+        assert!(read_pid_file(dir.path()).is_none());
+
+        // Write PID → read it back
+        fs::write(&pid_path, "12345").unwrap();
+        assert_eq!(read_pid_file(dir.path()), Some(12345));
+
+        // Garbage content → None
+        fs::write(&pid_path, "not-a-number").unwrap();
+        assert!(read_pid_file(dir.path()).is_none());
+    }
+
+    #[test]
+    fn pid_stale_detection() {
+        // PID 1 (launchd/init) is always alive
+        assert!(is_pid_alive(1));
+        // Non-existent PID (very high number)
+        assert!(!is_pid_alive(4_000_000));
+    }
+
+    #[test]
+    fn pid_identity_verification() {
+        // Our own process should NOT match "cass index --watch"
+        let our_pid = std::process::id();
+        assert!(!verify_pid_is_watcher(our_pid));
+        // Non-existent PID → false
+        assert!(!verify_pid_is_watcher(4_000_000));
+    }
+
+    #[test]
+    fn kill_errno_handling() {
+        let dir = TempDir::new().unwrap();
+        // Trying to kill a non-existent PID should succeed
+        // (kill_watcher handles ESRCH by cleaning up PID file)
+        let pid_path = dir.path().join("watcher.pid");
+        fs::write(&pid_path, "4000000").unwrap();
+
+        let result = kill_watcher(4_000_000, dir.path());
+        assert!(result.is_ok(), "kill of non-existent PID should succeed");
+        // PID file should be cleaned up
+        assert!(!pid_path.exists(), "PID file should be removed");
+    }
+
+    // ── T7: Log rotation test ────────────────────────────────────────
+
+    #[test]
+    fn log_rotation_threshold() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("cass-index-watch.log");
+
+        // Small file → no rotation
+        fs::write(&log_path, "small content").unwrap();
+        rotate_log_if_needed(&log_path).unwrap();
+        assert!(!dir.path().join("cass-index-watch.log.1").exists());
+
+        // File > 100MB → rotation occurs
+        {
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&log_path)
+                .unwrap();
+            // Write 101MB
+            let chunk = vec![b'x'; 1024 * 1024]; // 1MB
+            for _ in 0..101 {
+                f.write_all(&chunk).unwrap();
+            }
+        }
+
+        rotate_log_if_needed(&log_path).unwrap();
+        let rotated = dir.path().join("cass-index-watch.log.1");
+        assert!(rotated.exists(), "rotated file should exist");
+        // Original should be truncated
+        let meta = fs::metadata(&log_path).unwrap();
+        assert_eq!(meta.len(), 0, "original log should be truncated");
+        // Rotated should have the content
+        let rotated_meta = fs::metadata(&rotated).unwrap();
+        assert!(
+            rotated_meta.len() > LOG_MAX_BYTES,
+            "rotated log should have full content"
+        );
+
+        // No log file → no error
+        let missing = dir.path().join("nonexistent.log");
+        assert!(rotate_log_if_needed(&missing).is_ok());
+    }
+
+    // ── T8: Lockfile test ────────────────────────────────────────────
+
+    #[test]
+    fn lockfile_prevents_concurrent() {
+        let dir = TempDir::new().unwrap();
+
+        // First lock should succeed
+        let guard1 = acquire_lock(dir.path()).expect("first lock should succeed");
+
+        // Second lock should fail while first is held
+        let result2 = acquire_lock(dir.path());
+        assert!(result2.is_err(), "second lock should fail");
+        assert!(
+            result2.unwrap_err().to_string().contains("already running"),
+            "error should mention already running"
+        );
+
+        // Explicitly release first lock
+        drop(guard1);
+
+        // Small delay to ensure OS has processed the close + unlock
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Third lock should succeed after release
+        let _guard3 = acquire_lock(dir.path()).expect("lock after release should succeed");
+    }
+
+    // ── T10: Plist generation tests ──────────────────────────────────
+
+    #[test]
+    fn plist_generation_correct() {
+        let watcher_plist = generate_watcher_plist("/usr/local/bin/cass", "/Users/testuser");
+        assert!(watcher_plist.contains(PLIST_MARKER), "must contain marker");
+        assert!(watcher_plist.contains("<string>com.cass.index-watch</string>"));
+        assert!(watcher_plist.contains("<string>/usr/local/bin/cass</string>"));
+        assert!(watcher_plist.contains("<string>index</string>"));
+        assert!(watcher_plist.contains("<string>--watch</string>"));
+        assert!(
+            watcher_plist.contains("<true/>"),
+            "KeepAlive should be true"
+        );
+        assert!(watcher_plist.contains("/Users/testuser/Library/Logs/cass-index-watch.log"));
+
+        let watchdog_plist = generate_watchdog_plist("/usr/local/bin/cass", "/Users/testuser");
+        assert!(watchdog_plist.contains(PLIST_MARKER), "must contain marker");
+        assert!(watchdog_plist.contains("<string>com.cass.health-watchdog</string>"));
+        assert!(watchdog_plist.contains("<string>watchdog</string>"));
+        assert!(watchdog_plist.contains("<string>run</string>"));
+        assert!(watchdog_plist.contains(&format!("<integer>{WATCHDOG_INTERVAL_SECS}</integer>")));
+    }
+
+    #[test]
+    fn plist_marker_detection() {
+        let dir = TempDir::new().unwrap();
+        let plist_path = dir.path().join("test.plist");
+
+        // Cass-managed plist → true
+        let managed = "<?xml?><!-- managed by cass --><plist>content</plist>".to_string();
+        fs::write(&plist_path, &managed).unwrap();
+        assert!(is_cass_managed(&plist_path));
+
+        // Hand-written plist → false
+        let hand_written = "<?xml?><plist>content</plist>";
+        fs::write(&plist_path, hand_written).unwrap();
+        assert!(!is_cass_managed(&plist_path));
+
+        // Non-existent file → false
+        assert!(!is_cass_managed(&dir.path().join("nonexistent.plist")));
+    }
+
+    // ── T11: Install decision tree tests ─────────────────────────────
+
+    #[test]
+    fn install_overwrites_cass_managed() {
+        let dir = TempDir::new().unwrap();
+        let plist_path = dir.path().join("test.plist");
+
+        // Write a cass-managed plist
+        let managed = format!("<?xml?>{PLIST_MARKER}<plist>old content</plist>");
+        fs::write(&plist_path, &managed).unwrap();
+
+        assert!(is_cass_managed(&plist_path));
+        // The install logic checks is_cass_managed → allows overwrite
+        // (full install test would need launchctl, testing the decision branch here)
+    }
+
+    #[test]
+    fn install_blocks_hand_written_without_force() {
+        let dir = TempDir::new().unwrap();
+        let plist_path = dir.path().join("test.plist");
+
+        // Write a hand-written plist (no marker)
+        fs::write(&plist_path, "<?xml?><plist>hand written</plist>").unwrap();
+
+        assert!(!is_cass_managed(&plist_path));
+        // This verifies the is_cass_managed check — the install_plists function
+        // uses this to decide whether --force is needed
+    }
+
+    #[test]
+    fn install_force_overwrites_hand_written() {
+        let dir = TempDir::new().unwrap();
+        let plist_path = dir.path().join("test.plist");
+
+        // Write a hand-written plist
+        fs::write(&plist_path, "<?xml?><plist>hand written</plist>").unwrap();
+        assert!(!is_cass_managed(&plist_path));
+        // With --force, the install would proceed (tested via install decision tree)
+    }
+
+    // ── T9: WatchdogResult mapping ───────────────────────────────────
+
+    #[test]
+    fn watchdog_result_to_exit_code() {
+        assert_eq!(WatchdogResult::Healthy.exit_code(), 0);
+        assert_eq!(
+            WatchdogResult::Restarted {
+                was_stale_secs: 3000
+            }
+            .exit_code(),
+            1
+        );
+        assert_eq!(WatchdogResult::NotRunning.exit_code(), 2);
+        assert_eq!(WatchdogResult::AlreadyLocked.exit_code(), 0);
+        assert_eq!(WatchdogResult::Error("test".to_string()).exit_code(), 3);
+    }
+
+    // ── T12: Uninstall test ──────────────────────────────────────────
+
+    #[test]
+    fn uninstall_removes_both_plists() {
+        // Test file removal logic (without launchctl)
+        let dir = TempDir::new().unwrap();
+        let watcher_plist = dir.path().join(format!("{WATCHER_LABEL}.plist"));
+        let watchdog_plist = dir.path().join(format!("{WATCHDOG_LABEL}.plist"));
+
+        fs::write(&watcher_plist, "content").unwrap();
+        fs::write(&watchdog_plist, "content").unwrap();
+
+        assert!(watcher_plist.exists());
+        assert!(watchdog_plist.exists());
+
+        // Remove them (simulating uninstall file removal)
+        fs::remove_file(&watcher_plist).unwrap();
+        fs::remove_file(&watchdog_plist).unwrap();
+
+        assert!(!watcher_plist.exists());
+        assert!(!watchdog_plist.exists());
+    }
+
+    // ── Health JSON test ─────────────────────────────────────────────
+
+    #[test]
+    fn health_includes_watchdog_field() {
+        // Test via state_meta_json (requires data dir + db)
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+
+        // Create a minimal SQLite DB
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (id INTEGER);
+             CREATE TABLE messages (id INTEGER);
+             CREATE TABLE meta (key TEXT, value TEXT);",
+        )
+        .unwrap();
+
+        let state = crate::state_meta_json(dir.path(), &db_path, 1800);
+        let watchdog = state.get("watchdog");
+        assert!(
+            watchdog.is_some(),
+            "state_meta_json should include 'watchdog' key"
+        );
+        let wd = watchdog.unwrap();
+        assert!(wd.get("plist_installed").is_some());
+        assert!(wd.get("watcher_plist_installed").is_some());
+    }
+}

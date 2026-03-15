@@ -2292,7 +2292,7 @@ async fn execute_cli(
 }
 
 /// Compute lightweight state snapshot (index/db freshness) for robot meta and state command reuse
-fn state_meta_json(data_dir: &Path, db_path: &Path, stale_threshold: u64) -> serde_json::Value {
+pub fn state_meta_json(data_dir: &Path, db_path: &Path, stale_threshold: u64) -> serde_json::Value {
     use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
 
