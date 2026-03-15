@@ -287,6 +287,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomfilter"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f6d7f06817e48ea4e17532fa61bc4e8b9a101437f0623f69d2ea54284f3a817"
+dependencies = [
+ "getrandom 0.2.16",
+ "siphasher",
+]
+
+[[package]]
 name = "bon"
 version = "3.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -574,6 +584,7 @@ dependencies = [
  "dotenvy",
  "fastembed",
  "flate2",
+ "franken-agent-detection",
  "fxhash",
  "glob",
  "half",
@@ -1219,6 +1230,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "franken-agent-detection"
+version = "0.1.2"
+source = "git+https://github.com/Dicklesworthstone/franken_agent_detection?rev=5b0eb1a#5b0eb1a7ece0c741f30b0e280d73488b8c4dd783"
+dependencies = [
+ "anyhow",
+ "bloomfilter",
+ "chrono",
+ "dirs",
+ "dotenvy",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tracing",
+ "walkdir",
 ]
 
 [[package]]
@@ -3393,6 +3422,12 @@ name = "similar"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+
+[[package]]
+name = "siphasher"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "sketches-ddsketch"

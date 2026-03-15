@@ -183,6 +183,7 @@ pub mod codebuff;
 pub mod codex;
 pub mod cursor;
 pub mod factory;
+pub mod fad_adapter;
 pub mod gemini;
 pub mod opencode;
 pub mod pi_agent;

@@ -787,6 +787,11 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("pi_agent", || Box::new(PiAgentConnector::new())),
         ("factory", || Box::new(FactoryConnector::new())),
         ("codebuff", || Box::new(CodebuffConnector::new())),
+        // FAD-adapted connectors (spec 006-fork-sync-upstream)
+        ("copilot", crate::connectors::fad_adapter::copilot),
+        ("clawdbot", crate::connectors::fad_adapter::clawdbot),
+        ("openclaw", crate::connectors::fad_adapter::openclaw),
+        ("vibe", crate::connectors::fad_adapter::vibe),
     ]
 }
 
@@ -838,6 +843,10 @@ impl ConnectorKind {
             "pi_agent" => Some(Self::PiAgent),
             "factory" => Some(Self::Factory),
             "codebuff" => Some(Self::Codebuff),
+            "copilot" => Some(Self::Copilot),
+            "clawdbot" => Some(Self::Clawdbot),
+            "openclaw" => Some(Self::OpenClaw),
+            "vibe" => Some(Self::Vibe),
             _ => None,
         }
     }
@@ -858,6 +867,10 @@ impl ConnectorKind {
             Self::PiAgent => Box::new(PiAgentConnector::new()),
             Self::Factory => Box::new(FactoryConnector::new()),
             Self::Codebuff => Box::new(CodebuffConnector::new()),
+            Self::Copilot => crate::connectors::fad_adapter::copilot(),
+            Self::Clawdbot => crate::connectors::fad_adapter::clawdbot(),
+            Self::OpenClaw => crate::connectors::fad_adapter::openclaw(),
+            Self::Vibe => crate::connectors::fad_adapter::vibe(),
         }
     }
 }
@@ -1249,6 +1262,10 @@ enum ConnectorKind {
     PiAgent,
     Factory,
     Codebuff,
+    Copilot,
+    Clawdbot,
+    OpenClaw,
+    Vibe,
 }
 
 fn state_path(data_dir: &Path) -> PathBuf {

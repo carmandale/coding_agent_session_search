@@ -35,6 +35,7 @@ tantivy = "*"
 rayon = "*"
 crossbeam-channel = "*"
 signal-hook = "*"
+franken-agent-detection = { git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "5b0eb1a", features = ["connectors"] }
 parking_lot = "*"
 lru = "*"
 fxhash = "*"  # Fast non-cryptographic hashing for cache keys (P1 Opt 1.3)
