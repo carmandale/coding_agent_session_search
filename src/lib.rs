@@ -10,6 +10,7 @@ pub mod sources;
 pub mod storage;
 pub mod ui;
 pub mod update_check;
+pub mod watchdog;
 
 use anyhow::Result;
 use base64::{Engine, prelude::*};
@@ -495,6 +496,11 @@ pub enum Commands {
     /// Manage semantic search models
     #[command(subcommand)]
     Models(ModelsCommand),
+    /// Watchdog: monitor and manage the watcher daemon
+    Watchdog {
+        #[command(subcommand)]
+        command: Option<watchdog::WatchdogCommand>,
+    },
 }
 
 /// Subcommands for managing remote sources (P5.x)
@@ -2268,6 +2274,15 @@ async fn execute_cli(
                 Commands::Models(subcmd) => {
                     run_models_command(subcmd)?;
                 }
+                Commands::Watchdog { command } => {
+                    crate::watchdog::run_watchdog_command(command).map_err(|e| CliError {
+                        code: 3,
+                        kind: "watchdog",
+                        message: format!("{e}"),
+                        hint: None,
+                        retryable: false,
+                    })?;
+                }
                 _ => {}
             }
         }
@@ -2360,6 +2375,14 @@ fn state_meta_json(data_dir: &Path, db_path: &Path, stale_threshold: u64) -> ser
             "sessions": pending_sessions,
             "watch_active": watch_state_path.exists()
         },
+        "watchdog": {
+            "watcher_plist_installed": dirs::home_dir()
+                .map(|h| h.join("Library/LaunchAgents/com.cass.index-watch.plist").exists())
+                .unwrap_or(false),
+            "plist_installed": dirs::home_dir()
+                .map(|h| h.join("Library/LaunchAgents/com.cass.health-watchdog.plist").exists())
+                .unwrap_or(false),
+        },
         "_meta": {
             "timestamp": ts_str,
             "data_dir": data_dir.display().to_string(),
@@ -2430,6 +2453,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Timeline { .. }) => "timeline".to_string(),
         Some(Commands::Sources(..)) => "sources".to_string(),
         Some(Commands::Models(..)) => "models".to_string(),
+        Some(Commands::Watchdog { .. }) => "watchdog".to_string(),
         Some(Commands::Pages { .. }) => "pages".to_string(),
         None => "(default)".to_string(),
     }

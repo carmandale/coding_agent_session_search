@@ -26,6 +26,7 @@ serde_json = "*"
 rmp-serde = "1"  # MessagePack for binary metadata serialization (Opt 3.1)
 toml = "*"
 directories = "*"
+libc = "*"  # Explicit dep for watchdog PID management (libc::kill)
 which = "*"
 shell-words = "*"
 dotenvy = "*"
