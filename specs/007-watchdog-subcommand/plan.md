@@ -1,3 +1,6 @@
+<!-- Codex Review: APPROVED after 3 rounds | model: gpt-5.3-codex | date: 2026-03-15 -->
+<!-- Status: REVISED -->
+<!-- Revisions: R1: A6 health field, PID identity verification, macOS guard, launchctl sequence, bare cass watchdog default, 14→19 tests. R2: launchctl error handling, install decision tree, uninstall sequence, 5 more tests. -->
 ---
 title: "plan: cass watchdog subcommand — Shape A"
 date: 2026-03-15
@@ -8,8 +11,12 @@ bead: coding_agent_session_search-2efx
 
 ## Architecture
 
-**New file: `src/watchdog.rs`** (~300 lines) — all watchdog logic.
-**Modified: `src/lib.rs`** — `WatchdogCommand` enum + thin dispatch (~40 lines).
+**New file: `src/watchdog.rs`** (~350 lines) — all watchdog logic, wrapped
+in `#[cfg(target_os = "macos")]`. On non-macOS, a stub module provides the
+`WatchdogCommand` enum and a `run_watchdog_command()` that prints
+"watchdog is only supported on macOS" and exits with code 2.
+**Modified: `src/lib.rs`** — `WatchdogCommand` enum + thin dispatch (~40 lines),
+health JSON extension for plist status.
 **Modified: `src/indexer/mod.rs`** — PID file write/delete (~10 lines).
 **Modified: `Cargo.toml`** — add `libc = "*"` as explicit dep.
 
@@ -32,9 +39,33 @@ Plain text, decimal PID only. Written by watcher after startup banner.
 Deleted on clean shutdown (SIGTERM handler). Staleness checked via
 `libc::kill(pid, 0)`.
 
-**PID recycling mitigation:** Documented — heartbeat freshness covers
-this case. A recycled PID with a stale heartbeat is correctly identified
-as a stuck/dead watcher and restarted.
+**PID identity verification before kill:** Before sending SIGTERM, verify
+the process at that PID is actually `cass index --watch` by reading its
+command line via `sysctl kern.procargs2` (macOS). If the command line
+doesn't contain `cass` AND `index` AND `--watch`, treat as stale PID
+(clean up PID file, return `NotRunning`). This prevents killing the wrong
+process on PID reuse or PID file tampering.
+
+```rust
+fn verify_pid_is_watcher(pid: u32) -> bool {
+    // Use sysctl KERN_PROCARGS2 to get the process command line
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output();
+    match output {
+        Ok(out) => {
+            let cmdline = String::from_utf8_lossy(&out.stdout);
+            cmdline.contains("cass") && cmdline.contains("index") && cmdline.contains("--watch")
+        }
+        Err(_) => false, // Can't verify → treat as not-watcher
+    }
+}
+```
+
+**PID recycling mitigation:** Two-layer defense:
+1. Command-line verification (above) catches PID reuse by unrelated processes
+2. Heartbeat freshness covers the case where a recycled PID happens to be
+   another `cass` process (astronomically unlikely but documented)
 
 ### Binary path: `which::which("cass")` at install-time
 Called during `cass watchdog install`, NOT during watchdog runtime (launchd
@@ -45,6 +76,73 @@ Override via `--binary-path <path>`.
 All paths resolved at install-time via `dirs::home_dir()`. No shell variable
 expansion in plist XML. Each generated plist includes
 `<!-- managed by cass -->` marker on the first line inside `<plist>`.
+
+### Idempotent launchctl sequence (install)
+The install command uses a deterministic bootout→write→bootstrap flow:
+```rust
+fn install_and_load(plist_path: &Path, label: &str) -> Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let domain = format!("gui/{uid}");
+
+    // 1. Bootout if already loaded (ignore errors — may not be loaded)
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("{domain}/{label}")])
+        .output();
+
+    // 2. Write the plist file (already done by caller)
+
+    // 3. Bootstrap (load) the new plist
+    let output = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, &plist_path.display().to_string()])
+        .output()?;
+    if !output.status.success() {
+        // Fallback: try legacy `launchctl load` for older macOS
+        let fallback = std::process::Command::new("launchctl")
+            .args(["load", &plist_path.display().to_string()])
+            .output()?;
+        if !fallback.status.success() {
+            let stderr = String::from_utf8_lossy(&fallback.stderr);
+            anyhow::bail!(
+                "Failed to load plist {}: bootstrap and load both failed. {}",
+                plist_path.display(),
+                stderr
+            );
+        }
+    }
+    Ok(())
+}
+```
+This is idempotent: bootout removes the old job if loaded, bootstrap
+registers the new one. Both load paths check for failure and return
+an error if neither succeeds.
+
+### Install decision tree (R6 + R9)
+
+```
+For each plist (watcher + watchdog):
+  1. Does the plist file exist?
+     NO → write new plist, load it. Done.
+     YES → go to 2.
+  
+  2. Is it cass-managed? (contains <!-- managed by cass --> marker)
+     YES → overwrite silently, reload. Done.
+     NO → go to 3.
+
+  3. Was --force passed?
+     YES → overwrite, reload. Print warning: "Overwriting hand-written plist."
+     NO → return error: "Existing plist not managed by cass. Use --force."
+```
+
+### Uninstall sequence
+
+```
+For each plist (watcher + watchdog):
+  1. Bootout the launchd job: launchctl bootout gui/<uid>/<label>
+     (ignore errors — may not be loaded)
+  2. Remove the plist file: std::fs::remove_file()
+     (return error if file doesn't exist and was expected)
+  3. Print confirmation: "Removed <label>"
+```
 
 ### Result enum for testability
 ```rust
@@ -76,9 +174,14 @@ Already transitive, making explicit for `libc::kill()` usage.
 Add to `Commands` enum (~line 494, near `Sources`):
 ```rust
 /// Watchdog: monitor and manage the watcher daemon
-#[command(subcommand)]
-Watchdog(WatchdogCommand),
+Watchdog {
+    #[command(subcommand)]
+    command: Option<WatchdogCommand>,
+},
 ```
+
+Using `Option<WatchdogCommand>` so bare `cass watchdog` (no subcommand)
+defaults to `Run` behavior. The dispatch checks `None` → run health check.
 
 Add `WatchdogCommand` sub-enum:
 ```rust
@@ -102,13 +205,21 @@ pub enum WatchdogCommand {
 
 Dispatch in `execute_cli`:
 ```rust
-Commands::Watchdog(subcmd) => {
-    crate::watchdog::run_watchdog_command(subcmd)?;
+Commands::Watchdog { command } => {
+    crate::watchdog::run_watchdog_command(command)?;
 }
 ```
 
-Bare `cass watchdog` (no subcommand) maps to `Run` via `#[command(default_subcommand)]`
-or by checking if no subcommand was provided.
+**Extend `state_meta_json()` (lib.rs ~line 2280):** Add watchdog plist
+installed status to the health JSON output:
+```rust
+// In state_meta_json(), add after the "pending" section:
+"watchdog": {
+    "plist_installed": home.join("Library/LaunchAgents/com.cass.health-watchdog.plist").exists(),
+    "watcher_plist_installed": home.join("Library/LaunchAgents/com.cass.index-watch.plist").exists(),
+}
+```
+This satisfies spec Shape A6.
 
 ### `src/watchdog.rs` (new, ~300 lines)
 
@@ -196,8 +307,17 @@ let _ = std::fs::remove_file(&pid_path);
 | `log_rotation_threshold` | Files > 100MB trigger rotation | Unit |
 | `pid_file_read_write` | PID roundtrip to file | Unit |
 | `pid_stale_detection` | Non-existent PID → stale | Unit |
+| `pid_identity_verification` | Command-line check for cass index --watch | Unit |
 | `kill_errno_handling` | ESRCH vs EPERM vs success | Unit |
 | `plist_marker_detection` | `is_cass_managed` finds marker | Unit |
 | `plist_generation_correct` | Template interpolation produces valid XML | Unit |
 | `watchdog_result_to_exit_code` | Enum → code mapping | Unit |
 | `lockfile_prevents_concurrent` | Second lock attempt fails | Unit |
+| `health_includes_watchdog_field` | `cass health --json` includes `watchdog.plist_installed` | Integration |
+| `install_creates_both_plists` | Both plist files created at expected paths | Integration |
+| `install_overwrites_cass_managed` | Cass-managed plists overwritten silently | Unit |
+| `install_blocks_hand_written_without_force` | Hand-written plists require --force | Unit |
+| `install_force_overwrites_hand_written` | --force overwrites non-managed plists | Unit |
+| `uninstall_removes_both_plists` | Both plist files removed | Unit |
+| `install_fails_on_launchctl_error` | Returns error when both bootstrap and load fail | Unit |
+| `non_macos_shows_error` | On non-macOS, command prints unsupported message | Unit |
