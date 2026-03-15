@@ -1,0 +1,65 @@
+---
+schema_version: "1.0.0"
+mode: finalize
+date: 2026-03-15T12:49:28.730Z
+session: "coding_agent_session_search-2efx-implement-spec-007-watchdog-subcommand"
+outcome: "SUCCEEDED"
+primary_bead: "coding_agent_session_search-2efx"
+---
+
+goal: "Replace external scripts/watchdog.sh with built-in cass watchdog subcommand (spec 007)"
+now: "All 15 tasks complete. 4 commits on feat/007-watchdog-subcommand. PR #1 open. 18 new tests, 1179 total passing. Binary installed globally via cargo install --locked."
+
+final_solutions:
+  - "Built-in cass watchdog subcommand with run/install/uninstall replacing external bash script"
+  - "PID file lifecycle (write on startup, delete on shutdown) replacing pgrep-based process detection"
+  - "libc::flock(LOCK_EX|LOCK_NB) for advisory locking (File::try_lock_exclusive not stable in Rust 1.88)"
+  - "InstallDecision pure enum for testable 3-branch install decision tree separated from I/O"
+  - "PID identity verification via ps -p <pid> -o args= prevents killing wrong process on PID reuse"
+  - "Marker-based plist overwrite: <!-- managed by cass --> marker for safe silent updates"
+
+final_decisions:
+  - "Used libc::flock instead of std File::try_lock_exclusive (plan incorrectly stated stabilized in Rust 1.77)"
+  - "Extracted InstallDecision enum from install_plists after navigator flagged hollow tests"
+  - "Non-macOS stub module exits with code 2 (not supported), not an error"
+  - "state_meta_json made pub for test access to verify health JSON watchdog field"
+  - "Plist marker placed between <?xml?> and <!DOCTYPE> (outside <plist>) - functionally equivalent, contains() works"
+
+artifacts_produced:
+  - "src/watchdog.rs — new, ~920 lines with 18 unit tests"
+  - "src/lib.rs — CLI enum, dispatch, health JSON extension (+25 lines)"
+  - "src/indexer/mod.rs — PID file write/cleanup (+12 lines)"
+  - "Cargo.toml — libc = '*' explicit dep (+1 line)"
+  - "PR #1: https://github.com/carmandale/coding_agent_session_search/pull/1"
+
+done_this_session:
+  - "T1-T12: Full implementation of watchdog subcommand"
+  - "T4: PID file lifecycle in watcher (indexer/mod.rs)"
+  - "T13-T15: Verification — cargo check/clippy/fmt clean, 1179 tests pass, manual E2E verified"
+  - "Navigator review: 3 rounds with SageGrove (crew-challenger), all issues addressed"
+  - "Global install via cargo install --locked --force"
+
+next:
+  - "Merge PR #1 into fix/watcher-cpu-spin"
+  - "Run cass watchdog install on production machines to replace bash-based plists"
+  - "Remove scripts/watchdog.sh after confirming new watchdog works in production"
+  - "Pin rusqlite version in Cargo.toml (0.39.0 breaks wildcard deps with FromSql changes)"
+
+files:
+  - "src/watchdog.rs"
+  - "src/lib.rs"
+  - "src/indexer/mod.rs"
+  - "Cargo.toml"
+
+test:
+  new: 18
+  total: 1179
+  pass: 1179
+  fail: 0
+
+git:
+  branch: "feat/007-watchdog-subcommand"
+  commit: "17d3c725"
+  commits_count: 4
+  remote: "https://github.com/carmandale/coding_agent_session_search.git"
+  pr: "https://github.com/carmandale/coding_agent_session_search/pull/1"
