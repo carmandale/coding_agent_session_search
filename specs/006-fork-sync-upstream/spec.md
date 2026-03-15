@@ -1,206 +1,147 @@
 ---
-title: "chore: Evaluate fork sync — fast-forward main to upstream"
+title: "chore: Fork sync — hybrid port with FAD connectors"
 date: 2026-03-15
 bead: coding_agent_session_search-3fir
+shaping: true
 ---
 
-# Fork Sync Evaluation
+# Fork Sync: Hybrid Port
 
-## Situation
+## User Story
 
-Our fork (`carmandale/coding_agent_session_search`) is **51 commits behind**
-upstream (`Dicklesworthstone/coding_agent_session_search`) with **zero divergent
-commits** on main. Fork main can be fast-forwarded cleanly.
+**As a user running cass from our fork,** I want access to new upstream
+connectors (Copilot CLI, Kimi, Qwen) without rebasing 1,400+ commits or
+risking my working watcher fix. I also want to slow the maintenance
+divergence from upstream so this fork doesn't become unmaintainable.
 
-However, our active branch `fix/watcher-cpu-spin` was based on the old main
-and conflicts with 21 source files that upstream changed.
+## Problem
 
-The watcher fix is **already deployed and running** — the binary is installed,
-the watchdog is deployed, CPU is at 0%. The question is whether to sync with
-upstream or stay diverged.
+Our working codebase (`fix/watcher-cpu-spin` branch) diverged from upstream
+in December 2025. It carries ~15-20 functional commits (pi_agent connector,
+OpenCode rewrite, doctor reconciliation, watcher CPU fix) on top of a
+codebase that's 1,400+ commits behind upstream.
 
-## What Upstream Changed (51 commits)
+Meanwhile, upstream made three architectural moves that widened the gap:
+1. **Extracted all connectors** to `franken_agent_detection` (FAD) crate —
+   every connector file is now a 3-5 line re-export stub
+2. **Replaced rusqlite** with `frankensqlite` (concurrent-writer SQLite)
+3. **Replaced ratatui/tantivy** with `frankentui`/`frankensearch`
 
-### Major themes
+Our fork has 14,329 lines of in-tree connector code (including the spec-005
+watcher fix). Upstream has 134 lines of stubs. A full rebase is days of
+work and risks breaking the deployed watcher fix.
 
-| Theme | Commits | Impact |
-|-------|---------|--------|
-| **FrankenSQLite migration** | ~15 | Replaced rusqlite with frankensqlite (custom SQLite fork with BEGIN CONCURRENT). Major refactor of storage layer. |
-| **FrankenSearch/FrankenTUI** | ~5 | Replaced tantivy search and ratatui TUI with custom forks. API changes throughout. |
-| **Release pipeline hardening** | ~10 | Pin frankensqlite revisions, static OpenSSL, glibc floor, checksum verification |
-| **New connectors** | 3 | Copilot CLI, Kimi Code, Qwen Code (re-export stubs) |
-| **Security** | 1 | Redact secrets from tool-result content before DB insert |
-| **Incremental semantic embeddings** | 1 | Embedding in watch mode (relevant to our watcher work) |
-| **Colorblind theme** | 2 | Accessibility preset for deuteranopia/protanopia |
-| **Bug fixes** | ~10 | FTS5 registration, doctor OOM, export modal keys, resize logging, etc. |
+## Constraints
 
-### Conflict analysis
+- The spec-005 watcher fix is deployed and working — must not regress
+- This is a side project — work must fit in ≤8 hours
+- We don't push to upstream (fork only)
+- The cass binary runs from our dev branch, not fork main
 
-**21 files overlap** between upstream changes and our branch. The critical ones:
+---
 
-| File | Upstream changes | Our changes | Conflict severity |
-|------|-----------------|-------------|-------------------|
-| `src/indexer/mod.rs` | +716/-109 (semantic embeddings, frankensqlite) | +87 (SIGTERM, heartbeat, slow-scan logging) | **High** — massive upstream rewrite |
-| `src/lib.rs` | +426/-266 (frankensqlite, frankentui, API changes) | +60 (named threads) | **High** — widespread refactor |
-| `src/search/query.rs` | +353/-126 (frankensearch integration) | +3 (named test thread) | **Low** — our change is trivial |
-| `src/connectors/mod.rs` | New connectors, franken_agent_detection | No direct changes from us | **Medium** — structural |
-| `src/storage/sqlite.rs` | frankensqlite migration | None from us | **Medium** — we don't touch storage |
+## Requirements (R)
 
-**Files we changed that upstream did NOT touch (no conflict):**
+| ID | Requirement | Status |
+|----|-------------|--------|
+| R0 | Watcher fix (spec 005) stays deployed and working | Core goal |
+| R1 | New upstream connectors available (Copilot CLI, Kimi, Qwen) | Nice-to-have |
+| R2 | FrankenSQLite concurrent writers accessible | Nice-to-have |
+| R3 | Maintenance burden doesn't grow indefinitely | Must-have |
+| R4 | No regression in existing functionality | Must-have |
+| R5 | Completable in ≤8 hours | Leaning yes |
 
-| File | Our changes | Safe? |
-|------|-------------|-------|
-| `src/connectors/pi_agent.rs` | detect() root fix, scan() is_pi_path, max_depth, 6 tests | ✅ Clean |
-| `src/update_check.rs` | Named thread | ✅ Clean |
-| `src/ui/tui.rs` | Named thread | ✅ Clean |
-| `src/ui/data.rs` | Named test threads | ✅ Clean |
-| `scripts/watchdog.sh` | New file | ✅ Clean |
-| `Cargo.toml` | strip=debuginfo, signal-hook | ⚠️ Upstream changed deps too |
+---
 
-## Risk Assessment
+## A: Stay diverged (permanent fork)
 
-### If we sync (rebase onto upstream main)
+Our branch is the product. Accept solo maintenance of 63K lines.
 
-**Effort:** High. The `indexer/mod.rs` rebase alone is ~800 lines of upstream
-changes vs our ~90 lines. Many are frankensqlite API changes (`rusqlite::Connection`
-→ `frankensqlite` equivalents) that are mechanical but tedious. `lib.rs` has
-~700 lines of changes on both sides.
+| Part | Mechanism |
+|------|-----------|
+| A1 | Continue building on fix/watcher-cpu-spin |
+| A2 | Manually cherry-pick individual upstream fixes as needed |
 
-**Risk:** Moderate. Our changes (SIGTERM handler, heartbeat, named threads) are
-conceptually orthogonal to upstream's changes (frankensqlite, semantic embeddings).
-The conflicts are structural (same lines changed) but not semantic (different
-concerns). A careful rebase should preserve both.
+---
 
-**Benefit:**
-- Get frankensqlite (BEGIN CONCURRENT — better write performance)
-- Get secret redaction (security fix)
-- Get incremental semantic embeddings (relevant to watcher)
-- Get 3 new connectors (Copilot CLI, Kimi, Qwen)
-- Get bug fixes (FTS5, doctor OOM, export modal)
-- Stay current with upstream for future updates
+## B: Full rebase onto upstream main
 
-### If we stay diverged
+Re-implement our work against upstream's architecture (FAD, frankensqlite,
+frankensearch, frankentui).
 
-**Effort:** Zero now. Growing over time.
+| Part | Mechanism | Flag |
+|------|-----------|:----:|
+| B1 | Fast-forward fork main to upstream main | |
+| B2 | Re-implement spec-005 changes against FAD's pi_agent and upstream indexer | ⚠️ |
+| B3 | Re-implement spec-004 doctor changes against FAD's 2-method Connector trait | ⚠️ |
+| B4 | Resolve frankensqlite/frankensearch/frankentui API differences across ~1400 commits | ⚠️ |
 
-**Risk:** Low now. Every upstream release increases the eventual merge cost.
-If upstream refactors connectors or the indexer further, our pi_agent.rs
-and indexer changes become harder to port.
+**Note:** B is deferred due to time constraint (R5), not architectural
+unsoundness. With unlimited time, B passes all requirements. It becomes
+viable when a multi-day session can be allocated.
 
-**Benefit:**
-- The fix is deployed and working today
-- No risk of introducing regressions from upstream changes
-- Can cherry-pick individual upstream fixes if needed
+---
 
-## FrankenSQLite Deep Dive
+## D: Hybrid port — add FAD as dependency (selected)
 
-FrankenSQLite is NOT just "a different SQLite binding." It's a **ground-up
-Rust reimplementation of SQLite** with two major architectural innovations:
+Add `franken-agent-detection` to our Cargo.toml. Use FAD connectors for new
+agents only. Keep our pi_agent (with watcher fix) and all existing
+connectors in-tree.
 
-1. **MVCC Concurrent Writers** — Replaces SQLite's single-writer lock with
-   page-level Multi-Version Concurrency Control. Multiple writers commit
-   simultaneously as long as they touch different pages. Serializable
-   Snapshot Isolation (SSI) prevents write skew. This directly addresses
-   cass's write bottleneck during indexing.
+| Part | Mechanism |
+|------|-----------|
+| D1 | Add `franken-agent-detection` git dependency to Cargo.toml |
+| D2 | Write adapter layer: `From<fad::NormalizedConversation> for crate::NormalizedConversation` (or adapter structs implementing our 4-method Connector trait) |
+| D3 | Register FAD connectors for agents we DON'T already have (Copilot CLI, Kimi, Qwen) |
+| D4 | Keep all existing in-tree connectors unchanged (pi_agent, codex, claude, etc.) |
+| D5 | Verify all existing tests pass with the new dependency |
 
-2. **RaptorQ Self-Healing Storage** — RFC 6330 fountain codes infused into
-   every persistent layer. WAL frames carry repair symbols for self-healing
-   after torn writes. This is relevant to our CPU spin bug — if tantivy
-   corruption from dirty kills is the root cause, frankensqlite's
-   self-healing could prevent it at the storage layer.
+**Type collision note:** Both our codebase and FAD define structurally
+identical types (`NormalizedConversation`, `Connector` trait, etc.) but
+they're different Rust types. The adapter pattern (D2) bridges this — wrap
+each FAD connector in a struct implementing our 4-method trait. Estimated
+~2-3 hours for the 3 new connectors.
 
-### How upstream uses it in cass
+---
 
-Upstream has introduced a **dual-storage architecture**:
+## Fit Check
 
-- `SqliteStorage` — the existing rusqlite backend (still used by the indexer)
-- `FrankenStorage` — new frankensqlite backend with a `FrankenConnectionManager`
-  that provides a reader pool (4 connections) + concurrent writer pool
-  (up to available_parallelism connections)
+| Req | Requirement | Status | A | B | D |
+|-----|-------------|--------|---|---|---|
+| R0 | Watcher fix stays working | Core goal | ✅ | ❌ | ✅ |
+| R1 | New connectors available | Nice-to-have | ❌ | ✅ | ✅ |
+| R2 | FrankenSQLite accessible | Nice-to-have | ❌ | ✅ | ❌ |
+| R3 | Maintenance burden bounded | Must-have | ❌ | ✅ | ❌ |
+| R4 | No regression | Must-have | ✅ | ❌ | ✅ |
+| R5 | ≤8 hours | Leaning yes | ✅ | ❌ | ✅ |
 
-The migration is **in-progress, not complete**:
-- The indexer (`mod.rs`) still uses `SqliteStorage` (rusqlite)
-- The connection manager and concurrent writers exist but are used in
-  benchmarks, search, and vector index — not yet the hot indexing path
-- Both `rusqlite` and `frankensqlite` are in Cargo.toml simultaneously
+**Notes:**
+- B fails R0/R4 because R5 constrains time for safe porting, not because
+  B is architecturally wrong.
+- A fails R3 hard: all 63K lines diverge, gap grows with every upstream commit.
+- D fails R3 soft: only ~40K lines diverge (connector divergence stops via
+  FAD). Halves the growth rate. Not solved, but meaningfully slowed.
+- No shape passes all must-haves. R3 fails for A and D. B passes R3 but
+  fails R0, R4, R5.
+- Shape C (contribute upstream) is the correct long-term R3 answer but
+  requires upstream maintainer cooperation and is not session-sized.
 
-### What BEGIN CONCURRENT means for cass
+## Recommendation
 
-The indexer currently serializes all writes through a single `SqliteStorage`
-behind a `Mutex`. With `FrankenConnectionManager.concurrent_writer()`, the
-indexer could parallelize connector ingestion — each connector writes to its
-own concurrent writer connection, and frankensqlite's page-level MVCC
-resolves conflicts at commit time.
+**Shape D** is the pragmatic choice. It keeps the watcher fix safe (R0),
+gets new connectors (R1), fits in a session (R5), and halves the
+maintenance divergence rate (partial R3). FrankenSQLite (R2) is deferred —
+upstream's indexer doesn't use concurrent writers yet anyway.
 
-This would directly fix the "one connector blocks all others" bottleneck
-and make the 30-minute full scan faster (parallel connector writes instead
-of sequential).
-
-### Current status caveat
-
-The README has this important note:
-> "The current runnable engine is already real, but still hybrid.
-> Compatibility mode over standard SQLite files is the live runtime path
-> today; Native mode / ECS sections describe the longer-term design."
-
-So frankensqlite works today for SQLite-compatible operations, but some
-advanced features are still in progress.
-
-## Updated Recommendation
-
-**This changes the calculus.** FrankenSQLite's concurrent writers are
-directly relevant to the watcher performance problem — not just a nice-to-have.
-
-### Arguments for syncing now
-
-1. **Concurrent writers** could eliminate the "one slow connector blocks
-   everything" bottleneck that's causing the OpenCode 100% CPU scan
-   (115K files, 10 GB) to block all other connectors.
-2. **Self-healing storage** could mitigate the tantivy corruption risk
-   from dirty kills (defense in depth with our SIGTERM handler).
-3. **Incremental semantic embeddings in watch mode** — directly builds on
-   our watcher work.
-4. **Secret redaction** — security fix we should have.
-5. **3 new connectors** (Copilot CLI, Kimi, Qwen) — more agent coverage.
-6. The longer we wait, the harder the rebase gets.
-
-### Arguments for waiting
-
-1. FrankenSQLite is a **ground-up reimplementation** of SQLite by a single
-   developer. It's ambitious but young. The upstream commit history shows
-   ~10 "pin frankensqlite to X (fixes Y compile errors)" commits — it's
-   still stabilizing.
-2. The indexer hasn't actually switched to concurrent writers yet — it
-   still uses `SqliteStorage`. We'd be syncing to get the infrastructure
-   without the payoff in the hot path.
-3. 21 file conflicts is still a half-day of careful work.
-
-### Recommendation
-
-**Sync, but not urgently.** The concurrent writer infrastructure is worth
-having. Schedule it as a focused session:
-
-1. Fast-forward fork main to upstream main (clean fast-forward)
-2. Rebase `fix/watcher-cpu-spin` onto new main
-3. Resolve conflicts (the functions are the same, just larger)
-4. Re-test, rebuild, redeploy
-5. Estimated effort: 4-6 hours
-
-The key files that need conflict resolution:
-- `src/indexer/mod.rs` — our SIGTERM/heartbeat/slow-scan vs upstream's
-  semantic embeddings and new connectors (HIGH effort, same functions)
-- `src/lib.rs` — our named threads vs upstream's frankentui/API changes
-  (HIGH effort, widespread)
-- `Cargo.toml` — our signal-hook + strip vs upstream's franken deps
-  (LOW effort, additive)
-- 18 other files — mostly upstream-only changes that auto-resolve
+**Sequencing:** D now (pragmatic), B or C when time allows and
+frankensqlite's indexer integration matures.
 
 ## Acceptance Criteria
 
-- [x] Decision documented: sync — frankensqlite concurrent writers are worth having
+- [x] Decision documented: Shape D selected
 - [x] Napkin updated with fork ownership notes
-- [ ] Fork main fast-forwarded to upstream main
-- [ ] `fix/watcher-cpu-spin` rebased onto new main (21 file conflicts)
-- [ ] All tests pass after rebase
-- [ ] Release binary rebuilt and installed
-- [ ] Watcher restarted and verified healthy
+- [ ] FAD dependency added to Cargo.toml
+- [ ] Adapter layer for new connectors (Copilot CLI, Kimi, Qwen)
+- [ ] All existing tests pass
+- [ ] New connectors indexing sessions
+- [ ] Release binary rebuilt and deployed
