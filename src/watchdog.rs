@@ -401,6 +401,35 @@ mod platform {
             .unwrap_or(false)
     }
 
+    // ── Install decision logic ──────────────────────────────────────────
+
+    /// Decision outcome for a single plist file during install.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum InstallDecision {
+        /// No existing plist — write a new one.
+        WriteNew,
+        /// Existing cass-managed plist — overwrite silently.
+        OverwriteManaged,
+        /// Existing hand-written plist + --force — overwrite with warning.
+        OverwriteForced,
+        /// Existing hand-written plist, no --force — block with error.
+        BlockNotManaged,
+    }
+
+    /// Decide what to do for a single plist file (R6 + R9 decision tree).
+    /// Pure logic — no I/O, no side effects.
+    pub fn decide_install(plist_exists: bool, cass_managed: bool, force: bool) -> InstallDecision {
+        if !plist_exists {
+            InstallDecision::WriteNew
+        } else if cass_managed {
+            InstallDecision::OverwriteManaged
+        } else if force {
+            InstallDecision::OverwriteForced
+        } else {
+            InstallDecision::BlockNotManaged
+        }
+    }
+
     // ── Install / Uninstall ───────────────────────────────────────────────
 
     /// Install and load a launchd plist using the idempotent bootout→write→bootstrap flow.
@@ -474,16 +503,21 @@ mod platform {
         ];
 
         for (plist_path, label, content) in &plists {
-            // Install decision tree (R6 + R9)
-            if plist_path.exists() {
-                if is_cass_managed(plist_path) {
-                    // Cass-managed → overwrite silently
+            let decision = decide_install(
+                plist_path.exists(),
+                plist_path.exists() && is_cass_managed(plist_path),
+                force,
+            );
+
+            match decision {
+                InstallDecision::WriteNew => {}
+                InstallDecision::OverwriteManaged => {
                     tracing::info!(label, "updating cass-managed plist");
-                } else if force {
-                    // Hand-written + --force → overwrite with warning
+                }
+                InstallDecision::OverwriteForced => {
                     eprintln!("⚠ Overwriting hand-written plist: {}", plist_path.display());
-                } else {
-                    // Hand-written + no --force → error
+                }
+                InstallDecision::BlockNotManaged => {
                     bail!(
                         "Existing plist not managed by cass: {}. Use --force to overwrite.",
                         plist_path.display()
@@ -812,41 +846,48 @@ mod tests {
     // ── T11: Install decision tree tests ─────────────────────────────
 
     #[test]
+    fn install_decision_write_new() {
+        // No existing plist → WriteNew
+        assert_eq!(
+            decide_install(false, false, false),
+            InstallDecision::WriteNew
+        );
+        // Force doesn't matter when file doesn't exist
+        assert_eq!(
+            decide_install(false, false, true),
+            InstallDecision::WriteNew
+        );
+    }
+
+    #[test]
     fn install_overwrites_cass_managed() {
-        let dir = TempDir::new().unwrap();
-        let plist_path = dir.path().join("test.plist");
-
-        // Write a cass-managed plist
-        let managed = format!("<?xml?>{PLIST_MARKER}<plist>old content</plist>");
-        fs::write(&plist_path, &managed).unwrap();
-
-        assert!(is_cass_managed(&plist_path));
-        // The install logic checks is_cass_managed → allows overwrite
-        // (full install test would need launchctl, testing the decision branch here)
+        // Existing cass-managed plist → overwrite silently, regardless of --force
+        assert_eq!(
+            decide_install(true, true, false),
+            InstallDecision::OverwriteManaged
+        );
+        assert_eq!(
+            decide_install(true, true, true),
+            InstallDecision::OverwriteManaged
+        );
     }
 
     #[test]
     fn install_blocks_hand_written_without_force() {
-        let dir = TempDir::new().unwrap();
-        let plist_path = dir.path().join("test.plist");
-
-        // Write a hand-written plist (no marker)
-        fs::write(&plist_path, "<?xml?><plist>hand written</plist>").unwrap();
-
-        assert!(!is_cass_managed(&plist_path));
-        // This verifies the is_cass_managed check — the install_plists function
-        // uses this to decide whether --force is needed
+        // Existing hand-written plist, no --force → blocked
+        assert_eq!(
+            decide_install(true, false, false),
+            InstallDecision::BlockNotManaged
+        );
     }
 
     #[test]
     fn install_force_overwrites_hand_written() {
-        let dir = TempDir::new().unwrap();
-        let plist_path = dir.path().join("test.plist");
-
-        // Write a hand-written plist
-        fs::write(&plist_path, "<?xml?><plist>hand written</plist>").unwrap();
-        assert!(!is_cass_managed(&plist_path));
-        // With --force, the install would proceed (tested via install decision tree)
+        // Existing hand-written plist + --force → overwrite with warning
+        assert_eq!(
+            decide_install(true, false, true),
+            InstallDecision::OverwriteForced
+        );
     }
 
     // ── T9: WatchdogResult mapping ───────────────────────────────────
@@ -869,24 +910,15 @@ mod tests {
     // ── T12: Uninstall test ──────────────────────────────────────────
 
     #[test]
-    fn uninstall_removes_both_plists() {
-        // Test file removal logic (without launchctl)
-        let dir = TempDir::new().unwrap();
-        let watcher_plist = dir.path().join(format!("{WATCHER_LABEL}.plist"));
-        let watchdog_plist = dir.path().join(format!("{WATCHDOG_LABEL}.plist"));
-
-        fs::write(&watcher_plist, "content").unwrap();
-        fs::write(&watchdog_plist, "content").unwrap();
-
-        assert!(watcher_plist.exists());
-        assert!(watchdog_plist.exists());
-
-        // Remove them (simulating uninstall file removal)
-        fs::remove_file(&watcher_plist).unwrap();
-        fs::remove_file(&watchdog_plist).unwrap();
-
-        assert!(!watcher_plist.exists());
-        assert!(!watchdog_plist.exists());
+    fn uninstall_labels_are_correct() {
+        // Verify the plist label constants match the expected naming convention
+        assert_eq!(WATCHER_LABEL, "com.cass.index-watch");
+        assert_eq!(WATCHDOG_LABEL, "com.cass.health-watchdog");
+        // Verify plist filenames derived from labels
+        let watcher_filename = format!("{WATCHER_LABEL}.plist");
+        let watchdog_filename = format!("{WATCHDOG_LABEL}.plist");
+        assert_eq!(watcher_filename, "com.cass.index-watch.plist");
+        assert_eq!(watchdog_filename, "com.cass.health-watchdog.plist");
     }
 
     // ── Health JSON test ─────────────────────────────────────────────
