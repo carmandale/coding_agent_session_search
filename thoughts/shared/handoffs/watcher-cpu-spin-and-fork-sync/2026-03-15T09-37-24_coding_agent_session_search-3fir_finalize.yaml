@@ -1,0 +1,81 @@
+---
+mode: finalize
+primary_bead: coding_agent_session_search-3fir
+related_beads:
+  - coding_agent_session_search-2s40
+  - coding_agent_session_search-2hrs
+created: 2026-03-15T09:37:24Z
+agent: pi/claude-sonnet-4-20250514
+mesh_name: PureYak
+---
+
+goal: |
+  Fix watcher CPU spin (spec 005) and add upstream FAD connectors (spec 006).
+  The watcher daemon was pegging 100% CPU due to a watchdog kill loop,
+  excessive FSEvents noise, and unclean process termination.
+
+now: |
+  Both specs implemented, deployed, and verified:
+  
+  Spec 005 (bead 2s40 — CLOSED):
+  - Watcher running at 0% CPU with heartbeat-based watchdog
+  - SIGTERM handler enables graceful shutdown (no more tantivy corruption)
+  - PiAgent watch root narrowed from 22K to 1.7K files
+  - All spawned threads named for post-mortem diagnosis
+  - Debug symbols retained in release binary (strip=debuginfo)
+  - Slow scan logging (>30s threshold) for observability
+  - 10 regression tests covering all changes
+  - Watchdog script version-controlled at scripts/watchdog.sh
+  
+  Spec 006 (bead 3fir — CLOSED):
+  - 4 new connectors via FAD adapter: copilot, clawdbot, openclaw, vibe
+  - franken-agent-detection added as git dep (clean chain, no franken crates)
+  - 170-line adapter bridges FAD's 2-method trait to our 4-method trait
+  - All 71 existing tests pass
+
+outcome: SUCCEEDED
+
+final_solutions:
+  - name: "Watcher kill loop broken"
+    description: |
+      Root cause: health watchdog killed the watcher every 10 minutes via SIGKILL
+      (600s stale threshold too tight for 300s heartbeat + scan time). New watchdog
+      uses heartbeat file age (2700s threshold) instead of cass health staleness.
+      Kill sequence changed from immediate SIGKILL to SIGTERM → 120s → SIGKILL.
+  - name: "Graceful shutdown via SIGTERM"
+    description: |
+      Added signal_hook-based SIGTERM/SIGINT handler. Shutdown flag checked at two
+      levels: between connector iterations in reindex_paths, and after every callback
+      in watch_sources. No final t_index.commit() needed — each connector iteration
+      commits independently.
+  - name: "FAD connector adapter"
+    description: |
+      Generic FadAdapter<T> wraps franken-agent-detection connectors to implement our
+      4-method Connector trait. Field-by-field type conversion for structurally
+      identical types. ScanRoot/ScanContext/Origin conversion handles local vs remote.
+
+final_decisions:
+  - decision: "Keep follow_links(true) on PiAgent WalkDir"
+    rationale: "Removing it would silently drop 2,098 clawdbot sessions via symlink. Added max_depth(10) instead."
+  - decision: "strip = debuginfo (not none or symbols)"
+    rationale: "Keeps symbol table for sample output, strips large DWARF info. Best size/diagnosability tradeoff."
+  - decision: "Stay diverged from upstream main, use FAD for new connectors only"
+    rationale: "Full rebase is 1400+ commit merge (days of work). FAD dep is clean — no franken crates. Hybrid approach gets new connectors without risking our watcher fix."
+  - decision: "Heartbeat threshold 2700s"
+    rationale: "Must exceed full_scan_interval (1800s) + max scan duration (~600s) + margin (300s)."
+  - decision: "PiAgent scan() uses exact Self::home() comparison"
+    rationale: "Prevents remote Codex/Factory sessions dirs from being accepted while supporting arbitrary PI_CODING_AGENT_DIR values."
+
+artifacts_produced:
+  - specs/005-watcher-cpu-spin/ (spec, plan, tasks, shaping + planning transcripts, codex review)
+  - specs/006-fork-sync-upstream/ (spec, plan, tasks, shaping + planning transcripts)
+  - src/connectors/pi_agent.rs (detect root fix, scan is_pi_path, max_depth, 6 regression tests)
+  - src/connectors/fad_adapter.rs (new — 170 lines, FAD connector bridge)
+  - src/indexer/mod.rs (SIGTERM handler, heartbeat, slow-scan logging, shutdown checks, 4 tests)
+  - scripts/watchdog.sh (new — heartbeat-based watchdog with SIGTERM-first kill)
+  - Cargo.toml (strip=debuginfo, signal-hook, franken-agent-detection deps)
+
+follow_up:
+  - bead: coding_agent_session_search-2hrs
+    title: "Spike: detect tantivy opens-but-spins corruption on startup"
+    status: open
