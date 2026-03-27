@@ -1,33 +1,47 @@
+pub mod redact_secrets;
 pub mod semantic;
 
+use std::any::Any;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use fs2::FileExt;
+use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
 
-use crate::connectors::NormalizedConversation;
 use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
-    codex::CodexConnector, copilot::CopilotConnector, cursor::CursorConnector,
-    factory::FactoryConnector, gemini::GeminiConnector, openclaw::OpenClawConnector,
-    opencode::OpenCodeConnector, pi_agent::PiAgentConnector, vibe::VibeConnector,
+    codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
+    cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
+    kimi::KimiConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
+    pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
 };
+use crate::connectors::{NormalizedConversation, NormalizedMessage};
 use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
 
+use crate::ensure_cass_origin;
 use crate::sources::config::{Platform, SourcesConfig};
-use crate::sources::provenance::{Origin, Source};
+use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
-use crate::storage::sqlite::{MigrationError, SqliteStorage};
+use crate::storage::sqlite::{
+    FrankenStorage, HistoricalSalvageOutcome, MigrationError,
+    seed_canonical_from_best_historical_bundle,
+};
 use semantic::{EmbeddingInput, SemanticIndexer};
+
+#[cfg(test)]
+use std::iter::Peekable;
 
 /// Type alias for batch classification map: (ConnectorKind, Path) -> (ScanRoot, MinTS, MaxTS)
 type BatchClassificationMap =
@@ -161,6 +175,8 @@ pub struct StaleDetector {
     last_check: Mutex<Instant>,
     /// Total successful ingests since start.
     total_ingests: std::sync::atomic::AtomicU64,
+    /// Time when the detector was created.
+    start_time: Instant,
 }
 
 impl StaleDetector {
@@ -173,6 +189,7 @@ impl StaleDetector {
             warning_emitted: AtomicBool::new(false),
             last_check: Mutex::new(Instant::now()),
             total_ingests: std::sync::atomic::AtomicU64::new(0),
+            start_time: Instant::now(),
         }
     }
 
@@ -187,7 +204,11 @@ impl StaleDetector {
     pub fn record_scan(&self, conversations_indexed: usize) {
         if conversations_indexed > 0 {
             // Successful ingest
-            if let Ok(mut guard) = self.last_successful_ingest.lock() {
+            {
+                let mut guard = self
+                    .last_successful_ingest
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 *guard = Some(Instant::now());
             }
             self.consecutive_zero_scans.store(0, Ordering::Relaxed);
@@ -218,7 +239,7 @@ impl StaleDetector {
         // Check if enough time has passed since last check
         let now = Instant::now();
         {
-            let mut last_check = self.last_check.lock().ok()?;
+            let mut last_check = self.last_check.lock().unwrap_or_else(|e| e.into_inner());
             let check_interval = Duration::from_secs(self.config.check_interval_mins * 60);
             if now.duration_since(*last_check) < check_interval {
                 return None;
@@ -234,14 +255,15 @@ impl StaleDetector {
 
         // Check time since last successful ingest
         let threshold = Duration::from_secs(self.config.threshold_hours * 3600);
-        let is_stale = match self.last_successful_ingest.lock().ok()?.as_ref() {
+        let is_stale = match self
+            .last_successful_ingest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             Some(last) => now.duration_since(*last) > threshold,
             // No successful ingests ever - check if we've been running long enough
-            None => {
-                // If we've never had a successful ingest and have had many zero scans,
-                // consider stale after threshold period from start
-                true
-            }
+            None => now.duration_since(self.start_time) > threshold,
         };
 
         if is_stale {
@@ -256,7 +278,10 @@ impl StaleDetector {
 
     /// Get statistics for logging/debugging.
     pub fn stats(&self) -> StaleStats {
-        let last_ingest = self.last_successful_ingest.lock().ok().and_then(|g| *g);
+        let last_ingest = *self
+            .last_successful_ingest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         StaleStats {
             consecutive_zero_scans: self.consecutive_zero_scans.load(Ordering::Relaxed),
             total_ingests: self.total_ingests.load(Ordering::Relaxed),
@@ -269,7 +294,11 @@ impl StaleDetector {
 
     /// Reset the detector state (e.g., after a full rebuild).
     pub fn reset(&self) {
-        if let Ok(mut guard) = self.last_successful_ingest.lock() {
+        {
+            let mut guard = self
+                .last_successful_ingest
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *guard = Some(Instant::now());
         }
         self.consecutive_zero_scans.store(0, Ordering::Relaxed);
@@ -349,6 +378,521 @@ pub struct IndexOptions {
     /// Embedder ID to use for semantic indexing (hash, fastembed).
     pub embedder: String,
     pub progress: Option<Arc<IndexingProgress>>,
+    /// Minimum interval (in seconds) between watch scan cycles. Prevents tight-loop
+    /// CPU burn when filesystem events arrive continuously. Default: 30.
+    pub watch_interval_secs: u64,
+}
+
+fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
+    let Some(progress) = progress else {
+        return;
+    };
+
+    progress.phase.store(0, Ordering::Relaxed);
+    progress.is_rebuilding.store(false, Ordering::Relaxed);
+}
+
+struct RunIndexProgressReset {
+    progress: Option<Arc<IndexingProgress>>,
+}
+
+impl RunIndexProgressReset {
+    fn new(progress: Option<Arc<IndexingProgress>>) -> Self {
+        Self { progress }
+    }
+}
+
+impl Drop for RunIndexProgressReset {
+    fn drop(&mut self) {
+        reset_progress_to_idle(self.progress.as_ref());
+    }
+}
+
+const LEXICAL_REBUILD_STATE_VERSION: u8 = 2;
+const LEXICAL_REBUILD_PAGE_SIZE: i64 = 200;
+
+#[derive(Debug)]
+struct IndexRunLockGuard {
+    // Keep the file handle alive for the lifetime of the lock.
+    _file: File,
+    _path: PathBuf,
+}
+
+impl Drop for IndexRunLockGuard {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LexicalRebuildDbState {
+    db_path: String,
+    total_conversations: usize,
+    storage_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingLexicalCommit {
+    next_offset: i64,
+    processed_conversations: usize,
+    indexed_docs: usize,
+    base_meta_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LexicalRebuildState {
+    version: u8,
+    schema_hash: String,
+    db: LexicalRebuildDbState,
+    page_size: i64,
+    committed_offset: i64,
+    processed_conversations: usize,
+    indexed_docs: usize,
+    committed_meta_fingerprint: Option<String>,
+    pending: Option<PendingLexicalCommit>,
+    completed: bool,
+    updated_at_ms: i64,
+}
+
+impl LexicalRebuildState {
+    fn new(db: LexicalRebuildDbState, page_size: i64) -> Self {
+        Self {
+            version: LEXICAL_REBUILD_STATE_VERSION,
+            schema_hash: crate::search::tantivy::SCHEMA_HASH.to_string(),
+            db,
+            page_size,
+            committed_offset: 0,
+            processed_conversations: 0,
+            indexed_docs: 0,
+            committed_meta_fingerprint: None,
+            pending: None,
+            completed: false,
+            updated_at_ms: FrankenStorage::now_millis(),
+        }
+    }
+
+    fn matches_run(&self, db: &LexicalRebuildDbState, page_size: i64) -> bool {
+        self.version == LEXICAL_REBUILD_STATE_VERSION
+            && self.schema_hash == crate::search::tantivy::SCHEMA_HASH
+            && &self.db == db
+            && self.page_size == page_size
+    }
+
+    fn record_pending_commit(
+        &mut self,
+        next_offset: i64,
+        processed_conversations: usize,
+        indexed_docs: usize,
+        base_meta_fingerprint: Option<String>,
+    ) {
+        self.pending = Some(PendingLexicalCommit {
+            next_offset,
+            processed_conversations,
+            indexed_docs,
+            base_meta_fingerprint,
+        });
+        self.completed = false;
+        self.updated_at_ms = FrankenStorage::now_millis();
+    }
+
+    fn finalize_commit(&mut self, committed_meta_fingerprint: Option<String>) {
+        if let Some(pending) = self.pending.take() {
+            self.committed_offset = pending.next_offset;
+            self.processed_conversations = pending.processed_conversations;
+            self.indexed_docs = pending.indexed_docs;
+        }
+        self.committed_meta_fingerprint = committed_meta_fingerprint;
+        self.completed = false;
+        self.updated_at_ms = FrankenStorage::now_millis();
+    }
+
+    fn clear_pending(&mut self) {
+        self.pending = None;
+        self.updated_at_ms = FrankenStorage::now_millis();
+    }
+
+    fn mark_completed(&mut self, committed_meta_fingerprint: Option<String>) {
+        self.committed_meta_fingerprint = committed_meta_fingerprint;
+        self.pending = None;
+        self.completed = true;
+        self.updated_at_ms = FrankenStorage::now_millis();
+    }
+
+    fn is_incomplete(&self) -> bool {
+        !self.completed
+    }
+}
+
+fn acquire_index_run_lock(data_dir: &Path, db_path: &Path) -> Result<IndexRunLockGuard> {
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating cass data directory {}", data_dir.display()))?;
+    let lock_path = data_dir.join("index-run.lock");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening index-run lock file {}", lock_path.display()))?;
+
+    file.try_lock_exclusive().with_context(|| {
+        format!(
+            "another cass index process already holds {}",
+            lock_path.display()
+        )
+    })?;
+
+    file.set_len(0).with_context(|| {
+        format!(
+            "truncating index-run lock file after acquisition: {}",
+            lock_path.display()
+        )
+    })?;
+    writeln!(
+        file,
+        "pid={}\nstarted_at_ms={}\ndb_path={}",
+        std::process::id(),
+        FrankenStorage::now_millis(),
+        db_path.display()
+    )
+    .with_context(|| format!("writing index-run metadata to {}", lock_path.display()))?;
+    file.flush()
+        .with_context(|| format!("flushing index-run lock file {}", lock_path.display()))?;
+
+    Ok(IndexRunLockGuard {
+        _file: file,
+        _path: lock_path,
+    })
+}
+
+fn lexical_rebuild_state_path(index_path: &Path) -> PathBuf {
+    index_path.join(".lexical-rebuild-state.json")
+}
+
+fn lexical_rebuild_commit_interval_conversations() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1_000)
+}
+
+fn lexical_rebuild_commit_interval_messages() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5_000)
+}
+
+fn lexical_rebuild_commit_interval_message_bytes() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16 * 1024 * 1024)
+}
+
+fn should_commit_lexical_rebuild(
+    conversations_since_commit: usize,
+    messages_since_commit: usize,
+    message_bytes_since_commit: usize,
+    commit_interval_conversations: usize,
+    commit_interval_messages: usize,
+    commit_interval_message_bytes: usize,
+) -> bool {
+    conversations_since_commit >= commit_interval_conversations
+        || messages_since_commit >= commit_interval_messages
+        || message_bytes_since_commit >= commit_interval_message_bytes
+}
+
+fn write_json_pretty_atomically<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory for {}", path.display()))?;
+    }
+    let temp_path = unique_atomic_temp_path(path);
+    {
+        let file = File::create(&temp_path)
+            .with_context(|| format!("creating temporary file {}", temp_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, value)
+            .with_context(|| format!("serializing {}", path.display()))?;
+        writer
+            .flush()
+            .with_context(|| format!("flushing temporary file {}", temp_path.display()))?;
+    }
+    replace_file_from_temp(&temp_path, path)
+        .with_context(|| format!("replacing {} from temp file", path.display()))
+}
+
+fn load_lexical_rebuild_state(index_path: &Path) -> Result<Option<LexicalRebuildState>> {
+    let path = lexical_rebuild_state_path(index_path);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("reading lexical rebuild state {}", path.display()));
+        }
+    };
+
+    match serde_json::from_slice::<LexicalRebuildState>(&bytes) {
+        Ok(state) => Ok(Some(state)),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "ignoring malformed lexical rebuild checkpoint"
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn persist_lexical_rebuild_state(index_path: &Path, state: &LexicalRebuildState) -> Result<()> {
+    let path = lexical_rebuild_state_path(index_path);
+    write_json_pretty_atomically(&path, state)
+}
+
+fn clear_lexical_rebuild_state(index_path: &Path) -> Result<()> {
+    let path = lexical_rebuild_state_path(index_path);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("removing lexical rebuild state {}", path.display()))
+        }
+    }
+}
+
+fn index_meta_fingerprint(index_path: &Path) -> Result<Option<String>> {
+    let meta_path = index_path.join("meta.json");
+    match fs::read(&meta_path) {
+        Ok(bytes) => Ok(Some(blake3::hash(&bytes).to_hex().to_string())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(err).with_context(|| format!("reading Tantivy meta file {}", meta_path.display()))
+        }
+    }
+}
+
+fn pending_commit_landed(
+    base_meta_fingerprint: Option<&str>,
+    current_meta_fingerprint: Option<&str>,
+) -> bool {
+    match (base_meta_fingerprint, current_meta_fingerprint) {
+        (None, Some(_)) => true,
+        (Some(base), Some(current)) => current != base,
+        _ => false,
+    }
+}
+
+fn reconcile_pending_lexical_commit(
+    index_path: &Path,
+    mut state: LexicalRebuildState,
+) -> Result<LexicalRebuildState> {
+    let Some(pending) = state.pending.clone() else {
+        return Ok(state);
+    };
+
+    let current_meta_fingerprint = index_meta_fingerprint(index_path)?;
+    if pending_commit_landed(
+        pending.base_meta_fingerprint.as_deref(),
+        current_meta_fingerprint.as_deref(),
+    ) {
+        state.finalize_commit(current_meta_fingerprint);
+    } else {
+        state.clear_pending();
+    }
+    persist_lexical_rebuild_state(index_path, &state)?;
+    Ok(state)
+}
+
+fn metadata_stamp(path: &Path) -> Result<(u64, i64)> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("reading metadata for {}", path.display()))?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|dur| i64::try_from(dur.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    Ok((metadata.len(), modified_ms))
+}
+
+fn lexical_rebuild_storage_fingerprint(db_path: &Path) -> Result<String> {
+    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+    let (db_len, db_mtime_ms) = metadata_stamp(db_path)?;
+    let (wal_len, wal_mtime_ms) = match fs::metadata(&wal_path) {
+        Ok(_) => metadata_stamp(&wal_path)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0, 0),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("reading metadata for {}", wal_path.display()));
+        }
+    };
+    Ok(format!("{db_len}:{db_mtime_ms}:{wal_len}:{wal_mtime_ms}"))
+}
+
+fn count_total_conversations_exact(storage: &FrankenStorage) -> Result<usize> {
+    let total_conversations: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*) FROM conversations",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )
+        .context("counting canonical conversations for lexical rebuild state")?;
+    Ok(usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX))
+}
+
+fn should_salvage_historical_databases(
+    storage_rebuilt: bool,
+    canonical_sessions_before_salvage: usize,
+    has_pending_historical_bundles: bool,
+    canonical_only_full_rebuild: bool,
+) -> bool {
+    if canonical_only_full_rebuild {
+        return false;
+    }
+    storage_rebuilt || canonical_sessions_before_salvage == 0 || has_pending_historical_bundles
+}
+
+fn count_meta_entries_like(storage: &FrankenStorage, pattern: &str) -> Result<i64> {
+    storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*) FROM meta WHERE key LIKE ?1",
+            &[ParamValue::from(pattern)],
+            |row| row.get_typed(0),
+        )
+        .context(format!("counting meta rows matching {pattern}"))
+}
+
+fn full_rebuild_requires_historical_restart(
+    storage: &FrankenStorage,
+    db_path: &Path,
+    canonical_sessions_before_salvage: usize,
+) -> Result<bool> {
+    let bundles = crate::storage::sqlite::discover_historical_database_bundles(db_path);
+    if bundles.is_empty() {
+        return Ok(false);
+    }
+
+    let in_progress = count_meta_entries_like(storage, "historical_bundle_progress:%")? > 0;
+    if in_progress && canonical_sessions_before_salvage > 0 {
+        tracing::warn!(
+            db_path = %db_path.display(),
+            "ignoring stale historical salvage progress markers because the canonical database is already healthy and populated"
+        );
+    }
+
+    // Do not compare MAX(messages.id) across separate SQLite files. Those ids are only local
+    // row identifiers inside each database, so using them as a global freshness watermark
+    // produces false positives and can cause a healthy canonical database to be replaced.
+    //
+    // If historical bundles still contain unique conversations/messages, incremental salvage
+    // should import that delta into the populated canonical database without resetting it.
+    Ok(false)
+}
+
+fn lexical_rebuild_db_state(
+    storage: &FrankenStorage,
+    db_path: &Path,
+) -> Result<LexicalRebuildDbState> {
+    Ok(LexicalRebuildDbState {
+        db_path: db_path.to_string_lossy().into_owned(),
+        total_conversations: count_total_conversations_exact(storage)?,
+        storage_fingerprint: lexical_rebuild_storage_fingerprint(db_path)?,
+    })
+}
+
+fn has_pending_lexical_rebuild(
+    index_path: &Path,
+    db_state: &LexicalRebuildDbState,
+) -> Result<bool> {
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        return Ok(false);
+    };
+    Ok(state.matches_run(db_state, LEXICAL_REBUILD_PAGE_SIZE) && state.is_incomplete())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct LexicalRebuildSnapshot {
+    pub db_path: String,
+    pub total_conversations: usize,
+    pub storage_fingerprint: String,
+    pub committed_offset: i64,
+    pub processed_conversations: usize,
+    pub indexed_docs: usize,
+    pub completed: bool,
+    pub updated_at_ms: i64,
+}
+
+pub(crate) fn load_lexical_rebuild_snapshot(
+    index_path: &Path,
+    db_path: &Path,
+) -> Result<Option<LexicalRebuildSnapshot>> {
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        return Ok(None);
+    };
+
+    if state.completed || state.db.db_path != db_path.to_string_lossy() {
+        return Ok(None);
+    }
+
+    Ok(Some(LexicalRebuildSnapshot {
+        db_path: state.db.db_path,
+        total_conversations: state.db.total_conversations,
+        storage_fingerprint: state.db.storage_fingerprint,
+        committed_offset: state.committed_offset,
+        processed_conversations: state.processed_conversations,
+        indexed_docs: state.indexed_docs,
+        completed: state.completed,
+        updated_at_ms: state.updated_at_ms,
+    }))
+}
+
+fn repair_daily_stats_if_drifted(storage: &FrankenStorage, db_path: &Path) -> Result<()> {
+    let health = storage.daily_stats_health().with_context(|| {
+        format!(
+            "checking daily_stats health before index planning for {}",
+            db_path.display()
+        )
+    })?;
+
+    if health.populated && health.drift == 0 {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        db_path = %db_path.display(),
+        populated = health.populated,
+        row_count = health.row_count,
+        conversation_count = health.conversation_count,
+        materialized_total = health.materialized_total,
+        drift = health.drift,
+        "daily_stats is missing or drifted; rebuilding from canonical conversations"
+    );
+
+    let rebuilt = storage.rebuild_daily_stats().with_context(|| {
+        format!(
+            "rebuilding daily_stats before index planning for {}",
+            db_path.display()
+        )
+    })?;
+
+    tracing::info!(
+        db_path = %db_path.display(),
+        rows_created = rebuilt.rows_created,
+        total_sessions = rebuilt.total_sessions,
+        "rebuilt daily_stats before index planning"
+    );
+
+    Ok(())
 }
 
 // =============================================================================
@@ -370,6 +914,8 @@ pub enum IndexMessage {
         is_discovered: bool,
         /// Message count in this batch (for stats)
         message_count: usize,
+        /// Reserved text-byte budget for this batch that must be released after ingestion.
+        byte_reservation: usize,
     },
     /// A scan error occurred (non-fatal, logged but continues)
     ScanError {
@@ -381,6 +927,8 @@ pub enum IndexMessage {
         connector_name: &'static str,
         /// Time spent scanning this connector (ms)
         scan_ms: u64,
+        /// Whether this connector was discovered even if it produced no batches
+        is_discovered: bool,
     },
 }
 
@@ -388,6 +936,247 @@ pub enum IndexMessage {
 /// Balances memory usage with throughput - too small causes producer stalls,
 /// too large defeats the purpose of backpressure.
 const STREAMING_CHANNEL_SIZE: usize = 32;
+
+#[derive(Debug, Clone, Copy)]
+struct StreamingBatchLimits {
+    max_conversations: usize,
+    max_messages: usize,
+    max_chars: usize,
+}
+
+const DEFAULT_STREAMING_BATCH_LIMITS: StreamingBatchLimits = StreamingBatchLimits {
+    max_conversations: 64,
+    max_messages: 2_000,
+    max_chars: 4 * 1024 * 1024,
+};
+
+/// Maximum total text bytes allowed across queued/in-flight streaming batches.
+///
+/// This preserves the intended memory envelope for normal batches while also
+/// preventing oversized single conversations from multiplying across the queue.
+const STREAMING_MAX_BYTES_IN_FLIGHT: usize =
+    STREAMING_CHANNEL_SIZE * DEFAULT_STREAMING_BATCH_LIMITS.max_chars;
+
+#[derive(Debug)]
+struct StreamingByteLimiterState {
+    bytes_in_flight: usize,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct StreamingByteLimiter {
+    max_bytes_in_flight: usize,
+    state: Mutex<StreamingByteLimiterState>,
+    cv: Condvar,
+}
+
+impl StreamingByteLimiter {
+    fn new(max_bytes_in_flight: usize) -> Self {
+        debug_assert!(max_bytes_in_flight > 0);
+        Self {
+            max_bytes_in_flight,
+            state: Mutex::new(StreamingByteLimiterState {
+                bytes_in_flight: 0,
+                closed: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self, requested_bytes: usize) -> Result<usize> {
+        if requested_bytes == 0 {
+            return Ok(0);
+        }
+
+        let reservation = requested_bytes.min(self.max_bytes_in_flight);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if state.closed {
+                return Err(anyhow::anyhow!(
+                    "streaming byte limiter closed while waiting for capacity"
+                ));
+            }
+
+            if state.bytes_in_flight.saturating_add(reservation) <= self.max_bytes_in_flight {
+                state.bytes_in_flight += reservation;
+                return Ok(reservation);
+            }
+
+            state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn release(&self, reserved_bytes: usize) {
+        if reserved_bytes == 0 {
+            return;
+        }
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.bytes_in_flight = state.bytes_in_flight.saturating_sub(reserved_bytes);
+        self.cv.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        self.cv.notify_all();
+    }
+}
+
+fn conversation_batch_footprint(conv: &NormalizedConversation) -> (usize, usize) {
+    let message_count = conv.messages.len();
+    let char_count = conv.messages.iter().map(|msg| msg.content.len()).sum();
+    (message_count, char_count)
+}
+
+#[cfg(test)]
+fn next_streaming_batch(
+    conversations: &mut Peekable<std::vec::IntoIter<NormalizedConversation>>,
+    limits: StreamingBatchLimits,
+) -> Option<(Vec<NormalizedConversation>, usize)> {
+    let first = conversations.next()?;
+    let (first_messages, first_chars) = conversation_batch_footprint(&first);
+    let mut batch = vec![first];
+    let mut total_messages = first_messages;
+    let mut total_chars = first_chars;
+
+    while let Some(next) = conversations.peek() {
+        let (next_messages, next_chars) = conversation_batch_footprint(next);
+        let would_exceed_limits = batch.len() >= limits.max_conversations
+            || total_messages.saturating_add(next_messages) > limits.max_messages
+            || total_chars.saturating_add(next_chars) > limits.max_chars;
+        if would_exceed_limits {
+            break;
+        }
+
+        let conv = conversations
+            .next()
+            .expect("peek indicated another conversation existed");
+        total_messages += next_messages;
+        total_chars += next_chars;
+        batch.push(conv);
+    }
+
+    Some((batch, total_messages))
+}
+
+struct StreamingBatchSender<'a> {
+    tx: &'a Sender<IndexMessage>,
+    flow_limiter: Arc<StreamingByteLimiter>,
+    connector_name: &'static str,
+    next_batch_is_discovered: bool,
+    conversations: Vec<NormalizedConversation>,
+    message_count: usize,
+    char_count: usize,
+}
+
+fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_name: &'static str) {
+    if !discovered_names.iter().any(|name| name == connector_name) {
+        discovered_names.push(connector_name.to_string());
+    }
+}
+
+impl<'a> StreamingBatchSender<'a> {
+    fn new(
+        tx: &'a Sender<IndexMessage>,
+        flow_limiter: Arc<StreamingByteLimiter>,
+        connector_name: &'static str,
+        is_discovered: bool,
+    ) -> Self {
+        Self {
+            tx,
+            flow_limiter,
+            connector_name,
+            next_batch_is_discovered: is_discovered,
+            conversations: Vec::new(),
+            message_count: 0,
+            char_count: 0,
+        }
+    }
+
+    fn mark_next_batch_discovered(&mut self) {
+        self.next_batch_is_discovered = true;
+    }
+
+    fn push(&mut self, conversation: NormalizedConversation) -> Result<()> {
+        let (message_count, char_count) = conversation_batch_footprint(&conversation);
+        let would_exceed_limits = !self.conversations.is_empty()
+            && (self.conversations.len() >= DEFAULT_STREAMING_BATCH_LIMITS.max_conversations
+                || self.message_count.saturating_add(message_count)
+                    > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
+                || self.char_count.saturating_add(char_count)
+                    > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
+        if would_exceed_limits {
+            self.flush()?;
+        }
+
+        self.message_count += message_count;
+        self.char_count += char_count;
+        self.conversations.push(conversation);
+
+        let single_conversation_exceeds_limits = self.conversations.len() == 1
+            && (self.message_count > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
+                || self.char_count > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
+        if single_conversation_exceeds_limits {
+            self.flush()?;
+        }
+
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.conversations.is_empty() {
+            return Ok(());
+        }
+
+        let byte_reservation = self.flow_limiter.acquire(self.char_count).map_err(|_| {
+            anyhow::Error::new(StreamingConsumerDisconnected {
+                connector_name: self.connector_name,
+            })
+        })?;
+        let message_count = self.message_count;
+        let conversations = std::mem::take(&mut self.conversations);
+        if let Err(_send_error) = self.tx.send(IndexMessage::Batch {
+            connector_name: self.connector_name,
+            conversations,
+            is_discovered: self.next_batch_is_discovered,
+            message_count,
+            byte_reservation,
+        }) {
+            self.flow_limiter.release(byte_reservation);
+            return Err(anyhow::Error::new(StreamingConsumerDisconnected {
+                connector_name: self.connector_name,
+            }));
+        }
+        self.message_count = 0;
+        self.char_count = 0;
+        self.next_batch_is_discovered = false;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn send_conversation_batches(
+    tx: &Sender<IndexMessage>,
+    connector_name: &'static str,
+    conversations: Vec<NormalizedConversation>,
+    is_discovered: bool,
+) {
+    let mut sender = StreamingBatchSender::new(
+        tx,
+        Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+        connector_name,
+        is_discovered,
+    );
+    for conversation in conversations {
+        sender
+            .push(conversation)
+            .expect("test batch sender should deliver to in-memory receiver");
+    }
+    sender
+        .flush()
+        .expect("test batch sender should flush to in-memory receiver");
+}
 
 /// Check if streaming indexing is enabled via environment variable.
 ///
@@ -399,6 +1188,48 @@ pub fn streaming_index_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => "non-string panic payload".to_string(),
+        },
+    }
+}
+
+#[derive(Debug)]
+struct StreamingConsumerDisconnected {
+    connector_name: &'static str,
+}
+
+impl std::fmt::Display for StreamingConsumerDisconnected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "streaming consumer disconnected while sending batch for {}",
+            self.connector_name
+        )
+    }
+}
+
+impl std::error::Error for StreamingConsumerDisconnected {}
+
+fn is_streaming_consumer_disconnected(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<StreamingConsumerDisconnected>()
+        .is_some()
+}
+
+#[derive(Clone)]
+struct StreamingProducerConfig {
+    flow_limiter: Arc<StreamingByteLimiter>,
+    data_dir: PathBuf,
+    remote_roots: Vec<ScanRoot>,
+    since_ts: Option<i64>,
+    progress: Option<Arc<IndexingProgress>>,
+}
+
 /// Spawn a producer thread that scans a connector and sends batches through the channel.
 ///
 /// Each connector runs in its own thread, scanning local and remote roots.
@@ -408,10 +1239,7 @@ fn spawn_connector_producer(
     name: &'static str,
     factory: fn() -> Box<dyn Connector + Send>,
     tx: Sender<IndexMessage>,
-    data_dir: PathBuf,
-    remote_roots: Vec<ScanRoot>,
-    since_ts: Option<i64>,
-    progress: Option<Arc<IndexingProgress>>,
+    config: StreamingProducerConfig,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let scan_start = std::time::Instant::now();
@@ -422,35 +1250,52 @@ fn spawn_connector_producer(
 
         if detect.detected {
             // Update discovered agents count immediately when detected
-            if let Some(p) = &progress {
+            if let Some(p) = &config.progress {
                 p.discovered_agents.fetch_add(1, Ordering::Relaxed);
             }
             is_discovered = true;
 
             // Scan local sources
-            let ctx = crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
-            match conn.scan(&ctx) {
-                Ok(mut local_convs) => {
-                    // Inject local provenance
-                    let local_origin = Origin::local();
-                    for conv in &mut local_convs {
-                        inject_provenance(conv, &local_origin);
-                    }
-
-                    if !local_convs.is_empty() {
-                        // Count messages for stats
-                        let message_count: usize =
-                            local_convs.iter().map(|c| c.messages.len()).sum();
-                        // Send batch through channel (blocking if full - backpressure!)
-                        let _ = tx.send(IndexMessage::Batch {
+            let ctx = crate::connectors::ScanContext::local_default(
+                config.data_dir.clone(),
+                config.since_ts,
+            );
+            let local_origin = Origin::local();
+            let mut batch_sender =
+                StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
+            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                inject_provenance(&mut conversation, &local_origin);
+                batch_sender.push(conversation)
+            }) {
+                Ok(()) => {
+                    if let Err(error) = batch_sender.flush() {
+                        if is_streaming_consumer_disconnected(&error) {
+                            tracing::info!(
+                                connector = name,
+                                "streaming consumer disconnected; stopping producer"
+                            );
+                            return;
+                        }
+                        tracing::warn!(connector = name, "local flush failed: {}", error);
+                        let _ = tx.send(IndexMessage::ScanError {
                             connector_name: name,
-                            conversations: local_convs,
-                            is_discovered,
-                            message_count,
+                            error: format!("local flush failed: {error}"),
                         });
                     }
                 }
                 Err(e) => {
+                    if let Err(flush_error) = batch_sender.flush()
+                        && !is_streaming_consumer_disconnected(&flush_error)
+                    {
+                        tracing::warn!(connector = name, "local flush failed: {}", flush_error);
+                    }
+                    if is_streaming_consumer_disconnected(&e) {
+                        tracing::info!(
+                            connector = name,
+                            "streaming consumer disconnected; stopping producer"
+                        );
+                        return;
+                    }
                     tracing::warn!(connector = name, "local scan failed: {}", e);
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
@@ -461,45 +1306,80 @@ fn spawn_connector_producer(
         }
 
         // Scan remote sources
-        for root in &remote_roots {
+        for root in &config.remote_roots {
             let ctx = crate::connectors::ScanContext::with_roots(
                 root.path.clone(),
                 vec![root.clone()],
-                since_ts,
+                config.since_ts,
             );
-            match conn.scan(&ctx) {
-                Ok(mut remote_convs) => {
-                    for conv in &mut remote_convs {
-                        inject_provenance(conv, &root.origin);
-                        apply_workspace_rewrite(conv, root);
-                    }
+            let mut batch_sender =
+                StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
+            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                inject_provenance(&mut conversation, &root.origin);
+                apply_workspace_rewrite(&mut conversation, root);
 
-                    // Check if discovered via remote scan
-                    if !was_detected && !remote_convs.is_empty() && !is_discovered {
-                        if let Some(p) = &progress {
-                            p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+                if !was_detected && !is_discovered {
+                    if let Some(p) = &config.progress {
+                        p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+                    }
+                    is_discovered = true;
+                    batch_sender.mark_next_batch_discovered();
+                }
+
+                batch_sender.push(conversation)
+            }) {
+                Ok(()) => {
+                    if let Err(error) = batch_sender.flush() {
+                        if is_streaming_consumer_disconnected(&error) {
+                            tracing::info!(
+                                connector = name,
+                                "streaming consumer disconnected; stopping producer"
+                            );
+                            return;
                         }
-                        is_discovered = true;
-                    }
-
-                    if !remote_convs.is_empty() {
-                        // Count messages for stats
-                        let message_count: usize =
-                            remote_convs.iter().map(|c| c.messages.len()).sum();
-                        let _ = tx.send(IndexMessage::Batch {
+                        tracing::warn!(
+                            connector = name,
+                            root = %root.path.display(),
+                            "remote flush failed: {}",
+                            error
+                        );
+                        let _ = tx.send(IndexMessage::ScanError {
                             connector_name: name,
-                            conversations: remote_convs,
-                            is_discovered,
-                            message_count,
+                            error: format!(
+                                "remote flush failed for {}: {}",
+                                root.path.display(),
+                                error
+                            ),
                         });
                     }
                 }
                 Err(e) => {
+                    if let Err(flush_error) = batch_sender.flush()
+                        && !is_streaming_consumer_disconnected(&flush_error)
+                    {
+                        tracing::warn!(
+                            connector = name,
+                            root = %root.path.display(),
+                            "remote flush failed: {}",
+                            flush_error
+                        );
+                    }
+                    if is_streaming_consumer_disconnected(&e) {
+                        tracing::info!(
+                            connector = name,
+                            "streaming consumer disconnected; stopping producer"
+                        );
+                        return;
+                    }
                     tracing::warn!(
                         connector = name,
                         root = %root.path.display(),
                         "remote scan failed: {}", e
                     );
+                    let _ = tx.send(IndexMessage::ScanError {
+                        connector_name: name,
+                        error: format!("remote scan failed for {}: {}", root.path.display(), e),
+                    });
                 }
             }
         }
@@ -516,6 +1396,7 @@ fn spawn_connector_producer(
         let _ = tx.send(IndexMessage::Done {
             connector_name: name,
             scan_ms,
+            is_discovered,
         });
     })
 }
@@ -528,8 +1409,9 @@ fn spawn_connector_producer(
 fn run_streaming_consumer(
     rx: Receiver<IndexMessage>,
     num_producers: usize,
-    storage: &mut SqliteStorage,
+    storage: &FrankenStorage,
     t_index: &mut TantivyIndex,
+    flow_limiter: Arc<StreamingByteLimiter>,
     progress: &Option<Arc<IndexingProgress>>,
     needs_rebuild: bool,
 ) -> Result<Vec<String>> {
@@ -553,6 +1435,7 @@ fn run_streaming_consumer(
                 conversations,
                 is_discovered,
                 message_count,
+                byte_reservation,
             }) => {
                 let batch_size = conversations.len();
                 total_conversations += batch_size;
@@ -584,12 +1467,15 @@ fn run_streaming_consumer(
                 }
 
                 // Track discovered agent names
-                if is_discovered && !discovered_names.contains(&connector_name.to_string()) {
-                    discovered_names.push(connector_name.to_string());
+                if is_discovered {
+                    remember_discovered_connector(&mut discovered_names, connector_name);
                 }
 
                 // Ingest the batch
-                ingest_batch(storage, t_index, &conversations, progress, needs_rebuild)?;
+                let ingest_result =
+                    ingest_batch(storage, t_index, &conversations, progress, needs_rebuild);
+                flow_limiter.release(byte_reservation);
+                ingest_result?;
 
                 // Periodic commit to make results visible incrementally (every 5s)
                 if last_commit.elapsed() >= Duration::from_secs(5) {
@@ -631,6 +1517,7 @@ fn run_streaming_consumer(
             Ok(IndexMessage::Done {
                 connector_name,
                 scan_ms,
+                is_discovered,
             }) => {
                 active_producers -= 1;
 
@@ -642,6 +1529,10 @@ fn run_streaming_consumer(
                         ..Default::default()
                     });
                 stats.scan_ms = scan_ms;
+
+                if is_discovered {
+                    remember_discovered_connector(&mut discovered_names, connector_name);
+                }
 
                 // If we haven't switched to indexing phase yet, this Done message represents
                 // a completed scan step. Increment current to show scanning progress.
@@ -660,9 +1551,12 @@ fn run_streaming_consumer(
                 }
             }
             Err(_) => {
-                // Channel closed unexpectedly
-                tracing::warn!("streaming channel closed unexpectedly");
-                break;
+                let error = format!(
+                    "streaming indexing aborted: channel closed with {active_producers} producers still active"
+                );
+                tracing::warn!(remaining = active_producers, error = %error);
+                set_progress_last_error(progress.as_ref(), Some(error.clone()));
+                return Err(anyhow::anyhow!(error));
             }
         }
     }
@@ -709,15 +1603,50 @@ fn run_streaming_consumer(
 /// a bounded channel. The consumer receives and ingests batches as they arrive,
 /// providing backpressure when indexing falls behind scanning.
 fn run_streaming_index(
-    storage: &mut SqliteStorage,
+    storage: &FrankenStorage,
     t_index: &mut TantivyIndex,
     opts: &IndexOptions,
     since_ts: Option<i64>,
     needs_rebuild: bool,
     remote_roots: Vec<ScanRoot>,
 ) -> Result<()> {
-    let connector_factories = get_connector_factories();
+    run_streaming_index_with_connector_factories(
+        storage,
+        t_index,
+        opts,
+        since_ts,
+        needs_rebuild,
+        remote_roots,
+        get_connector_factories(),
+    )
+}
+
+type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
+
+fn run_streaming_index_with_connector_factories(
+    storage: &FrankenStorage,
+    t_index: &mut TantivyIndex,
+    opts: &IndexOptions,
+    since_ts: Option<i64>,
+    needs_rebuild: bool,
+    remote_roots: Vec<ScanRoot>,
+    connector_factories: Vec<(&'static str, ConnectorFactory)>,
+) -> Result<()> {
+    let buffered_connectors: Vec<&'static str> = connector_factories
+        .iter()
+        .filter_map(|(name, factory)| {
+            let connector = factory();
+            (!connector.supports_streaming_scan()).then_some(*name)
+        })
+        .collect();
     let num_connectors = connector_factories.len();
+
+    if !buffered_connectors.is_empty() {
+        tracing::warn!(
+            connectors = ?buffered_connectors,
+            "streaming index still has buffered connectors that do not implement callback streaming"
+        );
+    }
 
     // Set up progress tracking
     if let Some(p) = &opts.progress {
@@ -732,19 +1661,21 @@ fn run_streaming_index(
 
     // Create bounded channel for backpressure
     let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
+    let producer_config = StreamingProducerConfig {
+        flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+        data_dir: opts.data_dir.clone(),
+        remote_roots: remote_roots.clone(),
+        since_ts,
+        progress: opts.progress.clone(),
+    };
 
     // Spawn producer threads for each connector
-    let handles: Vec<JoinHandle<()>> = connector_factories
+    let handles: Vec<(&'static str, JoinHandle<()>)> = connector_factories
         .into_iter()
         .map(|(name, factory)| {
-            spawn_connector_producer(
+            (
                 name,
-                factory,
-                tx.clone(),
-                opts.data_dir.clone(),
-                remote_roots.clone(),
-                since_ts,
-                opts.progress.clone(),
+                spawn_connector_producer(name, factory, tx.clone(), producer_config.clone()),
             )
         })
         .collect();
@@ -753,19 +1684,55 @@ fn run_streaming_index(
     drop(tx);
 
     // Run consumer on main thread
-    let discovered_names = run_streaming_consumer(
+    let consumer_result = run_streaming_consumer(
         rx,
         num_connectors,
         storage,
         t_index,
+        producer_config.flow_limiter.clone(),
         &opts.progress,
         needs_rebuild,
-    )?;
+    );
 
-    // Wait for all producer threads to complete
-    for handle in handles {
-        let _ = handle.join();
+    if consumer_result.is_err() {
+        producer_config.flow_limiter.close();
     }
+
+    let mut join_errors = Vec::new();
+    for (name, handle) in handles {
+        if let Err(payload) = handle.join() {
+            let panic_message = panic_payload_message(payload);
+            tracing::error!(connector = name, panic = %panic_message, "streaming producer panicked");
+            join_errors.push(format!("{name}: {panic_message}"));
+        }
+    }
+
+    if let Err(error) = consumer_result {
+        if !join_errors.is_empty() {
+            let combined = format!(
+                "{error}; streaming producer thread panicked: {}",
+                join_errors.join("; ")
+            );
+            set_progress_last_error(opts.progress.as_ref(), Some(combined.clone()));
+            return Err(anyhow::anyhow!(combined));
+        }
+        set_progress_last_error(opts.progress.as_ref(), Some(error.to_string()));
+        return Err(error);
+    }
+
+    if !join_errors.is_empty() {
+        let error = format!(
+            "streaming producer thread panicked: {}",
+            join_errors.join("; ")
+        );
+        set_progress_last_error(opts.progress.as_ref(), Some(error.clone()));
+        return Err(anyhow::anyhow!(error));
+    }
+
+    let discovered_names = match consumer_result {
+        Ok(names) => names,
+        Err(_) => unreachable!("handled above"),
+    };
 
     // Update discovered agent names in progress tracker
     if let Some(p) = &opts.progress
@@ -783,7 +1750,7 @@ fn run_streaming_index(
 /// all conversations into memory before ingesting. This is the fallback when
 /// streaming is disabled via CASS_STREAMING_INDEX=0.
 fn run_batch_index(
-    storage: &mut SqliteStorage,
+    storage: &FrankenStorage,
     t_index: &mut TantivyIndex,
     opts: &IndexOptions,
     since_ts: Option<i64>,
@@ -942,8 +1909,60 @@ pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
 ) -> Result<()> {
-    let (mut storage, storage_rebuilt) = open_storage_for_index(&opts.db_path)?;
+    let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
+    set_progress_last_error(opts.progress.as_ref(), None);
+    let _index_run_lock = acquire_index_run_lock(&opts.data_dir, &opts.db_path)?;
+
+    let (storage, storage_rebuilt, opened_fresh_for_full) =
+        open_storage_for_index(&opts.db_path, opts.full)?;
+    let mut storage = storage;
+    let mut storage_rebuilt = storage_rebuilt;
+    let mut opened_fresh_for_full = opened_fresh_for_full;
+    persist::apply_index_writer_busy_timeout(&storage);
     let index_path = index_dir(&opts.data_dir)?;
+    let mut initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+    if opts.full
+        && !opened_fresh_for_full
+        && full_rebuild_requires_historical_restart(
+            &storage,
+            &opts.db_path,
+            initial_canonical_sessions_before_salvage,
+        )?
+    {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            conversations = initial_canonical_sessions_before_salvage,
+            "full rebuild detected incomplete historical salvage state; restarting from a fresh canonical database"
+        );
+        storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
+        storage_rebuilt = true;
+        opened_fresh_for_full = true;
+        persist::apply_index_writer_busy_timeout(&storage);
+        initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+    }
+    let canonical_only_full_rebuild = opts.full
+        && initial_canonical_sessions_before_salvage > 0
+        && !storage_rebuilt
+        && !opened_fresh_for_full;
+    let resume_lexical_rebuild = if initial_canonical_sessions_before_salvage > 0 {
+        let db_state = lexical_rebuild_db_state(&storage, &opts.db_path)?;
+        has_pending_lexical_rebuild(&index_path, &db_state)?
+    } else {
+        false
+    };
+    if opts.full && !resume_lexical_rebuild {
+        clear_lexical_rebuild_state(&index_path)?;
+    }
+    if opts.full && !canonical_only_full_rebuild {
+        repair_daily_stats_if_drifted(&storage, &opts.db_path)?;
+    } else if canonical_only_full_rebuild {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            conversations = initial_canonical_sessions_before_salvage,
+            "deferring daily_stats repair because full rebuild is reindexing an already-populated canonical database"
+        );
+    }
+    let mut performed_scan = false;
 
     // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
     // IMPORTANT: This must stay aligned with TantivyIndex::open_or_create() rebuild triggers.
@@ -986,45 +2005,12 @@ pub fn run_index(
         p.is_rebuilding.store(true, Ordering::Relaxed);
     }
 
-    if needs_rebuild {
+    if needs_rebuild && !resume_lexical_rebuild {
         // Clean slate: avoid stale lock files and ensure a fresh Tantivy index.
         let _ = std::fs::remove_dir_all(&index_path);
     }
-    let mut t_index = TantivyIndex::open_or_create(&index_path)?;
-
-    if opts.full {
-        reset_storage(&mut storage)?;
-        t_index.delete_all()?;
-        t_index.commit()?;
-    }
-
-    // Get last scan timestamp for incremental indexing.
-    // If full rebuild or force_rebuild, scan everything (since_ts = None).
-    // Otherwise, only scan files modified since last successful scan.
-    let since_ts = if opts.full || needs_rebuild {
-        None
-    } else {
-        storage
-            .get_last_scan_ts()
-            .unwrap_or(None)
-            .map(|ts| ts.saturating_sub(1))
-    };
-
-    if since_ts.is_some() {
-        tracing::info!(since_ts = ?since_ts, "incremental_scan: using last_scan_ts");
-    } else {
-        tracing::info!("full_scan: no last_scan_ts or rebuild requested");
-    }
-
     // Record scan start time before scanning
-    let scan_start_ts = SqliteStorage::now_millis();
-
-    // Reset progress error state
-    if let Some(p) = &opts.progress
-        && let Ok(mut last_error) = p.last_error.lock()
-    {
-        *last_error = None;
-    }
+    let scan_start_ts = FrankenStorage::now_millis();
 
     // Keep sources table in sync with sources.toml for provenance integrity.
     sync_sources_config_to_db(&storage);
@@ -1036,136 +2022,388 @@ pub fn run_index(
         .cloned()
         .collect();
 
-    // Choose between streaming indexing (Opt 8.2) and batch indexing
-    if streaming_index_enabled() {
-        tracing::info!("using streaming indexing (Opt 8.2)");
-        run_streaming_index(
-            &mut storage,
-            &mut t_index,
-            &opts,
-            since_ts,
-            needs_rebuild,
-            remote_roots.clone(),
+    let t_index = if resume_lexical_rebuild {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            "resuming incomplete lexical rebuild from canonical database checkpoint"
+        );
+        rebuild_tantivy_from_db(
+            &opts.db_path,
+            &opts.data_dir,
+            initial_canonical_sessions_before_salvage,
+            opts.progress.clone(),
         )?;
+        TantivyIndex::open_or_create(&index_path)?
     } else {
-        tracing::info!("using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)");
-        run_batch_index(
-            &mut storage,
-            &mut t_index,
-            &opts,
-            since_ts,
-            needs_rebuild,
-            remote_roots.clone(),
-        )?;
-    }
+        let mut t_index = TantivyIndex::open_or_create(&index_path)?;
 
-    t_index.commit()?;
+        if opts.full && !opened_fresh_for_full && initial_canonical_sessions_before_salvage == 0 {
+            storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
+            persist::apply_index_writer_busy_timeout(&storage);
+            t_index.delete_all()?;
+            t_index.commit()?;
+        } else if opts.full {
+            t_index.delete_all()?;
+            t_index.commit()?;
+        }
+
+        let canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+        let mut has_pending_historical_bundles =
+            storage.has_pending_historical_bundles(&opts.db_path)?;
+        let canonical_only_full_rebuild = opts.full
+            && canonical_sessions_before_salvage > 0
+            && !storage_rebuilt
+            && !opened_fresh_for_full;
+        let should_salvage_historical = should_salvage_historical_databases(
+            storage_rebuilt,
+            canonical_sessions_before_salvage,
+            has_pending_historical_bundles,
+            canonical_only_full_rebuild,
+        );
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            storage_rebuilt,
+            opened_fresh_for_full,
+            canonical_sessions_before_salvage,
+            has_pending_historical_bundles,
+            canonical_only_full_rebuild,
+            should_salvage_historical,
+            "historical salvage decision"
+        );
+        let historical_salvage: HistoricalSalvageOutcome = if should_salvage_historical {
+            let mut outcome = HistoricalSalvageOutcome::default();
+            if canonical_sessions_before_salvage == 0 {
+                let (reopened_storage, seed_outcome) =
+                    maybe_seed_empty_canonical_from_historical_bundle(storage, &opts.db_path)?;
+                storage = reopened_storage;
+                persist::apply_index_writer_busy_timeout(&storage);
+                if let Some(seed_outcome) = seed_outcome {
+                    outcome.accumulate(seed_outcome);
+                    has_pending_historical_bundles =
+                        storage.has_pending_historical_bundles(&opts.db_path)?;
+                }
+            }
+            if has_pending_historical_bundles {
+                outcome.accumulate(storage.salvage_historical_databases(&opts.db_path)?);
+            } else {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    "skipping incremental historical salvage because all discoverable historical bundles are already recorded in the canonical database"
+                );
+            }
+            outcome
+        } else {
+            tracing::info!(
+                db_path = %opts.db_path.display(),
+                conversations = canonical_sessions_before_salvage,
+                pending_historical_bundles = has_pending_historical_bundles,
+                "skipping historical salvage because canonical database is already populated and no additional historical bundles are pending"
+            );
+            HistoricalSalvageOutcome::default()
+        };
+        if historical_salvage.messages_imported > 0 {
+            tracing::info!(
+                bundles_imported = historical_salvage.bundles_imported,
+                conversations_imported = historical_salvage.conversations_imported,
+                messages_imported = historical_salvage.messages_imported,
+                "historical cass bundles merged into canonical database before scan"
+            );
+        }
+        let rebuild_from_canonical_only =
+            canonical_only_full_rebuild && historical_salvage.conversations_imported == 0;
+
+        if historical_salvage.conversations_imported > 0
+            || (opts.full && !rebuild_from_canonical_only)
+        {
+            repair_daily_stats_if_drifted(&storage, &opts.db_path)?;
+        }
+
+        if rebuild_from_canonical_only {
+            tracing::info!(
+                db_path = %opts.db_path.display(),
+                conversations = initial_canonical_sessions_before_salvage,
+                "skipping raw source rescan during full rebuild because the canonical database is already populated"
+            );
+        }
+
+        if rebuild_from_canonical_only {
+            drop(t_index);
+            rebuild_tantivy_from_db(
+                &opts.db_path,
+                &opts.data_dir,
+                count_total_conversations_exact(&storage)?,
+                opts.progress.clone(),
+            )?;
+            t_index = TantivyIndex::open_or_create(&index_path)?;
+        } else {
+            // Get last scan timestamp for incremental indexing.
+            // If full rebuild or force_rebuild, scan everything (since_ts = None).
+            // Otherwise, only scan files modified since last successful scan.
+            let since_ts = if opts.full || needs_rebuild {
+                None
+            } else {
+                storage
+                    .get_last_scan_ts()
+                    .unwrap_or(None)
+                    .map(|ts| ts.saturating_sub(1))
+            };
+
+            if since_ts.is_some() {
+                tracing::info!(since_ts = ?since_ts, "incremental_scan: using last_scan_ts");
+            } else {
+                tracing::info!("full_scan: no last_scan_ts or rebuild requested");
+            }
+
+            // Choose between streaming indexing (Opt 8.2) and batch indexing
+            if streaming_index_enabled() {
+                tracing::info!("using streaming indexing (Opt 8.2)");
+                run_streaming_index(
+                    &storage,
+                    &mut t_index,
+                    &opts,
+                    since_ts,
+                    needs_rebuild,
+                    remote_roots.clone(),
+                )?;
+            } else {
+                tracing::info!(
+                    "using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)"
+                );
+                run_batch_index(
+                    &storage,
+                    &mut t_index,
+                    &opts,
+                    since_ts,
+                    needs_rebuild,
+                    remote_roots.clone(),
+                )?;
+            }
+            performed_scan = true;
+
+            t_index.commit()?;
+
+            if opts.full || historical_salvage.messages_imported > 0 {
+                drop(t_index);
+                rebuild_tantivy_from_db(
+                    &opts.db_path,
+                    &opts.data_dir,
+                    count_total_conversations_exact(&storage)?,
+                    opts.progress.clone(),
+                )?;
+                t_index = TantivyIndex::open_or_create(&index_path)?;
+            }
+        }
+
+        t_index
+    };
 
     // Semantic indexing (if enabled)
     if opts.semantic {
-        tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
-
-        let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
-
-        // Fetch all messages with metadata from SQLite
-        let raw_messages = storage.fetch_messages_for_embedding()?;
-        tracing::info!(
-            message_count = raw_messages.len(),
-            "fetched messages for embedding"
-        );
-
-        // Convert to EmbeddingInput format
-        let embedding_inputs: Vec<EmbeddingInput> = raw_messages
-            .into_iter()
-            .filter_map(|msg| {
-                let role_u8 = match msg.role.as_str() {
-                    "user" => ROLE_USER,
-                    "agent" | "assistant" => ROLE_ASSISTANT,
-                    "system" => ROLE_SYSTEM,
-                    "tool" => ROLE_TOOL,
-                    _ => ROLE_USER, // default to user for unknown roles
-                };
-
-                let Some(message_id) = message_id_from_db(msg.message_id) else {
-                    tracing::warn!(
-                        raw_message_id = msg.message_id,
-                        "Skipping message with out-of-range id during semantic indexing"
-                    );
-                    return None;
-                };
-
-                Some(EmbeddingInput {
-                    message_id,
-                    created_at_ms: msg.created_at.unwrap_or(0),
-                    agent_id: saturating_u32_from_i64(msg.agent_id),
-                    workspace_id: saturating_u32_from_i64(msg.workspace_id.unwrap_or(0)),
-                    source_id: msg.source_id_hash,
-                    role: role_u8,
-                    chunk_idx: 0,
-                    content: msg.content,
+        // In watch mode, skip the expensive bulk re-embed if a vector index and
+        // watermark already exist. The incremental path in the watch callback
+        // will pick up any new messages via WAL append.
+        let vi_dir = opts
+            .data_dir
+            .join(crate::search::vector_index::VECTOR_INDEX_DIR);
+        let has_existing_index = vi_dir.is_dir()
+            && std::fs::read_dir(&vi_dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .any(|e| e.path().extension().is_some_and(|ext| ext == "fsvi"))
                 })
-            })
-            .collect();
+                .unwrap_or(false);
+        let has_watermark = storage.get_last_embedded_message_id()?.is_some();
 
-        // Generate embeddings
-        let embedded_messages = semantic_indexer.embed_messages(&embedding_inputs)?;
-        tracing::info!(
-            embedded_count = embedded_messages.len(),
-            "generated embeddings"
-        );
-
-        if !embedded_messages.is_empty() {
-            let vector_index =
-                semantic_indexer.build_and_save_index(embedded_messages, &opts.data_dir)?;
-            let index_path = crate::search::vector_index::vector_index_path(
-                &opts.data_dir,
-                semantic_indexer.embedder_id(),
-            );
+        if opts.watch && has_existing_index && has_watermark {
             tracing::info!(
-                path = %index_path.display(),
-                embedder = semantic_indexer.embedder_id(),
-                "saved semantic vector index"
+                dir = %vi_dir.display(),
+                "skipping bulk semantic re-embed (existing index + watermark found); \
+                 incremental watch callback will handle new messages"
+            );
+        } else {
+            tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
+
+            let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+
+            // Fetch all messages with metadata from SQLite
+            let raw_messages = storage.fetch_messages_for_embedding()?;
+            tracing::info!(
+                message_count = raw_messages.len(),
+                "fetched messages for embedding"
             );
 
-            // Build HNSW index for approximate nearest neighbor search (if enabled)
-            if opts.build_hnsw {
-                let hnsw_path = semantic_indexer.build_hnsw_index(
-                    &vector_index,
+            // Convert to EmbeddingInput format
+            let embedding_inputs: Vec<EmbeddingInput> = raw_messages
+                .into_iter()
+                .filter_map(|msg| {
+                    let role_u8 = match msg.role.as_str() {
+                        "user" => ROLE_USER,
+                        "agent" | "assistant" => ROLE_ASSISTANT,
+                        "system" => ROLE_SYSTEM,
+                        "tool" => ROLE_TOOL,
+                        _ => ROLE_USER, // default to user for unknown roles
+                    };
+
+                    let Some(message_id) = message_id_from_db(msg.message_id) else {
+                        tracing::warn!(
+                            raw_message_id = msg.message_id,
+                            "Skipping message with out-of-range id during semantic indexing"
+                        );
+                        return None;
+                    };
+
+                    Some(EmbeddingInput {
+                        message_id,
+                        created_at_ms: msg.created_at.unwrap_or(0),
+                        agent_id: saturating_u32_from_i64(msg.agent_id),
+                        workspace_id: saturating_u32_from_i64(msg.workspace_id.unwrap_or(0)),
+                        source_id: msg.source_id_hash,
+                        role: role_u8,
+                        chunk_idx: 0,
+                        content: msg.content,
+                    })
+                })
+                .collect();
+
+            // Generate embeddings
+            let embedded_messages = semantic_indexer.embed_messages(&embedding_inputs)?;
+            tracing::info!(
+                embedded_count = embedded_messages.len(),
+                "generated embeddings"
+            );
+
+            if !embedded_messages.is_empty() {
+                let vector_index =
+                    semantic_indexer.build_and_save_index(embedded_messages, &opts.data_dir)?;
+                let index_path = crate::search::vector_index::vector_index_path(
                     &opts.data_dir,
-                    None, // Use default M
-                    None, // Use default ef_construction
-                )?;
+                    semantic_indexer.embedder_id(),
+                );
                 tracing::info!(
-                    path = %hnsw_path.display(),
+                    path = %index_path.display(),
                     embedder = semantic_indexer.embedder_id(),
-                    "saved HNSW index for approximate search"
+                    "saved semantic vector index"
+                );
+
+                // Build HNSW index for approximate nearest neighbor search (if enabled)
+                if opts.build_hnsw {
+                    let hnsw_path = semantic_indexer.build_hnsw_index(
+                        &vector_index,
+                        &opts.data_dir,
+                        None, // Use default M
+                        None, // Use default ef_construction
+                    )?;
+                    tracing::info!(
+                        path = %hnsw_path.display(),
+                        embedder = semantic_indexer.embedder_id(),
+                        "saved HNSW index for approximate search"
+                    );
+                }
+            }
+
+            // Set watermark so incremental watch-mode embedding only sees new messages
+            if let Some(max_id) = embedding_inputs.iter().map(|e| e.message_id).max() {
+                storage.set_last_embedded_message_id(i64::try_from(max_id).unwrap_or(i64::MAX))?;
+            }
+        }
+    }
+
+    // Update last_scan_ts after successful scan and commit. Pure lexical-resume
+    // runs intentionally preserve the previous scan watermark.
+    if performed_scan {
+        persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
+            storage.set_last_scan_ts(scan_start_ts)
+        })
+        .with_context(|| {
+            format!(
+                "updating last_scan_ts after index run for {}",
+                opts.db_path.display()
+            )
+        })?;
+        tracing::info!(
+            scan_start_ts,
+            "updated last_scan_ts for incremental indexing"
+        );
+    } else {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            "preserving last_scan_ts because this run only resumed the lexical rebuild"
+        );
+    }
+
+    // Update last_indexed_at so `cass status` reflects the latest index time
+    let now_ms = FrankenStorage::now_millis();
+    persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
+        storage.set_last_indexed_at(now_ms)
+    })
+    .with_context(|| {
+        format!(
+            "updating last_indexed_at after index run for {}",
+            opts.db_path.display()
+        )
+    })?;
+    tracing::info!(now_ms, "updated last_indexed_at for status display");
+
+    if opts.full {
+        let repair = crate::storage::sqlite::ensure_fts_consistency_via_rusqlite(&opts.db_path)
+            .with_context(|| {
+                format!(
+                    "repairing stock-compatible FTS table after full index run for {}",
+                    opts.db_path.display()
+                )
+            })?;
+        match repair {
+            crate::storage::sqlite::FtsConsistencyRepair::AlreadyHealthy { rows } => {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    rows,
+                    "stock-compatible FTS table already matched canonical messages after full index run"
+                );
+            }
+            crate::storage::sqlite::FtsConsistencyRepair::IncrementalCatchUp {
+                inserted_rows,
+                total_rows,
+            } => {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    inserted_rows,
+                    total_rows,
+                    "incrementally repaired missing stock-compatible FTS rows after full index run"
+                );
+            }
+            crate::storage::sqlite::FtsConsistencyRepair::Rebuilt { inserted_rows } => {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    inserted_rows,
+                    "fully rebuilt stock-compatible FTS table after full index run"
                 );
             }
         }
     }
 
-    // Update last_scan_ts after successful scan and commit
-    storage.set_last_scan_ts(scan_start_ts)?;
-    tracing::info!(
-        scan_start_ts,
-        "updated last_scan_ts for incremental indexing"
-    );
-
-    // Update last_indexed_at so `cass status` reflects the latest index time
-    let now_ms = SqliteStorage::now_millis();
-    storage.set_last_indexed_at(now_ms)?;
-    tracing::info!(now_ms, "updated last_indexed_at for status display");
-
-    if let Some(p) = &opts.progress {
-        p.phase.store(0, Ordering::Relaxed); // Idle
-        p.is_rebuilding.store(false, Ordering::Relaxed);
-    }
+    reset_progress_to_idle(opts.progress.as_ref());
 
     if opts.watch || opts.watch_once_paths.is_some() {
         let opts_clone = opts.clone();
-        let state = Arc::new(Mutex::new(load_watch_state(&opts.data_dir)));
+        let state = Mutex::new(load_watch_state(&opts.data_dir));
         let storage = Arc::new(Mutex::new(storage));
-        let t_index = Arc::new(Mutex::new(t_index));
+        let storage_for_watch = Arc::clone(&storage);
+        let t_index = Mutex::new(t_index);
+
+        // Semantic embedding cooldown state for watch mode.
+        // The initial pass already embedded everything, so we start the clock
+        // from now — the cooldown must elapse before the first incremental pass.
+        let semantic_enabled = opts.semantic;
+        let embedder_id = opts.embedder.clone();
+        let data_dir_for_semantic = opts.data_dir.clone();
+        let semantic_cooldown = Duration::from_secs(
+            dotenvy::var("CASS_WATCH_SEMANTIC_COOLDOWN_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+        );
+        let last_semantic_embed = Mutex::new(Instant::now());
 
         // Initialize stale detector for watch mode
         let stale_detector = Arc::new(StaleDetector::from_env());
@@ -1186,16 +2424,19 @@ pub fn run_index(
         // Clone detector for the callback
         let detector_clone = stale_detector.clone();
 
-        watch_sources(
+        let watch_result = watch_sources(
             opts.watch_once_paths.clone(),
             watch_roots.clone(),
             event_channel,
             stale_detector,
+            opts.watch_interval_secs,
             move |paths, roots, is_rebuild| {
-                if is_rebuild {
+                let indexed = if is_rebuild {
                     if let Ok(mut g) = state.lock() {
                         g.clear();
-                        let _ = save_watch_state(&opts_clone.data_dir, &g);
+                        if let Err(e) = save_watch_state(&opts_clone.data_dir, &g) {
+                            tracing::warn!("failed to save watch state: {e}");
+                        }
                     }
                     // Reset stale detector on rebuild
                     detector_clone.reset();
@@ -1206,25 +2447,32 @@ pub fn run_index(
                         &opts_clone,
                         all_root_paths,
                         roots,
-                        state.clone(),
-                        storage.clone(),
-                        t_index.clone(),
+                        &state,
+                        &storage_for_watch,
+                        &t_index,
                         true,
                     );
-                    // Record result to stale detector
-                    detector_clone.record_scan(indexed.unwrap_or(0));
+                    finalize_watch_reindex_result(
+                        indexed,
+                        &detector_clone,
+                        opts_clone.progress.as_ref(),
+                        "watch rebuild reindex",
+                    )
                 } else {
-                    let indexed = reindex_paths(
-                        &opts_clone,
-                        paths,
-                        roots,
-                        state.clone(),
-                        storage.clone(),
-                        t_index.clone(),
-                        false,
+                    let indexed = finalize_watch_reindex_result(
+                        reindex_paths(
+                            &opts_clone,
+                            paths,
+                            roots,
+                            &state,
+                            &storage_for_watch,
+                            &t_index,
+                            false,
+                        ),
+                        &detector_clone,
+                        opts_clone.progress.as_ref(),
+                        "watch incremental reindex",
                     );
-                    // Record result to stale detector
-                    detector_clone.record_scan(indexed.unwrap_or(0));
 
                     // Merge Tantivy segments if idle conditions are met.
                     // Without this, each reindex_paths() commit creates a new
@@ -1237,21 +2485,198 @@ pub fn run_index(
                     {
                         tracing::warn!(error = %e, "segment merge failed during watch");
                     }
+                    indexed
+                };
+
+                // Incremental semantic embedding with cooldown
+                if semantic_enabled && indexed > 0 {
+                    let should_embed = last_semantic_embed
+                        .lock()
+                        .map(|t| t.elapsed() >= semantic_cooldown)
+                        .unwrap_or(false);
+                    if should_embed {
+                        match incremental_semantic_embed(
+                            &embedder_id,
+                            &data_dir_for_semantic,
+                            &storage_for_watch,
+                        ) {
+                            Ok(0) => {} // no new messages to embed
+                            Ok(n) => {
+                                tracing::info!(
+                                    count = n,
+                                    "incremental semantic embedding complete"
+                                );
+                                if let Ok(mut t) = last_semantic_embed.lock() {
+                                    *t = Instant::now();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "incremental semantic embedding failed");
+                                // Reset cooldown on error to avoid rapid-fire retries
+                                if let Ok(mut t) = last_semantic_embed.lock() {
+                                    *t = Instant::now();
+                                }
+                            }
+                        }
+                    }
                 }
             },
-        )?;
+        );
+
+        let close_result =
+            release_watch_storage_after_index(storage, &opts.db_path, "watch indexing session");
+        if let Err(err) = watch_result {
+            if let Err(close_err) = close_result {
+                tracing::warn!(
+                    error = %close_err,
+                    db_path = %opts.db_path.display(),
+                    "failed to close canonical db cleanly after watch indexing error"
+                );
+            }
+            return Err(err);
+        }
+        close_result?;
+        return Ok(());
     }
 
-    Ok(())
+    close_storage_after_index(storage, &opts.db_path, "index run")
 }
 
-/// Open SQLite storage for indexing with forward-compatibility recovery.
+fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &str) -> Result<()> {
+    storage.close().with_context(|| {
+        format!(
+            "closing canonical db after {context}: {}",
+            db_path.display()
+        )
+    })
+}
+
+fn release_watch_storage_after_index(
+    storage: Arc<Mutex<FrankenStorage>>,
+    db_path: &Path,
+    context: &str,
+) -> Result<()> {
+    let storage = Arc::try_unwrap(storage).map_err(|_| {
+        anyhow::anyhow!(
+            "watch indexing retained extra canonical db handles while closing {}",
+            db_path.display()
+        )
+    })?;
+    match storage.into_inner() {
+        Ok(storage) => close_storage_after_index(storage, db_path, context),
+        Err(poisoned) => {
+            let mut storage = poisoned.into_inner();
+            storage.close_best_effort_in_place();
+            Err(anyhow::anyhow!(
+                "storage mutex poisoned while closing canonical db after {context}: {}",
+                db_path.display()
+            ))
+        }
+    }
+}
+
+/// Perform incremental semantic embedding for messages added since the last
+/// watermark. Loads the ONNX model, embeds the batch, appends to the existing
+/// FSVI index via WAL, and updates the watermark.
+fn incremental_semantic_embed(
+    embedder: &str,
+    data_dir: &Path,
+    storage: &Mutex<FrankenStorage>,
+) -> Result<usize> {
+    // 1. Read watermark
+    let watermark = storage
+        .lock()
+        .map_err(|e| anyhow::anyhow!("lock storage for watermark read: {e}"))?
+        .get_last_embedded_message_id()?
+        .unwrap_or(0);
+
+    // 2. Fetch new messages since watermark
+    let raw_messages = storage
+        .lock()
+        .map_err(|e| anyhow::anyhow!("lock storage for message fetch: {e}"))?
+        .fetch_messages_for_embedding_since(watermark)?;
+
+    if raw_messages.is_empty() {
+        return Ok(0);
+    }
+
+    // Track the max raw DB id so we always advance the watermark, even if
+    // all messages are filtered out (e.g., empty content, out-of-range ids).
+    let raw_max_id = raw_messages.iter().map(|m| m.message_id).max().unwrap_or(0);
+
+    tracing::info!(
+        since_id = watermark,
+        count = raw_messages.len(),
+        "incremental semantic: fetched new messages"
+    );
+
+    // 3. Convert to EmbeddingInput
+    let embedding_inputs: Vec<EmbeddingInput> = raw_messages
+        .into_iter()
+        .filter_map(|msg| {
+            let role_u8 = match msg.role.as_str() {
+                "user" => ROLE_USER,
+                "agent" | "assistant" => ROLE_ASSISTANT,
+                "system" => ROLE_SYSTEM,
+                "tool" => ROLE_TOOL,
+                _ => ROLE_USER,
+            };
+
+            let Some(message_id) = message_id_from_db(msg.message_id) else {
+                tracing::warn!(
+                    raw_message_id = msg.message_id,
+                    "skipping out-of-range id during incremental semantic indexing"
+                );
+                return None;
+            };
+
+            Some(EmbeddingInput {
+                message_id,
+                created_at_ms: msg.created_at.unwrap_or(0),
+                agent_id: saturating_u32_from_i64(msg.agent_id),
+                workspace_id: saturating_u32_from_i64(msg.workspace_id.unwrap_or(0)),
+                source_id: msg.source_id_hash,
+                role: role_u8,
+                chunk_idx: 0,
+                content: msg.content,
+            })
+        })
+        .collect();
+
+    if embedding_inputs.is_empty() {
+        // All messages were filtered out; advance watermark to avoid re-fetching
+        storage
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock storage for watermark write: {e}"))?
+            .set_last_embedded_message_id(raw_max_id)?;
+        return Ok(0);
+    }
+
+    // 4. Load model, embed, append to existing index
+    let semantic_indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
+
+    let embedded = semantic_indexer.embed_messages(&embedding_inputs)?;
+    let count = semantic_indexer.append_to_index(embedded, data_dir)?;
+
+    // 5. Update watermark to highest raw DB id (not filtered embedding id)
+    storage
+        .lock()
+        .map_err(|e| anyhow::anyhow!("lock storage for watermark write: {e}"))?
+        .set_last_embedded_message_id(raw_max_id)?;
+
+    Ok(count)
+}
+
+/// Open frankensqlite storage for indexing with forward-compatibility recovery.
 ///
 /// Returns `(storage, rebuilt)` where `rebuilt=true` means we detected an
 /// incompatible/future schema, backed up + recreated the DB, and reopened it.
-fn open_storage_for_index(db_path: &Path) -> Result<(SqliteStorage, bool)> {
-    match SqliteStorage::open_or_rebuild(db_path) {
-        Ok(storage) => Ok((storage, false)),
+fn open_storage_for_index(
+    db_path: &Path,
+    allow_full_recovery: bool,
+) -> Result<(FrankenStorage, bool, bool)> {
+    match FrankenStorage::open_or_rebuild(db_path) {
+        Ok(storage) => Ok((storage, false, false)),
         Err(MigrationError::RebuildRequired {
             reason,
             backup_path,
@@ -1260,17 +2685,525 @@ fn open_storage_for_index(db_path: &Path) -> Result<(SqliteStorage, bool)> {
                 db_path = %db_path.display(),
                 reason = %reason,
                 backup_path = ?backup_path.as_ref().map(|p| p.display().to_string()),
-                "sqlite schema incompatible; rebuilt database before indexing"
+                "storage schema incompatible; rebuilt database before indexing"
             );
-            let storage = SqliteStorage::open(db_path)?;
-            Ok((storage, true))
+            let storage = FrankenStorage::open(db_path)?;
+            Ok((storage, true, true))
         }
-        Err(err) => Err(anyhow::anyhow!("failed to open sqlite storage: {err}")),
+        Err(err) if allow_full_recovery => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %err,
+                "full rebuild storage open failed; backing up and reopening with a fresh canonical db"
+            );
+            let backup_path =
+                crate::storage::sqlite::create_backup(db_path).map_err(|backup_err| {
+                    anyhow::anyhow!(
+                        "backing up busy/corrupt canonical db before full rebuild: {backup_err}"
+                    )
+                })?;
+            if db_path.exists() {
+                crate::storage::sqlite::remove_database_files(db_path).with_context(|| {
+                    format!(
+                        "removing busy/corrupt canonical db bundle before full rebuild: {}",
+                        db_path.display()
+                    )
+                })?;
+            }
+            if let Some(path) = backup_path {
+                tracing::info!(
+                    db_path = %db_path.display(),
+                    backup_path = %path.display(),
+                    "backed up canonical db after full-rebuild open failure"
+                );
+            }
+            let storage = FrankenStorage::open(db_path)?;
+            Ok((storage, true, true))
+        }
+        Err(err) => Err(anyhow::anyhow!(
+            "failed to open frankensqlite storage: {err}"
+        )),
     }
 }
 
+fn reopen_fresh_storage_for_full_rebuild(
+    storage: FrankenStorage,
+    db_path: &Path,
+) -> Result<FrankenStorage> {
+    storage.close().with_context(|| {
+        format!(
+            "closing canonical db before replacing it for full rebuild: {}",
+            db_path.display()
+        )
+    })?;
+
+    let backup_path = crate::storage::sqlite::create_backup(db_path)
+        .map_err(|err| anyhow::anyhow!("backing up canonical db before full rebuild: {err}"))?;
+    if db_path.exists() {
+        crate::storage::sqlite::remove_database_files(db_path).with_context(|| {
+            format!(
+                "removing existing canonical db bundle before full rebuild: {}",
+                db_path.display()
+            )
+        })?;
+    }
+
+    if let Some(path) = backup_path {
+        tracing::info!(
+            db_path = %db_path.display(),
+            backup_path = %path.display(),
+            "replaced canonical db with a fresh empty database for full rebuild"
+        );
+    }
+
+    FrankenStorage::open(db_path).with_context(|| {
+        format!(
+            "opening fresh canonical db for full rebuild: {}",
+            db_path.display()
+        )
+    })
+}
+
+fn quarantine_failed_seed_bundle(db_path: &Path) -> Result<Option<PathBuf>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    let Some(parent) = db_path.parent() else {
+        return Ok(None);
+    };
+    let db_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("agent_search.db");
+    let backups_dir = parent.join("backups");
+    fs::create_dir_all(&backups_dir).with_context(|| {
+        format!(
+            "creating backups directory for failed baseline seed bundle: {}",
+            backups_dir.display()
+        )
+    })?;
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let backup_root = backups_dir.join(format!("{db_name}.{timestamp}.failed-baseline-seed.bak"));
+
+    for suffix in ["", "-wal", "-shm"] {
+        let src = if suffix.is_empty() {
+            db_path.to_path_buf()
+        } else {
+            db_path.with_file_name(format!("{db_name}{suffix}"))
+        };
+        if !src.exists() {
+            continue;
+        }
+        let dest = if suffix.is_empty() {
+            backup_root.clone()
+        } else {
+            backup_root.with_file_name(format!(
+                "{}{}",
+                backup_root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("agent_search.db.failed-baseline-seed.bak"),
+                suffix
+            ))
+        };
+        fs::rename(&src, &dest).with_context(|| {
+            format!(
+                "moving failed baseline seed bundle component {} -> {}",
+                src.display(),
+                dest.display()
+            )
+        })?;
+    }
+
+    Ok(Some(backup_root))
+}
+
+fn maybe_seed_empty_canonical_from_historical_bundle(
+    storage: FrankenStorage,
+    db_path: &Path,
+) -> Result<(FrankenStorage, Option<HistoricalSalvageOutcome>)> {
+    let conversation_count = count_total_conversations_exact(&storage)?;
+    if conversation_count > 0 {
+        return Ok((storage, None));
+    }
+
+    storage.close().with_context(|| {
+        format!(
+            "closing canonical db before baseline historical seed attempt: {}",
+            db_path.display()
+        )
+    })?;
+    match seed_canonical_from_best_historical_bundle(db_path) {
+        Ok(result) => {
+            let reopened = if result.is_some() {
+                FrankenStorage::open_writer(db_path).with_context(|| {
+                    format!(
+                        "reopening canonical database after baseline historical seed attempt without rerunning migrations: {}",
+                        db_path.display()
+                    )
+                })?
+            } else {
+                FrankenStorage::open(db_path).with_context(|| {
+                    format!(
+                        "reopening canonical database after baseline historical seed attempt: {}",
+                        db_path.display()
+                    )
+                })?
+            };
+            Ok((reopened, result))
+        }
+        Err(err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %err,
+                "baseline historical seed import failed; falling back to incremental salvage"
+            );
+            match FrankenStorage::open(db_path) {
+                Ok(reopened) => Ok((reopened, None)),
+                Err(reopen_err) => {
+                    tracing::warn!(
+                        db_path = %db_path.display(),
+                        error = %reopen_err,
+                        "canonical database could not be reopened after failed baseline seed; quarantining partial bundle"
+                    );
+                    let failed_seed_backup =
+                        quarantine_failed_seed_bundle(db_path).with_context(|| {
+                            format!(
+                                "quarantining failed baseline seed bundle before incremental salvage: {}",
+                                db_path.display()
+                            )
+                        })?;
+                    if let Some(path) = failed_seed_backup {
+                        tracing::info!(
+                            db_path = %db_path.display(),
+                            backup_path = %path.display(),
+                            "moved failed baseline seed bundle aside before incremental salvage fallback"
+                        );
+                    }
+                    let reopened = FrankenStorage::open(db_path).with_context(|| {
+                        format!(
+                            "recreating fresh canonical database after failed baseline seed import: {}",
+                            db_path.display()
+                        )
+                    })?;
+                    Ok((reopened, None))
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn rebuild_tantivy_from_db(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<Arc<IndexingProgress>>,
+) -> Result<usize> {
+    use crate::model::types::MessageRole;
+
+    let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+        format!(
+            "opening database for Tantivy rebuild: {}",
+            db_path.display()
+        )
+    })?;
+
+    let sources = storage.list_sources().unwrap_or_default();
+    let mut source_map: HashMap<String, (SourceKind, Option<String>)> = HashMap::new();
+    for source in sources {
+        source_map.insert(source.id, (source.kind, source.host_label));
+    }
+
+    let index_path = index_dir(data_dir)?;
+    let db_state = lexical_rebuild_db_state(&storage, db_path)?;
+    let mut rebuild_state = match load_lexical_rebuild_state(&index_path)? {
+        Some(state) if state.matches_run(&db_state, LEXICAL_REBUILD_PAGE_SIZE) => {
+            reconcile_pending_lexical_commit(&index_path, state)?
+        }
+        Some(state) => {
+            tracing::info!(
+                db_path = %db_path.display(),
+                existing_db_path = %state.db.db_path,
+                existing_total_conversations = state.db.total_conversations,
+                existing_storage_fingerprint = %state.db.storage_fingerprint,
+                "discarding incompatible lexical rebuild checkpoint and restarting from zero"
+            );
+            LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
+        }
+        None => LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE),
+    };
+
+    let restart_from_zero = rebuild_state.completed
+        || (rebuild_state.committed_offset == 0 && rebuild_state.pending.is_none());
+    if restart_from_zero {
+        if let Err(err) = fs::remove_dir_all(&index_path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(err)
+                .with_context(|| format!("removing stale index {}", index_path.display()));
+        }
+        fs::create_dir_all(&index_path).with_context(|| {
+            format!("creating rebuilt index directory {}", index_path.display())
+        })?;
+        rebuild_state = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
+    }
+
+    let mut t_index = match TantivyIndex::open_or_create(&index_path) {
+        Ok(index) => index,
+        Err(err) if rebuild_state.committed_offset > 0 || rebuild_state.pending.is_some() => {
+            tracing::warn!(
+                path = %index_path.display(),
+                error = %err,
+                "partial lexical index could not be reopened; restarting lexical rebuild from zero"
+            );
+            if let Err(remove_err) = fs::remove_dir_all(&index_path)
+                && remove_err.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(remove_err).with_context(|| {
+                    format!("removing unreadable index {}", index_path.display())
+                });
+            }
+            fs::create_dir_all(&index_path).with_context(|| {
+                format!(
+                    "recreating lexical index directory after open failure {}",
+                    index_path.display()
+                )
+            })?;
+            rebuild_state = LexicalRebuildState::new(
+                lexical_rebuild_db_state(&storage, db_path)?,
+                LEXICAL_REBUILD_PAGE_SIZE,
+            );
+            TantivyIndex::open_or_create(&index_path)?
+        }
+        Err(err) => return Err(err),
+    };
+
+    if !lexical_rebuild_state_path(&index_path).exists() {
+        persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
+    }
+
+    if let Some(p) = &progress {
+        p.phase.store(2, Ordering::Relaxed);
+        p.is_rebuilding.store(true, Ordering::Relaxed);
+        p.total.store(total_conversations, Ordering::Relaxed);
+        p.current
+            .store(rebuild_state.processed_conversations, Ordering::Relaxed);
+        p.discovered_agents.store(0, Ordering::Relaxed);
+    }
+
+    if rebuild_state.completed
+        || rebuild_state.committed_offset >= i64::try_from(total_conversations).unwrap_or(i64::MAX)
+    {
+        storage.close().with_context(|| {
+            format!(
+                "closing readonly database after confirming completed Tantivy rebuild: {}",
+                db_path.display()
+            )
+        })?;
+        if let Some(p) = &progress {
+            p.phase.store(0, Ordering::Relaxed);
+            p.is_rebuilding.store(false, Ordering::Relaxed);
+        }
+        return Ok(rebuild_state.indexed_docs);
+    }
+
+    let mut offset = rebuild_state.committed_offset;
+    let page_size = LEXICAL_REBUILD_PAGE_SIZE;
+    let commit_interval_conversations = lexical_rebuild_commit_interval_conversations();
+    let commit_interval_messages = lexical_rebuild_commit_interval_messages();
+    let commit_interval_message_bytes = lexical_rebuild_commit_interval_message_bytes();
+    let mut indexed_docs = rebuild_state.indexed_docs;
+    let mut processed_conversations = rebuild_state.processed_conversations;
+    let mut conversations_since_commit = 0usize;
+    let mut messages_since_commit = 0usize;
+    let mut message_bytes_since_commit = 0usize;
+    let commit_rebuild_progress = |offset: i64,
+                                   processed_conversations: usize,
+                                   indexed_docs: usize,
+                                   rebuild_state: &mut LexicalRebuildState,
+                                   t_index: &mut TantivyIndex|
+     -> Result<()> {
+        rebuild_state.record_pending_commit(
+            offset,
+            processed_conversations,
+            indexed_docs,
+            index_meta_fingerprint(&index_path)?,
+        );
+        persist_lexical_rebuild_state(&index_path, rebuild_state)?;
+        t_index.commit()?;
+        rebuild_state.finalize_commit(index_meta_fingerprint(&index_path)?);
+        persist_lexical_rebuild_state(&index_path, rebuild_state)?;
+        Ok(())
+    };
+
+    loop {
+        let batch = storage.list_conversations_for_lexical_rebuild(page_size, offset)?;
+        if batch.is_empty() {
+            break;
+        }
+
+        for conv in batch {
+            offset = offset.saturating_add(1);
+            processed_conversations = processed_conversations.saturating_add(1);
+            conversations_since_commit = conversations_since_commit.saturating_add(1);
+
+            let Some(conv_id) = conv.id else {
+                if let Some(p) = &progress {
+                    p.current.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            };
+            // Querying each conversation separately avoids a pathological
+            // frankensqlite execution path for the batched `IN (...) ORDER BY`
+            // rebuild query that can consume enormous heap before the first
+            // lexical checkpoint is committed. The per-conversation fetch is
+            // forced onto the named messages(conversation_id, idx) index so the
+            // rebuild does not devolve into a full table scan per conversation.
+            let messages = storage.fetch_messages_for_lexical_rebuild(conv_id)?;
+
+            let (kind, host_label) =
+                source_map.get(&conv.source_id).cloned().unwrap_or_else(|| {
+                    let fallback_kind = if conv.source_id == LOCAL_SOURCE_ID {
+                        SourceKind::Local
+                    } else {
+                        SourceKind::Ssh
+                    };
+                    (fallback_kind, None)
+                });
+            let host = conv.origin_host.as_deref().or(host_label.as_deref());
+            let mut metadata = serde_json::Value::Object(serde_json::Map::new());
+            ensure_cass_origin(&mut metadata, &conv.source_id, kind, host);
+
+            let mut conversation_message_count = 0usize;
+            let mut conversation_message_bytes = 0usize;
+            let normalized_messages: Vec<NormalizedMessage> = messages
+                .into_iter()
+                .map(|msg| {
+                    conversation_message_count = conversation_message_count.saturating_add(1);
+                    conversation_message_bytes =
+                        conversation_message_bytes.saturating_add(msg.content.len());
+                    let role = match msg.role {
+                        MessageRole::User => "user".to_string(),
+                        MessageRole::Agent => "assistant".to_string(),
+                        MessageRole::Tool => "tool".to_string(),
+                        MessageRole::System => "system".to_string(),
+                        MessageRole::Other(other) => other,
+                    };
+
+                    NormalizedMessage {
+                        idx: msg.idx,
+                        role,
+                        author: msg.author,
+                        created_at: msg.created_at,
+                        content: msg.content,
+                        extra: msg.extra_json,
+                        snippets: Vec::new(),
+                    }
+                })
+                .collect();
+
+            let normalized = NormalizedConversation {
+                agent_slug: conv.agent_slug,
+                external_id: conv.external_id,
+                title: conv.title,
+                workspace: conv.workspace,
+                source_path: conv.source_path,
+                started_at: conv.started_at,
+                ended_at: conv.ended_at,
+                metadata,
+                messages: normalized_messages,
+            };
+
+            indexed_docs += normalized.messages.len();
+            t_index.add_messages(&normalized, &normalized.messages)?;
+            messages_since_commit =
+                messages_since_commit.saturating_add(conversation_message_count);
+            message_bytes_since_commit =
+                message_bytes_since_commit.saturating_add(conversation_message_bytes);
+
+            if let Some(p) = &progress {
+                p.current.fetch_add(1, Ordering::Relaxed);
+            }
+
+            if should_commit_lexical_rebuild(
+                conversations_since_commit,
+                messages_since_commit,
+                message_bytes_since_commit,
+                commit_interval_conversations,
+                commit_interval_messages,
+                commit_interval_message_bytes,
+            ) {
+                commit_rebuild_progress(
+                    offset,
+                    processed_conversations,
+                    indexed_docs,
+                    &mut rebuild_state,
+                    &mut t_index,
+                )?;
+                conversations_since_commit = 0;
+                messages_since_commit = 0;
+                message_bytes_since_commit = 0;
+            }
+        }
+        if should_commit_lexical_rebuild(
+            conversations_since_commit,
+            messages_since_commit,
+            message_bytes_since_commit,
+            commit_interval_conversations,
+            commit_interval_messages,
+            commit_interval_message_bytes,
+        ) {
+            commit_rebuild_progress(
+                offset,
+                processed_conversations,
+                indexed_docs,
+                &mut rebuild_state,
+                &mut t_index,
+            )?;
+            conversations_since_commit = 0;
+            messages_since_commit = 0;
+            message_bytes_since_commit = 0;
+        }
+    }
+
+    if conversations_since_commit > 0
+        || messages_since_commit > 0
+        || message_bytes_since_commit > 0
+        || rebuild_state.pending.is_some()
+    {
+        commit_rebuild_progress(
+            offset,
+            processed_conversations,
+            indexed_docs,
+            &mut rebuild_state,
+            &mut t_index,
+        )?;
+    }
+
+    storage.close().with_context(|| {
+        format!(
+            "closing readonly database after Tantivy rebuild: {}",
+            db_path.display()
+        )
+    })?;
+    rebuild_state.mark_completed(index_meta_fingerprint(&index_path)?);
+    persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
+
+    if let Some(p) = &progress {
+        p.phase.store(0, Ordering::Relaxed);
+        p.is_rebuilding.store(false, Ordering::Relaxed);
+    }
+
+    Ok(indexed_docs)
+}
+
 fn ingest_batch(
-    storage: &mut SqliteStorage,
+    storage: &FrankenStorage,
     t_index: &mut TantivyIndex,
     convs: &[NormalizedConversation],
     progress: &Option<Arc<IndexingProgress>>,
@@ -1343,6 +3276,9 @@ impl ConnectorKind {
             "factory" => Some(Self::Factory),
             "openclaw" => Some(Self::OpenClaw),
             "copilot" => Some(Self::Copilot),
+            "kimi" => Some(Self::Kimi),
+            "copilot_cli" => Some(Self::CopilotCli),
+            "qwen" => Some(Self::Qwen),
             _ => None,
         }
     }
@@ -1366,15 +3302,19 @@ impl ConnectorKind {
             Self::Factory => Box::new(FactoryConnector::new()),
             Self::OpenClaw => Box::new(OpenClawConnector::new()),
             Self::Copilot => Box::new(CopilotConnector::new()),
+            Self::Kimi => Box::new(KimiConnector::new()),
+            Self::CopilotCli => Box::new(CopilotCliConnector::new()),
+            Self::Qwen => Box::new(QwenConnector::new()),
         }
     }
 }
 
-fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send + 'static>(
+fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
     watch_once_paths: Option<Vec<PathBuf>>,
     roots: Vec<(ConnectorKind, ScanRoot)>,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     stale_detector: Arc<StaleDetector>,
+    watch_interval_secs: u64,
     callback: F,
 ) -> Result<()> {
     if let Some(paths) = watch_once_paths {
@@ -1389,6 +3329,13 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
 
     let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
+            if event.need_rescan() {
+                let _ = tx_clone.send(IndexerEvent::Command(ReindexCommand::Full));
+                return;
+            }
+            if !watch_event_should_trigger_reindex(&event) || event.paths.is_empty() {
+                return;
+            }
             let _ = tx_clone.send(IndexerEvent::Notify(event.paths));
         }
     })?;
@@ -1404,13 +3351,40 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
 
     let debounce = Duration::from_secs(2);
     let max_wait = Duration::from_secs(5);
+    // Minimum interval between scan cycles to prevent tight-loop CPU burn
+    // when filesystem events arrive continuously. Default: 30s. (Issue #129)
+    let min_scan_interval = Duration::from_secs(watch_interval_secs.max(1));
     // Stale check interval: check every 5 minutes for quicker detection
     let stale_check_interval = Duration::from_secs(300);
     let mut pending: Vec<PathBuf> = Vec::new();
     let mut first_event: Option<Instant> = None;
     let mut last_stale_check = Instant::now();
+    // Initialize to the past so the first scan can fire immediately.
+    // Use checked_sub to avoid panic if system uptime < min_scan_interval
+    // (e.g., --watch-interval 999999 on a freshly booted system).
+    // If the full interval won't fit, try smaller values so the first scan
+    // still fires quickly rather than waiting the full cooldown.
+    let mut last_scan = [
+        min_scan_interval,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    ]
+    .iter()
+    .find_map(|d| Instant::now().checked_sub(*d))
+    .unwrap_or_else(Instant::now);
+
+    tracing::info!(
+        watch_interval_secs,
+        "watch mode: minimum interval between scan cycles"
+    );
 
     loop {
+        // How much cooldown remains before we may fire the next callback.
+        // Using this as recv_timeout lets us keep accumulating events
+        // instead of blocking with thread::sleep (which would drop events
+        // if the inotify buffer fills up).
+        let cooldown_remaining = min_scan_interval.saturating_sub(last_scan.elapsed());
+
         // Calculate timeout: use stale check interval when idle, debounce when active
         let timeout = if pending.is_empty() {
             stale_check_interval
@@ -1418,37 +3392,48 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
             let now = Instant::now();
             let elapsed = now.duration_since(first_event.unwrap_or(now));
             if elapsed >= max_wait {
-                callback(std::mem::take(&mut pending), &roots, false);
-                first_event = None;
-                continue;
+                if cooldown_remaining.is_zero() {
+                    // Cooldown elapsed and max_wait exceeded: fire now.
+                    callback(std::mem::take(&mut pending), &roots, false);
+                    last_scan = Instant::now();
+                    first_event = None;
+                    continue;
+                }
+                // max_wait exceeded but cooldown still active: wait for
+                // the remaining cooldown while accumulating new events.
+                cooldown_remaining
+            } else {
+                let remaining = max_wait.saturating_sub(elapsed);
+                // Use the larger of (debounce, cooldown_remaining) to ensure
+                // we never fire the callback faster than min_scan_interval.
+                debounce.min(remaining).max(cooldown_remaining)
             }
-            let remaining = max_wait.saturating_sub(elapsed);
-            debounce.min(remaining)
         };
 
         match rx.recv_timeout(timeout) {
-            Ok(event) => match event {
-                IndexerEvent::Notify(paths) => {
-                    if pending.is_empty() {
-                        first_event = Some(Instant::now());
-                    }
-                    pending.extend(paths);
+            Ok(IndexerEvent::Notify(paths)) => {
+                if pending.is_empty() {
+                    first_event = Some(Instant::now());
                 }
-                IndexerEvent::Command(cmd) => match cmd {
-                    ReindexCommand::Full => {
-                        // Flush pending first, then do full rebuild
-                        if !pending.is_empty() {
-                            callback(std::mem::take(&mut pending), &roots, false);
-                        }
-                        callback(vec![], &roots, true);
-                        first_event = None;
+                pending.extend(paths);
+            }
+            Ok(IndexerEvent::Command(cmd)) => match cmd {
+                ReindexCommand::Full => {
+                    // Full rebuild commands bypass cooldown for responsive
+                    // operator-initiated rebuilds.
+                    if !pending.is_empty() {
+                        callback(std::mem::take(&mut pending), &roots, false);
                     }
-                },
+                    callback(vec![], &roots, true);
+                    last_scan = Instant::now();
+                    first_event = None;
+                }
             },
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                // Process pending events if any
-                if !pending.is_empty() {
+                // Process pending events only if cooldown has elapsed
+                if !pending.is_empty() && last_scan.elapsed() >= min_scan_interval {
                     callback(std::mem::take(&mut pending), &roots, false);
+                    last_scan = Instant::now();
                     first_event = None;
                 }
 
@@ -1480,6 +3465,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
                                 );
                                 // Trigger full rebuild
                                 callback(vec![], &roots, true);
+                                last_scan = Instant::now();
                             }
                             StaleAction::None => {
                                 // Stale detection disabled, should not reach here
@@ -1494,9 +3480,12 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) + Send 
     Ok(())
 }
 
-fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
-    // Wrap in transaction to ensure atomic reset - if any DELETE fails,
-    // all changes are rolled back to prevent inconsistent state
+#[cfg(test)]
+fn reset_storage(storage: &FrankenStorage, db_path: &Path) -> Result<()> {
+    // Wrap the canonical-table reset in a transaction so partial clears roll back.
+    // The derived FTS table is recreated explicitly afterward because the
+    // frankensqlite writer path does not implement the FTS5 control-column
+    // `delete-all` command used by stock SQLite.
     storage.raw().execute_batch(
         "BEGIN TRANSACTION;
          DELETE FROM usage_models_daily;
@@ -1506,7 +3495,6 @@ fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
          DELETE FROM daily_stats;
          DELETE FROM message_metrics;
          DELETE FROM token_usage;
-         DELETE FROM fts_messages;
          DELETE FROM snippets;
          DELETE FROM messages;
          DELETE FROM conversations;
@@ -1517,6 +3505,10 @@ fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
          DELETE FROM meta WHERE key = 'last_scan_ts';
          COMMIT;",
     )?;
+    let _ = storage
+        .raw()
+        .execute_batch("DROP TABLE IF EXISTS fts_messages;");
+    crate::storage::sqlite::materialize_fresh_fts_schema_via_rusqlite(db_path)?;
     Ok(())
 }
 
@@ -1528,9 +3520,9 @@ fn reindex_paths(
     opts: &IndexOptions,
     paths: Vec<PathBuf>,
     roots: &[(ConnectorKind, ScanRoot)],
-    state: Arc<Mutex<HashMap<ConnectorKind, i64>>>,
-    storage: Arc<Mutex<SqliteStorage>>,
-    t_index: Arc<Mutex<TantivyIndex>>,
+    state: &Mutex<HashMap<ConnectorKind, i64>>,
+    storage: &Mutex<FrankenStorage>,
+    t_index: &Mutex<TantivyIndex>,
     force_full: bool,
 ) -> Result<usize> {
     // DO NOT lock storage/index here for the whole duration.
@@ -1613,20 +3605,20 @@ fn reindex_paths(
 
         // INGEST PHASE: Acquire locks briefly
         {
-            let mut storage = storage
+            let storage = storage
                 .lock()
                 .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
             let mut t_index = t_index
                 .lock()
                 .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
 
-            ingest_batch(&mut storage, &mut t_index, &convs, &opts.progress, false)?;
+            ingest_batch(&storage, &mut t_index, &convs, &opts.progress, false)?;
 
             // Commit to Tantivy immediately to ensure index consistency before advancing watch state.
             t_index.commit()?;
 
             // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode
-            storage.set_last_indexed_at(SqliteStorage::now_millis())?;
+            storage.set_last_indexed_at(FrankenStorage::now_millis())?;
         }
 
         // Track total indexed for stale detection
@@ -1646,9 +3638,7 @@ fn reindex_paths(
     }
 
     // Reset phase to idle if progress exists
-    if let Some(p) = &opts.progress {
-        p.phase.store(0, Ordering::Relaxed);
-    }
+    reset_progress_to_idle(opts.progress.as_ref());
 
     Ok(total_indexed)
 }
@@ -1685,6 +3675,12 @@ enum ConnectorKind {
     OpenClaw,
     #[serde(rename = "cp", alias = "Copilot")]
     Copilot,
+    #[serde(rename = "ki", alias = "Kimi")]
+    Kimi,
+    #[serde(rename = "cc", alias = "CopilotCli")]
+    CopilotCli,
+    #[serde(rename = "qw", alias = "Qwen")]
+    Qwen,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -1720,6 +3716,101 @@ fn load_watch_state(data_dir: &Path) -> HashMap<ConnectorKind, i64> {
     HashMap::new()
 }
 
+fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        match fs::rename(temp_path, final_path) {
+            Ok(()) => Ok(()),
+            Err(first_err)
+                if final_path.exists()
+                    && matches!(
+                        first_err.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                let backup_path = unique_replace_backup_path(final_path);
+                fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    let _ = fs::remove_file(temp_path);
+                    anyhow::anyhow!(
+                        "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
+                        backup_path.display(),
+                        final_path.display(),
+                        first_err,
+                        backup_err
+                    )
+                })?;
+                match fs::rename(temp_path, final_path) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&backup_path);
+                        Ok(())
+                    }
+                    Err(second_err) => {
+                        let restore_result = fs::rename(&backup_path, final_path);
+                        match restore_result {
+                            Ok(()) => {
+                                let _ = fs::remove_file(temp_path);
+                                Err(anyhow::anyhow!(
+                                    "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
+                                    final_path.display(),
+                                    temp_path.display(),
+                                    first_err,
+                                    second_err
+                                ))
+                            }
+                            Err(restore_err) => Err(anyhow::anyhow!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err,
+                                restore_err,
+                                temp_path.display()
+                            )),
+                        }
+                    }
+                }
+            }
+            Err(rename_err) => Err(rename_err.into()),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp_path, final_path)?;
+        Ok(())
+    }
+}
+
+fn unique_atomic_temp_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "tmp", "watch_state.json")
+}
+
+#[cfg(windows)]
+fn unique_replace_backup_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "bak", "watch_state.json")
+}
+
+fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+
+    path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
+}
+
 fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Result<()> {
     let path = state_path(data_dir);
     if let Some(parent) = path.parent() {
@@ -1732,10 +3823,43 @@ fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Res
     let json = serde_json::to_vec(&watch_state)?;
     // Atomic write: write to temp file then rename, so a crash mid-write
     // cannot leave a truncated/corrupt watch_state.json.
-    let tmp_path = path.with_extension("json.tmp");
+    let tmp_path = unique_atomic_temp_path(&path);
     fs::write(&tmp_path, json)?;
-    fs::rename(&tmp_path, &path)?;
+    replace_file_from_temp(&tmp_path, &path)?;
     Ok(())
+}
+
+fn set_progress_last_error(progress: Option<&Arc<IndexingProgress>>, error: Option<String>) {
+    let Some(progress) = progress else {
+        return;
+    };
+
+    match progress.last_error.lock() {
+        Ok(mut guard) => *guard = error,
+        Err(poisoned) => *poisoned.into_inner() = error,
+    }
+}
+
+fn finalize_watch_reindex_result(
+    result: Result<usize>,
+    detector: &StaleDetector,
+    progress: Option<&Arc<IndexingProgress>>,
+    context: &str,
+) -> usize {
+    match result {
+        Ok(indexed) => {
+            set_progress_last_error(progress, None);
+            detector.record_scan(indexed);
+            indexed
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, context, "watch reindex failed");
+            reset_progress_to_idle(progress);
+            set_progress_last_error(progress, Some(format!("{context}: {error}")));
+            detector.record_scan(0);
+            0
+        }
+    }
 }
 
 fn classify_paths(
@@ -1782,7 +3906,24 @@ fn classify_paths(
         .collect()
 }
 
-fn sync_sources_config_to_db(storage: &SqliteStorage) {
+fn watch_event_should_trigger_reindex(event: &notify::Event) -> bool {
+    match event.kind {
+        notify::event::EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        notify::event::EventKind::Access(_) => false,
+        notify::event::EventKind::Create(_)
+        | notify::event::EventKind::Any
+        | notify::event::EventKind::Other => true,
+        // Incremental watch indexing is append-only today: once a path is gone,
+        // classify_paths() cannot derive a scan window from it and the ingest
+        // path cannot delete the stale conversation rows it previously indexed.
+        // Treat remove events as noise until delete-aware rebuilds exist.
+        notify::event::EventKind::Remove(_) => false,
+        notify::event::EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => false,
+        notify::event::EventKind::Modify(_) => true,
+    }
+}
+
+fn sync_sources_config_to_db(storage: &FrankenStorage) {
     if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
         return;
     }
@@ -1834,7 +3975,7 @@ fn sync_sources_config_to_db(storage: &SqliteStorage) {
 /// 2. Remote mirror roots (from registered sources in the database)
 ///
 /// Part of P2.2 - Indexer multi-root orchestration.
-pub fn build_scan_roots(storage: &SqliteStorage, data_dir: &Path) -> Vec<ScanRoot> {
+pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRoot> {
     let mut roots = Vec::new();
 
     // Add local default root with local provenance
@@ -2099,12 +4240,268 @@ pub fn apply_workspace_rewrite(conv: &mut NormalizedConversation, root: &ScanRoo
 }
 
 pub mod persist {
-    use anyhow::Result;
+    use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
+
+    use anyhow::{Context, Result, anyhow};
+    use frankensqlite::FrankenError;
+    use rayon::prelude::*;
 
     use crate::connectors::NormalizedConversation;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
     use crate::search::tantivy::TantivyIndex;
-    use crate::storage::sqlite::{IndexingCache, InsertOutcome, SqliteStorage};
+    use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome};
+
+    fn begin_concurrent_writes_enabled() -> bool {
+        dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(false)
+    }
+
+    pub(super) fn begin_concurrent_retry_limit() -> usize {
+        dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT_RETRIES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(6)
+    }
+
+    fn begin_concurrent_chunk_size() -> usize {
+        dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(32)
+    }
+
+    fn begin_concurrent_writer_cache_kib() -> i64 {
+        dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(4096)
+    }
+
+    fn index_writer_busy_timeout_ms() -> u64 {
+        dotenvy::var("CASS_INDEX_WRITER_BUSY_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(60_000)
+    }
+
+    fn apply_begin_concurrent_writer_tuning(storage: &FrankenStorage) {
+        let cache_kib = begin_concurrent_writer_cache_kib();
+        let pragma = format!("PRAGMA cache_size = -{cache_kib};");
+        if let Err(err) = storage.raw().execute(&pragma) {
+            tracing::debug!(
+                cache_kib,
+                error = %err,
+                "failed_to_apply_begin_concurrent_writer_cache_size"
+            );
+        }
+    }
+
+    pub(super) fn apply_index_writer_busy_timeout(storage: &FrankenStorage) {
+        let busy_timeout_ms = index_writer_busy_timeout_ms();
+        let pragma = format!("PRAGMA busy_timeout = {busy_timeout_ms};");
+        if let Err(err) = storage.raw().execute(&pragma) {
+            tracing::debug!(
+                busy_timeout_ms,
+                error = %err,
+                "failed_to_apply_index_writer_busy_timeout"
+            );
+        }
+    }
+
+    fn transient_franken_error(err: &anyhow::Error) -> Option<&FrankenError> {
+        err.downcast_ref::<FrankenError>()
+            .or_else(|| err.root_cause().downcast_ref::<FrankenError>())
+    }
+
+    fn is_retryable_franken_error(err: &anyhow::Error) -> bool {
+        transient_franken_error(err).is_some_and(|inner| {
+            matches!(
+                inner,
+                FrankenError::Busy
+                    | FrankenError::BusyRecovery
+                    | FrankenError::BusySnapshot { .. }
+                    | FrankenError::WriteConflict { .. }
+                    | FrankenError::SerializationFailure { .. }
+            )
+        })
+    }
+
+    /// Retry wrapper for any retryable FrankenError (BusySnapshot, WriteConflict, etc.)
+    pub(super) fn with_concurrent_retry<F, T>(max_retries: usize, mut f: F) -> Result<T>
+    where
+        F: FnMut() -> Result<T>,
+    {
+        let mut backoff_ms = 4_u64;
+        for attempt in 0..=max_retries {
+            match f() {
+                Ok(val) => return Ok(val),
+                Err(err) if attempt < max_retries && is_retryable_franken_error(&err) => {
+                    tracing::debug!(
+                        attempt = attempt + 1,
+                        max_retries,
+                        backoff_ms,
+                        error = %err,
+                        "begin_concurrent_retry"
+                    );
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
+                    backoff_ms = (backoff_ms * 2).min(128);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(anyhow!("exhausted begin-concurrent retries"))
+    }
+
+    fn duplicate_conversation_keys_present(convs: &[NormalizedConversation]) -> bool {
+        let mut seen = HashSet::with_capacity(convs.len());
+        for conv in convs {
+            let (source_id, _) = extract_provenance(&conv.metadata);
+            let key = if let Some(external_id) = conv.external_id.as_deref() {
+                (
+                    conv.agent_slug.clone(),
+                    source_id,
+                    Some(external_id.to_owned()),
+                    None,
+                    conv.started_at,
+                )
+            } else {
+                (
+                    conv.agent_slug.clone(),
+                    source_id,
+                    None,
+                    Some(conv.source_path.to_string_lossy().to_string()),
+                    None,
+                )
+            };
+            if !seen.insert(key) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn persist_conversations_batched_begin_concurrent(
+        db_path: &std::path::Path,
+        t_index: &mut TantivyIndex,
+        convs: &[NormalizedConversation],
+        force_tantivy_reindex: bool,
+    ) -> Result<()> {
+        let max_retries = begin_concurrent_retry_limit();
+        let chunk_size = begin_concurrent_chunk_size().min(convs.len().max(1));
+
+        let indexed_chunks: Vec<Result<Vec<(usize, InsertOutcome)>>> = convs
+            .par_chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let franken = FrankenStorage::open_writer(db_path).with_context(|| {
+                    format!(
+                        "opening frankensqlite writer for begin-concurrent mode: {}",
+                        db_path.display()
+                    )
+                })?;
+                apply_begin_concurrent_writer_tuning(&franken);
+                let result: Result<Vec<(usize, InsertOutcome)>> = (|| {
+                    let mut outcomes = Vec::with_capacity(chunk.len());
+                    let mut agent_cache: HashMap<String, i64> = HashMap::new();
+                    let mut workspace_cache: HashMap<std::path::PathBuf, i64> = HashMap::new();
+
+                    for (offset, conv) in chunk.iter().enumerate() {
+                        let idx = chunk_idx * chunk_size + offset;
+
+                        // Wrap the entire ensure_agent + ensure_workspace +
+                        // insert_conversation_tree sequence in the retry loop, since
+                        // ensure_agent/workspace also write and can hit page conflicts.
+                        let agent_slug = conv.agent_slug.clone();
+                        let workspace = conv.workspace.clone();
+                        let internal = map_to_internal(conv);
+
+                        let outcome = with_concurrent_retry(max_retries, || {
+                            let agent_id = if let Some(id) = agent_cache.get(&agent_slug) {
+                                *id
+                            } else {
+                                let agent = Agent {
+                                    id: None,
+                                    slug: agent_slug.clone(),
+                                    name: agent_slug.clone(),
+                                    version: None,
+                                    kind: AgentKind::Cli,
+                                };
+                                let id = franken.ensure_agent(&agent)?;
+                                agent_cache.insert(agent_slug.clone(), id);
+                                id
+                            };
+                            let workspace_id = if let Some(ws) = &workspace {
+                                if let Some(id) = workspace_cache.get(ws) {
+                                    Some(*id)
+                                } else {
+                                    let id = franken.ensure_workspace(ws, None)?;
+                                    workspace_cache.insert(ws.clone(), id);
+                                    Some(id)
+                                }
+                            } else {
+                                None
+                            };
+                            franken.insert_conversation_tree(agent_id, workspace_id, &internal)
+                        })?;
+                        outcomes.push((idx, outcome));
+                    }
+
+                    Ok(outcomes)
+                })();
+                let close_result = franken.close().with_context(|| {
+                    format!(
+                        "closing frankensqlite writer for begin-concurrent mode: {}",
+                        db_path.display()
+                    )
+                });
+                match result {
+                    Ok(outcomes) => {
+                        close_result?;
+                        Ok(outcomes)
+                    }
+                    Err(err) => {
+                        if let Err(close_err) = close_result {
+                            tracing::warn!(
+                                error = %close_err,
+                                db_path = %db_path.display(),
+                                "failed to close begin-concurrent writer cleanly after index error"
+                            );
+                        }
+                        Err(err)
+                    }
+                }
+            })
+            .collect();
+
+        let mut ordered = Vec::with_capacity(convs.len());
+        for chunk in indexed_chunks {
+            ordered.extend(chunk?);
+        }
+        ordered.sort_by_key(|(idx, _)| *idx);
+
+        for (idx, outcome) in ordered {
+            let conv = &convs[idx];
+            if force_tantivy_reindex {
+                t_index.add_messages(conv, &conv.messages)?;
+            } else if !outcome.inserted_indices.is_empty() {
+                let new_msgs: Vec<_> = conv
+                    .messages
+                    .iter()
+                    .filter(|m| outcome.inserted_indices.contains(&m.idx))
+                    .cloned()
+                    .collect();
+                t_index.add_messages(conv, &new_msgs)?;
+            }
+        }
+
+        Ok(())
+    }
 
     /// Extract provenance (source_id, origin_host) from conversation metadata.
     ///
@@ -2132,9 +4529,13 @@ pub mod persist {
     /// Convert a NormalizedConversation to the internal Conversation type for SQLite storage.
     ///
     /// Extracts provenance from `metadata.cass.origin` if present, otherwise defaults to local.
+    ///
+    /// Applies secret redaction to message content and extra_json before storage
+    /// (security fix for #112: tool-result secrets were persisted unredacted).
     pub fn map_to_internal(conv: &NormalizedConversation) -> Conversation {
         // Extract provenance from metadata (P2.2)
         let (source_id, origin_host) = extract_provenance(&conv.metadata);
+        let should_redact = super::redact_secrets::redaction_enabled();
 
         Conversation {
             id: None,
@@ -2150,26 +4551,38 @@ pub mod persist {
             messages: conv
                 .messages
                 .iter()
-                .map(|m| Message {
-                    id: None,
-                    idx: m.idx,
-                    role: map_role(&m.role),
-                    author: m.author.clone(),
-                    created_at: m.created_at,
-                    content: m.content.clone(),
-                    extra_json: m.extra.clone(),
-                    snippets: m
-                        .snippets
-                        .iter()
-                        .map(|s| Snippet {
-                            id: None,
-                            file_path: s.file_path.clone(),
-                            start_line: s.start_line,
-                            end_line: s.end_line,
-                            language: s.language.clone(),
-                            snippet_text: s.snippet_text.clone(),
-                        })
-                        .collect(),
+                .map(|m| {
+                    let content = if should_redact {
+                        super::redact_secrets::redact_text(&m.content)
+                    } else {
+                        m.content.clone()
+                    };
+                    let extra_json = if should_redact {
+                        super::redact_secrets::redact_json(&m.extra)
+                    } else {
+                        m.extra.clone()
+                    };
+                    Message {
+                        id: None,
+                        idx: m.idx,
+                        role: map_role(&m.role),
+                        author: m.author.clone(),
+                        created_at: m.created_at,
+                        content,
+                        extra_json,
+                        snippets: m
+                            .snippets
+                            .iter()
+                            .map(|s| Snippet {
+                                id: None,
+                                file_path: s.file_path.clone(),
+                                start_line: s.start_line,
+                                end_line: s.end_line,
+                                language: s.language.clone(),
+                                snippet_text: s.snippet_text.clone(),
+                            })
+                            .collect(),
+                    }
                 })
                 .collect(),
             source_id,
@@ -2178,7 +4591,7 @@ pub mod persist {
     }
 
     pub fn persist_conversation(
-        storage: &mut SqliteStorage,
+        storage: &FrankenStorage,
         t_index: &mut TantivyIndex,
         conv: &NormalizedConversation,
     ) -> Result<()> {
@@ -2224,13 +4637,40 @@ pub mod persist {
     /// Uses `IndexingCache` (Opt 7.2) to prevent N+1 queries for agent/workspace IDs.
     /// Set `CASS_SQLITE_CACHE=0` to disable caching for debugging.
     pub fn persist_conversations_batched(
-        storage: &mut SqliteStorage,
+        storage: &FrankenStorage,
         t_index: &mut TantivyIndex,
         convs: &[NormalizedConversation],
         force_tantivy_reindex: bool,
     ) -> Result<()> {
         if convs.is_empty() {
             return Ok(());
+        }
+
+        let begin_concurrent_enabled = begin_concurrent_writes_enabled();
+        let duplicate_keys_present =
+            begin_concurrent_enabled && duplicate_conversation_keys_present(convs);
+
+        if begin_concurrent_enabled && !duplicate_keys_present {
+            let db_path = storage
+                .database_path()
+                .with_context(|| "resolving database path for begin-concurrent write mode")?;
+            tracing::info!(
+                conversations = convs.len(),
+                "using begin-concurrent write path for indexing"
+            );
+            return persist_conversations_batched_begin_concurrent(
+                &db_path,
+                t_index,
+                convs,
+                force_tantivy_reindex,
+            );
+        }
+
+        if duplicate_keys_present {
+            tracing::info!(
+                conversations = convs.len(),
+                "duplicate conversation keys detected; falling back to serial batched indexing path"
+            );
         }
 
         let cache_enabled = IndexingCache::is_enabled();
@@ -2316,14 +4756,400 @@ pub mod persist {
             other => MessageRole::Other(other.to_string()),
         }
     }
+
+    #[cfg(test)]
+    mod persist_internal_tests {
+        use super::*;
+        use serial_test::serial;
+
+        struct EnvGuard {
+            key: &'static str,
+            previous: Option<String>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(value) = &self.previous {
+                    // SAFETY: test helper restores process env key it changed.
+                    unsafe {
+                        std::env::set_var(self.key, value);
+                    }
+                } else {
+                    // SAFETY: test helper restores process env key it changed.
+                    unsafe {
+                        std::env::remove_var(self.key);
+                    }
+                }
+            }
+        }
+
+        fn set_env(key: &'static str, value: &str) -> EnvGuard {
+            let previous = dotenvy::var(key).ok();
+            // SAFETY: isolated test mutates a process env var and restores via guard.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            EnvGuard { key, previous }
+        }
+
+        #[test]
+        fn begin_concurrent_flag_parsing() {
+            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
+            assert!(begin_concurrent_writes_enabled());
+        }
+
+        #[test]
+        fn begin_concurrent_chunk_size_parsing() {
+            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "7");
+            assert_eq!(begin_concurrent_chunk_size(), 7);
+        }
+
+        #[test]
+        fn begin_concurrent_retry_limit_parsing() {
+            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_RETRIES", "9");
+            assert_eq!(begin_concurrent_retry_limit(), 9);
+        }
+
+        #[test]
+        fn begin_concurrent_writer_cache_parsing() {
+            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB", "2048");
+            assert_eq!(begin_concurrent_writer_cache_kib(), 2048);
+        }
+
+        #[test]
+        fn begin_concurrent_writer_cache_invalid_defaults() {
+            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB", "0");
+            assert_eq!(begin_concurrent_writer_cache_kib(), 4096);
+        }
+
+        #[test]
+        fn retryable_franken_errors_are_detected() {
+            let retryable = anyhow::Error::new(FrankenError::BusySnapshot {
+                conflicting_pages: "1,2".to_string(),
+            });
+            assert!(is_retryable_franken_error(&retryable));
+
+            let not_retryable = anyhow::Error::new(FrankenError::ConcurrentUnavailable);
+            assert!(!is_retryable_franken_error(&not_retryable));
+        }
+
+        /// Helper: create a frankensqlite-native database with schema applied.
+        fn create_franken_db(path: &std::path::Path) -> FrankenStorage {
+            let fs = FrankenStorage::open(path).expect("open frankensqlite db");
+            fs.run_migrations().expect("run migrations");
+            fs
+        }
+
+        #[test]
+        fn begin_concurrent_persist_writes_all_conversations() {
+            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::search::tantivy::TantivyIndex;
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("test.db");
+            let index_path = dir.path().join("tantivy");
+
+            // Create frankensqlite-native database (BEGIN CONCURRENT requires it)
+            let frank = create_franken_db(&db_path);
+            drop(frank); // close so writers can open independently
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+            // Build 10 conversations across 3 agent slugs
+            let convs: Vec<NormalizedConversation> = (0..10)
+                .map(|i| {
+                    let slug = format!("agent-{}", i % 3);
+                    NormalizedConversation {
+                        agent_slug: slug,
+                        external_id: Some(format!("conv-{i}")),
+                        title: Some(format!("Conversation {i}")),
+                        workspace: Some(std::path::PathBuf::from(format!("/ws/{i}"))),
+                        source_path: std::path::PathBuf::from(format!("/log/{i}.jsonl")),
+                        started_at: Some(1000 + i * 100),
+                        ended_at: Some(1000 + i * 100 + 50),
+                        metadata: serde_json::json!({}),
+                        messages: (0..3)
+                            .map(|j| NormalizedMessage {
+                                idx: j,
+                                role: if j % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                                author: Some("tester".into()),
+                                created_at: Some(1000 + i * 100 + j * 10),
+                                content: format!("begin-concurrent-test conv={i} msg={j}"),
+                                extra: serde_json::json!({}),
+                                snippets: vec![],
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+
+            // Set chunk size < conversation count to exercise multiple parallel writers
+            let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "3");
+
+            persist_conversations_batched_begin_concurrent(&db_path, &mut t_index, &convs, true)
+                .expect("begin-concurrent persist should succeed");
+
+            // Verify using FrankenStorage reader
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(count, 10, "all 10 conversations should be persisted");
+
+            let msg_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(msg_count, 30, "all 30 messages should be persisted");
+
+            let agent_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(DISTINCT slug) FROM agents", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(agent_count, 3, "3 distinct agent slugs should exist");
+
+            // Commit tantivy to finalize
+            t_index.commit().unwrap();
+        }
+
+        #[test]
+        fn begin_concurrent_single_conversation_works() {
+            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::search::tantivy::TantivyIndex;
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("test.db");
+            let index_path = dir.path().join("tantivy");
+
+            let frank = create_franken_db(&db_path);
+            drop(frank);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+            let convs = vec![NormalizedConversation {
+                agent_slug: "solo-agent".into(),
+                external_id: Some("solo-1".into()),
+                title: Some("Solo test".into()),
+                workspace: None,
+                source_path: std::path::PathBuf::from("/log/solo.jsonl"),
+                started_at: Some(5000),
+                ended_at: Some(5050),
+                metadata: serde_json::json!({}),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".into(),
+                    author: Some("tester".into()),
+                    created_at: Some(5000),
+                    content: "single-conv-begin-concurrent-test".into(),
+                    extra: serde_json::json!({}),
+                    snippets: vec![],
+                }],
+            }];
+
+            persist_conversations_batched_begin_concurrent(&db_path, &mut t_index, &convs, true)
+                .expect("single conversation begin-concurrent persist should succeed");
+
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(count, 1);
+
+            let msg_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(msg_count, 1);
+        }
+
+        #[test]
+        #[serial]
+        fn persist_conversations_batched_falls_back_for_duplicate_keys() {
+            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::search::tantivy::TantivyIndex;
+            use crate::sources::provenance::{Source, SourceKind};
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+
+            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
+            let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("test.db");
+            let index_path = dir.path().join("tantivy");
+
+            let storage = create_franken_db(&db_path);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+            storage
+                .upsert_source(&Source {
+                    id: "remote-source".into(),
+                    kind: SourceKind::Ssh,
+                    host_label: Some("example-host".into()),
+                    machine_id: None,
+                    platform: None,
+                    config_json: None,
+                    created_at: None,
+                    updated_at: None,
+                })
+                .unwrap();
+            let metadata = serde_json::json!({
+                "cass": {
+                    "origin": {
+                        "source_id": "remote-source",
+                        "host": "example-host"
+                    }
+                }
+            });
+
+            let convs = vec![
+                NormalizedConversation {
+                    agent_slug: "shared-agent".into(),
+                    external_id: Some("dup-session".into()),
+                    title: Some("Shared Session".into()),
+                    workspace: Some(std::path::PathBuf::from("/ws/shared")),
+                    source_path: std::path::PathBuf::from("/log/first.jsonl"),
+                    started_at: Some(1_000),
+                    ended_at: Some(1_010),
+                    metadata: metadata.clone(),
+                    messages: vec![NormalizedMessage {
+                        idx: 2,
+                        role: "user".into(),
+                        author: Some("tester".into()),
+                        created_at: Some(1_002),
+                        content: "third".into(),
+                        extra: serde_json::json!({}),
+                        snippets: vec![],
+                    }],
+                },
+                NormalizedConversation {
+                    agent_slug: "shared-agent".into(),
+                    external_id: Some("dup-session".into()),
+                    title: Some("Shared Session".into()),
+                    workspace: Some(std::path::PathBuf::from("/ws/shared")),
+                    source_path: std::path::PathBuf::from("/log/second.jsonl"),
+                    started_at: Some(1_000),
+                    ended_at: Some(1_020),
+                    metadata,
+                    messages: vec![
+                        NormalizedMessage {
+                            idx: 0,
+                            role: "user".into(),
+                            author: Some("tester".into()),
+                            created_at: Some(1_000),
+                            content: "first".into(),
+                            extra: serde_json::json!({}),
+                            snippets: vec![],
+                        },
+                        NormalizedMessage {
+                            idx: 1,
+                            role: "assistant".into(),
+                            author: Some("tester".into()),
+                            created_at: Some(1_001),
+                            content: "second".into(),
+                            extra: serde_json::json!({}),
+                            snippets: vec![],
+                        },
+                    ],
+                },
+            ];
+
+            persist_conversations_batched(&storage, &mut t_index, &convs, false)
+                .expect("duplicate-key batch should fall back to serial path");
+
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let conversation_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(conversation_count, 1);
+
+            let stored_indices: Vec<i64> = reader
+                .raw()
+                .query_map_collect("SELECT idx FROM messages ORDER BY idx", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(stored_indices, vec![0, 1, 2]);
+
+            t_index.commit().unwrap();
+        }
+
+        #[test]
+        fn duplicate_conversation_keys_present_for_shared_source_path_without_external_id() {
+            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+
+            let convs = vec![
+                NormalizedConversation {
+                    agent_slug: "shared-agent".into(),
+                    external_id: None,
+                    title: Some("Shared Session".into()),
+                    workspace: Some(std::path::PathBuf::from("/ws/shared")),
+                    source_path: std::path::PathBuf::from("/log/shared.jsonl"),
+                    started_at: Some(1_000),
+                    ended_at: Some(1_010),
+                    metadata: serde_json::json!({}),
+                    messages: vec![NormalizedMessage {
+                        idx: 0,
+                        role: "user".into(),
+                        author: Some("tester".into()),
+                        created_at: Some(1_000),
+                        content: "first".into(),
+                        extra: serde_json::json!({}),
+                        snippets: vec![],
+                    }],
+                },
+                NormalizedConversation {
+                    agent_slug: "shared-agent".into(),
+                    external_id: None,
+                    title: Some("Shared Session".into()),
+                    workspace: Some(std::path::PathBuf::from("/ws/shared")),
+                    source_path: std::path::PathBuf::from("/log/shared.jsonl"),
+                    started_at: Some(9_999),
+                    ended_at: Some(10_010),
+                    metadata: serde_json::json!({}),
+                    messages: vec![NormalizedMessage {
+                        idx: 1,
+                        role: "assistant".into(),
+                        author: Some("tester".into()),
+                        created_at: Some(1_001),
+                        content: "second".into(),
+                        extra: serde_json::json!({}),
+                        snippets: vec![],
+                    }],
+                },
+            ];
+
+            assert!(duplicate_conversation_keys_present(&convs));
+        }
+
+        #[test]
+        fn begin_concurrent_disabled_falls_through_to_default() {
+            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            assert!(!begin_concurrent_writes_enabled());
+
+            let _guard2 = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "false");
+            assert!(!begin_concurrent_writes_enabled());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::{NormalizedConversation, NormalizedMessage};
+    use crate::connectors::{
+        Connector, DetectionResult, NormalizedConversation, NormalizedMessage,
+    };
     use crate::sources::provenance::SourceKind;
-    use rusqlite::Connection;
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
     use serial_test::serial;
     use tempfile::TempDir;
 
@@ -2358,6 +5184,18 @@ mod tests {
         EnvGuard { key, previous }
     }
 
+    fn ensure_fts_schema(storage: &FrankenStorage) {
+        let count: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "fts_messages should exist after migrations");
+    }
+
     fn norm_msg(idx: i64, created_at: i64) -> NormalizedMessage {
         NormalizedMessage {
             idx,
@@ -2387,6 +5225,562 @@ mod tests {
         }
     }
 
+    struct DetectedRemoteFailureConnector;
+
+    impl Connector for DetectedRemoteFailureConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec!["fixture".to_string()],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(Vec::new())
+        }
+
+        fn scan_with_callback(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+            _on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            if ctx.scan_roots.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("remote exploded"))
+            }
+        }
+    }
+
+    fn detected_remote_failure_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(DetectedRemoteFailureConnector)
+    }
+
+    struct PanicConnector;
+
+    impl Connector for PanicConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec!["fixture".to_string()],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(Vec::new())
+        }
+
+        fn scan_with_callback(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+            _on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            panic!("connector panic during local scan");
+        }
+    }
+
+    fn panic_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(PanicConnector)
+    }
+
+    static DISCONNECT_TEST_COUNTER: Mutex<Option<Arc<AtomicUsize>>> = Mutex::new(None);
+
+    struct DisconnectAwareConnector;
+
+    impl Connector for DisconnectAwareConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec!["fixture".to_string()],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(Vec::new())
+        }
+
+        fn scan_with_callback(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+            on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            let counter = DISCONNECT_TEST_COUNTER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("disconnect test counter should be configured");
+            let scope = if ctx.scan_roots.is_empty() {
+                "local"
+            } else {
+                "remote"
+            };
+
+            for idx in 0..3 {
+                counter.fetch_add(1, Ordering::Relaxed);
+                let oversized = NormalizedMessage {
+                    content: "x".repeat(DEFAULT_STREAMING_BATCH_LIMITS.max_chars + 1),
+                    ..norm_msg(idx, 2_000 + idx)
+                };
+                on_conversation(norm_conv(Some(scope), vec![oversized]))?;
+            }
+
+            Ok(())
+        }
+    }
+
+    fn disconnect_aware_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(DisconnectAwareConnector)
+    }
+
+    #[test]
+    fn next_streaming_batch_splits_large_message_batches() {
+        let limits = StreamingBatchLimits {
+            max_conversations: 8,
+            max_messages: 1_000,
+            max_chars: usize::MAX,
+        };
+        let convs = vec![
+            norm_conv(
+                Some("a"),
+                (0..700).map(|i| norm_msg(i, 1_000 + i)).collect(),
+            ),
+            norm_conv(
+                Some("b"),
+                (0..400).map(|i| norm_msg(i, 2_000 + i)).collect(),
+            ),
+            norm_conv(
+                Some("c"),
+                (0..300).map(|i| norm_msg(i, 3_000 + i)).collect(),
+            ),
+        ];
+
+        let mut iter = convs.into_iter().peekable();
+        let (batch1, batch1_messages) = next_streaming_batch(&mut iter, limits).unwrap();
+        let (batch2, batch2_messages) = next_streaming_batch(&mut iter, limits).unwrap();
+
+        assert_eq!(
+            batch1
+                .iter()
+                .map(|conv| conv.external_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(batch1_messages, 700);
+
+        assert_eq!(
+            batch2
+                .iter()
+                .map(|conv| conv.external_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
+        assert_eq!(batch2_messages, 700);
+        assert!(next_streaming_batch(&mut iter, limits).is_none());
+    }
+
+    #[test]
+    fn next_streaming_batch_keeps_single_oversized_conversation_isolated() {
+        let limits = StreamingBatchLimits {
+            max_conversations: 8,
+            max_messages: 8,
+            max_chars: 64,
+        };
+        let oversized = NormalizedMessage {
+            content: "x".repeat(256),
+            ..norm_msg(0, 1_000)
+        };
+        let convs = vec![
+            norm_conv(Some("huge"), vec![oversized]),
+            norm_conv(Some("small"), vec![norm_msg(0, 2_000)]),
+        ];
+
+        let mut iter = convs.into_iter().peekable();
+        let (batch1, batch1_messages) = next_streaming_batch(&mut iter, limits).unwrap();
+        let (batch2, batch2_messages) = next_streaming_batch(&mut iter, limits).unwrap();
+
+        assert_eq!(
+            batch1[0].external_id.as_deref(),
+            Some("huge"),
+            "oversized conversations should still index, but alone"
+        );
+        assert_eq!(batch1_messages, 1);
+        assert_eq!(batch2[0].external_id.as_deref(), Some("small"));
+        assert_eq!(batch2_messages, 1);
+        assert!(next_streaming_batch(&mut iter, limits).is_none());
+    }
+
+    #[test]
+    fn streaming_batch_sender_flushes_single_oversized_conversation_immediately() {
+        let (tx, rx) = bounded(2);
+        let mut sender = StreamingBatchSender::new(
+            &tx,
+            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+            "gemini",
+            false,
+        );
+        let oversized = NormalizedMessage {
+            content: "x".repeat(DEFAULT_STREAMING_BATCH_LIMITS.max_chars + 1),
+            ..norm_msg(0, 1_000)
+        };
+        let conversation = norm_conv(Some("huge"), vec![oversized]);
+
+        sender
+            .push(conversation)
+            .expect("oversized conversation should still flush even in tests");
+
+        match rx
+            .try_recv()
+            .expect("oversized conversation should flush immediately")
+        {
+            IndexMessage::Batch {
+                connector_name,
+                conversations,
+                message_count,
+                byte_reservation,
+                ..
+            } => {
+                assert_eq!(connector_name, "gemini");
+                assert_eq!(conversations.len(), 1);
+                assert_eq!(conversations[0].external_id.as_deref(), Some("huge"));
+                assert_eq!(message_count, 1);
+                assert_eq!(
+                    byte_reservation,
+                    DEFAULT_STREAMING_BATCH_LIMITS.max_chars + 1
+                );
+            }
+            other => panic!(
+                "expected batch for oversized conversation flush, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        assert!(
+            rx.try_recv().is_err(),
+            "sender buffer should be empty after auto-flush"
+        );
+        sender.flush().unwrap();
+        assert!(rx.try_recv().is_err(), "explicit flush should be a no-op");
+    }
+
+    #[test]
+    fn streaming_byte_limiter_blocks_until_capacity_is_released() {
+        let limiter = Arc::new(StreamingByteLimiter::new(64));
+        let first = limiter.acquire(128).unwrap();
+        let (ready_tx, ready_rx) = bounded(1);
+        let (result_tx, result_rx) = bounded(1);
+        let waiter = {
+            let limiter = limiter.clone();
+            thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                let second = limiter.acquire(32).unwrap();
+                result_tx.send(second).unwrap();
+                limiter.release(second);
+            })
+        };
+
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            result_rx.try_recv().is_err(),
+            "waiter should remain blocked while the limiter is full"
+        );
+
+        limiter.release(first);
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 32);
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn streaming_byte_limiter_close_wakes_waiters() {
+        let limiter = Arc::new(StreamingByteLimiter::new(64));
+        let first = limiter.acquire(64).unwrap();
+        let (ready_tx, ready_rx) = bounded(1);
+        let (result_tx, result_rx) = bounded(1);
+        let waiter = {
+            let limiter = limiter.clone();
+            thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                let result = limiter.acquire(1).map_err(|error| error.to_string());
+                result_tx.send(result).unwrap();
+            })
+        };
+
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            result_rx.try_recv().is_err(),
+            "waiter should remain blocked until the limiter is closed"
+        );
+
+        limiter.close();
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .expect_err("closing the limiter should wake blocked waiters with an error");
+        assert!(error.contains("closed"));
+        limiter.release(first);
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn send_conversation_batches_marks_only_first_batch_as_discovered() {
+        let (tx, rx) = bounded(4);
+        let convs = vec![
+            norm_conv(
+                Some("a"),
+                (0..1_200).map(|i| norm_msg(i, 1_000 + i)).collect(),
+            ),
+            norm_conv(
+                Some("b"),
+                (0..1_200).map(|i| norm_msg(i, 2_000 + i)).collect(),
+            ),
+        ];
+
+        send_conversation_batches(&tx, "claude", convs, true);
+        drop(tx);
+
+        let batches = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(batches.len(), 2);
+
+        match &batches[0] {
+            IndexMessage::Batch {
+                connector_name,
+                is_discovered,
+                message_count,
+                conversations,
+                ..
+            } => {
+                assert_eq!(*connector_name, "claude");
+                assert!(*is_discovered);
+                assert_eq!(*message_count, 1_200);
+                assert_eq!(conversations.len(), 1);
+            }
+            _ => panic!("expected first message to be a batch"),
+        }
+
+        match &batches[1] {
+            IndexMessage::Batch {
+                connector_name,
+                is_discovered,
+                message_count,
+                conversations,
+                ..
+            } => {
+                assert_eq!(*connector_name, "claude");
+                assert!(!*is_discovered);
+                assert_eq!(*message_count, 1_200);
+                assert_eq!(conversations.len(), 1);
+            }
+            _ => panic!("expected second message to be a batch"),
+        }
+    }
+
+    #[test]
+    fn streaming_consumer_preserves_discovered_connector_with_no_batches() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let (tx, rx) = bounded(2);
+
+        tx.send(IndexMessage::Done {
+            connector_name: "claude",
+            scan_ms: 42,
+            is_discovered: true,
+        })
+        .unwrap();
+        drop(tx);
+
+        let discovered = run_streaming_consumer(
+            rx,
+            1,
+            &storage,
+            &mut index,
+            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+            &Some(progress.clone()),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(discovered, vec!["claude".to_string()]);
+        let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
+        assert_eq!(stats.total_conversations, 0);
+        assert_eq!(stats.total_messages, 0);
+    }
+
+    #[test]
+    fn streaming_producer_records_remote_scan_errors_in_connector_stats() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+        let remote_root_path = PathBuf::from("/remote/fixture/claude");
+        let handle = spawn_connector_producer(
+            "claude",
+            detected_remote_failure_connector_factory,
+            tx,
+            StreamingProducerConfig {
+                flow_limiter: flow_limiter.clone(),
+                data_dir,
+                remote_roots: vec![ScanRoot::remote(
+                    remote_root_path.clone(),
+                    Origin::remote("fixture-host"),
+                    Some(crate::sources::config::Platform::Linux),
+                )],
+                since_ts: None,
+                progress: Some(progress.clone()),
+            },
+        );
+
+        let discovered = run_streaming_consumer(
+            rx,
+            1,
+            &storage,
+            &mut index,
+            flow_limiter,
+            &Some(progress.clone()),
+            false,
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(discovered, vec!["claude".to_string()]);
+
+        let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let connector = stats
+            .connectors
+            .iter()
+            .find(|connector| connector.name == "claude")
+            .expect("claude connector stats should exist");
+        assert_eq!(
+            connector.error.as_deref(),
+            Some("remote scan failed for /remote/fixture/claude: remote exploded")
+        );
+    }
+
+    #[test]
+    fn streaming_index_fails_closed_when_producer_panics() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir,
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: Some(progress.clone()),
+            watch_interval_secs: 30,
+        };
+
+        let error = run_streaming_index_with_connector_factories(
+            &storage,
+            &mut index,
+            &opts,
+            None,
+            false,
+            Vec::new(),
+            vec![("claude", panic_connector_factory)],
+        )
+        .expect_err("producer panic should abort streaming indexing");
+        let message = error.to_string();
+        assert!(
+            message.contains("streaming producer thread panicked"),
+            "panic should surface in the returned error: {message}"
+        );
+        assert!(
+            message.contains("claude: connector panic during local scan"),
+            "returned error should name the failing connector and panic: {message}"
+        );
+        assert_eq!(
+            progress
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
+            Some(message.as_str()),
+            "progress tracker should expose the real panic instead of pretending indexing succeeded"
+        );
+    }
+
+    #[test]
+    fn streaming_producer_stops_after_consumer_disconnect() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        *DISCONNECT_TEST_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(counter.clone());
+
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+        drop(rx);
+
+        let handle = spawn_connector_producer(
+            "claude",
+            disconnect_aware_connector_factory,
+            tx,
+            StreamingProducerConfig {
+                flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+                data_dir,
+                remote_roots: vec![ScanRoot::remote(
+                    PathBuf::from("/remote/fixture/claude"),
+                    Origin::remote("fixture-host"),
+                    Some(crate::sources::config::Platform::Linux),
+                )],
+                since_ts: None,
+                progress: None,
+            },
+        );
+
+        handle
+            .join()
+            .expect("producer should stop cleanly after consumer disconnect");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "producer should stop after the first failed batch send instead of chewing through local and remote scans"
+        );
+
+        *DISCONNECT_TEST_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     #[test]
     fn db_id_conversion_helpers_handle_invalid_ranges() {
         assert_eq!(message_id_from_db(-1), None);
@@ -2407,23 +5801,23 @@ mod tests {
         let db_path = tmp.path().join("future-schema.db");
 
         {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
-                [format!(
-                    "{}",
-                    crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
-                )],
-            )
-            .unwrap();
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
+                    &[ParamValue::from(format!(
+                        "{}",
+                        crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
+                    ))],
+                )
+                .unwrap();
         }
 
-        let (storage, rebuilt) = open_storage_for_index(&db_path).unwrap();
+        let (storage, rebuilt, opened_fresh_for_full) =
+            open_storage_for_index(&db_path, false).unwrap();
         assert!(rebuilt, "newer schema should trigger rebuild recovery");
+        assert!(opened_fresh_for_full);
         assert_eq!(
             storage.schema_version().unwrap(),
             crate::storage::sqlite::CURRENT_SCHEMA_VERSION
@@ -2451,8 +5845,8 @@ mod tests {
     fn reset_storage_clears_data_but_leaves_meta() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
-        let mut storage = SqliteStorage::open(&db_path).unwrap();
-        ensure_fts_schema(storage.raw());
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
 
         let agent = crate::model::types::Agent {
             id: None,
@@ -2500,47 +5894,416 @@ mod tests {
 
         let msg_count: i64 = storage
             .raw()
-            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .query_row_map("SELECT COUNT(*) FROM messages", &[] as &[ParamValue], |r| {
+                r.get_typed(0)
+            })
             .unwrap();
         assert_eq!(msg_count, 1);
 
         storage
             .raw()
-            .execute(
+            .execute_compat(
                 "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
                  VALUES(?1, ?2, ?3, 1, 1, 10, ?4)",
-                rusqlite::params![1_i64, "tester", "local", 123_i64],
+                &[
+                    ParamValue::from(1_i64),
+                    ParamValue::from("tester"),
+                    ParamValue::from("local"),
+                    ParamValue::from(123_i64),
+                ],
             )
             .unwrap();
         storage
             .raw()
-            .execute(
+            .execute_compat(
                 "INSERT INTO usage_daily(day_id, agent_slug, workspace_id, source_id, message_count, last_updated)
                  VALUES(?1, ?2, ?3, ?4, 1, ?5)",
-                rusqlite::params![1_i64, "tester", 0_i64, "local", 123_i64],
+                &[
+                    ParamValue::from(1_i64),
+                    ParamValue::from("tester"),
+                    ParamValue::from(0_i64),
+                    ParamValue::from("local"),
+                    ParamValue::from(123_i64),
+                ],
             )
             .unwrap();
 
-        reset_storage(&mut storage).unwrap();
+        reset_storage(&storage, &db_path).unwrap();
 
         let msg_count: i64 = storage
             .raw()
-            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .query_row_map("SELECT COUNT(*) FROM messages", &[] as &[ParamValue], |r| {
+                r.get_typed(0)
+            })
             .unwrap();
         assert_eq!(msg_count, 0);
         let daily_count: i64 = storage
             .raw()
-            .query_row("SELECT COUNT(*) FROM daily_stats", [], |r| r.get(0))
+            .query_row_map(
+                "SELECT COUNT(*) FROM daily_stats",
+                &[] as &[ParamValue],
+                |r| r.get_typed(0),
+            )
             .unwrap();
         assert_eq!(daily_count, 0);
         let usage_daily_count: i64 = storage
             .raw()
-            .query_row("SELECT COUNT(*) FROM usage_daily", [], |r| r.get(0))
+            .query_row_map(
+                "SELECT COUNT(*) FROM usage_daily",
+                &[] as &[ParamValue],
+                |r| r.get_typed(0),
+            )
             .unwrap();
         assert_eq!(usage_daily_count, 0);
+        let fts_count: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM fts_messages",
+                &[] as &[ParamValue],
+                |r| r.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(fts_count, 0, "reset should recreate an empty FTS table");
         assert_eq!(
             storage.schema_version().unwrap(),
             crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn repair_daily_stats_if_drifted_rebuilds_materialized_totals() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.run_migrations().unwrap();
+
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "tester".into(),
+            workspace: Some(std::path::PathBuf::from("/tmp/workspace")),
+            external_id: Some("daily-stats-repair".into()),
+            title: Some("repair".into()),
+            source_path: std::path::PathBuf::from("/tmp/repair.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![crate::model::types::Message {
+                id: None,
+                idx: 0,
+                role: crate::model::types::MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "hello".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &conversation)])
+            .unwrap();
+
+        storage.raw().execute("DELETE FROM daily_stats").unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+                 VALUES(0, 'all', 'all', 99, 99, 99, 0)",
+            )
+            .unwrap();
+
+        let before = storage.daily_stats_health().unwrap();
+        assert_eq!(before.materialized_total, 99);
+        assert!(before.drift > 0);
+
+        repair_daily_stats_if_drifted(&storage, &db_path).unwrap();
+        let after = storage.daily_stats_health().unwrap();
+        assert_eq!(after.conversation_count, 1);
+        assert_eq!(after.materialized_total, 1);
+        assert_eq!(after.drift, 0);
+    }
+
+    #[test]
+    fn historical_salvage_decision_skips_populated_canonical_db() {
+        assert!(!should_salvage_historical_databases(false, 1, false, false));
+        assert!(!should_salvage_historical_databases(
+            false, 43_678, false, false
+        ));
+    }
+
+    #[test]
+    fn historical_salvage_decision_keeps_empty_or_rebuilt_storage() {
+        assert!(should_salvage_historical_databases(false, 0, false, false));
+        assert!(should_salvage_historical_databases(true, 0, false, false));
+        assert!(should_salvage_historical_databases(
+            true, 43_678, false, false
+        ));
+    }
+
+    #[test]
+    fn historical_salvage_decision_keeps_populated_canonical_when_more_bundles_are_pending() {
+        assert!(should_salvage_historical_databases(
+            false, 43_678, true, false
+        ));
+    }
+
+    #[test]
+    fn historical_salvage_decision_skips_pending_bundles_during_canonical_only_full_rebuild() {
+        assert!(!should_salvage_historical_databases(
+            false, 43_678, true, true
+        ));
+    }
+
+    #[test]
+    fn full_rebuild_does_not_restart_based_on_historical_local_rowids() {
+        fn insert_demo_conversation(db_path: &Path, external_id: &str, msg_idx: i64, ts: i64) {
+            let storage = crate::storage::sqlite::SqliteStorage::open(db_path).unwrap();
+            let agent = crate::model::types::Agent {
+                id: None,
+                slug: "tester".into(),
+                name: "Tester".into(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            let conv = norm_conv(Some(external_id), vec![norm_msg(msg_idx, ts)]);
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &crate::model::types::Conversation {
+                        id: None,
+                        agent_slug: conv.agent_slug.clone(),
+                        workspace: conv.workspace.clone(),
+                        external_id: conv.external_id.clone(),
+                        title: conv.title.clone(),
+                        source_path: conv.source_path.clone(),
+                        started_at: conv.started_at,
+                        ended_at: conv.ended_at,
+                        approx_tokens: None,
+                        metadata_json: conv.metadata.clone(),
+                        messages: conv
+                            .messages
+                            .iter()
+                            .map(|m| crate::model::types::Message {
+                                id: None,
+                                idx: m.idx,
+                                role: crate::model::types::MessageRole::User,
+                                author: m.author.clone(),
+                                created_at: m.created_at,
+                                content: m.content.clone(),
+                                extra_json: m.extra.clone(),
+                                snippets: Vec::new(),
+                            })
+                            .collect(),
+                        source_id: "local".to_string(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap();
+            drop(storage);
+            crate::storage::sqlite::rebuild_fts_via_rusqlite(db_path).unwrap();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let canonical_db = tmp.path().join("agent_search.db");
+        let backups_dir = tmp.path().join("backups");
+        std::fs::create_dir_all(&backups_dir).unwrap();
+        let healthy_backup = backups_dir.join("agent_search.db.20260322T020200.bak");
+
+        insert_demo_conversation(&canonical_db, "canonical-only", 0, 1_700_000_000_000);
+        insert_demo_conversation(&healthy_backup, "backup-1", 0, 1_700_000_000_100);
+        insert_demo_conversation(&healthy_backup, "backup-2", 1, 1_700_000_000_200);
+
+        let conn = rusqlite::Connection::open(&canonical_db).unwrap();
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+            rusqlite::params![
+                "historical_bundle_salvaged:test",
+                "{\"salvage_version\":2,\"method\":\"baseline-bulk-sql-copy\"}"
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = FrankenStorage::open(&canonical_db).unwrap();
+        let canonical_sessions = count_total_conversations_exact(&storage).unwrap();
+        assert_eq!(canonical_sessions, 1);
+
+        assert!(
+            !full_rebuild_requires_historical_restart(&storage, &canonical_db, canonical_sessions)
+                .unwrap(),
+            "full rebuild must not compare local message rowids across different sqlite files"
+        );
+    }
+
+    #[test]
+    fn full_rebuild_restart_ignores_stale_progress_when_canonical_is_healthy() {
+        fn insert_demo_conversation(db_path: &Path, external_id: &str, msg_idx: i64, ts: i64) {
+            let storage = crate::storage::sqlite::SqliteStorage::open(db_path).unwrap();
+            let agent = crate::model::types::Agent {
+                id: None,
+                slug: "tester".into(),
+                name: "Tester".into(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            let conv = norm_conv(Some(external_id), vec![norm_msg(msg_idx, ts)]);
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &crate::model::types::Conversation {
+                        id: None,
+                        agent_slug: conv.agent_slug.clone(),
+                        workspace: conv.workspace.clone(),
+                        external_id: conv.external_id.clone(),
+                        title: conv.title.clone(),
+                        source_path: conv.source_path.clone(),
+                        started_at: conv.started_at,
+                        ended_at: conv.ended_at,
+                        approx_tokens: None,
+                        metadata_json: conv.metadata.clone(),
+                        messages: conv
+                            .messages
+                            .iter()
+                            .map(|m| crate::model::types::Message {
+                                id: None,
+                                idx: m.idx,
+                                role: crate::model::types::MessageRole::User,
+                                author: m.author.clone(),
+                                created_at: m.created_at,
+                                content: m.content.clone(),
+                                extra_json: m.extra.clone(),
+                                snippets: Vec::new(),
+                            })
+                            .collect(),
+                        source_id: "local".to_string(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap();
+            drop(storage);
+            crate::storage::sqlite::rebuild_fts_via_rusqlite(db_path).unwrap();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let canonical_db = tmp.path().join("agent_search.db");
+        let backups_dir = tmp.path().join("backups");
+        std::fs::create_dir_all(&backups_dir).unwrap();
+        let healthy_backup = backups_dir.join("agent_search.db.20260322T020200.bak");
+
+        insert_demo_conversation(&canonical_db, "canonical-only", 0, 1_700_000_000_000);
+        insert_demo_conversation(&healthy_backup, "backup-only", 0, 1_700_000_000_100);
+
+        let storage = FrankenStorage::open(&canonical_db).unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+                &[
+                    ParamValue::from("historical_bundle_progress:test"),
+                    ParamValue::from(
+                        "{\"progress_version\":1,\"last_completed_source_row_id\":78}",
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let canonical_sessions = count_total_conversations_exact(&storage).unwrap();
+        assert_eq!(canonical_sessions, 1);
+        assert!(
+            !full_rebuild_requires_historical_restart(&storage, &canonical_db, canonical_sessions)
+                .unwrap(),
+            "stale salvage progress alone must not force a fresh canonical restart when the canonical db is healthy"
+        );
+    }
+
+    #[test]
+    fn reopen_fresh_storage_for_full_rebuild_preserves_backup_and_starts_empty() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conv = norm_conv(Some("c1"), vec![norm_msg(0, 10)]);
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &crate::model::types::Conversation {
+                    id: None,
+                    agent_slug: conv.agent_slug.clone(),
+                    workspace: conv.workspace.clone(),
+                    external_id: conv.external_id.clone(),
+                    title: conv.title.clone(),
+                    source_path: conv.source_path.clone(),
+                    started_at: conv.started_at,
+                    ended_at: conv.ended_at,
+                    approx_tokens: None,
+                    metadata_json: conv.metadata.clone(),
+                    messages: conv
+                        .messages
+                        .iter()
+                        .map(|m| crate::model::types::Message {
+                            id: None,
+                            idx: m.idx,
+                            role: crate::model::types::MessageRole::User,
+                            author: m.author.clone(),
+                            created_at: m.created_at,
+                            content: m.content.clone(),
+                            extra_json: m.extra.clone(),
+                            snippets: Vec::new(),
+                        })
+                        .collect(),
+                    source_id: "local".to_string(),
+                    origin_host: None,
+                },
+            )
+            .unwrap();
+
+        let reopened = reopen_fresh_storage_for_full_rebuild(storage, &db_path).unwrap();
+        let msg_count: i64 = reopened
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", &[] as &[ParamValue], |r| {
+                r.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(msg_count, 0);
+
+        let backup_count = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.starts_with("db.sqlite.backup."))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            backup_count >= 1,
+            "expected preserved backup before opening a fresh full-rebuild db"
         );
     }
 
@@ -2551,12 +6314,12 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
 
         let db_path = data_dir.join("db.sqlite");
-        let mut storage = SqliteStorage::open(&db_path).unwrap();
-        ensure_fts_schema(storage.raw());
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
         let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
 
         let conv1 = norm_conv(Some("ext"), vec![norm_msg(0, 100), norm_msg(1, 200)]);
-        persist::persist_conversation(&mut storage, &mut index, &conv1).unwrap();
+        persist::persist_conversation(&storage, &mut index, &conv1).unwrap();
         index.commit().unwrap();
 
         let reader = index.reader().unwrap();
@@ -2567,7 +6330,7 @@ mod tests {
             Some("ext"),
             vec![norm_msg(0, 100), norm_msg(1, 200), norm_msg(2, 300)],
         );
-        persist::persist_conversation(&mut storage, &mut index, &conv2).unwrap();
+        persist::persist_conversation(&storage, &mut index, &conv2).unwrap();
         index.commit().unwrap();
 
         let reader = index.reader().unwrap();
@@ -2644,6 +6407,71 @@ mod tests {
     }
 
     #[test]
+    fn watch_event_filter_ignores_read_access_noise() {
+        let event = notify::Event::new(notify::event::EventKind::Access(AccessKind::Read))
+            .add_path(PathBuf::from("/tmp/session.jsonl"));
+        assert!(
+            !watch_event_should_trigger_reindex(&event),
+            "read-only access events should not retrigger watch indexing"
+        );
+
+        let event = notify::Event::new(notify::event::EventKind::Access(AccessKind::Close(
+            AccessMode::Read,
+        )))
+        .add_path(PathBuf::from("/tmp/session.jsonl"));
+        assert!(
+            !watch_event_should_trigger_reindex(&event),
+            "close-after-read events should not retrigger watch indexing"
+        );
+    }
+
+    #[test]
+    fn watch_event_filter_keeps_mutating_events() {
+        let event = notify::Event::new(notify::event::EventKind::Access(AccessKind::Close(
+            AccessMode::Write,
+        )))
+        .add_path(PathBuf::from("/tmp/session.jsonl"));
+        assert!(
+            watch_event_should_trigger_reindex(&event),
+            "close-after-write events should still retrigger indexing"
+        );
+
+        let event = notify::Event::new(notify::event::EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::WriteTime,
+        )))
+        .add_path(PathBuf::from("/tmp/session.jsonl"));
+        assert!(
+            watch_event_should_trigger_reindex(&event),
+            "write-time metadata changes should still retrigger indexing"
+        );
+    }
+
+    #[test]
+    fn watch_event_filter_ignores_access_time_metadata() {
+        let event = notify::Event::new(notify::event::EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime,
+        )))
+        .add_path(PathBuf::from("/tmp/session.jsonl"));
+        assert!(
+            !watch_event_should_trigger_reindex(&event),
+            "access-time metadata changes are read noise and should be ignored"
+        );
+    }
+
+    #[test]
+    fn watch_event_filter_ignores_remove_events_without_delete_support() {
+        let event = notify::Event::new(notify::event::EventKind::Remove(
+            notify::event::RemoveKind::File,
+        ))
+        .add_path(PathBuf::from("/tmp/session.jsonl"));
+        assert!(
+            !watch_event_should_trigger_reindex(&event),
+            "remove events should be ignored until watch mode can remove stale indexed rows"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn watch_state_round_trips_to_disk() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -2661,6 +6489,39 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn watch_state_overwrites_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut first = HashMap::new();
+        first.insert(ConnectorKind::Codex, 111);
+        save_watch_state(&data_dir, &first).unwrap();
+
+        let mut second = HashMap::new();
+        second.insert(ConnectorKind::Amp, 222);
+        save_watch_state(&data_dir, &second).unwrap();
+
+        let loaded = load_watch_state(&data_dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get(&ConnectorKind::Amp), Some(&222));
+        assert!(!loaded.contains_key(&ConnectorKind::Codex));
+    }
+
+    #[test]
+    fn watch_state_temp_paths_are_unique() {
+        let final_path = Path::new("/tmp/watch_state.json");
+        let first = unique_atomic_temp_path(final_path);
+        let second = unique_atomic_temp_path(final_path);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), final_path.parent());
+        assert_eq!(second.parent(), final_path.parent());
+    }
+
+    #[test]
+    #[serial]
     fn watch_state_loads_legacy_map_format() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -2675,6 +6536,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn watch_state_saves_compact_keys() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -2733,15 +6595,16 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
+            watch_interval_secs: 30,
         };
 
         // Manually set up dependencies for reindex_paths
-        let storage = SqliteStorage::open(&opts.db_path).unwrap();
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir).unwrap()).unwrap();
 
-        let state = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        let storage = std::sync::Arc::new(std::sync::Mutex::new(storage));
-        let t_index = std::sync::Arc::new(std::sync::Mutex::new(t_index));
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(t_index);
 
         // Need roots for reindex_paths
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
@@ -2750,9 +6613,9 @@ mod tests {
             &opts,
             vec![amp_file.clone()],
             &roots,
-            state.clone(),
-            storage.clone(),
-            t_index.clone(),
+            &state,
+            &storage,
+            &t_index,
             false,
         )
         .unwrap();
@@ -2761,11 +6624,6 @@ mod tests {
         assert!(loaded.contains_key(&ConnectorKind::Amp));
         let ts = loaded.get(&ConnectorKind::Amp).copied().unwrap();
         assert!(ts > 0);
-
-        // Explicitly drop resources to release locks before cleanup
-        drop(t_index);
-        drop(storage);
-        drop(state);
 
         if let Some(prev) = prev {
             unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
@@ -2783,6 +6641,7 @@ mod tests {
         let prev = dotenvy::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
 
+        // Use xdg directly (not dirs::data_dir() which doesn't respect XDG_DATA_HOME on macOS)
         let data_dir = xdg.join("amp");
         std::fs::create_dir_all(&data_dir).unwrap();
         let amp_dir = data_dir.join("amp");
@@ -2812,24 +6671,25 @@ mod tests {
             build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
+            watch_interval_secs: 30,
         };
 
-        let storage = SqliteStorage::open(&opts.db_path).unwrap();
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir).unwrap()).unwrap();
         let mut initial = HashMap::new();
         initial.insert(ConnectorKind::Amp, i64::MAX / 4);
-        let state = Arc::new(Mutex::new(initial));
-        let storage = Arc::new(Mutex::new(storage));
-        let t_index = Arc::new(Mutex::new(t_index));
+        let state = Mutex::new(initial);
+        let storage = Mutex::new(storage);
+        let t_index = Mutex::new(t_index);
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
 
         let indexed = reindex_paths(
             &opts,
             vec![amp_file],
             &roots,
-            state.clone(),
-            storage,
-            t_index,
+            &state,
+            &storage,
+            &t_index,
             false,
         )
         .unwrap();
@@ -2854,6 +6714,7 @@ mod tests {
         let prev = dotenvy::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
 
+        // Use xdg directly (not dirs::data_dir() which doesn't respect XDG_DATA_HOME on macOS)
         let data_dir = xdg.join("amp");
         std::fs::create_dir_all(&data_dir).unwrap();
         let amp_dir = data_dir.join("amp");
@@ -2873,24 +6734,25 @@ mod tests {
             build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
+            watch_interval_secs: 30,
         };
 
-        let storage = SqliteStorage::open(&opts.db_path).unwrap();
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir).unwrap()).unwrap();
         let mut initial = HashMap::new();
         initial.insert(ConnectorKind::Amp, 10_000);
-        let state = Arc::new(Mutex::new(initial));
-        let storage = Arc::new(Mutex::new(storage));
-        let t_index = Arc::new(Mutex::new(t_index));
+        let state = Mutex::new(initial);
+        let storage = Mutex::new(storage);
+        let t_index = Mutex::new(t_index);
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
 
         let indexed = reindex_paths(
             &opts,
             vec![amp_file],
             &roots,
-            state.clone(),
-            storage,
-            t_index,
+            &state,
+            &storage,
+            &t_index,
             false,
         )
         .unwrap();
@@ -2905,35 +6767,6 @@ mod tests {
             unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
         } else {
             unsafe { std::env::remove_var("XDG_DATA_HOME") };
-        }
-    }
-
-    fn ensure_fts_schema(conn: &Connection) {
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(fts_messages)")
-            .expect("prepare table_info");
-        let cols: Vec<String> = stmt
-            .query_map([], |row: &rusqlite::Row| row.get::<_, String>(1))
-            .unwrap()
-            .flatten()
-            .collect();
-        if !cols.iter().any(|c| c == "created_at") {
-            conn.execute_batch(
-                r#"
-DROP TABLE IF EXISTS fts_messages;
-CREATE VIRTUAL TABLE fts_messages USING fts5(
-    content,
-    title,
-    agent,
-    workspace,
-    source_path,
-    created_at UNINDEXED,
-    message_id UNINDEXED,
-    tokenize='porter'
-);
-"#,
-            )
-            .unwrap();
         }
     }
 
@@ -2983,21 +6816,22 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
             build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
+            watch_interval_secs: 30,
         };
 
-        let storage = SqliteStorage::open(&opts.db_path).unwrap();
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir).unwrap()).unwrap();
-        let state = Arc::new(Mutex::new(HashMap::new()));
-        let storage = Arc::new(Mutex::new(storage));
-        let t_index = Arc::new(Mutex::new(t_index));
+        let state = Mutex::new(HashMap::new());
+        let storage = Mutex::new(storage);
+        let t_index = Mutex::new(t_index);
 
         reindex_paths(
             &opts,
             vec![amp_file],
             &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
-            state.clone(),
-            storage.clone(),
-            t_index.clone(),
+            &state,
+            &storage,
+            &t_index,
             false,
         )
         .unwrap();
@@ -3010,7 +6844,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
 
         // Explicitly drop resources to release locks before cleanup
         drop(t_index);
-        drop(storage);
+        storage.into_inner().unwrap().close().unwrap();
         drop(state);
 
         if let Some(prev) = prev {
@@ -3108,7 +6942,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         std::fs::create_dir_all(&data_dir).unwrap();
 
         let db_path = data_dir.join("db.sqlite");
-        let storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
 
         let roots = build_scan_roots(&storage, &data_dir);
 
@@ -3128,7 +6962,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
 
         // Create a remote source in the database
         let db_path = data_dir.join("db.sqlite");
-        let storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
 
         // Register a remote source
         storage
@@ -3173,10 +7007,11 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        let db_path = data_dir.join("db.sqlite");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-
         // Register a remote source but don't create mirror directory
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        // Register a remote source
         storage
             .upsert_source(&crate::sources::provenance::Source {
                 id: "nonexistent".to_string(),
@@ -3189,6 +7024,10 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
                 updated_at: None,
             })
             .unwrap();
+
+        // Create the mirror directory but with a different name
+        let mirror_dir = data_dir.join("remotes").join("laptop").join("mirror");
+        std::fs::create_dir_all(&mirror_dir).unwrap();
 
         let roots = build_scan_roots(&storage, &data_dir);
 
@@ -3271,20 +7110,20 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         let mut conv = norm_conv(None, vec![norm_msg(0, 1000)]);
         conv.workspace = Some(PathBuf::from("/home/user/projects/special/app"));
 
-        let mappings = vec![
-            crate::sources::config::PathMapping::new("/home/user", "/Users/me"),
-            crate::sources::config::PathMapping::new(
-                "/home/user/projects/special",
-                "/Volumes/Special",
-            ),
-        ];
+        let mappings = vec![crate::sources::config::PathMapping::new(
+            "/home/user",
+            "/Users/me",
+        )];
 
         let mut root = crate::connectors::ScanRoot::local(PathBuf::from("/"));
         root.workspace_rewrites = mappings;
         apply_workspace_rewrite(&mut conv, &root);
 
-        // Should use longer prefix match
-        assert_eq!(conv.workspace, Some(PathBuf::from("/Volumes/Special/app")));
+        // Should use longest prefix match
+        assert_eq!(
+            conv.workspace,
+            Some(PathBuf::from("/Users/me/projects/special/app"))
+        );
     }
 
     #[test]
@@ -3319,14 +7158,11 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         conv.agent_slug = "claude-code".to_string();
         conv.workspace = Some(PathBuf::from("/home/user/projects/app"));
 
-        let mappings = vec![
-            crate::sources::config::PathMapping::new("/home/user", "/Users/me"),
-            crate::sources::config::PathMapping::with_agents(
-                "/home/user/projects",
-                "/Volumes/Work",
-                vec!["cursor".to_string()], // Only for cursor, not claude-code
-            ),
-        ];
+        let mappings = vec![crate::sources::config::PathMapping::with_agents(
+            "/home/user/projects",
+            "/Volumes/Work",
+            vec!["cursor".to_string()], // Only for cursor, not claude-code
+        )];
 
         let mut root = crate::connectors::ScanRoot::local(PathBuf::from("/"));
         root.workspace_rewrites = mappings;
@@ -3335,7 +7171,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         // Should NOT use cursor-specific mapping, falls back to general
         assert_eq!(
             conv.workspace,
-            Some(PathBuf::from("/Users/me/projects/app"))
+            Some(PathBuf::from("/home/user/projects/app"))
         );
     }
 
@@ -3449,6 +7285,224 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
         detector.reset();
         assert_eq!(detector.stats().consecutive_zero_scans, 0);
         assert!(detector.stats().seconds_since_last_ingest.is_some());
+    }
+
+    #[test]
+    fn finalize_watch_reindex_result_records_error_and_resets_phase() {
+        let detector = StaleDetector::new(StaleConfig::default());
+        let progress = Arc::new(IndexingProgress::default());
+        progress.phase.store(2, Ordering::Relaxed);
+
+        let indexed = finalize_watch_reindex_result(
+            Err(anyhow::anyhow!("boom")),
+            &detector,
+            Some(&progress),
+            "watch incremental reindex",
+        );
+
+        assert_eq!(
+            indexed, 0,
+            "failed watch reindex should report zero indexed"
+        );
+        assert_eq!(
+            detector.stats().consecutive_zero_scans,
+            1,
+            "failed watch reindex should still count as a zero-result scan for stale detection"
+        );
+        assert_eq!(
+            progress.phase.load(Ordering::Relaxed),
+            0,
+            "failed watch reindex should reset progress phase back to idle"
+        );
+        assert_eq!(
+            progress
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
+            Some("watch incremental reindex: boom"),
+            "failed watch reindex should surface the real error"
+        );
+    }
+
+    #[test]
+    fn run_index_progress_reset_guard_resets_idle_state_without_clobbering_error() {
+        let progress = Arc::new(IndexingProgress::default());
+        progress.phase.store(2, Ordering::Relaxed);
+        progress.is_rebuilding.store(true, Ordering::Relaxed);
+        *progress
+            .last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some("boom".to_string());
+
+        {
+            let _guard = RunIndexProgressReset::new(Some(progress.clone()));
+        }
+
+        assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
+        assert!(
+            !progress.is_rebuilding.load(Ordering::Relaxed),
+            "drop guard should clear stale rebuild state after failures"
+        );
+        assert_eq!(
+            progress
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
+            Some("boom"),
+            "idle-state cleanup should not erase the real error"
+        );
+    }
+
+    #[test]
+    fn reconcile_pending_lexical_commit_promotes_committed_offset_when_meta_changes() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(index_path.join("meta.json"), b"before").unwrap();
+
+        let db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 400,
+            storage_fingerprint: "seed:400".to_string(),
+        };
+        let mut state = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        state.record_pending_commit(200, 200, 600, index_meta_fingerprint(&index_path).unwrap());
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        fs::write(index_path.join("meta.json"), b"after").unwrap();
+
+        let reconciled = reconcile_pending_lexical_commit(&index_path, state).unwrap();
+        assert_eq!(reconciled.committed_offset, 200);
+        assert_eq!(reconciled.processed_conversations, 200);
+        assert_eq!(reconciled.indexed_docs, 600);
+        assert!(reconciled.pending.is_none());
+    }
+
+    #[test]
+    fn reconcile_pending_lexical_commit_rolls_back_uncommitted_batch_when_meta_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(index_path.join("meta.json"), b"stable").unwrap();
+
+        let db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 400,
+            storage_fingerprint: "seed:400".to_string(),
+        };
+        let mut state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
+        state.committed_offset = 100;
+        state.processed_conversations = 100;
+        state.indexed_docs = 250;
+        state.record_pending_commit(200, 200, 600, index_meta_fingerprint(&index_path).unwrap());
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        let reconciled = reconcile_pending_lexical_commit(&index_path, state).unwrap();
+        assert_eq!(reconciled.committed_offset, 100);
+        assert_eq!(reconciled.processed_conversations, 100);
+        assert_eq!(reconciled.indexed_docs, 250);
+        assert!(reconciled.pending.is_none());
+        assert!(has_pending_lexical_rebuild(&index_path, &db_state).unwrap());
+    }
+
+    #[test]
+    fn clear_lexical_rebuild_state_removes_stale_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+
+        let state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: "/tmp/agent_search.db".to_string(),
+                total_conversations: 12,
+                storage_fingerprint: "seed:12".to_string(),
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+        assert!(
+            load_lexical_rebuild_snapshot(&index_path, Path::new("/tmp/agent_search.db"))
+                .unwrap()
+                .is_some()
+        );
+
+        clear_lexical_rebuild_state(&index_path).unwrap();
+        assert!(
+            load_lexical_rebuild_snapshot(&index_path, Path::new("/tmp/agent_search.db"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn should_commit_lexical_rebuild_when_message_count_threshold_is_hit() {
+        assert!(should_commit_lexical_rebuild(
+            10,
+            5_000,
+            1_024,
+            1_000,
+            5_000,
+            16 * 1024 * 1024
+        ));
+        assert!(!should_commit_lexical_rebuild(
+            10,
+            4_999,
+            1_024,
+            1_000,
+            5_000,
+            16 * 1024 * 1024
+        ));
+    }
+
+    #[test]
+    fn should_commit_lexical_rebuild_when_message_byte_threshold_is_hit() {
+        assert!(should_commit_lexical_rebuild(
+            10,
+            100,
+            16 * 1024 * 1024,
+            1_000,
+            5_000,
+            16 * 1024 * 1024
+        ));
+        assert!(!should_commit_lexical_rebuild(
+            10,
+            100,
+            (16 * 1024 * 1024) - 1,
+            1_000,
+            5_000,
+            16 * 1024 * 1024
+        ));
+    }
+
+    #[test]
+    fn finalize_watch_reindex_result_clears_stale_error_on_success() {
+        let detector = StaleDetector::new(StaleConfig::default());
+        let progress = Arc::new(IndexingProgress::default());
+        *progress
+            .last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some("old".to_string());
+
+        let indexed = finalize_watch_reindex_result(
+            Ok(3),
+            &detector,
+            Some(&progress),
+            "watch incremental reindex",
+        );
+
+        assert_eq!(indexed, 3);
+        assert_eq!(detector.stats().total_ingests, 1);
+        assert_eq!(
+            progress
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
+            None,
+            "successful watch reindex should clear stale error diagnostics"
+        );
     }
 
     #[test]

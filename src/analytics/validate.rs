@@ -9,7 +9,9 @@
 //! Output is a structured [`ValidationReport`] that serialises to JSON
 //! for `cass analytics validate --json`.
 
-use rusqlite::Connection;
+use frankensqlite::Connection;
+use frankensqlite::Row;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use serde::Serialize;
 
 use super::query::table_exists;
@@ -215,8 +217,8 @@ fn validate_track_a(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
 
     // Get all distinct (day_id, agent_slug, workspace_id, source_id) buckets in usage_daily.
     let total_buckets: usize = conn
-        .query_row("SELECT COUNT(*) FROM usage_daily", [], |r| {
-            r.get::<_, i64>(0).map(|v| v as usize)
+        .query_row_map("SELECT COUNT(*) FROM usage_daily", &[], |r: &Row| {
+            r.get_typed::<i64>(0).map(|v| v as usize)
         })
         .unwrap_or(0);
 
@@ -278,48 +280,60 @@ fn validate_track_a(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
     let mut mismatches_api_cov = 0_usize;
     let mut checked = 0_usize;
 
-    if let Ok(mut stmt) = conn.prepare(&sql)
-        && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,    // day_id
-                row.get::<_, String>(1)?, // agent_slug
-                row.get::<_, i64>(4)?,    // ud.content_tokens_est_total
-                row.get::<_, i64>(5)?,    // mm.sum_content
-                row.get::<_, i64>(6)?,    // ud.message_count
-                row.get::<_, i64>(7)?,    // mm.sum_msgs
-                row.get::<_, i64>(8)?,    // ud.api_tokens_total
-                row.get::<_, i64>(9)?,    // mm.sum_api
-                row.get::<_, i64>(10)?,   // ud.api_coverage_message_count
-                row.get::<_, i64>(11)?,   // mm.sum_api_coverage
-            ))
-        })
-    {
-        for row in rows.flatten() {
-            checked += 1;
-            let (
-                _day_id,
-                _agent,
-                ud_content,
-                mm_content,
-                ud_msgs,
-                mm_msgs,
-                ud_api,
-                mm_api,
-                ud_cov,
-                mm_cov,
-            ) = row;
-            if ud_content != mm_content {
-                mismatches_content += 1;
-            }
-            if ud_msgs != mm_msgs {
-                mismatches_msg_count += 1;
-            }
-            if ud_api != mm_api {
-                mismatches_api += 1;
-            }
-            if ud_cov != mm_cov {
-                mismatches_api_cov += 1;
-            }
+    let rows = match conn.query_map_collect(&sql, &[], |row: &Row| {
+        Ok((
+            row.get_typed::<i64>(0)?,    // day_id
+            row.get_typed::<String>(1)?, // agent_slug
+            row.get_typed::<i64>(4)?,    // ud.content_tokens_est_total
+            row.get_typed::<i64>(5)?,    // mm.sum_content
+            row.get_typed::<i64>(6)?,    // ud.message_count
+            row.get_typed::<i64>(7)?,    // mm.sum_msgs
+            row.get_typed::<i64>(8)?,    // ud.api_tokens_total
+            row.get_typed::<i64>(9)?,    // mm.sum_api
+            row.get_typed::<i64>(10)?,   // ud.api_coverage_message_count
+            row.get_typed::<i64>(11)?,   // mm.sum_api_coverage
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(err) => {
+            checks.push(Check {
+                id: "track_a.query_exec".into(),
+                ok: false,
+                severity: Severity::Error,
+                details: format!("Track A invariant query failed: {err}"),
+                suggested_action: Some(
+                    "Run 'cass analytics rebuild --track a' or verify the analytics schema".into(),
+                ),
+            });
+            return (checks, 0, total_buckets);
+        }
+    };
+
+    for row in rows {
+        checked += 1;
+        let (
+            _day_id,
+            _agent,
+            ud_content,
+            mm_content,
+            ud_msgs,
+            mm_msgs,
+            ud_api,
+            mm_api,
+            ud_cov,
+            mm_cov,
+        ) = row;
+        if ud_content != mm_content {
+            mismatches_content += 1;
+        }
+        if ud_msgs != mm_msgs {
+            mismatches_msg_count += 1;
+        }
+        if ud_api != mm_api {
+            mismatches_api += 1;
+        }
+        if ud_cov != mm_cov {
+            mismatches_api_cov += 1;
         }
     }
 
@@ -428,8 +442,8 @@ fn validate_track_b(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
     });
 
     let total_buckets: usize = conn
-        .query_row("SELECT COUNT(*) FROM token_daily_stats", [], |r| {
-            r.get::<_, i64>(0).map(|v| v as usize)
+        .query_row_map("SELECT COUNT(*) FROM token_daily_stats", &[], |r: &Row| {
+            r.get_typed::<i64>(0).map(|v| v as usize)
         })
         .unwrap_or(0);
 
@@ -498,25 +512,38 @@ fn validate_track_b(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
     let mut mismatches_tools = 0_usize;
     let mut checked = 0_usize;
 
-    if let Ok(mut stmt) = conn.prepare(&sql)
-        && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(4)?, // tds.grand_total_tokens
-                row.get::<_, i64>(5)?, // tu.sum_total
-                row.get::<_, i64>(6)?, // tds.total_tool_calls
-                row.get::<_, i64>(7)?, // tu.sum_tools
-            ))
-        })
-    {
-        for row in rows.flatten() {
-            checked += 1;
-            let (tds_total, tu_total, tds_tools, tu_tools) = row;
-            if tds_total != tu_total {
-                mismatches_total += 1;
-            }
-            if tds_tools != tu_tools {
-                mismatches_tools += 1;
-            }
+    let rows = match conn.query_map_collect(&sql, &[], |row: &Row| {
+        Ok((
+            row.get_typed::<i64>(4)?, // tds.grand_total_tokens
+            row.get_typed::<i64>(5)?, // tu.sum_total
+            row.get_typed::<i64>(6)?, // tds.total_tool_calls
+            row.get_typed::<i64>(7)?, // tu.sum_tools
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(err) => {
+            checks.push(Check {
+                id: "track_b.query_exec".into(),
+                ok: false,
+                severity: Severity::Error,
+                details: format!("Track B invariant query failed: {err}"),
+                suggested_action: Some(
+                    "Run 'cass analytics rebuild --track all' or verify the analytics schema"
+                        .into(),
+                ),
+            });
+            return (checks, 0, total_buckets);
+        }
+    };
+
+    for row in rows {
+        checked += 1;
+        let (tds_total, tu_total, tds_tools, tu_tools) = row;
+        if tds_total != tu_total {
+            mismatches_total += 1;
+        }
+        if tds_tools != tu_tools {
+            mismatches_tools += 1;
         }
     }
 
@@ -640,82 +667,76 @@ fn validate_cross_track_drift(
     let mut drift_count = 0_usize;
     let mut drift_checked = 0_usize;
 
-    // Try compatible SQL (UNION-based).
-    let query_result = conn.prepare(&sql_compat);
-    if let Ok(mut stmt) = query_result
-        && let Ok(rows) = stmt.query_map([], |row| {
+    // Try compatible SQL (UNION-based) first, then fall back to the FULL OUTER JOIN
+    // variant for engines that support it. Either path must fail closed.
+    let rows = match conn.query_map_collect(&sql_compat, &[], |row: &Row| {
+        Ok((
+            row.get_typed::<i64>(0)?,    // day_id
+            row.get_typed::<String>(1)?, // agent_slug
+            row.get_typed::<String>(2)?, // source_id
+            row.get_typed::<i64>(3)?,    // a_total
+            row.get_typed::<i64>(4)?,    // b_total
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(compat_err) => match conn.query_map_collect(&sql, &[], |row: &Row| {
             Ok((
-                row.get::<_, i64>(0)?,    // day_id
-                row.get::<_, String>(1)?, // agent_slug
-                row.get::<_, String>(2)?, // source_id
-                row.get::<_, i64>(3)?,    // a_total
-                row.get::<_, i64>(4)?,    // b_total
+                row.get_typed::<i64>(0)?,
+                row.get_typed::<String>(1)?,
+                row.get_typed::<String>(2)?,
+                row.get_typed::<i64>(3)?,
+                row.get_typed::<i64>(4)?,
             ))
-        })
-    {
-        for row in rows.flatten() {
-            drift_checked += 1;
-            let (day_id, agent_slug, source_id, a_total, b_total) = row;
-            let delta = a_total - b_total;
-            let denom = a_total.max(b_total).max(1);
-            let delta_pct = (delta.abs() as f64 / denom as f64) * 100.0;
-
-            if delta.abs() > config.drift_abs_threshold && delta_pct > config.drift_pct_threshold {
-                drift_count += 1;
-                let likely_cause = if a_total > 0 && b_total == 0 {
-                    "Track B missing rows (rebuild needed or not yet ingested)"
-                } else if b_total > 0 && a_total == 0 {
-                    "Track A missing rows (rebuild needed)"
-                } else if a_total > b_total {
-                    "Track A higher — Track B may be stale or missing some messages"
-                } else {
-                    "Track B higher — Track A may have been rebuilt recently without all data"
-                };
-
-                entries.push(DriftEntry {
-                    day_id,
-                    agent_slug,
-                    source_id,
-                    track_a_total: a_total,
-                    track_b_total: b_total,
-                    delta,
-                    delta_pct: (delta_pct * 100.0).round() / 100.0,
-                    likely_cause: likely_cause.into(),
+        }) {
+            Ok(rows) => rows,
+            Err(fallback_err) => {
+                checks.push(Check {
+                    id: "cross_track.query_exec".into(),
+                    ok: false,
+                    severity: Severity::Error,
+                    details: format!(
+                        "Cross-track drift query failed: compatible query error ({compat_err}); fallback query error ({fallback_err})"
+                    ),
+                    suggested_action: Some(
+                        "Run 'cass analytics rebuild --track all' or verify the analytics schema"
+                            .into(),
+                    ),
                 });
+                return (checks, entries);
             }
-        }
-    } else if let Ok(mut stmt) = conn.prepare(&sql)
-        && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })
-    {
-        // Fallback: FULL OUTER JOIN (if UNION approach failed).
-        for row in rows.flatten() {
-            drift_checked += 1;
-            let (day_id, agent_slug, source_id, a_total, b_total) = row;
-            let delta = a_total - b_total;
-            let denom = a_total.max(b_total).max(1);
-            let delta_pct = (delta.abs() as f64 / denom as f64) * 100.0;
+        },
+    };
 
-            if delta.abs() > config.drift_abs_threshold && delta_pct > config.drift_pct_threshold {
-                drift_count += 1;
-                entries.push(DriftEntry {
-                    day_id,
-                    agent_slug,
-                    source_id,
-                    track_a_total: a_total,
-                    track_b_total: b_total,
-                    delta,
-                    delta_pct: (delta_pct * 100.0).round() / 100.0,
-                    likely_cause: "drift detected (unknown cause)".into(),
-                });
-            }
+    for row in rows {
+        drift_checked += 1;
+        let (day_id, agent_slug, source_id, a_total, b_total) = row;
+        let delta = a_total.saturating_sub(b_total);
+        let denom = a_total.max(b_total).max(1);
+        let abs_delta = delta.unsigned_abs();
+        let delta_pct = (abs_delta as f64 / denom as f64) * 100.0;
+
+        if abs_delta > config.drift_abs_threshold as u64 && delta_pct > config.drift_pct_threshold {
+            drift_count += 1;
+            let likely_cause = if a_total > 0 && b_total == 0 {
+                "Track B missing rows (rebuild needed or not yet ingested)"
+            } else if b_total > 0 && a_total == 0 {
+                "Track A missing rows (rebuild needed)"
+            } else if a_total > b_total {
+                "Track A higher — Track B may be stale or missing some messages"
+            } else {
+                "Track B higher — Track A may have been rebuilt recently without all data"
+            };
+
+            entries.push(DriftEntry {
+                day_id,
+                agent_slug,
+                source_id,
+                track_a_total: a_total,
+                track_b_total: b_total,
+                delta,
+                delta_pct: (delta_pct * 100.0).round() / 100.0,
+                likely_cause: likely_cause.into(),
+            });
         }
     }
 
@@ -767,52 +788,78 @@ fn validate_non_negative_counters(conn: &Connection) -> Vec<Check> {
             .collect::<Vec<_>>()
             .join(" OR ");
         let sql = format!("SELECT COUNT(*) FROM usage_daily WHERE {cond}");
-        let negative_rows: i64 = conn.query_row(&sql, [], |r| r.get(0)).unwrap_or(0);
-
-        checks.push(Check {
-            id: "track_a.non_negative_counters".into(),
-            ok: negative_rows == 0,
-            severity: if negative_rows > 0 {
-                Severity::Error
-            } else {
-                Severity::Info
-            },
-            details: format!("usage_daily: {negative_rows} rows with negative counters"),
-            suggested_action: if negative_rows > 0 {
-                Some("Run 'cass analytics rebuild --track a'".into())
-            } else {
-                None
-            },
-        });
+        match conn.query_row_map(&sql, &[], |r: &Row| r.get_typed::<i64>(0)) {
+            Ok(negative_rows) => {
+                checks.push(Check {
+                    id: "track_a.non_negative_counters".into(),
+                    ok: negative_rows == 0,
+                    severity: if negative_rows > 0 {
+                        Severity::Error
+                    } else {
+                        Severity::Info
+                    },
+                    details: format!("usage_daily: {negative_rows} rows with negative counters"),
+                    suggested_action: if negative_rows > 0 {
+                        Some("Run 'cass analytics rebuild --track a'".into())
+                    } else {
+                        None
+                    },
+                });
+            }
+            Err(err) => {
+                checks.push(Check {
+                    id: "track_a.non_negative_counters".into(),
+                    ok: false,
+                    severity: Severity::Error,
+                    details: format!("usage_daily negative-counter query failed: {err}"),
+                    suggested_action: Some(
+                        "Run 'cass analytics rebuild --track a' or verify the analytics schema"
+                            .into(),
+                    ),
+                });
+            }
+        }
     }
 
     // Track A: api_coverage_message_count <= message_count.
     if table_exists(conn, "usage_daily") {
-        let bad: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM usage_daily WHERE api_coverage_message_count > message_count",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-
-        checks.push(Check {
-            id: "track_a.coverage_lte_messages".into(),
-            ok: bad == 0,
-            severity: if bad > 0 {
-                Severity::Warning
-            } else {
-                Severity::Info
-            },
-            details: format!(
-                "usage_daily: {bad} rows where api_coverage_message_count > message_count"
-            ),
-            suggested_action: if bad > 0 {
-                Some("Run 'cass analytics rebuild --track a'".into())
-            } else {
-                None
-            },
-        });
+        match conn.query_row_map(
+            "SELECT COUNT(*) FROM usage_daily WHERE api_coverage_message_count > message_count",
+            &[],
+            |r: &Row| r.get_typed::<i64>(0),
+        ) {
+            Ok(bad) => {
+                checks.push(Check {
+                    id: "track_a.coverage_lte_messages".into(),
+                    ok: bad == 0,
+                    severity: if bad > 0 {
+                        Severity::Warning
+                    } else {
+                        Severity::Info
+                    },
+                    details: format!(
+                        "usage_daily: {bad} rows where api_coverage_message_count > message_count"
+                    ),
+                    suggested_action: if bad > 0 {
+                        Some("Run 'cass analytics rebuild --track a'".into())
+                    } else {
+                        None
+                    },
+                });
+            }
+            Err(err) => {
+                checks.push(Check {
+                    id: "track_a.coverage_lte_messages".into(),
+                    ok: false,
+                    severity: Severity::Error,
+                    details: format!("usage_daily coverage query failed: {err}"),
+                    suggested_action: Some(
+                        "Run 'cass analytics rebuild --track a' or verify the analytics schema"
+                            .into(),
+                    ),
+                });
+            }
+        }
     }
 
     // Track B: token_daily_stats non-negative.
@@ -830,23 +877,39 @@ fn validate_non_negative_counters(conn: &Connection) -> Vec<Check> {
             .collect::<Vec<_>>()
             .join(" OR ");
         let sql = format!("SELECT COUNT(*) FROM token_daily_stats WHERE {cond}");
-        let negative_rows: i64 = conn.query_row(&sql, [], |r| r.get(0)).unwrap_or(0);
-
-        checks.push(Check {
-            id: "track_b.non_negative_counters".into(),
-            ok: negative_rows == 0,
-            severity: if negative_rows > 0 {
-                Severity::Error
-            } else {
-                Severity::Info
-            },
-            details: format!("token_daily_stats: {negative_rows} rows with negative counters"),
-            suggested_action: if negative_rows > 0 {
-                Some("Run 'cass analytics rebuild --track all'".into())
-            } else {
-                None
-            },
-        });
+        match conn.query_row_map(&sql, &[], |r: &Row| r.get_typed::<i64>(0)) {
+            Ok(negative_rows) => {
+                checks.push(Check {
+                    id: "track_b.non_negative_counters".into(),
+                    ok: negative_rows == 0,
+                    severity: if negative_rows > 0 {
+                        Severity::Error
+                    } else {
+                        Severity::Info
+                    },
+                    details: format!(
+                        "token_daily_stats: {negative_rows} rows with negative counters"
+                    ),
+                    suggested_action: if negative_rows > 0 {
+                        Some("Run 'cass analytics rebuild --track all'".into())
+                    } else {
+                        None
+                    },
+                });
+            }
+            Err(err) => {
+                checks.push(Check {
+                    id: "track_b.non_negative_counters".into(),
+                    ok: false,
+                    severity: Severity::Error,
+                    details: format!("token_daily_stats negative-counter query failed: {err}"),
+                    suggested_action: Some(
+                        "Run 'cass analytics rebuild --track all' or verify the analytics schema"
+                            .into(),
+                    ),
+                });
+            }
+        }
     }
 
     checks
@@ -863,6 +926,8 @@ pub struct PerfMeasurement {
     pub elapsed_ms: u64,
     pub budget_ms: u64,
     pub within_budget: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub details: String,
 }
 
@@ -872,23 +937,41 @@ pub fn perf_query_guardrail(conn: &Connection) -> PerfMeasurement {
 
     // Run a basic rollup query — same as query_tokens_timeseries with no filters.
     let budget_ms = 500_u64; // 500ms budget for rollup timeseries query
-    let row_count: i64 = if table_exists(conn, "usage_daily") {
-        let sql = "SELECT COUNT(*) FROM (
-            SELECT day_id, SUM(message_count) FROM usage_daily GROUP BY day_id
-        )";
-        conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0)
-    } else {
-        0
-    };
+    if !table_exists(conn, "usage_daily") {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return PerfMeasurement {
+            id: "perf.query_timeseries".into(),
+            elapsed_ms,
+            budget_ms,
+            within_budget: true,
+            error: None,
+            details: "Skipped timeseries rollup query: usage_daily table missing".into(),
+        };
+    }
 
+    let sql = "SELECT COUNT(*) FROM (
+        SELECT day_id, SUM(message_count) FROM usage_daily GROUP BY day_id
+    )";
+    let row_count = conn.query_row_map(sql, &[], |r: &Row| r.get_typed::<i64>(0));
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
-    PerfMeasurement {
-        id: "perf.query_timeseries".into(),
-        elapsed_ms,
-        budget_ms,
-        within_budget: elapsed_ms <= budget_ms,
-        details: format!("Timeseries rollup query: {row_count} day buckets in {elapsed_ms}ms"),
+    match row_count {
+        Ok(row_count) => PerfMeasurement {
+            id: "perf.query_timeseries".into(),
+            elapsed_ms,
+            budget_ms,
+            within_budget: elapsed_ms <= budget_ms,
+            error: None,
+            details: format!("Timeseries rollup query: {row_count} day buckets in {elapsed_ms}ms"),
+        },
+        Err(err) => PerfMeasurement {
+            id: "perf.query_timeseries".into(),
+            elapsed_ms,
+            budget_ms,
+            within_budget: false,
+            error: Some(err.to_string()),
+            details: format!("Timeseries rollup query failed after {elapsed_ms}ms: {err}"),
+        },
     }
 }
 
@@ -897,24 +980,42 @@ pub fn perf_breakdown_guardrail(conn: &Connection) -> PerfMeasurement {
     let start = std::time::Instant::now();
     let budget_ms = 200_u64;
 
-    let row_count: i64 = if table_exists(conn, "usage_daily") {
-        let sql = "SELECT COUNT(*) FROM (
-            SELECT agent_slug, SUM(api_tokens_total)
-            FROM usage_daily GROUP BY agent_slug
-        )";
-        conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0)
-    } else {
-        0
-    };
+    if !table_exists(conn, "usage_daily") {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return PerfMeasurement {
+            id: "perf.query_breakdown".into(),
+            elapsed_ms,
+            budget_ms,
+            within_budget: true,
+            error: None,
+            details: "Skipped breakdown query: usage_daily table missing".into(),
+        };
+    }
 
+    let sql = "SELECT COUNT(*) FROM (
+        SELECT agent_slug, SUM(api_tokens_total)
+        FROM usage_daily GROUP BY agent_slug
+    )";
+    let row_count = conn.query_row_map(sql, &[], |r: &Row| r.get_typed::<i64>(0));
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
-    PerfMeasurement {
-        id: "perf.query_breakdown".into(),
-        elapsed_ms,
-        budget_ms,
-        within_budget: elapsed_ms <= budget_ms,
-        details: format!("Breakdown query: {row_count} agent groups in {elapsed_ms}ms"),
+    match row_count {
+        Ok(row_count) => PerfMeasurement {
+            id: "perf.query_breakdown".into(),
+            elapsed_ms,
+            budget_ms,
+            within_budget: elapsed_ms <= budget_ms,
+            error: None,
+            details: format!("Breakdown query: {row_count} agent groups in {elapsed_ms}ms"),
+        },
+        Err(err) => PerfMeasurement {
+            id: "perf.query_breakdown".into(),
+            elapsed_ms,
+            budget_ms,
+            within_budget: false,
+            error: Some(err.to_string()),
+            details: format!("Breakdown query failed after {elapsed_ms}ms: {err}"),
+        },
     }
 }
 
@@ -930,7 +1031,7 @@ mod tests {
 
     /// Create a minimal Track A fixture (message_metrics + usage_daily).
     fn setup_track_a_fixture() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         conn.execute_batch(
             "CREATE TABLE message_metrics (
                 message_id INTEGER PRIMARY KEY,
@@ -1104,11 +1205,8 @@ mod tests {
         let conn = setup_track_a_fixture();
 
         // Inject drift: change usage_daily content_tokens_est_total.
-        conn.execute(
-            "UPDATE usage_daily SET content_tokens_est_total = 9999 WHERE day_id = 20254",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE usage_daily SET content_tokens_est_total = 9999 WHERE day_id = 20254")
+            .unwrap();
 
         let config = ValidateConfig::deep();
         let report = run_validation(&conn, &config);
@@ -1127,11 +1225,8 @@ mod tests {
         let conn = setup_track_a_fixture();
 
         // Inject drift: change message_count.
-        conn.execute(
-            "UPDATE usage_daily SET message_count = 999 WHERE day_id = 20254",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE usage_daily SET message_count = 999 WHERE day_id = 20254")
+            .unwrap();
 
         let config = ValidateConfig::deep();
         let report = run_validation(&conn, &config);
@@ -1163,14 +1258,11 @@ mod tests {
         let conn = setup_both_tracks_fixture();
 
         // Inject drift: delete token_usage row (Track B ledger).
-        conn.execute("DELETE FROM token_usage WHERE id = 1", [])
+        conn.execute("DELETE FROM token_usage WHERE id = 1")
             .unwrap();
         // Also zero out token_daily_stats to be consistent with the deletion.
-        conn.execute(
-            "UPDATE token_daily_stats SET grand_total_tokens = 0 WHERE day_id = 20254",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE token_daily_stats SET grand_total_tokens = 0 WHERE day_id = 20254")
+            .unwrap();
 
         let config = ValidateConfig::deep();
         let report = run_validation(&conn, &config);
@@ -1192,11 +1284,8 @@ mod tests {
         let conn = setup_track_a_fixture();
 
         // Inject negative counter.
-        conn.execute(
-            "UPDATE usage_daily SET tool_call_count = -5 WHERE day_id = 20254",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE usage_daily SET tool_call_count = -5 WHERE day_id = 20254")
+            .unwrap();
 
         let config = ValidateConfig::deep();
         let report = run_validation(&conn, &config);
@@ -1216,7 +1305,6 @@ mod tests {
         // Inject bad data: coverage > message count.
         conn.execute(
             "UPDATE usage_daily SET api_coverage_message_count = 999 WHERE day_id = 20254",
-            [],
         )
         .unwrap();
 
@@ -1233,7 +1321,7 @@ mod tests {
 
     #[test]
     fn empty_database_reports_missing_tables() {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         let config = ValidateConfig::default();
         let report = run_validation(&conn, &config);
 
@@ -1290,6 +1378,7 @@ mod tests {
             m.within_budget,
             "Query should be within 500ms budget on fixture"
         );
+        assert!(m.error.is_none());
     }
 
     #[test]
@@ -1300,5 +1389,93 @@ mod tests {
             m.within_budget,
             "Breakdown should be within 200ms budget on fixture"
         );
+        assert!(m.error.is_none());
+    }
+
+    #[test]
+    fn perf_query_guardrail_reports_query_failure() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch("CREATE TABLE usage_daily (day_id INTEGER);")
+            .unwrap();
+
+        let m = perf_query_guardrail(&conn);
+        assert!(!m.within_budget);
+        assert!(m.error.is_some());
+        assert!(m.details.contains("failed"));
+    }
+
+    #[test]
+    fn perf_breakdown_guardrail_reports_query_failure() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch("CREATE TABLE usage_daily (day_id INTEGER);")
+            .unwrap();
+
+        let m = perf_breakdown_guardrail(&conn);
+        assert!(!m.within_budget);
+        assert!(m.error.is_some());
+        assert!(m.details.contains("failed"));
+    }
+
+    #[test]
+    fn malformed_track_a_schema_reports_query_failure() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message_metrics (day_id INTEGER);
+             CREATE TABLE usage_daily (day_id INTEGER);",
+        )
+        .unwrap();
+
+        let (checks, checked, total) = validate_track_a(&conn, &ValidateConfig::deep());
+        let failure = checks
+            .iter()
+            .find(|c| c.id == "track_a.query_exec")
+            .expect("Track A query failure should be reported");
+
+        assert!(!failure.ok);
+        assert_eq!(failure.severity, Severity::Error);
+        assert_eq!(checked, 0);
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn malformed_track_b_schema_reports_query_failure() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE token_usage (day_id INTEGER, agent_id INTEGER, source_id TEXT, model_family TEXT);
+             CREATE TABLE token_daily_stats (day_id INTEGER, agent_slug TEXT, source_id TEXT, model_family TEXT);",
+        )
+        .unwrap();
+
+        let (checks, checked, total) = validate_track_b(&conn, &ValidateConfig::deep());
+        let failure = checks
+            .iter()
+            .find(|c| c.id == "track_b.query_exec")
+            .expect("Track B query failure should be reported");
+
+        assert!(!failure.ok);
+        assert_eq!(failure.severity, Severity::Error);
+        assert_eq!(checked, 0);
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn malformed_cross_track_schema_reports_query_failure() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_daily (day_id INTEGER);
+             CREATE TABLE token_daily_stats (day_id INTEGER);",
+        )
+        .unwrap();
+
+        let (checks, drift) = validate_cross_track_drift(&conn, &ValidateConfig::deep());
+        let failure = checks
+            .iter()
+            .find(|c| c.id == "cross_track.query_exec")
+            .expect("Cross-track query failure should be reported");
+
+        assert!(!failure.ok);
+        assert_eq!(failure.severity, Severity::Error);
+        assert!(drift.is_empty());
     }
 }

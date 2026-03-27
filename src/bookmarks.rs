@@ -5,10 +5,7 @@
 
 use anyhow::{Context, Result};
 use frankensqlite::Connection;
-use frankensqlite::compat::{
-    BatchExt, ConnectionExt, OptionalExtension, RowExt,
-    TransactionExt,
-};
+use frankensqlite::compat::{ConnectionExt, OptionalExtension, RowExt, TransactionExt};
 use frankensqlite::params;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -144,7 +141,7 @@ impl BookmarkStore {
     pub fn add(&self, bookmark: &Bookmark) -> Result<i64> {
         let line_number = line_number_to_db(bookmark.line_number)?;
 
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
@@ -161,11 +158,7 @@ impl BookmarkStore {
             ],
         )?;
 
-        let rowid: i64 = self.conn.query_row_map(
-            "SELECT last_insert_rowid()",
-            &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
-        )?;
+        let rowid = self.conn.last_insert_rowid();
         Ok(rowid)
     }
 
@@ -173,7 +166,7 @@ impl BookmarkStore {
     pub fn update(&self, bookmark: &Bookmark) -> Result<bool> {
         let now = current_timestamp();
 
-        let rows = self.conn.execute_params(
+        let rows = self.conn.execute_compat(
             "UPDATE bookmarks SET title = ?1, note = ?2, tags = ?3, updated_at = ?4 WHERE id = ?5",
             params![
                 bookmark.title.as_str(),
@@ -191,7 +184,7 @@ impl BookmarkStore {
     pub fn remove(&self, id: i64) -> Result<bool> {
         let rows = self
             .conn
-            .execute_params("DELETE FROM bookmarks WHERE id = ?1", params![id])?;
+            .execute_compat("DELETE FROM bookmarks WHERE id = ?1", params![id])?;
         Ok(rows > 0)
     }
 
@@ -213,10 +206,14 @@ impl BookmarkStore {
         let sql = "SELECT id, title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet
                    FROM bookmarks ORDER BY created_at DESC";
 
-        let all_bookmarks: Vec<Bookmark> = self.conn.query_map_collect(sql, &[], row_to_bookmark)?;
+        let all_bookmarks: Vec<Bookmark> =
+            self.conn.query_map_collect(sql, &[], row_to_bookmark)?;
 
         if let Some(tag) = tag_filter {
-            Ok(all_bookmarks.into_iter().filter(|b| b.has_tag(tag)).collect())
+            Ok(all_bookmarks
+                .into_iter()
+                .filter(|b| b.has_tag(tag))
+                .collect())
         } else {
             Ok(all_bookmarks)
         }
@@ -259,9 +256,11 @@ impl BookmarkStore {
 
     /// Count total bookmarks
     pub fn count(&self) -> Result<usize> {
-        let count: i64 = self
-            .conn
-            .query_row_map("SELECT COUNT(*) FROM bookmarks", &[], |row: &frankensqlite::Row| row.get_typed(0))?;
+        let count: i64 = self.conn.query_row_map(
+            "SELECT COUNT(*) FROM bookmarks",
+            &[],
+            |row: &frankensqlite::Row| row.get_typed(0),
+        )?;
         usize::try_from(count).context("bookmark count is out of range")
     }
 
@@ -288,7 +287,7 @@ impl BookmarkStore {
             serde_json::from_str(json).context("parsing bookmark JSON")?;
         let mut imported = 0;
 
-        let tx = self.conn.transaction()?;
+        let mut tx = self.conn.transaction()?;
 
         for mut bookmark in bookmarks {
             let line_number = line_number_to_db(bookmark.line_number)?;
@@ -300,13 +299,14 @@ impl BookmarkStore {
                 "SELECT EXISTS(SELECT 1 FROM bookmarks WHERE source_path = ?1 AND line_number IS ?2)",
                 &check_values,
             )?;
-            let exists: i64 = exists_row.first()
+            let exists: i64 = exists_row
+                .first()
                 .and_then(|row| row.get_typed(0).ok())
                 .unwrap_or(0);
 
             if exists == 0 {
                 bookmark.id = 0; // Reset ID for new insert
-                tx.execute_params(
+                tx.execute_compat(
                     "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
@@ -351,10 +351,7 @@ fn row_to_bookmark(row: &frankensqlite::Row) -> Result<Bookmark, frankensqlite::
 
 /// Get the default bookmarks database path
 pub fn default_bookmarks_path() -> PathBuf {
-    directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search").map_or_else(
-        || PathBuf::from("bookmarks.db"),
-        |dirs| dirs.data_dir().join("bookmarks.db"),
-    )
+    crate::default_data_dir().join("bookmarks.db")
 }
 
 /// SQL schema for bookmarks database
@@ -526,7 +523,7 @@ mod tests {
         let now = current_timestamp();
         store
             .conn
-            .execute_params(
+            .execute_compat(
                 "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![

@@ -33,12 +33,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64
-          - os: ubuntu-latest
+          # Linux x86_64 — ubuntu-24.04 (glibc 2.39); ort-sys prebuilt ONNX
+          # Runtime binaries require glibc ≥2.38, so 22.04 cannot link.
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_name: cass
             asset_name: cass-linux-amd64
-          # Linux ARM64
+          # Linux ARM64 — same glibc constraint as x86_64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: cass
@@ -306,21 +307,43 @@ jobs:
     runs-on: ubuntu-latest
     needs: release
     timeout-minutes: 5
-    # Don't fail the release if notification fails (token may not be configured)
-    continue-on-error: true
     env:
       HAS_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
     steps:
       - name: Check for token
-        id: check
         run: |
           if [[ "${{ env.HAS_TOKEN }}" != "true" ]]; then
-            echo "::warning::HOMEBREW_TAP_TOKEN not configured, skipping notification"
-            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "::error::HOMEBREW_TAP_TOKEN not configured; refusing to cut a release with stale Homebrew metadata."
+            exit 1
           fi
 
+      - name: Resolve release checksums
+        id: checksums
+        shell: bash
+        run: |
+          BASE_URL="https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v${{ needs.release.outputs.version }}"
+
+          linux_amd64="$(curl -fsSL "${BASE_URL}/cass-linux-amd64.tar.gz.sha256" | awk '{print $1}')"
+          linux_arm64="$(curl -fsSL "${BASE_URL}/cass-linux-arm64.tar.gz.sha256" | awk '{print $1}')"
+          darwin_arm64="$(curl -fsSL "${BASE_URL}/cass-darwin-arm64.tar.gz.sha256" | awk '{print $1}')"
+
+          for item in \
+            "linux_amd64:${linux_amd64}" \
+            "linux_arm64:${linux_arm64}" \
+            "darwin_arm64:${darwin_arm64}"; do
+            name="${item%%:*}"
+            value="${item#*:}"
+            if [[ ! "${value}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid checksum for ${name}: ${value}"
+              exit 1
+            fi
+          done
+
+          echo "linux_amd64=${linux_amd64}" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=${linux_arm64}" >> "$GITHUB_OUTPUT"
+          echo "darwin_arm64=${darwin_arm64}" >> "$GITHUB_OUTPUT"
+
       - name: Trigger formula update
-        if: steps.check.outputs.skip != 'true'
         uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -329,15 +352,104 @@ jobs:
           client-payload: |
             {
               "tool": "cass",
-              "version": "${{ needs.release.outputs.version }}"
+              "version": "${{ needs.release.outputs.version }}",
+              "checksums": {
+                "cass-linux-amd64.tar.gz": "${{ steps.checksums.outputs.linux_amd64 }}",
+                "cass-linux-arm64.tar.gz": "${{ steps.checksums.outputs.linux_arm64 }}",
+                "cass-darwin-arm64.tar.gz": "${{ steps.checksums.outputs.darwin_arm64 }}"
+              }
             }
 
       - name: Log dispatch
-        if: steps.check.outputs.skip != 'true'
         run: |
           echo "Dispatched formula-update event to homebrew-tap"
           echo "   Tool: cass"
           echo "   Version: ${{ needs.release.outputs.version }}"
+          echo "   Checksums:"
+          echo "     cass-linux-amd64.tar.gz: ${{ steps.checksums.outputs.linux_amd64 }}"
+          echo "     cass-linux-arm64.tar.gz: ${{ steps.checksums.outputs.linux_arm64 }}"
+          echo "     cass-darwin-arm64.tar.gz: ${{ steps.checksums.outputs.darwin_arm64 }}"
+
+      - name: Verify live Homebrew formula matches release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          formula_url="https://raw.githubusercontent.com/Dicklesworthstone/homebrew-tap/main/Formula/cass.rb"
+          expected_version="${{ needs.release.outputs.version }}"
+          expected_linux_amd64="${{ steps.checksums.outputs.linux_amd64 }}"
+          expected_linux_arm64="${{ steps.checksums.outputs.linux_arm64 }}"
+          expected_darwin_arm64="${{ steps.checksums.outputs.darwin_arm64 }}"
+
+          fetch_formula() {
+            curl --fail --silent --show-error --location \
+              --retry 4 \
+              --retry-all-errors \
+              --retry-delay 2 \
+              --connect-timeout 10 \
+              --max-time 30 \
+              "${formula_url}"
+          }
+
+          extract_sha() {
+            local formula="$1"
+            local asset="$2"
+            printf '%s\n' "${formula}" | sed -n "/${asset//./\\.}/{n;s/.*sha256 \"\\([0-9a-f]\\{64\\}\\)\".*/\\1/p;}"
+          }
+
+          saw_expected_version="false"
+
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            if ! formula="$(fetch_formula)"; then
+              if [[ "${attempt}" -lt 12 ]]; then
+                echo "Failed to fetch Homebrew formula on attempt ${attempt}; retrying in 10s..."
+                sleep 10
+                continue
+              fi
+              echo "::warning::Unable to fetch the live Homebrew formula after repeated retries."
+              echo "::warning::Skipping checksum enforcement because GitHub raw content was unreachable."
+              exit 0
+            fi
+            actual_version="$(printf '%s\n' "${formula}" | sed -n 's/.*version \"\\([^\"]*\\)\".*/\\1/p' | head -1)"
+            actual_linux_amd64="$(extract_sha "${formula}" "cass-linux-amd64.tar.gz")"
+            actual_linux_arm64="$(extract_sha "${formula}" "cass-linux-arm64.tar.gz")"
+            actual_darwin_arm64="$(extract_sha "${formula}" "cass-darwin-arm64.tar.gz")"
+
+            if [[ "${actual_version}" == "${expected_version}" \
+              && "${actual_linux_amd64}" == "${expected_linux_amd64}" \
+              && "${actual_linux_arm64}" == "${expected_linux_arm64}" \
+              && "${actual_darwin_arm64}" == "${expected_darwin_arm64}" ]]; then
+              echo "Homebrew tap formula is up to date."
+              exit 0
+            fi
+
+            if [[ "${actual_version}" == "${expected_version}" ]]; then
+              saw_expected_version="true"
+              break
+            fi
+
+            if [[ "${attempt}" -lt 12 ]]; then
+              echo "Homebrew formula not updated yet or has mismatched checksums; retrying in 10s..."
+              sleep 10
+            fi
+          done
+
+          if [[ "${saw_expected_version}" != "true" ]]; then
+            echo "::warning::Homebrew tap formula did not update to v${expected_version} within the verification window."
+            echo "::warning::Skipping checksum enforcement because the tap update may still be queued."
+            exit 0
+          fi
+
+          echo "::error::Homebrew tap formula does not match the release after dispatch."
+          echo "::error::Expected version ${expected_version}"
+          echo "::error::Expected cass-linux-amd64.tar.gz ${expected_linux_amd64}"
+          echo "::error::Expected cass-linux-arm64.tar.gz ${expected_linux_arm64}"
+          echo "::error::Expected cass-darwin-arm64.tar.gz ${expected_darwin_arm64}"
+          echo "::error::Actual version ${actual_version}"
+          echo "::error::Actual cass-linux-amd64.tar.gz ${actual_linux_amd64}"
+          echo "::error::Actual cass-linux-arm64.tar.gz ${actual_linux_arm64}"
+          echo "::error::Actual cass-darwin-arm64.tar.gz ${actual_darwin_arm64}"
+          exit 1
 
   notify-scoop-bucket:
     name: Notify Scoop Bucket
@@ -357,6 +469,19 @@ jobs:
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
 
+      - name: Resolve Windows checksum
+        if: steps.check.outputs.skip != 'true'
+        id: checksums
+        shell: bash
+        run: |
+          BASE_URL="https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v${{ needs.release.outputs.version }}"
+          windows_amd64="$(curl -fsSL "${BASE_URL}/cass-windows-amd64.zip.sha256" | awk '{print $1}')"
+          if [[ ! "${windows_amd64}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid checksum for windows_amd64: ${windows_amd64}"
+            exit 1
+          fi
+          echo "windows_amd64=${windows_amd64}" >> "$GITHUB_OUTPUT"
+
       - name: Trigger manifest update
         if: steps.check.outputs.skip != 'true'
         uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
@@ -367,7 +492,10 @@ jobs:
           client-payload: |
             {
               "tool": "cass",
-              "version": "${{ needs.release.outputs.version }}"
+              "version": "${{ needs.release.outputs.version }}",
+              "url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v${{ needs.release.outputs.version }}/cass-windows-amd64.zip",
+              "hash": "${{ steps.checksums.outputs.windows_amd64 }}",
+              "asset_name": "cass-windows-amd64.zip"
             }
 
       - name: Log dispatch
@@ -376,3 +504,5 @@ jobs:
           echo "Dispatched manifest-update event to scoop-bucket"
           echo "   Tool: cass"
           echo "   Version: ${{ needs.release.outputs.version }}"
+          echo "   Asset: cass-windows-amd64.zip"
+          echo "   Checksum: ${{ steps.checksums.outputs.windows_amd64 }}"

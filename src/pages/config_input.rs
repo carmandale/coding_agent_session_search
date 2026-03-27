@@ -491,12 +491,23 @@ impl PagesConfig {
             ));
         }
 
+        if let Some(chunk_size) = self.encryption.chunk_size {
+            if chunk_size == 0 {
+                errors.push("encryption.chunk_size must be greater than 0 bytes.".to_string());
+            } else if chunk_size > crate::pages::encrypt::MAX_CHUNK_SIZE as u64 {
+                errors.push(format!(
+                    "encryption.chunk_size ({chunk_size}) exceeds the maximum supported size of {} bytes.",
+                    crate::pages::encrypt::MAX_CHUNK_SIZE
+                ));
+            }
+        }
+
         // Warnings
         if self
             .encryption
             .password
             .as_ref()
-            .is_some_and(|p| p.len() < 12)
+            .is_some_and(|p| p.chars().count() < 12)
         {
             warnings.push(
                 "Password is less than 12 characters. Consider using a stronger password."
@@ -505,8 +516,8 @@ impl PagesConfig {
         }
 
         if self.bundle.include_attachments {
-            warnings.push(
-                "include_attachments is enabled. This may significantly increase export size."
+            errors.push(
+                "include_attachments is not implemented for pages exports yet. The current pipeline cannot extract attachment blobs from the source database."
                     .to_string(),
             );
         }
@@ -730,6 +741,24 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_include_attachments_until_supported() {
+        let json = r#"{
+            "encryption": {"password": "test-password-123"},
+            "bundle": {"include_attachments": true}
+        }"#;
+        let config: PagesConfig = serde_json::from_str(json).unwrap();
+        let validation = config.validate();
+
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|err| err.contains("include_attachments is not implemented"))
+        );
+    }
+
+    #[test]
     fn test_validate_missing_password() {
         let config = PagesConfig::default();
         let result = config.validate();
@@ -769,6 +798,28 @@ mod tests {
         let result = config.validate();
         assert!(!result.valid);
         assert!(result.errors.iter().any(|e| e.contains("repo")));
+    }
+
+    #[test]
+    fn test_validate_zero_chunk_size() {
+        let mut config = PagesConfig::default();
+        config.encryption.password = Some("test123".to_string());
+        config.encryption.chunk_size = Some(0);
+
+        let result = config.validate();
+        assert!(!result.valid);
+        assert!(result.errors.iter().any(|e| e.contains("chunk_size")));
+    }
+
+    #[test]
+    fn test_validate_oversized_chunk_size() {
+        let mut config = PagesConfig::default();
+        config.encryption.password = Some("test123".to_string());
+        config.encryption.chunk_size = Some(crate::pages::encrypt::MAX_CHUNK_SIZE as u64 + 1);
+
+        let result = config.validate();
+        assert!(!result.valid);
+        assert!(result.errors.iter().any(|e| e.contains("chunk_size")));
     }
 
     #[test]

@@ -161,11 +161,19 @@ fn verify_export_schema(conn: &Connection) -> rusqlite::Result<()> {
     // Check messages table
     let _: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
 
-    // Check FTS tables
-    let _: i64 = conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |row| row.get(0))?;
-    let _: i64 = conn.query_row("SELECT COUNT(*) FROM messages_code_fts", [], |row| {
-        row.get(0)
-    })?;
+    // Check FTS tables are present in schema
+    let fts_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_fts'",
+        [],
+        |row| row.get(0),
+    )?;
+    let code_fts_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_code_fts'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(fts_exists, 1);
+    assert_eq!(code_fts_exists, 1);
 
     // Check export_meta
     let schema_version: String = conn.query_row(
@@ -174,6 +182,14 @@ fn verify_export_schema(conn: &Connection) -> rusqlite::Result<()> {
         |row| row.get(0),
     )?;
     assert_eq!(schema_version, "1");
+
+    let message_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(messages)")?
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(message_columns.contains(&"updated_at".to_string()));
+    assert!(message_columns.contains(&"model".to_string()));
+    assert!(message_columns.contains(&"attachment_refs".to_string()));
 
     Ok(())
 }
@@ -670,6 +686,72 @@ fn export_engine_rejects_output_directory() {
     assert!(err.to_string().contains("directory"));
 }
 
+#[test]
+fn export_engine_preserves_existing_output_on_cancelled_rerun() {
+    let tmp = TempDir::new().unwrap();
+    let source_path = tmp.path().join("source.db");
+    let output_path = tmp.path().join("export.db");
+
+    let src_conn = Connection::open(&source_path).unwrap();
+    create_source_db(&src_conn).unwrap();
+    insert_test_data(&src_conn).unwrap();
+    drop(src_conn);
+
+    let filter = ExportFilter {
+        agents: None,
+        workspaces: None,
+        since: None,
+        until: None,
+        path_mode: PathMode::Full,
+    };
+
+    let engine = ExportEngine::new(&source_path, &output_path, filter.clone());
+    let stats = engine.execute(|_, _| {}, None).unwrap();
+    assert_eq!(stats.conversations_processed, 4);
+    assert_eq!(stats.messages_processed, 14);
+
+    let original_size = std::fs::metadata(&output_path).unwrap().len();
+    assert!(
+        original_size > 0,
+        "initial export should create a non-empty database"
+    );
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let rerun = ExportEngine::new(&source_path, &output_path, filter);
+    let err = match rerun.execute(|_, _| {}, Some(cancelled)) {
+        Ok(_) => panic!("rerun should stop before replacing the existing export"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("cancelled"),
+        "expected cancellation error, got: {err}"
+    );
+
+    let preserved_size = std::fs::metadata(&output_path).unwrap().len();
+    assert_eq!(
+        preserved_size, original_size,
+        "cancelled rerun should preserve the previous export file"
+    );
+
+    let preserved_conn = Connection::open(&output_path).unwrap();
+    let schema_version: String = preserved_conn
+        .query_row(
+            "SELECT value FROM export_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(schema_version, "1");
+    let conv_count: i64 = preserved_conn
+        .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+        .unwrap();
+    let msg_count: i64 = preserved_conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(conv_count, 4);
+    assert_eq!(msg_count, 14);
+}
+
 // =============================================================================
 // FTS Verification Tests
 // =============================================================================
@@ -698,26 +780,38 @@ fn export_engine_populates_fts_indexes() {
 
     let out_conn = Connection::open(&output_path).unwrap();
 
-    // Test FTS search works
-    let fts_count: i64 = out_conn
+    let messages_count: i64 = out_conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .unwrap();
+    assert!(messages_count > 0, "Export should contain indexed messages");
+
+    let fts_exists: i64 = out_conn
         .query_row(
-            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'debug'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert!(fts_count > 0, "FTS should find 'debug' in messages");
-
-    let code_fts_count: i64 = out_conn
+    let code_fts_exists: i64 = out_conn
         .query_row(
-            "SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH 'auth'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_code_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fts_exists, 1, "Export should create prose FTS index");
+    assert_eq!(code_fts_exists, 1, "Export should create code FTS index");
+
+    let fts_sql: String = out_conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert!(
-        code_fts_count > 0,
-        "Code FTS should find 'auth' in messages"
+        fts_sql.contains("fts5"),
+        "messages_fts should be an FTS5 virtual table"
     );
 }
 

@@ -16,13 +16,19 @@
 //! **Network Policy**: No network calls occur without explicit user consent.
 //! The download system is consent-gated via [`ModelState::NeedsConsent`].
 
+use std::collections::HashSet;
 use std::fs::{self, File};
+use std::future::{Future, poll_fn};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
+use asupersync::bytes::Buf;
+use asupersync::http::Body;
 use sha2::{Digest, Sha256};
 
 /// Model state machine for download lifecycle.
@@ -491,7 +497,7 @@ impl ModelManifest {
 }
 
 /// Progress callback for downloads.
-pub type ProgressCallback = Box<dyn Fn(DownloadProgress) + Send + Sync>;
+pub type ProgressCallback = Arc<dyn Fn(DownloadProgress) + Send + Sync>;
 
 /// Download progress information.
 #[derive(Debug, Clone)]
@@ -596,10 +602,69 @@ impl std::error::Error for DownloadError {
     }
 }
 
+impl DownloadError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            DownloadError::NetworkError(_) | DownloadError::IoError(_) | DownloadError::Timeout => {
+                true
+            }
+            DownloadError::HttpError { status, .. } => {
+                *status == 408 || *status == 429 || (500..=599).contains(status)
+            }
+            DownloadError::VerificationFailed { .. }
+            | DownloadError::Cancelled
+            | DownloadError::ManifestNotVerified { .. } => false,
+        }
+    }
+
+    fn should_discard_temp(&self) -> bool {
+        matches!(self, DownloadError::VerificationFailed { .. })
+    }
+}
+
 impl From<std::io::Error> for DownloadError {
     fn from(err: std::io::Error) -> Self {
         DownloadError::IoError(err)
     }
+}
+
+fn run_download_with_cx<T, F, Fut>(f: F) -> Result<T, DownloadError>
+where
+    T: Send + 'static,
+    F: FnOnce(asupersync::Cx) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, DownloadError>> + Send + 'static,
+{
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| {
+            DownloadError::NetworkError(format!("failed to build download runtime: {e}"))
+        })?;
+
+    runtime.block_on(async move {
+        let handle = asupersync::runtime::Runtime::current_handle().ok_or_else(|| {
+            DownloadError::NetworkError("download runtime handle unavailable".into())
+        })?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        handle
+            .try_spawn_with_cx(move |cx| async move {
+                let _ = tx.send(f(cx).await);
+            })
+            .map_err(|e| {
+                DownloadError::NetworkError(format!("failed to spawn download task: {e}"))
+            })?;
+
+        loop {
+            match rx.try_recv() {
+                Ok(result) => return result,
+                Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
+                Err(TryRecvError::Disconnected) => {
+                    return Err(DownloadError::NetworkError(
+                        "download task exited before returning a result".into(),
+                    ));
+                }
+            }
+        }
+    })
 }
 
 /// Model downloader with resumption and verification.
@@ -698,18 +763,16 @@ impl ModelDownloader {
         // Reset cancellation flag
         self.cancelled.store(false, Ordering::SeqCst);
 
-        // Create temp directory
-        fs::create_dir_all(&self.temp_dir)?;
+        // Prepare the temp directory for a safe resume. Keep partials for the
+        // current manifest, but remove stale or unsafe entries from older runs.
+        self.prepare_temp_dir(manifest)?;
 
         let grand_total = manifest.total_size();
         let total_files = manifest.files.len();
         let bytes_downloaded = Arc::new(AtomicU64::new(0));
 
         for (idx, file) in manifest.files.iter().enumerate() {
-            if self.is_cancelled() {
-                self.cleanup_temp();
-                return Err(DownloadError::Cancelled);
-            }
+            self.fail_if_cancelled()?;
 
             // Use local_name() for local path (handles onnx/model.onnx -> model.onnx)
             let file_path = self.temp_dir.join(file.local_name());
@@ -721,10 +784,7 @@ impl ModelDownloader {
             // Download with retries
             let mut last_error = None;
             for attempt in 0..self.max_retries {
-                if self.is_cancelled() {
-                    self.cleanup_temp();
-                    return Err(DownloadError::Cancelled);
-                }
+                self.fail_if_cancelled()?;
 
                 // Reset byte counter to before this file on retry (avoid double-counting)
                 if attempt > 0 {
@@ -751,31 +811,36 @@ impl ModelDownloader {
                         last_error = None;
                         break;
                     }
+                    Err(DownloadError::Cancelled) => {
+                        return Err(DownloadError::Cancelled);
+                    }
                     Err(e) => {
+                        if !e.is_retryable() {
+                            self.cleanup_temp_for_error(&e);
+                            return Err(e);
+                        }
                         last_error = Some(e);
                     }
                 }
             }
 
             if let Some(err) = last_error {
-                self.cleanup_temp();
+                self.cleanup_temp_for_error(&err);
                 return Err(err);
             }
 
             // Verify SHA256
-            if self.is_cancelled() {
-                self.cleanup_temp();
-                return Err(DownloadError::Cancelled);
-            }
+            self.fail_if_cancelled()?;
 
             let actual_hash = compute_sha256(&file_path)?;
             if actual_hash != file.sha256 {
-                self.cleanup_temp();
-                return Err(DownloadError::VerificationFailed {
+                let err = DownloadError::VerificationFailed {
                     file: file.name.clone(),
                     expected: file.sha256.clone(),
                     actual: actual_hash,
-                });
+                };
+                self.cleanup_temp_for_error(&err);
+                return Err(err);
             }
         }
 
@@ -784,6 +849,39 @@ impl ModelDownloader {
 
         // Write verified marker
         self.write_verified_marker(manifest)?;
+
+        Ok(())
+    }
+
+    fn prepare_temp_dir(&self, manifest: &ModelManifest) -> Result<(), DownloadError> {
+        fs::create_dir_all(&self.temp_dir)?;
+
+        let expected_files: HashSet<String> = manifest
+            .files
+            .iter()
+            .map(|file| file.local_name().to_string())
+            .collect();
+
+        for entry in fs::read_dir(&self.temp_dir)? {
+            let entry = entry?;
+            let entry_type = entry.file_type()?;
+            let entry_name = entry.file_name();
+            let keep_entry = entry_type.is_file()
+                && entry_name
+                    .to_str()
+                    .is_some_and(|name| expected_files.contains(name));
+
+            if keep_entry {
+                continue;
+            }
+
+            let entry_path = entry.path();
+            if entry_type.is_dir() {
+                fs::remove_dir_all(entry_path)?;
+            } else {
+                fs::remove_file(entry_path)?;
+            }
+        }
 
         Ok(())
     }
@@ -820,104 +918,142 @@ impl ModelDownloader {
             return Ok(());
         }
 
-        // Build request with Range header for resume
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(self.connect_timeout)
-            .timeout(self.file_timeout)
-            .build()
-            .map_err(|e| DownloadError::NetworkError(e.to_string()))?;
+        let url = url.to_string();
+        let path = path.to_path_buf();
+        let bytes_downloaded = Arc::clone(bytes_downloaded);
+        let cancelled = Arc::clone(&self.cancelled);
+        let progress_callback = on_progress.cloned();
+        let connect_timeout = self.connect_timeout;
+        let file_timeout = self.file_timeout;
 
-        let mut request = client.get(url);
+        run_download_with_cx(move |cx| async move {
+            let client = asupersync::http::h1::HttpClient::builder()
+                .user_agent(concat!(
+                    "cass/",
+                    env!("CARGO_PKG_VERSION"),
+                    " (model-download)"
+                ))
+                .build();
+            let mut headers = vec![("Accept".to_string(), "application/octet-stream".to_string())];
 
-        // Resume from existing size
-        if existing_size > 0 {
-            request = request.header("Range", format!("bytes={}-", existing_size));
-            bytes_downloaded.fetch_add(existing_size, Ordering::SeqCst);
-        }
-
-        let response = request
-            .send()
-            .map_err(|e| DownloadError::NetworkError(e.to_string()))?;
-
-        let status = response.status().as_u16();
-        if status >= 400 {
-            return Err(DownloadError::HttpError {
-                status,
-                message: response.status().to_string(),
-            });
-        }
-
-        // Check if server honored Range request
-        // 206 = Partial Content (resume works), 200 = Full file (server ignored Range)
-        let actually_resuming = existing_size > 0 && status == 206;
-        if existing_size > 0 && status == 200 {
-            // Server doesn't support Range, reset byte counter and start fresh
-            bytes_downloaded.fetch_sub(existing_size, Ordering::SeqCst);
-        }
-
-        // Open file in append or create mode
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(actually_resuming)
-            .write(true)
-            .truncate(!actually_resuming)
-            .open(path)?;
-
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        // Stream download with progress updates
-        let mut reader = BufReader::new(response);
-        let mut buffer = [0u8; 8192];
-        let start = Instant::now();
-
-        loop {
-            if self.is_cancelled() {
-                return Err(DownloadError::Cancelled);
+            if existing_size > 0 {
+                headers.push(("Range".to_string(), format!("bytes={existing_size}-")));
+                bytes_downloaded.fetch_add(existing_size, Ordering::SeqCst);
             }
 
-            let n = reader.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
+            let mut response = asupersync::time::timeout(
+                cx.now(),
+                connect_timeout,
+                client.request_streaming(
+                    &cx,
+                    asupersync::http::h1::Method::Get,
+                    &url,
+                    headers,
+                    Vec::new(),
+                ),
+            )
+            .await
+            .map_err(|_| DownloadError::Timeout)?
+            .map_err(|e| DownloadError::NetworkError(e.to_string()))?;
 
-            file.write_all(&buffer[..n])?;
-            bytes_downloaded.fetch_add(n as u64, Ordering::SeqCst);
-
-            // Report progress
-            if let Some(callback) = on_progress {
-                let total_downloaded = bytes_downloaded.load(Ordering::SeqCst);
-                let file_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-
-                let progress_pct = if grand_total > 0 {
-                    ((total_downloaded as f64 / grand_total as f64) * 100.0).min(100.0) as u8
-                } else {
-                    0
-                };
-
-                callback(DownloadProgress {
-                    current_file: file_name.clone(),
-                    file_index: file_idx + 1,
-                    total_files,
-                    file_bytes,
-                    file_total: expected_size,
-                    total_bytes: total_downloaded,
-                    grand_total,
-                    progress_pct,
+            let status = response.head.status;
+            if status >= 400 {
+                return Err(DownloadError::HttpError {
+                    status,
+                    message: if response.head.reason.is_empty() {
+                        status.to_string()
+                    } else {
+                        format!("{} {}", status, response.head.reason)
+                    },
                 });
             }
 
-            // Check timeout
-            if start.elapsed() > self.file_timeout {
-                return Err(DownloadError::Timeout);
+            // 206 = Partial Content (resume works), 200 = Full file (server ignored Range)
+            let actually_resuming = existing_size > 0 && status == 206;
+            if existing_size > 0 && status == 200 {
+                bytes_downloaded.fetch_sub(existing_size, Ordering::SeqCst);
+                existing_size = 0;
             }
-        }
 
-        file.sync_all()?;
-        Ok(())
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(actually_resuming)
+                .write(true)
+                .truncate(!actually_resuming)
+                .open(&path)?;
+
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let start = Instant::now();
+            let mut file_bytes = if actually_resuming { existing_size } else { 0 };
+
+            loop {
+                if cancelled.load(Ordering::SeqCst) {
+                    return Err(DownloadError::Cancelled);
+                }
+
+                let remaining = file_timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    return Err(DownloadError::Timeout);
+                }
+
+                let frame = asupersync::time::timeout(
+                    cx.now(),
+                    remaining,
+                    poll_fn(|task_cx| Pin::new(&mut response.body).poll_frame(task_cx)),
+                )
+                .await
+                .map_err(|_| DownloadError::Timeout)?;
+
+                let Some(frame) = frame else {
+                    break;
+                };
+
+                match frame.map_err(|e| DownloadError::NetworkError(e.to_string()))? {
+                    asupersync::http::body::Frame::Data(mut buf) => {
+                        while buf.has_remaining() {
+                            let chunk = buf.chunk();
+                            if chunk.is_empty() {
+                                break;
+                            }
+                            file.write_all(chunk)?;
+                            let chunk_len = chunk.len();
+                            buf.advance(chunk_len);
+                            file_bytes = file_bytes.saturating_add(chunk_len as u64);
+                            bytes_downloaded.fetch_add(chunk_len as u64, Ordering::SeqCst);
+
+                            if let Some(callback) = progress_callback.as_ref() {
+                                let total_downloaded = bytes_downloaded.load(Ordering::SeqCst);
+                                let progress_pct = if grand_total > 0 {
+                                    ((total_downloaded as f64 / grand_total as f64) * 100.0)
+                                        .min(100.0) as u8
+                                } else {
+                                    0
+                                };
+
+                                callback(DownloadProgress {
+                                    current_file: file_name.clone(),
+                                    file_index: file_idx + 1,
+                                    total_files,
+                                    file_bytes,
+                                    file_total: expected_size,
+                                    total_bytes: total_downloaded,
+                                    grand_total,
+                                    progress_pct,
+                                });
+                            }
+                        }
+                    }
+                    asupersync::http::body::Frame::Trailers(_) => {}
+                }
+            }
+
+            file.sync_all()?;
+            Ok(())
+        })
     }
 
     /// Atomically install downloaded files.
@@ -993,6 +1129,20 @@ impl ModelDownloader {
     /// Clean up temporary download directory.
     fn cleanup_temp(&self) {
         let _ = fs::remove_dir_all(&self.temp_dir);
+    }
+
+    fn cleanup_temp_for_error(&self, err: &DownloadError) {
+        if err.should_discard_temp() {
+            self.cleanup_temp();
+        }
+    }
+
+    fn fail_if_cancelled(&self) -> Result<(), DownloadError> {
+        if self.is_cancelled() {
+            Err(DownloadError::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1327,5 +1477,135 @@ mod tests {
         assert!(!downloader.is_cancelled());
         downloader.cancel();
         assert!(downloader.is_cancelled());
+    }
+
+    #[test]
+    fn test_prepare_temp_dir_prunes_stale_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        fs::write(downloader.temp_dir.join("model.onnx"), b"partial").unwrap();
+        fs::write(downloader.temp_dir.join("stale.bin"), b"stale").unwrap();
+        fs::create_dir_all(downloader.temp_dir.join("nested")).unwrap();
+        fs::write(
+            downloader.temp_dir.join("nested").join("should-remove.txt"),
+            b"stale",
+        )
+        .unwrap();
+
+        downloader
+            .prepare_temp_dir(&ModelManifest::minilm_v2())
+            .unwrap();
+
+        assert!(downloader.temp_dir.join("model.onnx").exists());
+        assert!(!downloader.temp_dir.join("stale.bin").exists());
+        assert!(!downloader.temp_dir.join("nested").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_prepare_temp_dir_removes_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        let outside = tmp.path().join("outside.bin");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, downloader.temp_dir.join("model.onnx")).unwrap();
+
+        downloader
+            .prepare_temp_dir(&ModelManifest::minilm_v2())
+            .unwrap();
+
+        let metadata = fs::symlink_metadata(downloader.temp_dir.join("model.onnx"));
+        assert!(metadata.is_err(), "symlink should be removed before resume");
+        assert!(
+            outside.exists(),
+            "cleanup must not touch the symlink target"
+        );
+    }
+
+    #[test]
+    fn test_retryable_error_classification() {
+        assert!(DownloadError::NetworkError("boom".into()).is_retryable());
+        assert!(DownloadError::Timeout.is_retryable());
+        assert!(
+            DownloadError::HttpError {
+                status: 503,
+                message: "unavailable".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !DownloadError::HttpError {
+                status: 404,
+                message: "missing".into()
+            }
+            .is_retryable()
+        );
+        assert!(!DownloadError::Cancelled.is_retryable());
+        assert!(
+            !DownloadError::VerificationFailed {
+                file: "model.onnx".into(),
+                expected: "a".into(),
+                actual: "b".into(),
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn test_cleanup_temp_for_error_preserves_partial_downloads_on_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        let partial = downloader.temp_dir.join("model.onnx");
+        fs::write(&partial, b"partial").unwrap();
+
+        downloader.cleanup_temp_for_error(&DownloadError::Cancelled);
+
+        assert!(
+            partial.exists(),
+            "cancelled downloads should keep partial files for a resumable retry"
+        );
+    }
+
+    #[test]
+    fn test_fail_if_cancelled_preserves_partial_downloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        let partial = downloader.temp_dir.join("model.onnx");
+        fs::write(&partial, b"partial").unwrap();
+        downloader.cancel();
+
+        let result = downloader.fail_if_cancelled();
+
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert!(
+            partial.exists(),
+            "early cancellation checks should not discard resumable partial files"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_temp_for_error_discards_temp_after_verification_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        let partial = downloader.temp_dir.join("model.onnx");
+        fs::write(&partial, b"partial").unwrap();
+
+        downloader.cleanup_temp_for_error(&DownloadError::VerificationFailed {
+            file: "model.onnx".into(),
+            expected: "good".into(),
+            actual: "bad".into(),
+        });
+
+        assert!(
+            !downloader.temp_dir.exists(),
+            "verification failures should discard the temp directory to avoid reusing corrupt data"
+        );
     }
 }

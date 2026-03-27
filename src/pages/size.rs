@@ -6,7 +6,7 @@
 use anyhow::{Context, Result, bail};
 use frankensqlite::Connection;
 use frankensqlite::Row;
-use frankensqlite::compat::{ConnectionExt, RowExt, ParamValue};
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -99,34 +99,28 @@ impl SizeEstimate {
         // Query conversation count
         let conv_sql = format!("SELECT COUNT(*) FROM conversations c{}", where_clause);
         let conversation_count: u64 = conn
-            .query_row_map(
-                &conv_sql,
-                params_slice,
-                |row: &Row| row.get_typed::<i64>(0).map(|v| v as u64),
-            )
+            .query_row_map(&conv_sql, params_slice, |row: &Row| {
+                row.get_typed::<i64>(0).map(|v| v as u64)
+            })
             .unwrap_or(0);
 
         // Query message count and content size
         let msg_sql = format!(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(m.content)), 0)
+            "SELECT COUNT(*), SUM(LENGTH(m.content))
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              {}",
             where_clause
         );
         let (message_count, plaintext_bytes): (u64, u64) = conn
-            .query_row_map(
-                &msg_sql,
-                params_slice,
-                |row: &Row| {
-                    let raw_message_count = row.get_typed::<i64>(0).unwrap_or(0);
-                    let raw_plaintext_bytes = row.get_typed::<i64>(1).unwrap_or(0);
-                    Ok((
-                        raw_message_count.max(0) as u64,
-                        raw_plaintext_bytes.max(0) as u64,
-                    ))
-                },
-            )
+            .query_row_map(&msg_sql, params_slice, |row: &Row| {
+                let raw_message_count = row.get_typed::<i64>(0).unwrap_or(0);
+                let raw_plaintext_bytes = row.get_typed::<Option<i64>>(1)?.unwrap_or(0);
+                Ok((
+                    raw_message_count.max(0) as u64,
+                    raw_plaintext_bytes.max(0) as u64,
+                ))
+            })
             .unwrap_or((0, 0));
 
         Self::from_plaintext_size(plaintext_bytes, conversation_count, message_count)

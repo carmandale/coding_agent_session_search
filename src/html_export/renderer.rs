@@ -17,7 +17,7 @@ use std::fmt;
 use std::time::Instant;
 
 use super::template::html_escape;
-use pulldown_cmark::{Options, Parser, html};
+use pulldown_cmark::{CowStr, Options, Parser, html};
 use serde_json;
 use tracing::{debug, info, trace};
 
@@ -686,28 +686,34 @@ fn render_message_group(
     };
 
     // Check for content collapse
-    let content_chars = group.primary.content.chars().count();
-    let (content_wrapper_start, content_wrapper_end) =
-        if options.collapse_threshold > 0 && content_chars > options.collapse_threshold {
-            let preview_chars = options.collapse_threshold.min(500);
-            let safe_len = byte_index_for_char_count(&group.primary.content, preview_chars);
-            let preview = &group.primary.content[..safe_len];
-            (
-                format!(
-                    r#"<details class="message-collapse">
+    let content_bytes = group.primary.content.len();
+    let mut content_chars = 0; // Calculated lazily
+    let should_collapse =
+        options.collapse_threshold > 0 && content_bytes > options.collapse_threshold && {
+            content_chars = group.primary.content.chars().count();
+            content_chars > options.collapse_threshold
+        };
+
+    let (content_wrapper_start, content_wrapper_end) = if should_collapse {
+        let preview_chars = options.collapse_threshold.min(500);
+        let safe_len = byte_index_for_char_count(&group.primary.content, preview_chars);
+        let preview = &group.primary.content[..safe_len];
+        (
+            format!(
+                r#"<details class="message-collapse">
                     <summary>
                         <span class="message-preview">{}</span>
                         <span class="message-expand-hint">Click to expand ({} chars)</span>
                     </summary>
                     <div class="message-expanded">"#,
-                    super::template::html_escape(preview),
-                    content_chars
-                ),
-                "</div></details>".to_string(),
-            )
-        } else {
-            (String::new(), String::new())
-        };
+                super::template::html_escape(preview),
+                content_chars
+            ),
+            "</div></details>".to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
 
     // Only render content div if there's actual content
     let content_section = if content_html.trim().is_empty() {
@@ -954,37 +960,43 @@ pub fn render_message(message: &Message, options: &RenderOptions) -> Result<Stri
     let content_html = render_content(&message.content, options);
 
     // Check if message should be collapsed
-    let content_chars = message.content.chars().count();
-    let (content_wrapper_start, content_wrapper_end) =
-        if options.collapse_threshold > 0 && content_chars > options.collapse_threshold {
-            debug!(
-                component = "renderer",
-                operation = "collapse_message",
-                message_index = message.index.unwrap_or(0),
-                content_len = content_chars,
-                collapse_threshold = options.collapse_threshold,
-                "Collapsing long message"
-            );
-            let preview_chars = options.collapse_threshold.min(500);
-            // Safe truncation at char boundary to avoid panic on multi-byte UTF-8.
-            let safe_len = byte_index_for_char_count(&message.content, preview_chars);
-            let preview = &message.content[..safe_len];
-            (
-                format!(
-                    r#"<details class="message-collapse">
+    let content_bytes = message.content.len();
+    let mut content_chars = 0; // Calculated lazily
+    let should_collapse =
+        options.collapse_threshold > 0 && content_bytes > options.collapse_threshold && {
+            content_chars = message.content.chars().count();
+            content_chars > options.collapse_threshold
+        };
+
+    let (content_wrapper_start, content_wrapper_end) = if should_collapse {
+        debug!(
+            component = "renderer",
+            operation = "collapse_message",
+            message_index = message.index.unwrap_or(0),
+            content_len = content_chars,
+            collapse_threshold = options.collapse_threshold,
+            "Collapsing long message"
+        );
+        let preview_chars = options.collapse_threshold.min(500);
+        // Safe truncation at char boundary to avoid panic on multi-byte UTF-8.
+        let safe_len = byte_index_for_char_count(&message.content, preview_chars);
+        let preview = &message.content[..safe_len];
+        (
+            format!(
+                r#"<details class="message-collapse">
                     <summary>
                         <span class="message-preview">{}</span>
                         <span class="message-expand-hint">Click to expand ({} chars)</span>
                     </summary>
                     <div class="message-expanded">"#,
-                    html_escape(preview),
-                    content_chars
-                ),
-                "</div></details>".to_string(),
-            )
-        } else {
-            (String::new(), String::new())
-        };
+                html_escape(preview),
+                content_chars
+            ),
+            "</div></details>".to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
 
     // Tool badges rendered as compact icons in header (upper-right)
     let tool_badges_html = if options.show_tool_calls {
@@ -1063,14 +1075,14 @@ fn format_role_display(role: &str) -> String {
         "assistant" | "agent" => "Assistant".to_string(),
         "tool" => "Tool".to_string(),
         "system" => "System".to_string(),
-        other => other.to_string(),
+        other => html_escape(other),
     }
 }
 
 /// Render message content, converting markdown to HTML using pulldown-cmark.
 /// Raw HTML in the input is escaped for security (XSS prevention).
 fn render_content(content: &str, _options: &RenderOptions) -> String {
-    use pulldown_cmark::Event;
+    use pulldown_cmark::{Event, Tag};
 
     // Configure pulldown-cmark with all common extensions
     let mut opts = Options::empty();
@@ -1085,6 +1097,29 @@ fn render_content(content: &str, _options: &RenderOptions) -> String {
         // Convert raw HTML to escaped text (XSS prevention)
         Event::Html(html) => Event::Text(html),
         Event::InlineHtml(html) => Event::Text(html),
+        // Sanitize link destinations to prevent javascript:/vbscript:/data: XSS
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Link {
+            link_type,
+            dest_url: sanitize_markdown_dest_url(dest_url),
+            title,
+            id,
+        }),
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Image {
+            link_type,
+            dest_url: sanitize_markdown_dest_url(dest_url),
+            title,
+            id,
+        }),
         // Pass through all other events
         other => other,
     });
@@ -1093,6 +1128,23 @@ fn render_content(content: &str, _options: &RenderOptions) -> String {
     html::push_html(&mut html_output, parser);
 
     html_output
+}
+
+fn sanitize_markdown_dest_url(dest_url: CowStr<'_>) -> CowStr<'_> {
+    let lower = dest_url
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace() && !ch.is_ascii_control())
+        .collect::<String>()
+        .to_lowercase();
+    if lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
+        || lower.starts_with("data:")
+    {
+        "#".into()
+    } else {
+        dest_url
+    }
 }
 
 /// Render a compact tool badge with hover popover for the message header.
@@ -1315,6 +1367,125 @@ mod tests {
         let html = render_message(&msg, &RenderOptions::default()).unwrap();
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_javascript_url_sanitized_in_markdown_links() {
+        let msg = test_message("user", "[click](javascript:alert(1))");
+        let html = render_message(&msg, &RenderOptions::default()).unwrap();
+        assert!(
+            !html.contains("javascript:"),
+            "javascript: URL should be sanitized, got: {}",
+            html
+        );
+        assert!(html.contains("click")); // link text preserved
+    }
+
+    #[test]
+    fn test_vbscript_and_data_urls_sanitized() {
+        let msg = test_message("user", "[a](vbscript:foo) [b](data:text/html,<script>)");
+        let html = render_message(&msg, &RenderOptions::default()).unwrap();
+        assert!(
+            !html.contains("vbscript:"),
+            "vbscript: URL should be sanitized, got: {}",
+            html
+        );
+        assert!(
+            !html.contains("data:text"),
+            "data: URL should be sanitized, got: {}",
+            html
+        );
+    }
+
+    #[test]
+    fn test_unsafe_markdown_image_urls_sanitized() {
+        let msg = test_message(
+            "user",
+            "![a](javascript:alert(1)) ![b](data:image/svg+xml,<svg/onload=alert(1)>)",
+        );
+        let html = render_message(&msg, &RenderOptions::default()).unwrap();
+        assert!(
+            !html.contains("javascript:"),
+            "unsafe image URL should be sanitized, got: {}",
+            html
+        );
+        assert!(
+            !html.contains("data:image"),
+            "data: image URL should be sanitized, got: {}",
+            html
+        );
+        assert!(
+            html.contains("<img"),
+            "image markup should still render, got: {}",
+            html
+        );
+        assert!(
+            html.contains("src=\"#\""),
+            "unsafe image src should be rewritten, got: {}",
+            html
+        );
+    }
+
+    #[test]
+    fn test_normal_markdown_image_urls_not_affected() {
+        let msg = test_message("user", "![logo](https://example.com/logo.png)");
+        let html = render_message(&msg, &RenderOptions::default()).unwrap();
+        assert!(
+            html.contains("https://example.com/logo.png"),
+            "normal image URLs should be preserved, got: {}",
+            html
+        );
+    }
+
+    #[test]
+    fn test_javascript_url_case_insensitive() {
+        let msg = test_message("user", "[x](JaVaScRiPt:alert(1))");
+        let html = render_message(&msg, &RenderOptions::default()).unwrap();
+        assert!(
+            !html.contains("javascript:"),
+            "case-variant javascript: should be sanitized, got: {}",
+            html
+        );
+        assert!(
+            !html.contains("JaVaScRiPt:"),
+            "case-variant javascript: should be sanitized, got: {}",
+            html
+        );
+    }
+
+    #[test]
+    fn test_sanitize_markdown_dest_url_blocks_control_character_variants() {
+        assert!(
+            sanitize_markdown_dest_url("java\tscript:alert(1)".into()) == CowStr::from("#"),
+            "tab-obfuscated javascript: URL should be rejected"
+        );
+        assert!(
+            sanitize_markdown_dest_url("\u{0000}data:image/svg+xml,<svg/onload=1>".into())
+                == CowStr::from("#"),
+            "control-character data: URL should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_normal_urls_not_affected() {
+        let msg = test_message("user", "[link](https://example.com)");
+        let html = render_message(&msg, &RenderOptions::default()).unwrap();
+        assert!(
+            html.contains("https://example.com"),
+            "normal URLs should be preserved, got: {}",
+            html
+        );
+    }
+
+    #[test]
+    fn test_format_role_display_escapes_unknown_roles() {
+        let display = format_role_display("<img src=x onerror=alert(1)>");
+        assert!(
+            !display.contains("<img"),
+            "unknown role should be HTML-escaped, got: {}",
+            display
+        );
+        assert!(display.contains("&lt;img"));
     }
 
     #[test]

@@ -44,7 +44,7 @@ fn tracker_for(test_name: &str) -> PhaseTracker {
 
 /// Create a minimal test database with conversations for recovery testing.
 fn create_test_database(db_path: &Path, conversation_count: usize) -> anyhow::Result<()> {
-    let mut storage = SqliteStorage::open(db_path)?;
+    let storage = SqliteStorage::open(db_path)?;
 
     let agent = Agent {
         id: None,
@@ -278,6 +278,7 @@ fn test_corrupted_index_triggers_rebuild() {
         build_hnsw: false,
         embedder: "fastembed".to_string(),
         progress: None,
+        watch_interval_secs: 30,
     };
     let result = indexer::run_index(opts, None);
     // Index creation may fail if connectors aren't configured, which is fine
@@ -307,6 +308,7 @@ fn test_corrupted_index_triggers_rebuild() {
             build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
+            watch_interval_secs: 30,
         };
         // force_rebuild should handle corrupted index gracefully
         let _ = indexer::run_index(rebuild_opts, None);

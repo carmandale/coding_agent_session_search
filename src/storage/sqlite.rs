@@ -6,17 +6,22 @@ use anyhow::{Context, Result, anyhow};
 use frankensqlite::{
     Connection as FrankenConnection, Row as FrankenRow,
     compat::{
-        BatchExt as FrankenBatchExt, ConnectionExt as FrankenConnectionExt,
-        OpenFlags as FrankenOpenFlags, OptionalExtension as FrankenOptionalExtension, ParamValue,
-        RowExt as FrankenRowExt, Transaction as FrankenTransaction,
-        TransactionExt as FrankenTransactionExt, open_with_flags as open_franken_with_flags,
+        ConnectionExt as FrankenConnectionExt, OpenFlags as FrankenOpenFlags,
+        OptionalExtension as FrankenOptionalExtension, ParamValue, RowExt as FrankenRowExt,
+        Transaction as FrankenTransaction, TransactionExt as FrankenTransactionExt,
+        open_with_flags as open_franken_with_flags, param_slice_to_values, params_from_iter,
     },
     migrate::MigrationRunner,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rusqlite::OptionalExtension as RusqliteOptionalExtension;
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
 
-/// Frankensqlite parameter list builder (avoids name conflict with rusqlite `params!`).
+/// Frankensqlite parameter list builder.
 macro_rules! fparams {
     () => {
         &[] as &[ParamValue]
@@ -31,7 +36,7 @@ use thiserror::Error;
 use tracing::info;
 
 // -------------------------------------------------------------------------
-// Lazy SQLite Connection (bd-1ueu)
+// Lazy FrankenSQLite Connection (bd-1ueu)
 // -------------------------------------------------------------------------
 // Defers opening the database until first use, cutting startup cost for
 // commands that may not need the DB at all.  Thread-safe via parking_lot
@@ -42,44 +47,73 @@ use tracing::info;
 pub enum LazyDbError {
     #[error("Database not found at {0}")]
     NotFound(PathBuf),
-    #[error("Failed to open database at {path}: {source}")]
-    OpenFailed {
+    #[error("Failed to open FrankenSQLite database at {path}: {source}")]
+    FrankenOpenFailed {
         path: PathBuf,
-        source: rusqlite::Error,
+        source: frankensqlite::FrankenError,
     },
 }
 
-/// A lazily-initialized, thread-safe SQLite connection handle.
+// -------------------------------------------------------------------------
+// LazyFrankenDb — lazy wrapper around FrankenConnection
+// -------------------------------------------------------------------------
+
+/// Wrapper around `FrankenConnection` that implements `Send`.
 ///
-/// Constructing a `LazyDb` is cheap (no I/O).  The underlying
-/// `rusqlite::Connection` is opened on the first call to [`get`].
-/// Subsequent calls return the cached connection.
-pub struct LazyDb {
-    path: PathBuf,
-    conn: parking_lot::Mutex<Option<Connection>>,
+/// `FrankenConnection` is `!Send` because it uses `Rc` internally.
+/// However, the `Rc` values are entirely self-contained within the Connection
+/// and are not shared externally.  When wrapped in a `Mutex`,
+/// exclusive access is guaranteed, making cross-thread transfer safe.
+pub struct SendFrankenConnection(FrankenConnection);
+
+// Safety: Rc fields inside FrankenConnection are not cloned or shared externally.
+// The Mutex<Option<SendFrankenConnection>> ensures exclusive access.
+unsafe impl Send for SendFrankenConnection {}
+
+impl SendFrankenConnection {
+    pub(crate) fn new(conn: FrankenConnection) -> Self {
+        Self(conn)
+    }
 }
 
-/// RAII guard that dereferences to the inner `Connection`.
-pub struct LazyDbGuard<'a>(parking_lot::MutexGuard<'a, Option<Connection>>);
+impl std::ops::Deref for SendFrankenConnection {
+    type Target = FrankenConnection;
+    fn deref(&self) -> &FrankenConnection {
+        &self.0
+    }
+}
 
-impl std::fmt::Debug for LazyDbGuard<'_> {
+/// Lazy-opening wrapper for `FrankenConnection` (frankensqlite).
+///
+/// Constructing a `LazyFrankenDb` is cheap (no I/O).  The underlying
+/// `FrankenConnection` is opened on the first call to [`get`].
+/// Subsequent calls return the cached connection.
+pub struct LazyFrankenDb {
+    path: PathBuf,
+    conn: parking_lot::Mutex<Option<SendFrankenConnection>>,
+}
+
+/// RAII guard that dereferences to the inner `FrankenConnection`.
+pub struct LazyFrankenDbGuard<'a>(parking_lot::MutexGuard<'a, Option<SendFrankenConnection>>);
+
+impl std::fmt::Debug for LazyFrankenDbGuard<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("LazyDbGuard")
+        f.debug_tuple("LazyFrankenDbGuard")
             .field(&self.0.is_some())
             .finish()
     }
 }
 
-impl std::ops::Deref for LazyDbGuard<'_> {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
+impl std::ops::Deref for LazyFrankenDbGuard<'_> {
+    type Target = FrankenConnection;
+    fn deref(&self) -> &FrankenConnection {
         self.0
             .as_ref()
-            .expect("LazyDb connection must be initialized before access")
+            .expect("LazyFrankenDb connection must be initialized before access")
     }
 }
 
-impl LazyDb {
+impl LazyFrankenDb {
     /// Create a lazy handle pointing at `path`.  No I/O is performed.
     pub fn new(path: PathBuf) -> Self {
         Self {
@@ -101,27 +135,77 @@ impl LazyDb {
     ///
     /// `reason` is logged alongside the open duration so callers can
     /// identify which command triggered the open.
-    pub fn get(&self, reason: &str) -> std::result::Result<LazyDbGuard<'_>, LazyDbError> {
+    pub fn get(&self, reason: &str) -> std::result::Result<LazyFrankenDbGuard<'_>, LazyDbError> {
         let mut guard = self.conn.lock();
         if guard.is_none() {
             if !self.path.exists() {
                 return Err(LazyDbError::NotFound(self.path.clone()));
             }
             let start = Instant::now();
-            let conn = Connection::open(&self.path).map_err(|e| LazyDbError::OpenFailed {
-                path: self.path.clone(),
-                source: e,
-            })?;
+            let conn =
+                FrankenConnection::open(self.path.to_string_lossy().into_owned()).map_err(|e| {
+                    LazyDbError::FrankenOpenFailed {
+                        path: self.path.clone(),
+                        source: e,
+                    }
+                })?;
             let elapsed_ms = start.elapsed().as_millis();
             info!(
                 path = %self.path.display(),
                 elapsed_ms = elapsed_ms,
                 reason = reason,
-                "lazily opened SQLite database"
+                "lazily opened FrankenSQLite database"
+            );
+            *guard = Some(SendFrankenConnection(conn));
+        }
+        Ok(LazyFrankenDbGuard(guard))
+    }
+
+    /// Get the connection with a timeout, opening the database on first access.
+    ///
+    /// Like [`get`] but spawns the open in a background thread and waits up to
+    /// `timeout` for it to complete. Returns `LazyDbError::FrankenOpenFailed`
+    /// with a descriptive message if the timeout elapses. Fix for #128.
+    pub fn get_with_timeout(
+        &self,
+        reason: &str,
+        timeout: Duration,
+    ) -> std::result::Result<LazyFrankenDbGuard<'_>, LazyDbError> {
+        let mut guard = self.conn.lock();
+        if guard.is_none() {
+            if !self.path.exists() {
+                return Err(LazyDbError::NotFound(self.path.clone()));
+            }
+            let start = Instant::now();
+            let path_owned = self.path.to_string_lossy().into_owned();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ =
+                    tx.send(FrankenConnection::open(path_owned).map(SendFrankenConnection::new));
+            });
+            let conn = rx
+                .recv_timeout(timeout)
+                .map_err(|_| LazyDbError::FrankenOpenFailed {
+                    path: self.path.clone(),
+                    source: frankensqlite::FrankenError::Internal(format!(
+                        "database open timed out after {}s (possible corruption or lock contention)",
+                        timeout.as_secs()
+                    )),
+                })?
+                .map_err(|e| LazyDbError::FrankenOpenFailed {
+                    path: self.path.clone(),
+                    source: e,
+                })?;
+            let elapsed_ms = start.elapsed().as_millis();
+            info!(
+                path = %self.path.display(),
+                elapsed_ms = elapsed_ms,
+                reason = reason,
+                "lazily opened FrankenSQLite database (with timeout)"
             );
             *guard = Some(conn);
         }
-        Ok(LazyDbGuard(guard))
+        Ok(LazyFrankenDbGuard(guard))
     }
 
     /// Path to the database file (even if not yet opened).
@@ -132,6 +216,246 @@ impl LazyDb {
     /// Whether the connection has been opened.
     pub fn is_open(&self) -> bool {
         self.conn.lock().is_some()
+    }
+}
+
+impl Drop for LazyFrankenDb {
+    fn drop(&mut self) {
+        let Some(mut conn) = self.conn.get_mut().take() else {
+            return;
+        };
+        conn.0.close_best_effort_in_place();
+    }
+}
+
+// -------------------------------------------------------------------------
+// FrankenSQLite Connection Manager (bead 3rlf8)
+// -------------------------------------------------------------------------
+// Multi-connection management: reader pool + concurrent writer connections.
+// Replaces the LazyFrankenDb single-connection bottleneck for high-throughput
+// scenarios (indexer parallel writes, concurrent TUI reads + indexer writes).
+
+/// Configuration for the [`FrankenConnectionManager`].
+#[derive(Debug, Clone)]
+pub struct ConnectionManagerConfig {
+    /// Number of pre-opened reader connections (default: 4).
+    pub reader_count: usize,
+    /// Maximum concurrent writer connections (default: available parallelism).
+    pub max_writers: usize,
+}
+
+impl Default for ConnectionManagerConfig {
+    fn default() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        Self {
+            reader_count: 4,
+            max_writers: cpus,
+        }
+    }
+}
+
+/// Multi-connection manager for frankensqlite.
+///
+/// Provides:
+/// - A pool of pre-opened reader connections (round-robin, Mutex-protected)
+/// - Controlled creation of writer connections with token-based limits
+/// - RAII guards that auto-rollback uncommitted transactions on drop
+///
+/// Thread-safe: reader connections are wrapped in Mutex (FrankenConnection is !Sync).
+/// Writer connections are created per-request (each thread gets its own).
+pub struct FrankenConnectionManager {
+    db_path: PathBuf,
+    readers: Vec<parking_lot::Mutex<SendFrankenConnection>>,
+    reader_idx: std::sync::atomic::AtomicUsize,
+    /// Token-based writer limit: channel pre-filled with `max_writers` tokens.
+    /// `recv()` = acquire slot, `send()` = release slot.
+    writer_tokens: (
+        crossbeam_channel::Sender<()>,
+        crossbeam_channel::Receiver<()>,
+    ),
+    config: ConnectionManagerConfig,
+}
+
+// Safety: FrankenConnectionManager is Send+Sync because:
+// - readers wrapped in Mutex<SendFrankenConnection> (exclusive access)
+// - writer_tokens uses crossbeam (Send+Sync)
+// - db_path is PathBuf (Send+Sync)
+unsafe impl Send for FrankenConnectionManager {}
+unsafe impl Sync for FrankenConnectionManager {}
+
+impl FrankenConnectionManager {
+    /// Create a new connection manager.
+    ///
+    /// Opens `config.reader_count` reader connections immediately.
+    /// Writer connections are created on demand (up to `config.max_writers`).
+    pub fn new(db_path: impl Into<PathBuf>, config: ConnectionManagerConfig) -> Result<Self> {
+        let db_path = db_path.into();
+        let path_str = db_path.to_string_lossy().to_string();
+
+        let reader_count = config.reader_count.max(1);
+        let mut readers = Vec::with_capacity(reader_count);
+        for _ in 0..reader_count {
+            let conn = FrankenConnection::open(&path_str)
+                .with_context(|| format!("opening reader connection at {}", db_path.display()))?;
+            // Apply read-tuned config (no migration, no write PRAGMAs)
+            let _ = conn.execute("PRAGMA busy_timeout = 5000;"); // match writer config
+            let _ = conn.execute("PRAGMA cache_size = -16384;"); // 16MB reader cache
+            readers.push(parking_lot::Mutex::new(SendFrankenConnection(conn)));
+        }
+
+        // Pre-fill bounded channel with tokens (acts as counting semaphore)
+        let (tx, rx) = crossbeam_channel::bounded(config.max_writers);
+        for _ in 0..config.max_writers {
+            tx.send(()).expect("pre-filling writer tokens");
+        }
+
+        Ok(Self {
+            db_path,
+            readers,
+            reader_idx: std::sync::atomic::AtomicUsize::new(0),
+            writer_tokens: (tx, rx),
+            config,
+        })
+    }
+
+    /// Get a reader connection (round-robin from the pool).
+    ///
+    /// Returns a mutex guard wrapping the connection. The guard prevents
+    /// concurrent access to the same connection (FrankenConnection is !Sync).
+    pub fn reader(&self) -> parking_lot::MutexGuard<'_, SendFrankenConnection> {
+        let idx = self
+            .reader_idx
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.readers[idx % self.readers.len()].lock()
+    }
+
+    /// Acquire a writer connection.
+    ///
+    /// Opens a new frankensqlite connection with full config (no migration).
+    /// Blocks if `max_writers` connections are already in use.
+    /// The returned [`WriterGuard`] auto-rolls back on drop.
+    pub fn writer(&self) -> Result<WriterGuard<'_>> {
+        self.writer_tokens
+            .1
+            .recv()
+            .map_err(|_| anyhow!("writer token channel closed"))?;
+        let path_str = self.db_path.to_string_lossy().to_string();
+        let conn = match FrankenConnection::open(&path_str) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = self.writer_tokens.0.send(());
+                return Err(anyhow::Error::from(e).context(format!(
+                    "opening writer connection at {}",
+                    self.db_path.display()
+                )));
+            }
+        };
+        let storage = FrankenStorage { conn };
+        if let Err(e) = storage.apply_config() {
+            let _ = self.writer_tokens.0.send(());
+            return Err(e);
+        }
+        Ok(WriterGuard {
+            storage,
+            mgr: self,
+            committed: false,
+        })
+    }
+
+    /// Acquire a concurrent writer connection (BEGIN CONCURRENT via MVCC).
+    ///
+    /// Similar to [`writer`] but tuned for the parallel indexer write pool.
+    /// Uses reduced cache size and is designed for short-lived batch inserts.
+    pub fn concurrent_writer(&self) -> Result<WriterGuard<'_>> {
+        self.writer_tokens
+            .1
+            .recv()
+            .map_err(|_| anyhow!("writer token channel closed"))?;
+        let path_str = self.db_path.to_string_lossy().to_string();
+        let conn = match FrankenConnection::open(&path_str) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = self.writer_tokens.0.send(());
+                return Err(anyhow::Error::from(e).context(format!(
+                    "opening concurrent writer at {}",
+                    self.db_path.display()
+                )));
+            }
+        };
+        let storage = FrankenStorage { conn };
+        if let Err(e) = storage.apply_config() {
+            let _ = self.writer_tokens.0.send(());
+            return Err(e);
+        }
+        // Reduced cache for concurrent writers (they're short-lived)
+        let _ = storage.raw().execute("PRAGMA cache_size = -4096;");
+        Ok(WriterGuard {
+            storage,
+            mgr: self,
+            committed: false,
+        })
+    }
+
+    /// Database path managed by this pool.
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    /// Number of reader connections in the pool.
+    pub fn reader_count(&self) -> usize {
+        self.readers.len()
+    }
+
+    /// Maximum concurrent writers allowed.
+    pub fn max_writers(&self) -> usize {
+        self.config.max_writers
+    }
+}
+
+impl Drop for FrankenConnectionManager {
+    fn drop(&mut self) {
+        for reader in &mut self.readers {
+            reader.get_mut().0.close_best_effort_in_place();
+        }
+    }
+}
+
+/// RAII guard for a writer connection.
+///
+/// Provides access to a [`FrankenStorage`] for write operations.
+/// Releases the writer semaphore slot when dropped.
+pub struct WriterGuard<'a> {
+    storage: FrankenStorage,
+    mgr: &'a FrankenConnectionManager,
+    committed: bool,
+}
+
+impl<'a> WriterGuard<'a> {
+    /// Access the underlying storage for read/write operations.
+    pub fn storage(&self) -> &FrankenStorage {
+        &self.storage
+    }
+
+    /// Mark this writer as successfully committed.
+    ///
+    /// Call after your transaction's `commit()` succeeds. Prevents the drop
+    /// guard from attempting a rollback.
+    pub fn mark_committed(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Best-effort rollback — connection may already be in autocommit
+            let _ = self.storage.raw().execute("ROLLBACK;");
+        }
+        self.storage.close_best_effort_in_place();
+        // Release writer token
+        let _ = self.mgr.writer_tokens.0.send(());
     }
 }
 
@@ -166,29 +490,6 @@ fn deserialize_msgpack_to_json(bytes: &[u8]) -> serde_json::Value {
     })
 }
 
-/// Read metadata from row, preferring binary column, falling back to JSON.
-/// This provides backward compatibility during migration.
-fn read_metadata_compat(
-    row: &rusqlite::Row<'_>,
-    json_idx: usize,
-    bin_idx: usize,
-) -> serde_json::Value {
-    // Try binary column first (new format)
-    if let Ok(Some(bytes)) = row.get::<_, Option<Vec<u8>>>(bin_idx)
-        && !bytes.is_empty()
-    {
-        return deserialize_msgpack_to_json(&bytes);
-    }
-
-    // Fall back to JSON column (old format or migration in progress)
-    if let Ok(Some(json_str)) = row.get::<_, Option<String>>(json_idx) {
-        return serde_json::from_str(&json_str)
-            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-    }
-
-    serde_json::Value::Object(serde_json::Map::new())
-}
-
 /// Read metadata from a frankensqlite Row, preferring binary (msgpack) over JSON.
 fn franken_read_metadata_compat(
     row: &FrankenRow,
@@ -196,10 +497,10 @@ fn franken_read_metadata_compat(
     bin_idx: usize,
 ) -> serde_json::Value {
     // Try binary column first (new format)
-    if let Ok(Some(bytes)) = row.get_typed::<Option<Vec<u8>>>(bin_idx) {
-        if !bytes.is_empty() {
-            return deserialize_msgpack_to_json(&bytes);
-        }
+    if let Ok(Some(bytes)) = row.get_typed::<Option<Vec<u8>>>(bin_idx)
+        && !bytes.is_empty()
+    {
+        return deserialize_msgpack_to_json(&bytes);
     }
 
     // Fall back to JSON column (old format or migration in progress)
@@ -227,7 +528,7 @@ pub enum MigrationError {
 
     /// A database error occurred during migration.
     #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] frankensqlite::FrankenError),
 
     /// An I/O error occurred during backup.
     #[error("I/O error: {0}")]
@@ -258,7 +559,341 @@ pub fn is_user_data_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Create a timestamped backup of the database file.
+/// SQL to register the FTS5 virtual table on a frankensqlite connection.
+///
+/// FrankenSQLite skips virtual-table entries (rootpage=0) when loading
+/// `sqlite_master` from a stock-SQLite database.  Executing this CREATE
+/// triggers the legacy FTS5 fallback path and materialises the table so
+/// subsequent FTS queries work.
+pub const FTS5_REGISTER_SQL: &str = "\
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
+        content, title, agent, workspace, source_path, \
+        created_at UNINDEXED, \
+        content='', tokenize='porter'\
+    )";
+
+/// SQL to clear all rows from the contentless `fts_messages` table.
+///
+/// Contentless FTS5 tables reject ordinary `DELETE FROM ...` statements.
+pub const FTS5_DELETE_ALL_SQL: &str =
+    "INSERT INTO fts_messages(fts_messages) VALUES('delete-all');";
+
+pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
+    {
+        let conn = rusqlite::Connection::open(db_path).with_context(|| {
+            format!(
+                "opening rusqlite db at {} for FTS placeholder cleanup",
+                db_path.display()
+            )
+        })?;
+        conn.execute_batch("PRAGMA busy_timeout = 30000;")
+            .with_context(|| {
+                format!(
+                    "configuring rusqlite busy timeout for {}",
+                    db_path.display()
+                )
+            })?;
+
+        let existing_entries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'fts_messages%'",
+                [],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("probing fresh FTS schema in {}", db_path.display()))?;
+
+        if existing_entries > 0 {
+            conn.execute_batch(
+                "PRAGMA writable_schema = ON;
+                 DELETE FROM sqlite_master WHERE name LIKE 'fts_messages%';
+                 PRAGMA writable_schema = OFF;",
+            )
+            .with_context(|| {
+                format!(
+                    "removing placeholder FTS schema entries in {}",
+                    db_path.display()
+                )
+            })?;
+        }
+    }
+
+    let mut conn = rusqlite::Connection::open(db_path).with_context(|| {
+        format!(
+            "reopening rusqlite db at {} for FTS materialization",
+            db_path.display()
+        )
+    })?;
+    conn.execute_batch("PRAGMA busy_timeout = 30000;")
+        .with_context(|| {
+            format!(
+                "configuring rusqlite busy timeout for {}",
+                db_path.display()
+            )
+        })?;
+
+    let tx = conn.transaction().with_context(|| {
+        format!(
+            "starting rusqlite FTS materialization transaction for {}",
+            db_path.display()
+        )
+    })?;
+    tx.execute_batch(FTS5_REGISTER_SQL)
+        .with_context(|| format!("creating fresh FTS schema in {}", db_path.display()))?;
+    tx.commit()
+        .with_context(|| format!("committing fresh FTS schema in {}", db_path.display()))?;
+    Ok(())
+}
+
+pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
+    {
+        let conn = rusqlite::Connection::open(db_path).with_context(|| {
+            format!(
+                "opening rusqlite db at {} for FTS schema cleanup",
+                db_path.display()
+            )
+        })?;
+        conn.execute_batch(
+            "PRAGMA busy_timeout = 30000;
+             PRAGMA writable_schema = ON;
+             DELETE FROM sqlite_master WHERE name LIKE 'fts_messages%';
+             PRAGMA writable_schema = OFF;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .with_context(|| {
+            format!(
+                "clearing existing FTS schema rows before rebuild in {}",
+                db_path.display()
+            )
+        })?;
+    }
+
+    let mut conn = rusqlite::Connection::open(db_path).with_context(|| {
+        format!(
+            "reopening rusqlite db at {} for FTS rebuild",
+            db_path.display()
+        )
+    })?;
+    conn.execute_batch("PRAGMA busy_timeout = 30000;")
+        .with_context(|| {
+            format!(
+                "configuring rusqlite busy timeout for FTS rebuild at {}",
+                db_path.display()
+            )
+        })?;
+
+    let tx = conn.transaction().with_context(|| {
+        format!(
+            "starting rusqlite FTS rebuild transaction for {}",
+            db_path.display()
+        )
+    })?;
+    tx.execute_batch(FTS5_REGISTER_SQL)
+        .with_context(|| format!("creating fresh FTS schema in {}", db_path.display()))?;
+    let inserted = tx
+        .execute(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             ORDER BY m.rowid",
+            [],
+        )
+        .with_context(|| format!("populating rebuilt FTS rows in {}", db_path.display()))?;
+    tx.commit()
+        .with_context(|| format!("committing rebuilt FTS rows in {}", db_path.display()))?;
+    Ok(inserted)
+}
+
+fn rusqlite_fts_schema_rows(conn: &rusqlite::Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+        [],
+        |row| row.get(0),
+    )
+    .context("counting sqlite_master rows for fts_messages")
+}
+
+fn rusqlite_fts_limit_probe(conn: &rusqlite::Connection) -> bool {
+    conn.prepare("SELECT rowid FROM fts_messages LIMIT 1")
+        .and_then(|mut stmt| stmt.exists([]))
+        .is_ok()
+}
+
+pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsConsistencyRepair> {
+    let conn = rusqlite::Connection::open(db_path).with_context(|| {
+        format!(
+            "opening rusqlite db at {} for FTS consistency check",
+            db_path.display()
+        )
+    })?;
+    conn.execute_batch("PRAGMA busy_timeout = 30000;")
+        .with_context(|| {
+            format!(
+                "configuring rusqlite busy timeout for FTS consistency check at {}",
+                db_path.display()
+            )
+        })?;
+
+    let schema_version = read_meta_schema_version(&conn)?;
+    let fts_schema_rows = rusqlite_fts_schema_rows(&conn)?;
+    let fts_queryable = fts_schema_rows == 1 && rusqlite_fts_limit_probe(&conn);
+
+    if schema_version != Some(CURRENT_SCHEMA_VERSION) || !fts_queryable {
+        drop(conn);
+        let inserted_rows = rebuild_fts_via_rusqlite(db_path)?;
+        return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+    }
+
+    let total_messages: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .context("counting canonical messages for FTS consistency check")?;
+    let indexed_messages: i64 = conn
+        .query_row("SELECT COUNT(*) FROM fts_messages", [], |row| row.get(0))
+        .context("counting canonical FTS rows for FTS consistency check")?;
+
+    if indexed_messages == total_messages {
+        return Ok(FtsConsistencyRepair::AlreadyHealthy {
+            rows: usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX),
+        });
+    }
+
+    if indexed_messages > total_messages {
+        drop(conn);
+        let inserted_rows = rebuild_fts_via_rusqlite(db_path)?;
+        return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+    }
+
+    let mut conn = conn;
+    let tx = conn.transaction().with_context(|| {
+        format!(
+            "starting incremental FTS consistency repair for {}",
+            db_path.display()
+        )
+    })?;
+    let inserted_rows = tx
+        .execute(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             LEFT JOIN fts_messages f ON f.rowid = m.id
+             WHERE f.rowid IS NULL
+             ORDER BY m.rowid",
+            [],
+        )
+        .with_context(|| format!("incrementally repairing missing FTS rows in {}", db_path.display()))?;
+    tx.commit().with_context(|| {
+        format!(
+            "committing incremental FTS consistency repair in {}",
+            db_path.display()
+        )
+    })?;
+
+    let repaired_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM fts_messages", [], |row| row.get(0))
+        .context("counting repaired canonical FTS rows")?;
+    if repaired_rows == total_messages {
+        return Ok(FtsConsistencyRepair::IncrementalCatchUp {
+            inserted_rows,
+            total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
+        });
+    }
+
+    drop(conn);
+    let inserted_rows = rebuild_fts_via_rusqlite(db_path)?;
+    Ok(FtsConsistencyRepair::Rebuilt { inserted_rows })
+}
+
+fn fast_forward_schema_v13_fts_via_rusqlite(db_path: &Path) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+
+    let schema_version = {
+        let conn = rusqlite::Connection::open(db_path).with_context(|| {
+            format!(
+                "opening rusqlite db at {} for schema-13 preflight",
+                db_path.display()
+            )
+        })?;
+        conn.execute_batch("PRAGMA busy_timeout = 30000;")
+            .with_context(|| {
+                format!(
+                    "configuring rusqlite busy timeout for schema-13 preflight at {}",
+                    db_path.display()
+                )
+            })?;
+        read_meta_schema_version(&conn)?
+    };
+
+    if schema_version != Some(13) {
+        return Ok(false);
+    }
+
+    let inserted = rebuild_fts_via_rusqlite(db_path)?;
+    let conn = rusqlite::Connection::open(db_path).with_context(|| {
+        format!(
+            "reopening rusqlite db at {} after schema-13 FTS preflight",
+            db_path.display()
+        )
+    })?;
+    conn.execute_batch("PRAGMA busy_timeout = 30000;")
+        .with_context(|| {
+            format!(
+                "configuring busy timeout after schema-13 FTS preflight at {}",
+                db_path.display()
+            )
+        })?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
+        rusqlite::params![CURRENT_SCHEMA_VERSION.to_string()],
+    )
+    .with_context(|| {
+        format!(
+            "marking schema_version={} after rusqlite FTS preflight in {}",
+            CURRENT_SCHEMA_VERSION,
+            db_path.display()
+        )
+    })?;
+
+    let migration_table_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_schema_migrations'",
+            [],
+            |row| row.get(0),
+        )
+        .with_context(|| {
+            format!(
+                "checking for _schema_migrations after rusqlite FTS preflight in {}",
+                db_path.display()
+            )
+        })?;
+    if migration_table_exists > 0 {
+        conn.execute(
+            "INSERT OR IGNORE INTO _schema_migrations(version, name) VALUES(?1, 'fts_contentless')",
+            rusqlite::params![CURRENT_SCHEMA_VERSION],
+        )
+        .with_context(|| {
+            format!(
+                "recording fts_contentless migration after rusqlite FTS preflight in {}",
+                db_path.display()
+            )
+        })?;
+    }
+
+    tracing::info!(
+        db_path = %db_path.display(),
+        inserted_fts_rows = inserted,
+        "fast-forwarded schema-13 FTS migration via rusqlite before frankensqlite open"
+    );
+    Ok(true)
+}
+
+/// Create a uniquely named backup of the database file.
 ///
 /// Returns the path to the backup file, or None if the source doesn't exist.
 pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, MigrationError> {
@@ -266,28 +901,26 @@ pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, Migra
         return Ok(None);
     }
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
-    let backup_name = format!(
-        "{}.backup.{}",
-        db_path.file_name().and_then(|n| n.to_str()).unwrap_or("db"),
-        timestamp
-    );
-
-    let backup_path = db_path.with_file_name(&backup_name);
+    let backup_path = unique_backup_path(db_path);
 
     // Try to use SQLite's VACUUM INTO command first, which safely handles WAL files
     // and produces a clean, minimized backup.
-    let vacuum_success = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    let vacuum_success = open_franken_with_flags(
+        &db_path.to_string_lossy(),
+        FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
     )
-    .and_then(|conn| {
+    .and_then(|mut conn| {
         let path_str = backup_path.to_string_lossy();
-        conn.execute("VACUUM INTO ?", params![path_str])
+        let result = conn.execute_compat("VACUUM INTO ?", fparams![path_str.as_ref()]);
+        if let Err(close_err) = conn.close_in_place() {
+            tracing::warn!(
+                error = %close_err,
+                db_path = %db_path.display(),
+                "create_backup: close_in_place failed after VACUUM INTO; falling back to best-effort close"
+            );
+            conn.close_best_effort_in_place();
+        }
+        result
     })
     .is_ok();
 
@@ -302,31 +935,103 @@ pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, Migra
 
     // Best-effort copy of WAL/SHM sidecar files if they exist
     // SQLite sidecars are named: <path>-wal and <path>-shm
-    let path_str = db_path.to_string_lossy();
-    let backup_str = backup_path.to_string_lossy();
-
-    let wal_src = std::path::PathBuf::from(format!("{}-wal", path_str));
-    let shm_src = std::path::PathBuf::from(format!("{}-shm", path_str));
+    let wal_src = database_sidecar_path(db_path, "-wal");
+    let shm_src = database_sidecar_path(db_path, "-shm");
 
     if wal_src.exists() {
-        let _ = fs::copy(&wal_src, format!("{}-wal", backup_str));
+        let _ = fs::copy(&wal_src, database_sidecar_path(&backup_path, "-wal"));
     }
     if shm_src.exists() {
-        let _ = fs::copy(&shm_src, format!("{}-shm", backup_str));
+        let _ = fs::copy(&shm_src, database_sidecar_path(&backup_path, "-shm"));
     }
 
     Ok(Some(backup_path))
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DatabaseBundleMoveResult {
+    pub database: bool,
+    pub wal: bool,
+    pub shm: bool,
+}
+
+impl DatabaseBundleMoveResult {
+    pub fn moved_any(&self) -> bool {
+        self.database || self.wal || self.shm
+    }
+}
+
+fn database_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix))
+}
+
+/// Move a database file and its WAL/SHM sidecars to a new basename.
+///
+/// This is used for non-destructive quarantine of a corrupted bundle before a
+/// rebuild. If the main database file is already missing but orphaned sidecars
+/// remain, those sidecars are still moved so a fresh database can be created
+/// without inheriting stale WAL state.
+pub(crate) fn move_database_bundle(
+    source_root: &Path,
+    destination_root: &Path,
+) -> std::io::Result<DatabaseBundleMoveResult> {
+    let mut moved = DatabaseBundleMoveResult::default();
+
+    if source_root.exists() {
+        fs::rename(source_root, destination_root)?;
+        moved.database = true;
+    }
+
+    let wal_source = database_sidecar_path(source_root, "-wal");
+    if wal_source.exists() {
+        fs::rename(&wal_source, database_sidecar_path(destination_root, "-wal"))?;
+        moved.wal = true;
+    }
+
+    let shm_source = database_sidecar_path(source_root, "-shm");
+    if shm_source.exists() {
+        fs::rename(&shm_source, database_sidecar_path(destination_root, "-shm"))?;
+        moved.shm = true;
+    }
+
+    Ok(moved)
+}
+
+fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<()> {
+    fs::copy(source_root, destination_root).with_context(|| {
+        format!(
+            "copying database bundle {} -> {}",
+            source_root.display(),
+            destination_root.display()
+        )
+    })?;
+
+    for suffix in ["-wal", "-shm"] {
+        let source_sidecar = database_sidecar_path(source_root, suffix);
+        if !source_sidecar.exists() {
+            continue;
+        }
+        let destination_sidecar = database_sidecar_path(destination_root, suffix);
+        fs::copy(&source_sidecar, &destination_sidecar).with_context(|| {
+            format!(
+                "copying database bundle sidecar {} -> {}",
+                source_sidecar.display(),
+                destination_sidecar.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 /// Helper to safely remove a database file and its potential WAL/SHM sidecars.
-fn remove_database_files(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_database_files(path: &Path) -> std::io::Result<()> {
     // Remove the main database file
     fs::remove_file(path)?;
 
     // Best-effort removal of sidecar files (ignore errors if they don't exist)
-    let path_str = path.to_string_lossy();
-    let _ = fs::remove_file(format!("{}-wal", path_str));
-    let _ = fs::remove_file(format!("{}-shm", path_str));
+    let _ = fs::remove_file(database_sidecar_path(path, "-wal"));
+    let _ = fs::remove_file(database_sidecar_path(path, "-shm"));
 
     Ok(())
 }
@@ -349,8 +1054,9 @@ pub fn cleanup_old_backups(db_path: &Path, keep_count: usize) -> Result<(), std:
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && name.starts_with(&prefix)
+                && is_backup_root_name(name, &prefix)
                 && let Ok(meta) = fs::metadata(&path)
+                && meta.is_file()
                 && let Ok(mtime) = meta.modified()
             {
                 backups.push((path, mtime));
@@ -366,16 +1072,977 @@ pub fn cleanup_old_backups(db_path: &Path, keep_count: usize) -> Result<(), std:
         let _ = fs::remove_file(&path);
 
         // Also try to cleanup potential sidecars from fs::copy fallback
-        let path_str = path.to_string_lossy();
-        let _ = fs::remove_file(format!("{}-wal", path_str));
-        let _ = fs::remove_file(format!("{}-shm", path_str));
+        let _ = fs::remove_file(database_sidecar_path(&path, "-wal"));
+        let _ = fs::remove_file(database_sidecar_path(&path, "-shm"));
     }
 
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct HistoricalDatabaseBundle {
+    root_path: PathBuf,
+    total_bytes: u64,
+    modified_at_ms: i64,
+    supports_direct_readonly: bool,
+    probe: HistoricalBundleProbe,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HistoricalBundleProbe {
+    schema_version: Option<i64>,
+    fts_schema_rows: Option<i64>,
+    fts_queryable: bool,
+    max_message_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SqliteDatabaseHealthProbe {
+    pub schema_version: Option<i64>,
+    pub quick_check_ok: bool,
+    pub fts_schema_rows: i64,
+    pub fts_queryable: bool,
+    pub message_count: i64,
+    pub max_message_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FtsConsistencyRepair {
+    AlreadyHealthy {
+        rows: usize,
+    },
+    IncrementalCatchUp {
+        inserted_rows: usize,
+        total_rows: usize,
+    },
+    Rebuilt {
+        inserted_rows: usize,
+    },
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HistoricalSalvageOutcome {
+    pub bundles_considered: usize,
+    pub bundles_imported: usize,
+    pub conversations_imported: usize,
+    pub messages_imported: usize,
+}
+
+impl HistoricalSalvageOutcome {
+    pub(crate) fn accumulate(&mut self, other: Self) {
+        self.bundles_considered += other.bundles_considered;
+        self.bundles_imported += other.bundles_imported;
+        self.conversations_imported += other.conversations_imported;
+        self.messages_imported += other.messages_imported;
+    }
+}
+
+#[derive(Debug)]
+struct HistoricalReadConnection {
+    conn: rusqlite::Connection,
+    method: &'static str,
+    _tempdir: Option<tempfile::TempDir>,
+}
+
+const HISTORICAL_RECOVERY_CORE_SCHEMA: &str = r"
+CREATE TABLE sources (
+    id TEXT PRIMARY KEY,
+    kind TEXT,
+    host_label TEXT,
+    machine_id TEXT,
+    platform TEXT,
+    config_json TEXT,
+    created_at INTEGER,
+    updated_at INTEGER
+);
+CREATE TABLE agents (
+    id INTEGER PRIMARY KEY,
+    slug TEXT,
+    name TEXT,
+    version TEXT,
+    kind TEXT,
+    created_at INTEGER,
+    updated_at INTEGER
+);
+CREATE TABLE workspaces (
+    id INTEGER PRIMARY KEY,
+    path TEXT,
+    display_name TEXT
+);
+CREATE TABLE conversations (
+    id INTEGER PRIMARY KEY,
+    agent_id INTEGER,
+    workspace_id INTEGER,
+    source_id TEXT,
+    external_id TEXT,
+    title TEXT,
+    source_path TEXT,
+    started_at INTEGER,
+    ended_at INTEGER,
+    approx_tokens INTEGER,
+    metadata_json TEXT,
+    origin_host TEXT,
+    metadata_bin BLOB,
+    total_input_tokens INTEGER,
+    total_output_tokens INTEGER,
+    total_cache_read_tokens INTEGER,
+    total_cache_creation_tokens INTEGER,
+    grand_total_tokens INTEGER,
+    estimated_cost_usd REAL,
+    primary_model TEXT,
+    api_call_count INTEGER,
+    tool_call_count INTEGER,
+    user_message_count INTEGER,
+    assistant_message_count INTEGER
+);
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY,
+    conversation_id INTEGER,
+    idx INTEGER,
+    role TEXT,
+    author TEXT,
+    created_at INTEGER,
+    content TEXT,
+    extra_json TEXT,
+    extra_bin BLOB
+);
+CREATE TABLE snippets (
+    id INTEGER PRIMARY KEY,
+    message_id INTEGER,
+    file_path TEXT,
+    start_line INTEGER,
+    end_line INTEGER,
+    language TEXT,
+    snippet_text TEXT
+);
+";
+const HISTORICAL_SALVAGE_LEDGER_VERSION: u32 = 2;
+const HISTORICAL_SALVAGE_PROGRESS_VERSION: u32 = 1;
+const SOURCE_PATH_MERGE_START_TOLERANCE_MS: i64 = 5 * 60 * 1000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalBundleProgress {
+    progress_version: u32,
+    path: String,
+    bytes: u64,
+    modified_at_ms: i64,
+    method: String,
+    last_completed_source_row_id: i64,
+    conversations_imported: usize,
+    messages_imported: usize,
+    updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalBatchEntry {
+    source_row_id: i64,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    conversation: Conversation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HistoricalBatchImportTotals {
+    inserted_source_rows: usize,
+    inserted_messages: usize,
+}
+
+fn historical_bundle_root_paths(db_path: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let Some(parent) = db_path.parent() else {
+        return roots;
+    };
+    let db_name = db_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("agent_search.db");
+    let db_stem = db_path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("agent_search");
+
+    let mut push_root = |path: PathBuf| {
+        if path == db_path {
+            return;
+        }
+        if !roots.iter().any(|existing| existing == &path) {
+            roots.push(path);
+        }
+    };
+
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with("-wal") || name.ends_with("-shm") {
+                continue;
+            }
+            if name.starts_with(&format!("{db_name}.backup."))
+                || name.starts_with(&format!("{db_stem}.corrupt."))
+            {
+                push_root(path);
+            }
+        }
+    }
+
+    let backups_dir = parent.join("backups");
+    if let Ok(entries) = fs::read_dir(backups_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with("-wal") || name.ends_with("-shm") {
+                continue;
+            }
+            if name.starts_with(&format!("{db_name}.")) && name.ends_with(".bak") {
+                push_root(path);
+            }
+        }
+    }
+
+    push_named_database_children(&mut roots, db_path, &parent.join("repair-lab"), db_name);
+    push_named_database_children(&mut roots, db_path, &parent.join("snapshots"), db_name);
+
+    roots
+}
+
+fn push_named_database_children(
+    roots: &mut Vec<PathBuf>,
+    canonical_db_path: &Path,
+    dir: &Path,
+    db_name: &str,
+) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join(db_name);
+            if candidate == canonical_db_path {
+                continue;
+            }
+            if candidate.exists() && !roots.iter().any(|existing| existing == &candidate) {
+                roots.push(candidate);
+            }
+        }
+    }
+}
+
+fn file_mtime_ms(path: &Path) -> i64 {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn bundle_total_bytes(root_path: &Path) -> u64 {
+    let mut total = fs::metadata(root_path).map(|meta| meta.len()).unwrap_or(0);
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = database_sidecar_path(root_path, suffix);
+        total = total.saturating_add(fs::metadata(sidecar).map(|meta| meta.len()).unwrap_or(0));
+    }
+    total
+}
+
+pub(crate) fn discover_historical_database_bundles(
+    db_path: &Path,
+) -> Vec<HistoricalDatabaseBundle> {
+    let mut bundles: Vec<_> = historical_bundle_root_paths(db_path)
+        .into_iter()
+        .filter(|root| root.exists())
+        .map(|root_path| {
+            let modified_at_ms = file_mtime_ms(&root_path);
+            let total_bytes = bundle_total_bytes(&root_path);
+            let supports_direct_readonly = historical_bundle_supports_direct_readonly(&root_path);
+            let probe = probe_historical_bundle(&root_path, supports_direct_readonly);
+            HistoricalDatabaseBundle {
+                modified_at_ms,
+                total_bytes,
+                supports_direct_readonly,
+                root_path,
+                probe,
+            }
+        })
+        .filter(|bundle| bundle.total_bytes > 0)
+        .collect();
+
+    fn bundle_priority(path: &Path) -> i32 {
+        let path_str = path.to_string_lossy();
+        if path_str.contains("/repair-lab/replay-") {
+            return 5;
+        }
+        if path_str.contains("/repair-lab/") {
+            return 4;
+        }
+        if path_str.contains("/snapshots/") {
+            return 3;
+        }
+        if path_str.contains(".corrupt.") || path_str.contains("failed-baseline-seed") {
+            return 0;
+        }
+        1
+    }
+
+    fn bundle_health_rank(bundle: &HistoricalDatabaseBundle) -> i32 {
+        let clean_schema14_fts = bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION)
+            && bundle.probe.fts_schema_rows == Some(1)
+            && bundle.probe.fts_queryable;
+        if clean_schema14_fts {
+            return 5;
+        }
+
+        let clean_fts = bundle.probe.fts_schema_rows == Some(1) && bundle.probe.fts_queryable;
+        if clean_fts {
+            return 4;
+        }
+
+        if bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION)
+            && bundle.supports_direct_readonly
+        {
+            return 3;
+        }
+
+        if bundle.supports_direct_readonly {
+            return 2;
+        }
+
+        1
+    }
+
+    bundles.sort_by(|left, right| {
+        bundle_health_rank(right)
+            .cmp(&bundle_health_rank(left))
+            .then_with(|| right.probe.max_message_id.cmp(&left.probe.max_message_id))
+            .then_with(|| bundle_priority(&right.root_path).cmp(&bundle_priority(&left.root_path)))
+            .then_with(|| {
+                right
+                    .supports_direct_readonly
+                    .cmp(&left.supports_direct_readonly)
+            })
+            .then_with(|| right.total_bytes.cmp(&left.total_bytes))
+            .then_with(|| right.modified_at_ms.cmp(&left.modified_at_ms))
+            .then_with(|| right.root_path.cmp(&left.root_path))
+    });
+    bundles
+}
+
+fn probe_historical_bundle(
+    root_path: &Path,
+    supports_direct_readonly: bool,
+) -> HistoricalBundleProbe {
+    if !supports_direct_readonly {
+        return HistoricalBundleProbe::default();
+    }
+
+    let Ok(conn) = open_historical_bundle_readonly(root_path) else {
+        return HistoricalBundleProbe::default();
+    };
+
+    let schema_version = read_meta_schema_version(&conn).ok().flatten();
+    let fts_schema_rows = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let fts_queryable = matches!(fts_schema_rows, Some(1))
+        && conn
+            .prepare("SELECT rowid FROM fts_messages LIMIT 1")
+            .and_then(|mut stmt| stmt.exists([]))
+            .is_ok();
+    let max_message_id = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+
+    HistoricalBundleProbe {
+        schema_version,
+        fts_schema_rows,
+        fts_queryable,
+        max_message_id,
+    }
+}
+
+fn historical_bundle_supports_direct_readonly(root_path: &Path) -> bool {
+    open_historical_bundle_readonly(root_path)
+        .and_then(|conn| historical_bundle_has_queryable_core_tables(&conn))
+        .is_ok()
+}
+
+fn historical_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| format!("checking for historical table {table}"))?;
+    Ok(found.is_some())
+}
+
+fn probe_historical_table_reads(conn: &rusqlite::Connection, table: &str) -> Result<()> {
+    if !historical_table_exists(conn, table)? {
+        return Err(anyhow!(
+            "historical database missing required table {table}"
+        ));
+    }
+
+    let sql = format!("SELECT rowid FROM {table} LIMIT 1");
+    let _: Option<i64> = conn
+        .query_row(&sql, [], |row| row.get(0))
+        .optional()
+        .with_context(|| format!("probing rows from historical table {table}"))?;
+    Ok(())
+}
+
+fn historical_bundle_has_queryable_core_tables(conn: &rusqlite::Connection) -> Result<()> {
+    probe_historical_table_reads(conn, "conversations")?;
+    probe_historical_table_reads(conn, "messages")?;
+    Ok(())
+}
+
+fn open_historical_bundle_readonly(root_path: &Path) -> Result<rusqlite::Connection> {
+    let uri = format!("file:{}?immutable=1", root_path.to_string_lossy());
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+    let conn = rusqlite::Connection::open_with_flags(uri, flags)
+        .with_context(|| format!("opening historical database {}", root_path.display()))?;
+    conn.pragma_update(None, "writable_schema", "ON")
+        .with_context(|| format!("enabling writable_schema for {}", root_path.display()))?;
+    conn.pragma_update(None, "query_only", "ON")
+        .with_context(|| format!("enabling query_only for {}", root_path.display()))?;
+    conn.busy_timeout(Duration::from_secs(30))
+        .with_context(|| format!("configuring busy_timeout for {}", root_path.display()))?;
+    Ok(conn)
+}
+
+fn is_recoverable_insert_line(line: &str) -> bool {
+    [
+        "sources",
+        "agents",
+        "workspaces",
+        "conversations",
+        "messages",
+        "snippets",
+    ]
+    .iter()
+    .any(|table| {
+        line.starts_with(&format!("INSERT INTO '{table}'"))
+            || line.starts_with(&format!("INSERT OR IGNORE INTO '{table}'"))
+            || line.starts_with(&format!("INSERT INTO \"{table}\""))
+            || line.starts_with(&format!("INSERT OR IGNORE INTO \"{table}\""))
+    })
+}
+
+fn recover_historical_bundle_via_sqlite3(
+    bundle: &HistoricalDatabaseBundle,
+) -> Result<HistoricalReadConnection> {
+    let tempdir = tempfile::TempDir::new().context("creating temporary salvage directory")?;
+    let recovered_db = tempdir.path().join("historical-recovered.db");
+    let temp_conn = rusqlite::Connection::open(&recovered_db)
+        .with_context(|| format!("creating recovered database {}", recovered_db.display()))?;
+    temp_conn
+        .execute_batch(HISTORICAL_RECOVERY_CORE_SCHEMA)
+        .with_context(|| format!("initializing recovered schema {}", recovered_db.display()))?;
+    drop(temp_conn);
+
+    let bundle_uri = format!("file:{}?immutable=1", bundle.root_path.to_string_lossy());
+    let mut recover = Command::new("sqlite3")
+        .arg(&bundle_uri)
+        .arg(".recover")
+        .stdout(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "launching sqlite3 .recover for historical bundle {}",
+                bundle.root_path.display()
+            )
+        })?;
+    let recover_stdout = recover
+        .stdout
+        .take()
+        .context("capturing sqlite3 .recover stdout")?;
+
+    let mut importer = Command::new("sqlite3")
+        .arg(&recovered_db)
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "launching sqlite3 importer for recovered bundle {}",
+                recovered_db.display()
+            )
+        })?;
+
+    {
+        let importer_stdin = importer
+            .stdin
+            .as_mut()
+            .context("opening sqlite3 importer stdin")?;
+        importer_stdin
+            .write_all(b"BEGIN;\n")
+            .context("starting recovery import transaction")?;
+
+        let reader = BufReader::new(recover_stdout);
+        for line in reader.lines() {
+            let line = line.context("reading sqlite3 .recover output")?;
+            if is_recoverable_insert_line(&line) {
+                importer_stdin
+                    .write_all(line.as_bytes())
+                    .context("writing recovered INSERT")?;
+                importer_stdin
+                    .write_all(b"\n")
+                    .context("writing recovered INSERT newline")?;
+            }
+        }
+
+        importer_stdin
+            .write_all(b"COMMIT;\n")
+            .context("committing recovery import transaction")?;
+    }
+
+    let recover_status = recover
+        .wait()
+        .context("waiting for sqlite3 .recover process")?;
+    if !recover_status.success() {
+        anyhow::bail!(
+            "sqlite3 .recover exited with status {} for {}",
+            recover_status,
+            bundle.root_path.display()
+        );
+    }
+
+    let importer_status = importer
+        .wait()
+        .context("waiting for sqlite3 recovery importer")?;
+    if !importer_status.success() {
+        anyhow::bail!(
+            "sqlite3 recovery importer exited with status {} for {}",
+            importer_status,
+            recovered_db.display()
+        );
+    }
+
+    let conn = open_historical_bundle_readonly(&recovered_db)?;
+    historical_bundle_has_queryable_core_tables(&conn)?;
+    Ok(HistoricalReadConnection {
+        conn,
+        method: "sqlite3-recover",
+        _tempdir: Some(tempdir),
+    })
+}
+
+fn open_historical_bundle_for_salvage(
+    bundle: &HistoricalDatabaseBundle,
+) -> Result<HistoricalReadConnection> {
+    match open_historical_bundle_readonly(&bundle.root_path) {
+        Ok(conn) => {
+            if historical_bundle_has_queryable_core_tables(&conn).is_ok() {
+                return Ok(HistoricalReadConnection {
+                    conn,
+                    method: "direct-readonly",
+                    _tempdir: None,
+                });
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %bundle.root_path.display(),
+                error = %err,
+                "historical bundle direct open failed; falling back to sqlite3 .recover"
+            );
+        }
+    }
+
+    recover_historical_bundle_via_sqlite3(bundle)
+}
+
+fn historical_bundle_counts(conn: &rusqlite::Connection) -> Result<(usize, usize)> {
+    let conversations: i64 =
+        conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?;
+    let messages: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+    Ok((
+        usize::try_from(conversations.max(0)).unwrap_or(usize::MAX),
+        usize::try_from(messages.max(0)).unwrap_or(usize::MAX),
+    ))
+}
+
+fn clear_seeded_runtime_meta_via_rusqlite(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM meta
+         WHERE key LIKE 'historical_bundle_salvaged:%'
+            OR key IN ('last_scan_ts', 'last_indexed_at', 'last_embedded_message_id')",
+        [],
+    )?;
+    Ok(())
+}
+
+fn record_historical_bundle_import_via_rusqlite(
+    conn: &rusqlite::Connection,
+    bundle: &HistoricalDatabaseBundle,
+    method: &str,
+    conversations_imported: usize,
+    messages_imported: usize,
+) -> Result<()> {
+    let key = FrankenStorage::historical_bundle_meta_key(bundle);
+    let value = serde_json::json!({
+        "salvage_version": HISTORICAL_SALVAGE_LEDGER_VERSION,
+        "path": bundle.root_path.display().to_string(),
+        "bytes": bundle.total_bytes,
+        "modified_at_ms": bundle.modified_at_ms,
+        "method": method,
+        "conversations_imported": conversations_imported,
+        "messages_imported": messages_imported,
+        "recorded_at_ms": FrankenStorage::now_millis(),
+    });
+    let value_str = serde_json::to_string(&value)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        rusqlite::params![key, value_str],
+    )?;
+    Ok(())
+}
+
+fn finalize_seeded_canonical_bundle_via_rusqlite(
+    canonical_db_path: &Path,
+    bundle: &HistoricalDatabaseBundle,
+    conversations_imported: usize,
+    messages_imported: usize,
+) -> Result<()> {
+    let schema_version = {
+        let conn = rusqlite::Connection::open(canonical_db_path).with_context(|| {
+            format!(
+                "opening seeded canonical database for post-seed finalization: {}",
+                canonical_db_path.display()
+            )
+        })?;
+        conn.execute_batch("PRAGMA busy_timeout = 30000;")
+            .with_context(|| {
+                format!(
+                    "configuring busy timeout for seeded canonical database {}",
+                    canonical_db_path.display()
+                )
+            })?;
+        read_meta_schema_version(&conn)?
+    };
+
+    if let Some(version) = schema_version
+        && version < CURRENT_SCHEMA_VERSION
+    {
+        if version != 13 {
+            anyhow::bail!(
+                "seeded canonical bundle schema_version {version} cannot be finalized automatically"
+            );
+        }
+        rebuild_fts_via_rusqlite(canonical_db_path)?;
+    }
+
+    let conn = rusqlite::Connection::open(canonical_db_path).with_context(|| {
+        format!(
+            "reopening seeded canonical database for runtime-meta cleanup: {}",
+            canonical_db_path.display()
+        )
+    })?;
+    conn.execute_batch("PRAGMA busy_timeout = 30000;")
+        .with_context(|| {
+            format!(
+                "configuring post-seed busy timeout for {}",
+                canonical_db_path.display()
+            )
+        })?;
+
+    clear_seeded_runtime_meta_via_rusqlite(&conn)?;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
+        rusqlite::params![CURRENT_SCHEMA_VERSION.to_string()],
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO _schema_migrations(version, name) VALUES(?1, 'fts_contentless')",
+        rusqlite::params![CURRENT_SCHEMA_VERSION],
+    )?;
+    record_historical_bundle_import_via_rusqlite(
+        &conn,
+        bundle,
+        "baseline-bulk-sql-copy",
+        conversations_imported,
+        messages_imported,
+    )?;
+    Ok(())
+}
+
+fn read_meta_schema_version(conn: &rusqlite::Connection) -> Result<Option<i64>> {
+    let version = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|raw| raw.parse::<i64>().ok());
+    Ok(version)
+}
+
+pub(crate) fn probe_database_health_via_rusqlite(
+    db_path: &Path,
+) -> Result<SqliteDatabaseHealthProbe> {
+    let conn = rusqlite::Connection::open(db_path).with_context(|| {
+        format!(
+            "opening rusqlite db at {} for database health probe",
+            db_path.display()
+        )
+    })?;
+    conn.execute_batch("PRAGMA busy_timeout = 30000;")
+        .with_context(|| {
+            format!(
+                "configuring rusqlite busy timeout for database health probe at {}",
+                db_path.display()
+            )
+        })?;
+
+    let schema_version = read_meta_schema_version(&conn)?;
+    let quick_check_status: String = conn
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .with_context(|| format!("running PRAGMA quick_check(1) for {}", db_path.display()))?;
+    let quick_check_ok = quick_check_status.trim().eq_ignore_ascii_case("ok");
+    let fts_schema_rows = rusqlite_fts_schema_rows(&conn)?;
+    let fts_queryable = fts_schema_rows == 1 && rusqlite_fts_limit_probe(&conn);
+
+    if !quick_check_ok {
+        return Ok(SqliteDatabaseHealthProbe {
+            schema_version,
+            quick_check_ok,
+            fts_schema_rows,
+            fts_queryable,
+            message_count: 0,
+            max_message_id: 0,
+        });
+    }
+
+    let message_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .context("counting messages during rusqlite database health probe")?;
+    let max_message_id: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| {
+            row.get(0)
+        })
+        .context("reading max message id during rusqlite database health probe")?;
+
+    Ok(SqliteDatabaseHealthProbe {
+        schema_version,
+        quick_check_ok,
+        fts_schema_rows,
+        fts_queryable,
+        message_count,
+        max_message_id,
+    })
+}
+
+fn seed_canonical_from_historical_bundle_via_bulk_copy(
+    canonical_db_path: &Path,
+    bundle: &HistoricalDatabaseBundle,
+) -> Result<()> {
+    let canonical_parent = canonical_db_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(canonical_parent).with_context(|| {
+        format!(
+            "creating canonical database directory before bulk historical seed import: {}",
+            canonical_parent.display()
+        )
+    })?;
+    let tempdir = tempfile::TempDir::new_in(canonical_parent)
+        .context("creating temporary baseline seed directory")?;
+    let staged_seed_db = tempdir.path().join("baseline-seed-output.db");
+    copy_database_bundle(&bundle.root_path, &staged_seed_db)?;
+
+    if canonical_db_path.exists() {
+        remove_database_files(canonical_db_path).with_context(|| {
+            format!(
+                "removing canonical database before promoting staged historical seed import: {}",
+                canonical_db_path.display()
+            )
+        })?;
+    }
+    move_database_bundle(&staged_seed_db, canonical_db_path).with_context(|| {
+        format!(
+            "promoting staged historical seed database bundle {} into canonical path {}",
+            staged_seed_db.display(),
+            canonical_db_path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+pub(crate) fn seed_canonical_from_best_historical_bundle(
+    canonical_db_path: &Path,
+) -> Result<Option<HistoricalSalvageOutcome>> {
+    let ordered_bundles = discover_historical_database_bundles(canonical_db_path);
+    let mut last_seed_error: Option<anyhow::Error> = None;
+    for bundle in ordered_bundles
+        .into_iter()
+        .filter(|bundle| bundle.supports_direct_readonly)
+    {
+        let source = open_historical_bundle_for_salvage(&bundle).with_context(|| {
+            format!(
+                "opening historical seed bundle {} for baseline import",
+                bundle.root_path.display()
+            )
+        })?;
+        let (conversations_imported, messages_imported) = historical_bundle_counts(&source.conn)?;
+
+        if let Err(err) =
+            seed_canonical_from_historical_bundle_via_bulk_copy(canonical_db_path, &bundle)
+        {
+            tracing::warn!(
+                path = %bundle.root_path.display(),
+                error = %err,
+                "bulk baseline seed import from historical bundle failed; trying next candidate"
+            );
+            last_seed_error = Some(err);
+            continue;
+        }
+
+        if let Err(err) = finalize_seeded_canonical_bundle_via_rusqlite(
+            canonical_db_path,
+            &bundle,
+            conversations_imported,
+            messages_imported,
+        ) {
+            tracing::warn!(
+                path = %bundle.root_path.display(),
+                error = %err,
+                "finalizing bulk baseline seed import from historical bundle failed; trying next candidate"
+            );
+            last_seed_error = Some(err);
+            continue;
+        }
+
+        tracing::info!(
+            path = %bundle.root_path.display(),
+            conversations_imported,
+            messages_imported,
+            "seeded empty canonical database from largest healthy historical bundle"
+        );
+
+        return Ok(Some(HistoricalSalvageOutcome {
+            bundles_considered: 0,
+            bundles_imported: 1,
+            conversations_imported,
+            messages_imported,
+        }));
+    }
+    if let Some(err) = last_seed_error {
+        return Err(err);
+    }
+    Ok(None)
+}
+
+fn parse_json_column(value: Option<String>) -> serde_json::Value {
+    value
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+const HISTORICAL_RAW_JSON_SENTINEL_KEY: &str = "__cass_historical_raw_json__";
+
+fn wrap_historical_raw_json(raw: String) -> serde_json::Value {
+    serde_json::json!({ HISTORICAL_RAW_JSON_SENTINEL_KEY: raw })
+}
+
+fn historical_raw_json(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::Object(map) if map.len() == 1 => map
+            .get(HISTORICAL_RAW_JSON_SENTINEL_KEY)
+            .and_then(serde_json::Value::as_str),
+        _ => None,
+    }
+}
+
+fn parse_historical_json_column(value: Option<String>) -> serde_json::Value {
+    match value {
+        Some(raw) if raw.trim().is_empty() => serde_json::Value::Null,
+        Some(raw) => wrap_historical_raw_json(raw),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn historical_salvage_debug_enabled() -> bool {
+    std::env::var_os("CASS_DEBUG_HISTORICAL_SALVAGE").is_some()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HistoricalImportBatchLimits {
+    conversations: usize,
+    messages: usize,
+    payload_chars: usize,
+}
+
+fn env_positive_usize(key: &str) -> Option<usize> {
+    dotenvy::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn historical_import_batch_limits() -> HistoricalImportBatchLimits {
+    let cpu_count = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+
+    let default_limits = if cpu_count >= 32 {
+        HistoricalImportBatchLimits {
+            conversations: 128,
+            messages: 16_384,
+            payload_chars: 12_000_000,
+        }
+    } else {
+        HistoricalImportBatchLimits {
+            conversations: 32,
+            messages: 4_096,
+            payload_chars: 3_000_000,
+        }
+    };
+
+    HistoricalImportBatchLimits {
+        conversations: env_positive_usize("CASS_HISTORICAL_IMPORT_BATCH_CONVERSATIONS")
+            .unwrap_or(default_limits.conversations),
+        messages: env_positive_usize("CASS_HISTORICAL_IMPORT_BATCH_MESSAGES")
+            .unwrap_or(default_limits.messages),
+        payload_chars: env_positive_usize("CASS_HISTORICAL_IMPORT_BATCH_CHARS")
+            .unwrap_or(default_limits.payload_chars),
+    }
+}
+
+fn json_value_size_hint(value: &serde_json::Value) -> usize {
+    if let Some(raw) = historical_raw_json(value) {
+        return raw.len();
+    }
+    match value {
+        serde_json::Value::Null => 0,
+        other => serde_json::to_string(other)
+            .map(|raw| raw.len())
+            .unwrap_or(0),
+    }
+}
+
+fn message_payload_size_hint(message: &Message) -> usize {
+    message
+        .content
+        .len()
+        .saturating_add(json_value_size_hint(&message.extra_json))
+}
+
+fn is_backup_root_name(name: &str, prefix: &str) -> bool {
+    name.starts_with(prefix) && !name.ends_with("-wal") && !name.ends_with("-shm")
+}
+
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 13;
+pub const CURRENT_SCHEMA_VERSION: i64 = 14;
 
 /// Result of checking schema compatibility.
 #[derive(Debug, Clone)]
@@ -388,70 +2055,117 @@ pub enum SchemaCheck {
     NeedsRebuild(String),
 }
 
+fn schema_check_error_requires_rebuild(err: &frankensqlite::FrankenError) -> bool {
+    // Only on-disk corruption classes justify destructive rebuild.
+    // Locking, open, and generic I/O failures are often transient and must
+    // surface as errors rather than deleting the database under the caller.
+    matches!(
+        err,
+        frankensqlite::FrankenError::DatabaseCorrupt { .. }
+            | frankensqlite::FrankenError::WalCorrupt { .. }
+            | frankensqlite::FrankenError::NotADatabase { .. }
+            | frankensqlite::FrankenError::ShortRead { .. }
+    )
+}
+
+fn unique_backup_path(path: &Path) -> PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("db");
+
+    path.with_file_name(format!(
+        "{file_name}.backup.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
+}
+
 /// Check schema compatibility without modifying the database.
 ///
 /// Opens the database read-only and checks the schema version.
-fn check_schema_compatibility(path: &Path) -> std::result::Result<SchemaCheck, rusqlite::Error> {
-    let conn = Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+fn check_schema_compatibility(
+    path: &Path,
+) -> std::result::Result<SchemaCheck, frankensqlite::FrankenError> {
+    let mut conn = open_franken_with_flags(
+        &path.to_string_lossy(),
+        FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
 
-    // Check if meta table exists
-    let meta_exists: i32 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
-        [],
-        |row| row.get(0),
-    )?;
-
-    if meta_exists == 0 {
-        // No meta table - could be empty or very old schema, needs rebuild
-        // But first check if there are any tables at all
-        let table_count: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
-            [],
-            |row| row.get(0),
+    let result = (|| {
+        // Check if meta table exists
+        let meta_exists: i32 = conn.query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
+            fparams![],
+            |row| row.get_typed(0),
         )?;
 
-        if table_count == 0 {
-            // Empty database, will be initialized fresh
-            return Ok(SchemaCheck::NeedsMigration);
+        if meta_exists == 0 {
+            // No meta table - could be empty or very old schema, needs rebuild
+            // But first check if there are any tables at all
+            let table_count: i32 = conn.query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+
+            if table_count == 0 {
+                // Empty database, will be initialized fresh
+                return Ok(SchemaCheck::NeedsMigration);
+            }
+
+            // Has tables but no meta - very old or corrupted
+            return Ok(SchemaCheck::NeedsRebuild(
+                "Database missing schema version metadata".to_string(),
+            ));
         }
 
-        // Has tables but no meta - very old or corrupted
-        return Ok(SchemaCheck::NeedsRebuild(
-            "Database missing schema version metadata".to_string(),
-        ));
-    }
+        // Get the schema version
+        let version: Option<i64> = conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                fparams![],
+                |row| Ok(row.get_typed::<String>(0)?.parse().ok()),
+            )
+            .ok()
+            .flatten();
 
-    // Get the schema version
-    let version: Option<i64> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get::<_, String>(0).map(|s| s.parse().ok()),
-        )
-        .ok()
-        .flatten();
-
-    match version {
-        Some(v) if v == SCHEMA_VERSION => Ok(SchemaCheck::Compatible),
-        Some(v) if v < SCHEMA_VERSION => Ok(SchemaCheck::NeedsMigration),
-        Some(v) => {
-            // v > SCHEMA_VERSION - database is from a newer version
-            Ok(SchemaCheck::NeedsRebuild(format!(
-                "Schema version {} is newer than supported version {}",
-                v, SCHEMA_VERSION
-            )))
+        match version {
+            Some(v) if v == SCHEMA_VERSION => Ok(SchemaCheck::Compatible),
+            Some(v) if v < SCHEMA_VERSION => Ok(SchemaCheck::NeedsMigration),
+            Some(v) => {
+                // v > SCHEMA_VERSION - database is from a newer version
+                Ok(SchemaCheck::NeedsRebuild(format!(
+                    "Schema version {} is newer than supported version {}",
+                    v, SCHEMA_VERSION
+                )))
+            }
+            None => Ok(SchemaCheck::NeedsRebuild(
+                "Schema version not found or invalid".to_string(),
+            )),
         }
-        None => Ok(SchemaCheck::NeedsRebuild(
-            "Schema version not found or invalid".to_string(),
-        )),
+    })();
+
+    if let Err(close_err) = conn.close_in_place() {
+        tracing::warn!(
+            error = %close_err,
+            db_path = %path.display(),
+            "check_schema_compatibility: close_in_place failed; falling back to best-effort close"
+        );
+        conn.close_best_effort_in_place();
     }
+
+    result
 }
 
 const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
 
+#[cfg(test)]
 const MIGRATION_V1: &str = r"
 PRAGMA foreign_keys = ON;
 
@@ -533,6 +2247,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_created
     ON messages(created_at);
 ";
 
+#[cfg(test)]
 const MIGRATION_V2: &str = r"
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
     content,
@@ -559,6 +2274,7 @@ JOIN agents a ON c.agent_id = a.id
 LEFT JOIN workspaces w ON c.workspace_id = w.id;
 ";
 
+#[cfg(test)]
 const MIGRATION_V3: &str = r"
 DROP TABLE IF EXISTS fts_messages;
 CREATE VIRTUAL TABLE fts_messages USING fts5(
@@ -586,6 +2302,7 @@ JOIN agents a ON c.agent_id = a.id
 LEFT JOIN workspaces w ON c.workspace_id = w.id;
 ";
 
+#[cfg(test)]
 const MIGRATION_V4: &str = r"
 -- Sources table for tracking where conversations come from
 CREATE TABLE IF NOT EXISTS sources (
@@ -604,6 +2321,7 @@ INSERT OR IGNORE INTO sources (id, kind, host_label, created_at, updated_at)
 VALUES ('local', 'local', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000);
 ";
 
+#[cfg(test)]
 const MIGRATION_V5: &str = r"
 -- Add provenance columns to conversations table
 -- SQLite cannot alter unique constraints, so we need to recreate the table
@@ -641,11 +2359,13 @@ CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agen
 CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
 ";
 
+#[cfg(test)]
 const MIGRATION_V6: &str = r"
 -- Optimize lookup by source_path (used by TUI detail view)
 CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
 ";
 
+#[cfg(test)]
 const MIGRATION_V7: &str = r"
 -- Add binary columns for MessagePack serialization (Opt 3.1)
 -- Binary format is 50-70% smaller than JSON and faster to parse
@@ -653,6 +2373,7 @@ ALTER TABLE conversations ADD COLUMN metadata_bin BLOB;
 ALTER TABLE messages ADD COLUMN extra_bin BLOB;
 ";
 
+#[cfg(test)]
 const MIGRATION_V8: &str = r"
 -- Opt 3.2: Daily stats materialized table for O(1) time-range histograms
 -- Provides fast aggregated queries for stats/dashboard without full table scans
@@ -672,6 +2393,7 @@ CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_
 CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
 ";
 
+#[cfg(test)]
 const MIGRATION_V9: &str = r"
 -- Background embedding jobs tracking table
 CREATE TABLE IF NOT EXISTS embedding_jobs (
@@ -694,6 +2416,7 @@ ON embedding_jobs(db_path, model_id)
 WHERE status IN ('pending', 'running');
 ";
 
+#[cfg(test)]
 const MIGRATION_V10: &str = r"
 -- Token analytics: per-message token usage ledger
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -817,190 +2540,35 @@ ALTER TABLE conversations ADD COLUMN user_message_count INTEGER;
 ALTER TABLE conversations ADD COLUMN assistant_message_count INTEGER;
 ";
 
-const MIGRATION_V11: &str = r"
--- Analytics fact table: one row per message with pre-extracted metrics.
--- Designed for fast analytical queries without touching message content.
--- Buckets use message created_at (not conversation started_at).
-CREATE TABLE IF NOT EXISTS message_metrics (
-    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
-    created_at_ms INTEGER NOT NULL,
-    hour_id INTEGER NOT NULL,          -- hours since 2020-01-01 00:00 UTC
-    day_id INTEGER NOT NULL,           -- days since 2020-01-01 (matches daily_stats)
-
-    -- Dimensions
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,  -- 0 = unknown
-    source_id TEXT NOT NULL DEFAULT 'local',
-    role TEXT NOT NULL,                -- user/assistant/tool/system/other
-
-    -- Content-size metrics (always available, every message)
-    content_chars INTEGER NOT NULL,
-    content_tokens_est INTEGER NOT NULL,  -- chars/4 deterministic estimate
-
-    -- API usage metrics (nullable — only agents with provider data)
-    api_input_tokens INTEGER,
-    api_output_tokens INTEGER,
-    api_cache_read_tokens INTEGER,
-    api_cache_creation_tokens INTEGER,
-    api_thinking_tokens INTEGER,
-    api_service_tier TEXT,
-    api_data_source TEXT NOT NULL DEFAULT 'estimated',  -- 'api' or 'estimated'
-
-    -- Tool / plan flags
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    has_tool_calls INTEGER NOT NULL DEFAULT 0,  -- 0/1
-    has_plan INTEGER NOT NULL DEFAULT 0         -- 0/1 (cheap heuristic)
+const MIGRATION_V14: &str = r"
+-- Switch FTS5 from internal-content to contentless mode.
+-- Internal-content mode duplicated all indexed columns in shadow tables,
+-- causing ~45% DB bloat. Contentless mode (content='') stores only the
+-- inverted index, and queries JOIN back to source tables for column data.
+DROP TABLE IF EXISTS fts_messages;
+CREATE VIRTUAL TABLE fts_messages USING fts5(
+    content,
+    title,
+    agent,
+    workspace,
+    source_path,
+    created_at UNINDEXED,
+    content='',
+    tokenize='porter'
 );
-
-CREATE INDEX IF NOT EXISTS idx_mm_hour ON message_metrics(hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_day ON message_metrics(day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_agent_hour ON message_metrics(agent_slug, hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_agent_day ON message_metrics(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_workspace_hour ON message_metrics(workspace_id, hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_source_hour ON message_metrics(source_id, hour_id);
-
--- Hourly rollup table: fast time-series queries at hour granularity.
--- Keyed by (hour_id, agent_slug, workspace_id, source_id).
-CREATE TABLE IF NOT EXISTS usage_hourly (
-    hour_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-
-    -- Counts
-    message_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    plan_message_count INTEGER NOT NULL DEFAULT 0,
-    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,  -- messages with api_data_source='api'
-
-    -- Content-estimated tokens
-    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
-
-    -- API tokens
-    api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
-
-    last_updated INTEGER NOT NULL DEFAULT 0,
-
-    PRIMARY KEY (hour_id, agent_slug, workspace_id, source_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_uh_agent ON usage_hourly(agent_slug, hour_id);
-CREATE INDEX IF NOT EXISTS idx_uh_workspace ON usage_hourly(workspace_id, hour_id);
-CREATE INDEX IF NOT EXISTS idx_uh_source ON usage_hourly(source_id, hour_id);
-
--- Daily rollup table: same schema as hourly, keyed by day_id.
--- Avoids summing 24 hourly rows for daily queries.
-CREATE TABLE IF NOT EXISTS usage_daily (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-
-    -- Counts
-    message_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    plan_message_count INTEGER NOT NULL DEFAULT 0,
-    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
-
-    -- Content-estimated tokens
-    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
-
-    -- API tokens
-    api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
-
-    last_updated INTEGER NOT NULL DEFAULT 0,
-
-    PRIMARY KEY (day_id, agent_slug, workspace_id, source_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_ud_agent ON usage_daily(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_ud_workspace ON usage_daily(workspace_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_ud_source ON usage_daily(source_id, day_id);
-";
-
-const MIGRATION_V12: &str = r"
--- Add model dimensions to message_metrics for model-aware Track A analytics.
-ALTER TABLE message_metrics ADD COLUMN model_name TEXT;
-ALTER TABLE message_metrics ADD COLUMN model_family TEXT NOT NULL DEFAULT 'unknown';
-ALTER TABLE message_metrics ADD COLUMN model_tier TEXT NOT NULL DEFAULT 'unknown';
-ALTER TABLE message_metrics ADD COLUMN provider TEXT NOT NULL DEFAULT 'unknown';
-
-CREATE INDEX IF NOT EXISTS idx_mm_model_family_day ON message_metrics(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_provider_day ON message_metrics(provider, day_id);
-
--- Daily model rollups for fast model-oriented analytics queries.
-CREATE TABLE IF NOT EXISTS usage_models_daily (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-    model_family TEXT NOT NULL DEFAULT 'unknown',
-    model_tier TEXT NOT NULL DEFAULT 'unknown',
-
-    -- Counts
-    message_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    plan_message_count INTEGER NOT NULL DEFAULT 0,
-    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
-
-    -- Content-estimated tokens
-    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
-
-    -- API tokens
-    api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
-
-    last_updated INTEGER NOT NULL DEFAULT 0,
-
-    PRIMARY KEY (
-        day_id,
-        agent_slug,
-        workspace_id,
-        source_id,
-        model_family,
-        model_tier
-    )
-);
-
-CREATE INDEX IF NOT EXISTS idx_umd_model_day ON usage_models_daily(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_agent_day ON usage_models_daily(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_workspace_day ON usage_models_daily(workspace_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, day_id);
-";
-
-const MIGRATION_V13: &str = r"
--- Add plan-attributed token rollups to usage tables.
-ALTER TABLE usage_hourly ADD COLUMN plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE usage_hourly ADD COLUMN plan_api_tokens_total INTEGER NOT NULL DEFAULT 0;
-
-ALTER TABLE usage_daily ADD COLUMN plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE usage_daily ADD COLUMN plan_api_tokens_total INTEGER NOT NULL DEFAULT 0;
+INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+SELECT
+    m.id,
+    m.content,
+    c.title,
+    a.slug,
+    w.path,
+    c.source_path,
+    m.created_at
+FROM messages m
+JOIN conversations c ON m.conversation_id = c.id
+JOIN agents a ON c.agent_id = a.id
+LEFT JOIN workspaces w ON c.workspace_id = w.id;
 ";
 
 /// Row from the embedding_jobs table.
@@ -1018,14 +2586,30 @@ pub struct EmbeddingJobRow {
     pub completed_at: Option<String>,
 }
 
-pub struct SqliteStorage {
-    conn: Connection,
+/// Lightweight conversation projection used while rebuilding the lexical index.
+///
+/// This intentionally omits `metadata_json` / `metadata_bin` and other bulky
+/// fields because Tantivy only needs the stable envelope plus provenance
+/// identifiers. Reading full metadata here can force frankensqlite to traverse
+/// large overflow chains before the first lexical checkpoint is committed.
+#[derive(Debug, Clone)]
+pub struct LexicalRebuildConversationRow {
+    pub id: Option<i64>,
+    pub agent_slug: String,
+    pub workspace: Option<PathBuf>,
+    pub external_id: Option<String>,
+    pub title: Option<String>,
+    pub source_path: PathBuf,
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub source_id: String,
+    pub origin_host: Option<String>,
 }
 
-/// Migration foundation for the future frankensqlite-backed storage backend.
-///
-/// This intentionally coexists with `SqliteStorage` during the staged migration.
-/// Full CRUD parity is tracked in follow-on beads.
+/// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
+pub type SqliteStorage = FrankenStorage;
+
+/// Primary frankensqlite-backed storage backend.
 pub struct FrankenStorage {
     conn: FrankenConnection,
 }
@@ -1036,9 +2620,13 @@ impl FrankenStorage {
     /// Migrations run before PRAGMAs to avoid page lock contention in
     /// frankensqlite's WAL mode on file-based databases.
     pub fn open(path: &Path) -> Result<Self> {
+        let db_existed = path.exists();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating db directory {}", parent.display()))?;
+        }
+        if db_existed {
+            fast_forward_schema_v13_fts_via_rusqlite(path)?;
         }
 
         let path_str = path.to_string_lossy().to_string();
@@ -1046,6 +2634,35 @@ impl FrankenStorage {
             .with_context(|| format!("opening frankensqlite db at {}", path.display()))?;
         let storage = Self { conn };
         storage.run_migrations()?;
+        storage.repair_missing_current_schema_objects()?;
+        if !db_existed {
+            storage.close().with_context(|| {
+                format!(
+                    "closing freshly migrated frankensqlite db before FTS bootstrap: {}",
+                    path.display()
+                )
+            })?;
+            materialize_fresh_fts_schema_via_rusqlite(path)?;
+            let conn = FrankenConnection::open(&path_str)
+                .with_context(|| format!("reopening frankensqlite db at {}", path.display()))?;
+            let storage = Self { conn };
+            storage.apply_config()?;
+            return Ok(storage);
+        }
+        storage.apply_config()?;
+        Ok(storage)
+    }
+
+    /// Open a writer connection that skips migration (assumes DB already migrated).
+    ///
+    /// Used by the BEGIN CONCURRENT parallel writer pool: each writer needs its
+    /// own connection with config applied, but migrations have already been run
+    /// by the primary connection.
+    pub fn open_writer(path: &Path) -> Result<Self> {
+        let path_str = path.to_string_lossy().to_string();
+        let conn = FrankenConnection::open(&path_str)
+            .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
+        let storage = Self { conn };
         storage.apply_config()?;
         Ok(storage)
     }
@@ -1056,12 +2673,35 @@ impl FrankenStorage {
     /// not enforce strict read-only behavior yet; this constructor still provides
     /// the migration-compatible call site.
     pub fn open_readonly(path: &Path) -> Result<Self> {
+        let preflight = Self::open(path).with_context(|| {
+            format!(
+                "preflighting frankensqlite readonly open at {}",
+                path.display()
+            )
+        })?;
+        preflight.close().with_context(|| {
+            format!(
+                "closing frankensqlite preflight connection before readonly reopen at {}",
+                path.display()
+            )
+        })?;
+
         let path_str = path.to_string_lossy().to_string();
         let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening frankensqlite db readonly at {}", path.display()))?;
         let storage = Self { conn };
-        storage.apply_config()?;
+        storage.apply_readonly_config()?;
         Ok(storage)
+    }
+
+    pub fn close(self) -> Result<()> {
+        self.conn
+            .close()
+            .with_context(|| "closing frankensqlite connection")
+    }
+
+    pub fn close_best_effort_in_place(&mut self) {
+        self.conn.close_best_effort_in_place();
     }
 
     /// Access the raw frankensqlite connection.
@@ -1080,7 +2720,7 @@ impl FrankenStorage {
     pub fn apply_config(&self) -> Result<()> {
         // journal_mode: frankensqlite defaults to WAL, same as cass.
         // synchronous: frankensqlite defaults to NORMAL, same as cass.
-        // Both are set explicitly for clarity and to match rusqlite behavior.
+        // Both are set explicitly for clarity.
         self.conn
             .execute("PRAGMA journal_mode = WAL;")
             .with_context(|| "setting journal_mode")?;
@@ -1111,7 +2751,27 @@ impl FrankenStorage {
         // wal_autocheckpoint: frankensqlite manages WAL internally, but the
         // PRAGMA is accepted for compatibility.
         let _ = self.conn.execute("PRAGMA wal_autocheckpoint = 1000;");
+        // Explicitly enable concurrent writer mode for BEGIN/transaction paths.
+        // Try both namespace variants for compatibility across fsqlite builds.
+        let _ = self.conn.execute("PRAGMA fsqlite.concurrent_mode = ON;");
+        let _ = self.conn.execute("PRAGMA concurrent_mode = ON;");
 
+        Ok(())
+    }
+
+    fn apply_readonly_config(&self) -> Result<()> {
+        self.conn
+            .execute("PRAGMA query_only = 1;")
+            .with_context(|| "setting query_only")?;
+        self.conn
+            .execute("PRAGMA busy_timeout = 5000;")
+            .with_context(|| "setting busy_timeout")?;
+        self.conn
+            .execute("PRAGMA cache_size = -65536;")
+            .with_context(|| "setting cache_size")?;
+        self.conn
+            .execute("PRAGMA foreign_keys = ON;")
+            .with_context(|| "setting foreign_keys")?;
         Ok(())
     }
 
@@ -1156,6 +2816,39 @@ impl FrankenStorage {
         Ok(())
     }
 
+    /// Some historical canonical rebuild paths produced databases whose
+    /// version markers claim the current schema while post-V10 analytics
+    /// tables were never materialized. Detect that drift and backfill the
+    /// idempotent table/index set from the combined schema migration.
+    fn repair_missing_current_schema_objects(&self) -> Result<()> {
+        let mut missing_tables = Vec::new();
+        for &(table_name, probe_sql) in REQUIRED_CURRENT_SCHEMA_TABLE_PROBES {
+            if let Err(err) = self.conn.query(probe_sql) {
+                if error_indicates_missing_table(&err) {
+                    missing_tables.push(table_name);
+                    continue;
+                }
+                return Err(err).with_context(|| {
+                    format!("probing required schema table {table_name} for completeness")
+                });
+            }
+        }
+
+        if missing_tables.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            missing_tables = ?missing_tables,
+            "repairing missing current-schema tables on an already-versioned cass database"
+        );
+
+        self.conn
+            .execute_batch(MIGRATION_FRESH_SCHEMA)
+            .with_context(|| "repairing missing current-schema tables")?;
+        Ok(())
+    }
+
     /// Return the current schema version from `_schema_migrations`.
     pub fn schema_version(&self) -> Result<i64> {
         let rows = self
@@ -1163,10 +2856,10 @@ impl FrankenStorage {
             .query("SELECT MAX(version) FROM _schema_migrations;")
             .with_context(|| "reading schema version from _schema_migrations")?;
 
-        if let Some(row) = rows.first() {
-            if let Ok(v) = row.get_typed::<Option<i64>>(0) {
-                return Ok(v.unwrap_or(0));
-            }
+        if let Some(row) = rows.first()
+            && let Ok(v) = row.get_typed::<Option<i64>>(0)
+        {
+            return Ok(v.unwrap_or(0));
         }
         Ok(0)
     }
@@ -1175,22 +2868,81 @@ impl FrankenStorage {
     fn sync_meta_schema_version(&self, version: i64) -> Result<()> {
         // The meta table is created by V1 migration. If it doesn't exist yet,
         // there's nothing to sync.
-        let rows = self
-            .conn
-            .query("SELECT name FROM sqlite_master WHERE type='table' AND name='meta';")
-            .with_context(|| "checking for meta table")?;
-        if rows.is_empty() {
+        if self.conn.query("SELECT key FROM meta LIMIT 1;").is_err() {
             return Ok(());
         }
 
+        // Only write if the version needs updating to avoid write lock contention
+        if let Ok(rows) = self
+            .conn
+            .query("SELECT value FROM meta WHERE key = 'schema_version';")
+            && let Some(row) = rows.first()
+            && let Ok(val) = row.get_typed::<String>(0)
+            && val == version.to_string()
+        {
+            return Ok(()); // Already up to date
+        }
+
         self.conn
-            .execute_params(
+            .execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1);",
                 &[ParamValue::from(version.to_string())],
             )
             .with_context(|| "syncing meta schema_version")?;
 
         Ok(())
+    }
+
+    /// Resolve the database file path for this connection.
+    pub fn database_path(&self) -> Result<PathBuf> {
+        let rows = self.conn.query("PRAGMA database_list;")?;
+        for row in &rows {
+            if let Ok(name) = row.get_typed::<String>(1)
+                && name == "main"
+            {
+                let file_path: String = row.get_typed(2)?;
+                return Ok(PathBuf::from(file_path));
+            }
+        }
+        Err(anyhow!("could not resolve database file path"))
+    }
+
+    /// Open database with migration, backing up if schema is incompatible.
+    pub fn open_or_rebuild(path: &Path) -> std::result::Result<Self, MigrationError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        if path.exists() {
+            let check_result = check_schema_compatibility(path);
+            match check_result {
+                Ok(SchemaCheck::Compatible) | Ok(SchemaCheck::NeedsMigration) => {
+                    // Continue with normal open
+                }
+                Ok(SchemaCheck::NeedsRebuild(reason)) => {
+                    let backup_path = create_backup(path)?;
+                    cleanup_old_backups(path, MAX_BACKUPS)?;
+                    remove_database_files(path)?;
+                    return Err(MigrationError::RebuildRequired {
+                        reason,
+                        backup_path,
+                    });
+                }
+                Err(err) if schema_check_error_requires_rebuild(&err) => {
+                    let backup_path = create_backup(path)?;
+                    cleanup_old_backups(path, MAX_BACKUPS)?;
+                    remove_database_files(path)?;
+                    return Err(MigrationError::RebuildRequired {
+                        reason: format!("Database appears corrupted: {err}"),
+                        backup_path,
+                    });
+                }
+                Err(err) => return Err(MigrationError::Database(err)),
+            }
+        }
+
+        let storage = Self::open(path).map_err(|e| MigrationError::Other(e.to_string()))?;
+        Ok(storage)
     }
 }
 
@@ -1210,7 +2962,9 @@ impl FrankenStorage {
 /// the transition function backfills `_schema_migrations` and no further
 /// migrations are needed.
 fn build_cass_migrations() -> MigrationRunner {
-    MigrationRunner::new().add(13, "full_schema_v13", MIGRATION_FRESH_SCHEMA)
+    MigrationRunner::new()
+        .add(13, "full_schema_v13", MIGRATION_FRESH_SCHEMA)
+        .add(14, "fts_contentless", MIGRATION_V14)
 }
 
 /// Combined V13 schema for fresh databases.
@@ -1325,18 +3079,6 @@ CREATE TABLE IF NOT EXISTS conversation_tags (
     conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
     PRIMARY KEY (conversation_id, tag_id)
-);
-
--- Full-text search (V2/V3)
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
-    content,
-    title,
-    agent,
-    workspace,
-    source_path,
-    created_at UNINDEXED,
-    message_id UNINDEXED,
-    tokenize='porter'
 );
 
 -- Daily stats (V8)
@@ -1592,7 +3334,7 @@ CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, d
 ";
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 13] = [
+const MIGRATION_NAMES: [(i64, &str); 14] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -1606,6 +3348,7 @@ const MIGRATION_NAMES: [(i64, &str); 13] = [
     (11, "message_metrics"),
     (12, "model_dimensions"),
     (13, "plan_token_rollups"),
+    (14, "fts_contentless"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -1624,19 +3367,18 @@ const MIGRATION_NAMES: [(i64, &str); 13] = [
 ///   let `MigrationRunner` handle it
 /// - If `schema_version = 0` but tables exist → corrupted state, log warning
 fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
-    // Check if _schema_migrations already exists → already transitioned.
-    let rows = conn
-        .query("SELECT name FROM sqlite_master WHERE type='table' AND name='_schema_migrations';")
-        .with_context(|| "checking for _schema_migrations table")?;
-    if !rows.is_empty() {
+    // Avoid sqlite_master enumeration here. Databases with FTS virtual tables
+    // can trigger frankensqlite parse-recovery on sqlite_master reads, which is
+    // enough to break the transition on otherwise-healthy legacy cass DBs.
+    if conn
+        .query("SELECT version FROM \"_schema_migrations\";")
+        .is_ok()
+    {
         return Ok(());
     }
 
     // Check if the meta table exists.
-    let rows = conn
-        .query("SELECT name FROM sqlite_master WHERE type='table' AND name='meta';")
-        .with_context(|| "checking for meta table")?;
-    if rows.is_empty() {
+    if conn.query("SELECT key FROM meta;").is_err() {
         // No meta table → fresh database, let MigrationRunner handle it.
         return Ok(());
     }
@@ -1654,13 +3396,7 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
 
     if current_version == 0 {
         // Check if tables actually exist (corrupted state: tables present but version=0).
-        let rows = conn
-            .query(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations';",
-            )
-            .with_context(|| "checking for conversations table")?;
-
-        if rows.is_empty() {
+        if conn.query("SELECT id FROM conversations LIMIT 1;").is_err() {
             // Truly fresh DB (meta table exists but empty/reset). Let MigrationRunner handle it.
             return Ok(());
         }
@@ -1690,7 +3426,7 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
         if version > current_version {
             break;
         }
-        conn.execute_params(
+        conn.execute_compat(
             "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
             &[ParamValue::from(version), ParamValue::from(name)],
         )
@@ -1705,9 +3441,214 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
     Ok(())
 }
 
+const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
+    ("sources", "SELECT id FROM sources LIMIT 1;"),
+    ("daily_stats", "SELECT day_id FROM daily_stats LIMIT 1;"),
+    ("embedding_jobs", "SELECT id FROM embedding_jobs LIMIT 1;"),
+    ("token_usage", "SELECT id FROM token_usage LIMIT 1;"),
+    (
+        "token_daily_stats",
+        "SELECT day_id FROM token_daily_stats LIMIT 1;",
+    ),
+    (
+        "model_pricing",
+        "SELECT model_pattern FROM model_pricing LIMIT 1;",
+    ),
+    (
+        "message_metrics",
+        "SELECT message_id FROM message_metrics LIMIT 1;",
+    ),
+    ("usage_hourly", "SELECT hour_id FROM usage_hourly LIMIT 1;"),
+    ("usage_daily", "SELECT day_id FROM usage_daily LIMIT 1;"),
+    (
+        "usage_models_daily",
+        "SELECT day_id FROM usage_models_daily LIMIT 1;",
+    ),
+];
+
+fn error_indicates_missing_table(err: &impl std::fmt::Display) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("no such table")
+}
+
 pub struct InsertOutcome {
     pub conversation_id: i64,
     pub inserted_indices: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PendingConversationKey {
+    External {
+        source_id: String,
+        agent_id: i64,
+        external_id: String,
+    },
+    SourcePath {
+        source_id: String,
+        agent_id: i64,
+        source_path: String,
+        started_at: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MessageMergeFingerprint {
+    idx: i64,
+    created_at: Option<i64>,
+    role: String,
+    author: Option<String>,
+    content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MessageReplayFingerprint {
+    created_at: Option<i64>,
+    role: String,
+    author: Option<String>,
+    content_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConversationMergeEvidence {
+    exact_overlap: usize,
+    replay_overlap: usize,
+    smaller_replay_set: usize,
+    started_close: bool,
+    start_distance_ms: i64,
+}
+
+fn conversation_effective_started_at(conv: &Conversation) -> Option<i64> {
+    conv.started_at
+        .or_else(|| conv.messages.iter().filter_map(|msg| msg.created_at).min())
+}
+
+fn message_merge_fingerprint(msg: &Message) -> MessageMergeFingerprint {
+    MessageMergeFingerprint {
+        idx: msg.idx,
+        created_at: msg.created_at,
+        role: role_str(&msg.role).to_string(),
+        author: msg.author.clone(),
+        content_hash: blake3::hash(msg.content.as_bytes()).to_hex().to_string(),
+    }
+}
+
+fn message_replay_fingerprint(msg: &Message) -> MessageReplayFingerprint {
+    MessageReplayFingerprint {
+        created_at: msg.created_at,
+        role: role_str(&msg.role).to_string(),
+        author: msg.author.clone(),
+        content_hash: blake3::hash(msg.content.as_bytes()).to_hex().to_string(),
+    }
+}
+
+fn conversation_message_fingerprints(conv: &Conversation) -> HashSet<MessageMergeFingerprint> {
+    conv.messages
+        .iter()
+        .map(message_merge_fingerprint)
+        .collect()
+}
+
+fn conversation_message_replay_fingerprints(
+    conv: &Conversation,
+) -> HashSet<MessageReplayFingerprint> {
+    conv.messages
+        .iter()
+        .map(message_replay_fingerprint)
+        .collect()
+}
+
+fn replay_fingerprint_from_merge(
+    fingerprint: &MessageMergeFingerprint,
+) -> MessageReplayFingerprint {
+    MessageReplayFingerprint {
+        created_at: fingerprint.created_at,
+        role: fingerprint.role.clone(),
+        author: fingerprint.author.clone(),
+        content_hash: fingerprint.content_hash.clone(),
+    }
+}
+
+fn replay_fingerprints_from_merge_set(
+    fingerprints: &HashSet<MessageMergeFingerprint>,
+) -> HashSet<MessageReplayFingerprint> {
+    fingerprints
+        .iter()
+        .map(replay_fingerprint_from_merge)
+        .collect()
+}
+
+fn start_distance_ms(left: Option<i64>, right: Option<i64>) -> i64 {
+    match (left, right) {
+        (Some(left), Some(right)) => (i128::from(left) - i128::from(right))
+            .abs()
+            .try_into()
+            .unwrap_or(i64::MAX),
+        _ => i64::MAX,
+    }
+}
+
+fn conversation_merge_evidence(
+    incoming_exact: &HashSet<MessageMergeFingerprint>,
+    incoming_replay: &HashSet<MessageReplayFingerprint>,
+    existing_exact: &HashSet<MessageMergeFingerprint>,
+    existing_replay: &HashSet<MessageReplayFingerprint>,
+    incoming_started_at: Option<i64>,
+    existing_started_at: Option<i64>,
+) -> Option<ConversationMergeEvidence> {
+    let exact_overlap = incoming_exact.intersection(existing_exact).count();
+    let replay_overlap = incoming_replay.intersection(existing_replay).count();
+    if exact_overlap == 0 && replay_overlap == 0 {
+        return None;
+    }
+
+    let smaller_replay_set = incoming_replay.len().min(existing_replay.len());
+    let started_close = timestamps_within_tolerance(
+        incoming_started_at,
+        existing_started_at,
+        SOURCE_PATH_MERGE_START_TOLERANCE_MS,
+    );
+    let full_replay_subset_match = smaller_replay_set >= 2 && replay_overlap == smaller_replay_set;
+
+    let merge_allowed = if started_close {
+        exact_overlap >= 1 || replay_overlap >= 2
+    } else {
+        exact_overlap >= 2 || full_replay_subset_match
+    };
+
+    merge_allowed.then_some(ConversationMergeEvidence {
+        exact_overlap,
+        replay_overlap,
+        smaller_replay_set,
+        started_close,
+        start_distance_ms: start_distance_ms(incoming_started_at, existing_started_at),
+    })
+}
+
+fn timestamps_within_tolerance(left: Option<i64>, right: Option<i64>, tolerance_ms: i64) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            (i128::from(left) - i128::from(right)).abs() <= i128::from(tolerance_ms)
+        }
+        _ => false,
+    }
+}
+
+fn conversation_merge_key(agent_id: i64, conv: &Conversation) -> PendingConversationKey {
+    if let Some(external_id) = conv.external_id.clone() {
+        PendingConversationKey::External {
+            source_id: conv.source_id.clone(),
+            agent_id,
+            external_id,
+        }
+    } else {
+        PendingConversationKey::SourcePath {
+            source_id: conv.source_id.clone(),
+            agent_id,
+            source_path: path_to_string(&conv.source_path),
+            started_at: conversation_effective_started_at(conv),
+        }
+    }
 }
 
 /// Message data needed for semantic embedding generation.
@@ -1729,7 +3670,7 @@ impl FrankenStorage {
     /// Ensure an agent exists in the database, returning its ID.
     pub fn ensure_agent(&self, agent: &Agent) -> Result<i64> {
         let now = Self::now_millis();
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT INTO agents(slug, name, version, kind, created_at, updated_at) VALUES(?1,?2,?3,?4,?5,?6)
              ON CONFLICT(slug) DO UPDATE SET name=excluded.name, version=excluded.version, kind=excluded.kind, updated_at=excluded.updated_at",
             fparams![
@@ -1754,7 +3695,7 @@ impl FrankenStorage {
     /// Ensure a workspace exists in the database, returning its ID.
     pub fn ensure_workspace(&self, path: &Path, display_name: Option<&str>) -> Result<i64> {
         let path_str = path.to_string_lossy().to_string();
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT INTO workspaces(path, display_name) VALUES(?1,?2)
              ON CONFLICT(path) DO UPDATE SET display_name=COALESCE(excluded.display_name, workspaces.display_name)",
             fparams![path_str.as_str(), display_name],
@@ -1780,15 +3721,15 @@ impl FrankenStorage {
     /// Convert a millisecond timestamp to a day ID (days since 2020-01-01).
     pub fn day_id_from_millis(timestamp_ms: i64) -> i64 {
         const EPOCH_2020_SECS: i64 = 1_577_836_800;
-        let secs = timestamp_ms / 1000;
-        (secs - EPOCH_2020_SECS) / 86400
+        let secs = timestamp_ms.div_euclid(1000);
+        (secs - EPOCH_2020_SECS).div_euclid(86400)
     }
 
     /// Convert a millisecond timestamp to an hour ID (hours since 2020-01-01 00:00 UTC).
     pub fn hour_id_from_millis(timestamp_ms: i64) -> i64 {
         const EPOCH_2020_SECS: i64 = 1_577_836_800;
-        let secs = timestamp_ms / 1000;
-        (secs - EPOCH_2020_SECS) / 3600
+        let secs = timestamp_ms.div_euclid(1000);
+        (secs - EPOCH_2020_SECS).div_euclid(3600)
     }
 
     /// Convert a day ID back to milliseconds (start of day).
@@ -1819,7 +3760,7 @@ impl FrankenStorage {
 
     /// Set the timestamp of the last successful scan (milliseconds since epoch).
     pub fn set_last_scan_ts(&self, ts: i64) -> Result<()> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('last_scan_ts', ?1)",
             fparams![ts.to_string()],
         )?;
@@ -1828,7 +3769,7 @@ impl FrankenStorage {
 
     /// Set the timestamp of the last successful index completion (milliseconds since epoch).
     pub fn set_last_indexed_at(&self, ts: i64) -> Result<()> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('last_indexed_at', ?1)",
             fparams![ts.to_string()],
         )?;
@@ -1914,11 +3855,54 @@ impl FrankenStorage {
             .with_context(|| "listing conversations")
     }
 
+    /// List conversations in primary-key order for full lexical rebuilds.
+    ///
+    /// This avoids the user-facing recency sort, which forces SQLite to build a
+    /// temp B-tree on every page. Rebuilds only need a stable traversal order,
+    /// not reverse-chronological presentation.
+    pub fn list_conversations_for_lexical_rebuild(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<LexicalRebuildConversationRow>> {
+        self.conn
+            .query_map_collect(
+                r"SELECT c.id, a.slug, w.path, c.external_id, c.title, c.source_path,
+                       c.started_at, c.ended_at, c.source_id, c.origin_host
+                FROM conversations c
+                JOIN agents a ON c.agent_id = a.id
+                LEFT JOIN workspaces w ON c.workspace_id = w.id
+                ORDER BY c.id ASC
+                LIMIT ?1 OFFSET ?2",
+                fparams![limit, offset],
+                |row| {
+                    let workspace_path: Option<String> = row.get_typed(2)?;
+                    let source_path: String = row.get_typed(5)?;
+                    let source_id: Option<String> = row.get_typed(8)?;
+                    Ok(LexicalRebuildConversationRow {
+                        id: Some(row.get_typed(0)?),
+                        agent_slug: row.get_typed(1)?,
+                        workspace: workspace_path.map(|p| Path::new(&p).to_path_buf()),
+                        external_id: row.get_typed(3)?,
+                        title: row.get_typed(4)?,
+                        source_path: Path::new(&source_path).to_path_buf(),
+                        started_at: row.get_typed(6)?,
+                        ended_at: row.get_typed(7)?,
+                        source_id: source_id.unwrap_or_else(|| "local".to_string()),
+                        origin_host: row.get_typed(9)?,
+                    })
+                },
+            )
+            .with_context(|| "listing conversations for lexical rebuild")
+    }
+
     /// Fetch messages for a conversation.
     pub fn fetch_messages(&self, conversation_id: i64) -> Result<Vec<Message>> {
         self.conn
             .query_map_collect(
-                "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+                "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin \
+                 FROM messages \
+                 WHERE conversation_id = ?1 ORDER BY idx",
                 fparams![conversation_id],
                 |row| {
                     let role: String = row.get_typed(2)?;
@@ -1941,6 +3925,109 @@ impl FrankenStorage {
                 },
             )
             .with_context(|| format!("fetching messages for conversation {conversation_id}"))
+    }
+
+    /// Fetch messages for lexical index rebuilds without deserializing extra metadata.
+    ///
+    /// Tantivy only needs message text and core envelope fields, so avoiding
+    /// `extra_json` here prevents rebuilds from rehydrating enormous historical
+    /// payloads that are irrelevant to lexical search.
+    pub fn fetch_messages_for_lexical_rebuild(&self, conversation_id: i64) -> Result<Vec<Message>> {
+        self.conn
+            .query_map_collect(
+                "SELECT id, idx, role, author, created_at, content \
+                 FROM messages \
+                 WHERE conversation_id = ?1 ORDER BY idx",
+                fparams![conversation_id],
+                |row| {
+                    let role: String = row.get_typed(2)?;
+                    Ok(Message {
+                        id: Some(row.get_typed(0)?),
+                        idx: row.get_typed(1)?,
+                        role: match role.as_str() {
+                            "user" => MessageRole::User,
+                            "agent" | "assistant" => MessageRole::Agent,
+                            "tool" => MessageRole::Tool,
+                            "system" => MessageRole::System,
+                            other => MessageRole::Other(other.to_string()),
+                        },
+                        author: row.get_typed(3)?,
+                        created_at: row.get_typed(4)?,
+                        content: row.get_typed(5)?,
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    })
+                },
+            )
+            .with_context(|| {
+                format!("fetching messages for lexical rebuild of conversation {conversation_id}")
+            })
+    }
+
+    /// Fetch messages for multiple conversations during lexical rebuilds.
+    ///
+    /// This preserves the lightweight lexical-rebuild projection while avoiding
+    /// one round-trip per conversation when rebuilding large canonical indexes.
+    pub fn fetch_messages_for_lexical_rebuild_batch(
+        &self,
+        conversation_ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<Message>>> {
+        if conversation_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut sql = String::from(
+            "SELECT conversation_id, id, idx, role, author, created_at, content \
+             FROM messages \
+             WHERE conversation_id IN (",
+        );
+        let mut params: Vec<ParamValue> = Vec::with_capacity(conversation_ids.len());
+        for (idx, conversation_id) in conversation_ids.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("?{}", idx + 1));
+            params.push(ParamValue::from(*conversation_id));
+        }
+        sql.push_str(") ORDER BY conversation_id ASC, idx ASC");
+
+        let rows: Vec<(i64, Message)> = self
+            .conn
+            .query_map_collect(&sql, &params, |row| {
+                let role: String = row.get_typed(3)?;
+                Ok((
+                    row.get_typed(0)?,
+                    Message {
+                        id: Some(row.get_typed(1)?),
+                        idx: row.get_typed(2)?,
+                        role: match role.as_str() {
+                            "user" => MessageRole::User,
+                            "agent" | "assistant" => MessageRole::Agent,
+                            "tool" => MessageRole::Tool,
+                            "system" => MessageRole::System,
+                            other => MessageRole::Other(other.to_string()),
+                        },
+                        author: row.get_typed(4)?,
+                        created_at: row.get_typed(5)?,
+                        content: row.get_typed(6)?,
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                ))
+            })
+            .with_context(|| {
+                format!(
+                    "fetching lexical rebuild messages for {} conversations",
+                    conversation_ids.len()
+                )
+            })?;
+
+        let mut grouped: HashMap<i64, Vec<Message>> =
+            HashMap::with_capacity(conversation_ids.len());
+        for (conversation_id, message) in rows {
+            grouped.entry(conversation_id).or_default().push(message);
+        }
+        Ok(grouped)
     }
 
     /// Get a source by ID.
@@ -2011,7 +4098,7 @@ impl FrankenStorage {
             .map(serde_json::to_string)
             .transpose()?;
 
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "INSERT INTO sources(id, kind, host_label, machine_id, platform, config_json, created_at, updated_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(id) DO UPDATE SET
@@ -2035,15 +4122,773 @@ impl FrankenStorage {
         Ok(())
     }
 
+    fn historical_bundle_key_hash(
+        version: u32,
+        bundle: &HistoricalDatabaseBundle,
+        include_bundle_stats: bool,
+    ) -> String {
+        let signature = if include_bundle_stats {
+            format!(
+                "{}:{}:{}:{}",
+                version,
+                bundle.root_path.display(),
+                bundle.total_bytes,
+                bundle.modified_at_ms
+            )
+        } else {
+            format!("{}:{}", version, bundle.root_path.display())
+        };
+        blake3::hash(signature.as_bytes()).to_hex().to_string()
+    }
+
+    fn historical_bundle_meta_key(bundle: &HistoricalDatabaseBundle) -> String {
+        format!(
+            "historical_bundle_salvaged:{}",
+            Self::historical_bundle_key_hash(HISTORICAL_SALVAGE_LEDGER_VERSION, bundle, false)
+        )
+    }
+
+    fn historical_bundle_legacy_meta_key(bundle: &HistoricalDatabaseBundle) -> String {
+        let signature = format!(
+            "{}:{}:{}:{}",
+            HISTORICAL_SALVAGE_LEDGER_VERSION,
+            bundle.root_path.display(),
+            bundle.total_bytes,
+            bundle.modified_at_ms
+        );
+        format!(
+            "historical_bundle_salvaged:{}",
+            blake3::hash(signature.as_bytes()).to_hex()
+        )
+    }
+
+    fn historical_bundle_progress_key(bundle: &HistoricalDatabaseBundle) -> String {
+        format!(
+            "historical_bundle_progress:{}",
+            Self::historical_bundle_key_hash(HISTORICAL_SALVAGE_PROGRESS_VERSION, bundle, false)
+        )
+    }
+
+    fn historical_bundle_legacy_progress_key(bundle: &HistoricalDatabaseBundle) -> String {
+        let signature = format!(
+            "{}:{}:{}:{}",
+            HISTORICAL_SALVAGE_PROGRESS_VERSION,
+            bundle.root_path.display(),
+            bundle.total_bytes,
+            bundle.modified_at_ms
+        );
+        format!(
+            "historical_bundle_progress:{}",
+            blake3::hash(signature.as_bytes()).to_hex()
+        )
+    }
+
+    fn historical_bundle_already_imported(
+        &self,
+        bundle: &HistoricalDatabaseBundle,
+    ) -> Result<bool> {
+        for key in [
+            Self::historical_bundle_meta_key(bundle),
+            Self::historical_bundle_legacy_meta_key(bundle),
+        ] {
+            let existing: Option<String> = self
+                .conn
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams![key.as_str()],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+            if existing.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn has_pending_historical_bundles(&self, canonical_db_path: &Path) -> Result<bool> {
+        for bundle in discover_historical_database_bundles(canonical_db_path) {
+            if !self.historical_bundle_already_imported(&bundle)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn load_historical_bundle_progress(
+        &self,
+        bundle: &HistoricalDatabaseBundle,
+    ) -> Result<Option<HistoricalBundleProgress>> {
+        for key in [
+            Self::historical_bundle_progress_key(bundle),
+            Self::historical_bundle_legacy_progress_key(bundle),
+        ] {
+            let raw: Option<String> = self
+                .conn
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams![key.as_str()],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+            let Some(raw) = raw else {
+                continue;
+            };
+            let parsed: HistoricalBundleProgress =
+                serde_json::from_str(&raw).with_context(|| {
+                    format!(
+                        "parsing historical salvage progress checkpoint for {}",
+                        bundle.root_path.display()
+                    )
+                })?;
+            if parsed.progress_version == HISTORICAL_SALVAGE_PROGRESS_VERSION {
+                return Ok(Some(parsed));
+            }
+        }
+        Ok(None)
+    }
+
+    fn record_historical_bundle_progress(
+        &self,
+        bundle: &HistoricalDatabaseBundle,
+        method: &str,
+        last_completed_source_row_id: i64,
+        conversations_imported: usize,
+        messages_imported: usize,
+    ) -> Result<()> {
+        let key = Self::historical_bundle_progress_key(bundle);
+        let value = HistoricalBundleProgress {
+            progress_version: HISTORICAL_SALVAGE_PROGRESS_VERSION,
+            path: bundle.root_path.display().to_string(),
+            bytes: bundle.total_bytes,
+            modified_at_ms: bundle.modified_at_ms,
+            method: method.to_string(),
+            last_completed_source_row_id,
+            conversations_imported,
+            messages_imported,
+            updated_at_ms: Self::now_millis(),
+        };
+        let value_str = serde_json::to_string(&value)?;
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![key.as_str(), value_str.as_str()],
+        )?;
+        Ok(())
+    }
+
+    fn clear_historical_bundle_progress(&self, bundle: &HistoricalDatabaseBundle) -> Result<()> {
+        for key in [
+            Self::historical_bundle_progress_key(bundle),
+            Self::historical_bundle_legacy_progress_key(bundle),
+        ] {
+            self.conn
+                .execute_compat("DELETE FROM meta WHERE key = ?1", fparams![key.as_str()])?;
+        }
+        Ok(())
+    }
+
+    fn record_historical_bundle_import(
+        &self,
+        bundle: &HistoricalDatabaseBundle,
+        method: &str,
+        conversations_imported: usize,
+        messages_imported: usize,
+    ) -> Result<()> {
+        let key = Self::historical_bundle_meta_key(bundle);
+        let value = serde_json::json!({
+            "salvage_version": HISTORICAL_SALVAGE_LEDGER_VERSION,
+            "path": bundle.root_path.display().to_string(),
+            "bytes": bundle.total_bytes,
+            "modified_at_ms": bundle.modified_at_ms,
+            "method": method,
+            "conversations_imported": conversations_imported,
+            "messages_imported": messages_imported,
+            "recorded_at_ms": Self::now_millis(),
+        });
+        let value_str = serde_json::to_string(&value)?;
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![key.as_str(), value_str.as_str()],
+        )?;
+        Ok(())
+    }
+
+    fn historical_import_error_is_split_retryable(err: &anyhow::Error) -> bool {
+        const RETRYABLE_PATTERNS: &[&str] = &[
+            "out of memory",
+            "string or blob too big",
+            "too many sql variables",
+        ];
+        err.chain().any(|cause| {
+            let rendered = cause.to_string().to_ascii_lowercase();
+            RETRYABLE_PATTERNS
+                .iter()
+                .any(|pattern| rendered.contains(pattern))
+        })
+    }
+
+    fn split_historical_batch_entry_messages(
+        entry: &HistoricalBatchEntry,
+    ) -> Option<(HistoricalBatchEntry, HistoricalBatchEntry)> {
+        if entry.conversation.messages.len() < 2 {
+            return None;
+        }
+        let split_at = entry.conversation.messages.len() / 2;
+        if split_at == 0 || split_at >= entry.conversation.messages.len() {
+            return None;
+        }
+
+        let mut left = entry.clone();
+        left.conversation.messages = entry.conversation.messages[..split_at].to_vec();
+
+        let mut right = entry.clone();
+        right.conversation.messages = entry.conversation.messages[split_at..].to_vec();
+
+        Some((left, right))
+    }
+
+    fn import_historical_batch_with_retry<F>(
+        entries: &[HistoricalBatchEntry],
+        insert_batch: &mut F,
+    ) -> Result<HistoricalBatchImportTotals>
+    where
+        F: FnMut(&[HistoricalBatchEntry]) -> Result<HistoricalBatchImportTotals>,
+    {
+        match insert_batch(entries) {
+            Ok(totals) => Ok(totals),
+            Err(err) if Self::historical_import_error_is_split_retryable(&err) => {
+                if entries.len() > 1 {
+                    let mid = entries.len() / 2;
+                    tracing::warn!(
+                        batch_entries = entries.len(),
+                        split_left = mid,
+                        split_right = entries.len() - mid,
+                        error = %err,
+                        "historical salvage batch failed; retrying in smaller sub-batches"
+                    );
+                    let left =
+                        Self::import_historical_batch_with_retry(&entries[..mid], insert_batch)?;
+                    let right =
+                        Self::import_historical_batch_with_retry(&entries[mid..], insert_batch)?;
+                    return Ok(HistoricalBatchImportTotals {
+                        inserted_source_rows: left.inserted_source_rows
+                            + right.inserted_source_rows,
+                        inserted_messages: left.inserted_messages + right.inserted_messages,
+                    });
+                }
+
+                if let Some(entry) = entries.first() {
+                    if let Some((left, right)) = Self::split_historical_batch_entry_messages(entry)
+                    {
+                        tracing::warn!(
+                            source_row_id = entry.source_row_id,
+                            message_count = entry.conversation.messages.len(),
+                            error = %err,
+                            "historical salvage conversation failed; retrying in smaller message slices"
+                        );
+                        let left_totals = Self::import_historical_batch_with_retry(
+                            std::slice::from_ref(&left),
+                            insert_batch,
+                        )?;
+                        let right_totals = Self::import_historical_batch_with_retry(
+                            std::slice::from_ref(&right),
+                            insert_batch,
+                        )?;
+                        return Ok(HistoricalBatchImportTotals {
+                            inserted_source_rows: usize::from(
+                                left_totals.inserted_source_rows > 0
+                                    || right_totals.inserted_source_rows > 0,
+                            ),
+                            inserted_messages: left_totals
+                                .inserted_messages
+                                .saturating_add(right_totals.inserted_messages),
+                        });
+                    }
+                }
+
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn import_historical_sources(&self, source_conn: &rusqlite::Connection) -> Result<()> {
+        let mut stmt = match source_conn.prepare(
+            "SELECT id, kind, host_label, machine_id, platform, config_json, created_at, updated_at
+             FROM sources",
+        ) {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                tracing::warn!(error = %err, "historical sources table unavailable; skipping source import");
+                return Ok(());
+            }
+        };
+
+        let rows = stmt.query_map([], |row| {
+            let kind_str: String = row.get(1)?;
+            let config_json_raw: Option<String> = row.get(5)?;
+            Ok(Source {
+                id: row.get(0)?,
+                kind: SourceKind::parse(&kind_str).unwrap_or_default(),
+                host_label: row.get(2)?,
+                machine_id: row.get(3)?,
+                platform: row.get(4)?,
+                config_json: config_json_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })?;
+
+        for row in rows {
+            let source = row.context("reading historical source row")?;
+            self.upsert_source(&source)?;
+        }
+        Ok(())
+    }
+
+    fn import_historical_conversations(
+        &self,
+        bundle: &HistoricalDatabaseBundle,
+        salvage_method: &str,
+        source_conn: &rusqlite::Connection,
+    ) -> Result<(usize, usize)> {
+        let batch_limits = historical_import_batch_limits();
+        let cache_enabled = IndexingCache::is_enabled();
+        let mut indexing_cache = IndexingCache::new();
+        let mut known_sources: HashSet<String> = self
+            .list_sources()?
+            .into_iter()
+            .map(|source| source.id)
+            .collect();
+        let resume_progress = self.load_historical_bundle_progress(bundle)?;
+        let resume_after_row_id = resume_progress
+            .as_ref()
+            .map(|progress| progress.last_completed_source_row_id)
+            .filter(|row_id| *row_id > 0);
+
+        tracing::info!(
+            target: "cass::historical_salvage",
+            batch_conversations = batch_limits.conversations,
+            batch_messages = batch_limits.messages,
+            batch_payload_chars = batch_limits.payload_chars,
+            cache_enabled,
+            resume_after_row_id,
+            "configured historical salvage batch limits"
+        );
+
+        if let Some(progress) = &resume_progress {
+            tracing::info!(
+                target: "cass::historical_salvage",
+                path = %bundle.root_path.display(),
+                resume_after_row_id = progress.last_completed_source_row_id,
+                prior_conversations_imported = progress.conversations_imported,
+                prior_messages_imported = progress.messages_imported,
+                "resuming historical salvage bundle from durable checkpoint"
+            );
+        }
+
+        let conv_sql = if resume_after_row_id.is_some() {
+            "SELECT
+                c.id,
+                a.slug,
+                w.path,
+                c.external_id,
+                c.title,
+                c.source_path,
+                c.started_at,
+                c.ended_at,
+                c.approx_tokens,
+                c.metadata_json,
+                c.source_id,
+                c.origin_host
+             FROM conversations c
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             WHERE c.id > ?1
+             ORDER BY c.id"
+        } else {
+            "SELECT
+                c.id,
+                a.slug,
+                w.path,
+                c.external_id,
+                c.title,
+                c.source_path,
+                c.started_at,
+                c.ended_at,
+                c.approx_tokens,
+                c.metadata_json,
+                c.source_id,
+                c.origin_host
+             FROM conversations c
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             ORDER BY c.id"
+        };
+        let mut conv_stmt = source_conn.prepare(conv_sql)?;
+        let mut message_stmt = source_conn.prepare(
+            "SELECT idx, role, author, created_at, content, extra_json
+             FROM messages
+             WHERE conversation_id = ?1
+             ORDER BY idx",
+        )?;
+
+        let mut rows = if let Some(last_completed_source_row_id) = resume_after_row_id {
+            conv_stmt.query(rusqlite::params![last_completed_source_row_id])?
+        } else {
+            conv_stmt.query([])?
+        };
+        let mut imported_conversations = resume_progress
+            .as_ref()
+            .map(|progress| progress.conversations_imported)
+            .unwrap_or(0);
+        let mut imported_messages = resume_progress
+            .as_ref()
+            .map(|progress| progress.messages_imported)
+            .unwrap_or(0);
+        let mut pending_batch: Vec<HistoricalBatchEntry> = Vec::new();
+        let mut pending_batch_messages = 0usize;
+        let mut pending_batch_chars = 0usize;
+        let mut pending_batch_first_row_id: Option<i64> = None;
+        let mut pending_batch_last_row_id: Option<i64> = None;
+
+        let flush_batch = |storage: &FrankenStorage,
+                           batch: &mut Vec<HistoricalBatchEntry>,
+                           pending_messages: &mut usize,
+                           pending_chars: &mut usize,
+                           first_row_id: &mut Option<i64>,
+                           last_row_id: &mut Option<i64>,
+                           imported_conversations: &mut usize,
+                           imported_messages: &mut usize|
+         -> Result<()> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+
+            let batch_first_row_id = *first_row_id;
+            let batch_last_row_id = *last_row_id;
+            if historical_salvage_debug_enabled() {
+                eprintln!(
+                    "[historical-salvage] flushing batch rows {:?}..{:?} conversations={} messages={} payload_chars={}",
+                    batch_first_row_id,
+                    batch_last_row_id,
+                    batch.len(),
+                    *pending_messages,
+                    *pending_chars
+                );
+            }
+            tracing::info!(
+                target: "cass::historical_salvage",
+                batch_conversations = batch.len(),
+                batch_messages = *pending_messages,
+                batch_payload_chars = *pending_chars,
+                first_source_row_id = batch_first_row_id,
+                last_source_row_id = batch_last_row_id,
+                "flushing historical salvage batch"
+            );
+
+            let mut insert_batch =
+                |entries: &[HistoricalBatchEntry]| -> Result<HistoricalBatchImportTotals> {
+                    let borrowed_batch: Vec<(i64, Option<i64>, &Conversation)> = entries
+                        .iter()
+                        .map(|entry| (entry.agent_id, entry.workspace_id, &entry.conversation))
+                        .collect();
+                    let outcomes = storage
+                        .insert_conversations_batched(&borrowed_batch)
+                        .with_context(|| {
+                            let first_source_row_id =
+                                entries.first().map(|entry| entry.source_row_id);
+                            let last_source_row_id =
+                                entries.last().map(|entry| entry.source_row_id);
+                            format!(
+                                "inserting historical salvage batch source rows {:?}..{:?}",
+                                first_source_row_id, last_source_row_id
+                            )
+                        })?;
+                    let mut totals = HistoricalBatchImportTotals::default();
+                    for outcome in outcomes {
+                        if !outcome.inserted_indices.is_empty() {
+                            totals.inserted_source_rows += 1;
+                            totals.inserted_messages += outcome.inserted_indices.len();
+                        }
+                    }
+                    Ok(totals)
+                };
+            let totals =
+                Self::import_historical_batch_with_retry(batch.as_slice(), &mut insert_batch)?;
+            *imported_conversations =
+                (*imported_conversations).saturating_add(totals.inserted_source_rows);
+            *imported_messages = (*imported_messages).saturating_add(totals.inserted_messages);
+            if let Some(last_completed_row_id) = batch_last_row_id {
+                storage.record_historical_bundle_progress(
+                    bundle,
+                    salvage_method,
+                    last_completed_row_id,
+                    *imported_conversations,
+                    *imported_messages,
+                )?;
+            }
+            tracing::info!(
+                target: "cass::historical_salvage",
+                batch_conversations = batch.len(),
+                batch_messages = *pending_messages,
+                imported_conversations = *imported_conversations,
+                imported_messages = *imported_messages,
+                first_source_row_id = batch_first_row_id,
+                last_source_row_id = batch_last_row_id,
+                "historical salvage batch committed"
+            );
+            if historical_salvage_debug_enabled() {
+                eprintln!(
+                    "[historical-salvage] committed batch rows {:?}..{:?} imported_conversations={} imported_messages={}",
+                    batch_first_row_id,
+                    batch_last_row_id,
+                    *imported_conversations,
+                    *imported_messages
+                );
+            }
+            batch.clear();
+            *pending_messages = 0;
+            *pending_chars = 0;
+            *first_row_id = None;
+            *last_row_id = None;
+            Ok(())
+        };
+
+        while let Some(row) = rows.next()? {
+            let conversation_row_id: i64 = row.get(0)?;
+            let agent_slug: String = row.get(1)?;
+            let workspace_path: Option<String> = row.get(2)?;
+            let source_path: String = row.get(5)?;
+            let source_id: Option<String> = row.get(10)?;
+
+            let messages = message_stmt
+                .query_map(rusqlite::params![conversation_row_id], |msg_row| {
+                    let role: String = msg_row.get(1)?;
+                    Ok(Message {
+                        id: None,
+                        idx: msg_row.get(0)?,
+                        role: match role.as_str() {
+                            "user" => MessageRole::User,
+                            "agent" | "assistant" => MessageRole::Agent,
+                            "tool" => MessageRole::Tool,
+                            "system" => MessageRole::System,
+                            other => MessageRole::Other(other.to_string()),
+                        },
+                        author: msg_row.get(2)?,
+                        created_at: msg_row.get(3)?,
+                        content: msg_row.get(4)?,
+                        extra_json: parse_historical_json_column(msg_row.get(5)?),
+                        snippets: Vec::new(),
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("collecting historical message rows")?;
+
+            if messages.is_empty() {
+                continue;
+            }
+
+            let conversation_message_count = messages.len();
+            let conversation_chars = messages
+                .iter()
+                .map(message_payload_size_hint)
+                .sum::<usize>();
+
+            let conversation = Conversation {
+                id: None,
+                agent_slug: agent_slug.clone(),
+                workspace: workspace_path.map(PathBuf::from),
+                external_id: row.get(3)?,
+                title: row.get(4)?,
+                source_path: PathBuf::from(source_path),
+                started_at: row.get(6)?,
+                ended_at: row.get(7)?,
+                approx_tokens: row.get(8)?,
+                metadata_json: parse_json_column(row.get(9)?),
+                messages,
+                source_id: source_id.unwrap_or_else(|| LOCAL_SOURCE_ID.to_string()),
+                origin_host: row.get(11)?,
+            };
+
+            if !known_sources.contains(&conversation.source_id) {
+                let placeholder = if conversation.source_id == LOCAL_SOURCE_ID {
+                    Source::local()
+                } else {
+                    Source {
+                        id: conversation.source_id.clone(),
+                        kind: SourceKind::Ssh,
+                        host_label: conversation.origin_host.clone(),
+                        machine_id: None,
+                        platform: None,
+                        config_json: None,
+                        created_at: None,
+                        updated_at: None,
+                    }
+                };
+                self.upsert_source(&placeholder)?;
+                known_sources.insert(conversation.source_id.clone());
+            }
+
+            let agent = Agent {
+                id: None,
+                slug: agent_slug.clone(),
+                name: agent_slug,
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = if cache_enabled {
+                indexing_cache.get_or_insert_agent(self, &agent)?
+            } else {
+                self.ensure_agent(&agent)?
+            };
+            let workspace_id = if let Some(workspace) = &conversation.workspace {
+                if cache_enabled {
+                    Some(indexing_cache.get_or_insert_workspace(self, workspace, None)?)
+                } else {
+                    Some(self.ensure_workspace(workspace, None)?)
+                }
+            } else {
+                None
+            };
+
+            let exceeds_pending_limits = !pending_batch.is_empty()
+                && (pending_batch.len() >= batch_limits.conversations
+                    || pending_batch_messages.saturating_add(conversation_message_count)
+                        > batch_limits.messages
+                    || pending_batch_chars.saturating_add(conversation_chars)
+                        > batch_limits.payload_chars);
+            if exceeds_pending_limits {
+                flush_batch(
+                    self,
+                    &mut pending_batch,
+                    &mut pending_batch_messages,
+                    &mut pending_batch_chars,
+                    &mut pending_batch_first_row_id,
+                    &mut pending_batch_last_row_id,
+                    &mut imported_conversations,
+                    &mut imported_messages,
+                )?;
+            }
+
+            if pending_batch_first_row_id.is_none() {
+                pending_batch_first_row_id = Some(conversation_row_id);
+            }
+            pending_batch_last_row_id = Some(conversation_row_id);
+            pending_batch_messages =
+                pending_batch_messages.saturating_add(conversation_message_count);
+            pending_batch_chars = pending_batch_chars.saturating_add(conversation_chars);
+            pending_batch.push(HistoricalBatchEntry {
+                source_row_id: conversation_row_id,
+                agent_id,
+                workspace_id,
+                conversation,
+            });
+
+            if pending_batch.len() >= batch_limits.conversations
+                || pending_batch_messages >= batch_limits.messages
+                || pending_batch_chars >= batch_limits.payload_chars
+            {
+                flush_batch(
+                    self,
+                    &mut pending_batch,
+                    &mut pending_batch_messages,
+                    &mut pending_batch_chars,
+                    &mut pending_batch_first_row_id,
+                    &mut pending_batch_last_row_id,
+                    &mut imported_conversations,
+                    &mut imported_messages,
+                )?;
+            }
+        }
+
+        flush_batch(
+            self,
+            &mut pending_batch,
+            &mut pending_batch_messages,
+            &mut pending_batch_chars,
+            &mut pending_batch_first_row_id,
+            &mut pending_batch_last_row_id,
+            &mut imported_conversations,
+            &mut imported_messages,
+        )?;
+
+        if cache_enabled {
+            let (hits, misses, hit_rate) = indexing_cache.stats();
+            tracing::info!(
+                target: "cass::historical_salvage",
+                hits,
+                misses,
+                hit_rate = format!("{:.1}%", hit_rate * 100.0),
+                agents = indexing_cache.agent_count(),
+                workspaces = indexing_cache.workspace_count(),
+                sources = known_sources.len(),
+                "historical salvage cache stats"
+            );
+        }
+
+        Ok((imported_conversations, imported_messages))
+    }
+
+    pub fn salvage_historical_databases(
+        &self,
+        canonical_db_path: &Path,
+    ) -> Result<HistoricalSalvageOutcome> {
+        let ordered_bundles = discover_historical_database_bundles(canonical_db_path);
+        let mut outcome = HistoricalSalvageOutcome {
+            bundles_considered: ordered_bundles.len(),
+            ..HistoricalSalvageOutcome::default()
+        };
+
+        for bundle in ordered_bundles {
+            if self.historical_bundle_already_imported(&bundle)? {
+                self.clear_historical_bundle_progress(&bundle)?;
+                continue;
+            }
+
+            let source = open_historical_bundle_for_salvage(&bundle).with_context(|| {
+                format!(
+                    "opening historical bundle {} for salvage",
+                    bundle.root_path.display()
+                )
+            })?;
+
+            self.import_historical_sources(&source.conn)?;
+            let (imported_conversations, imported_messages) =
+                self.import_historical_conversations(&bundle, source.method, &source.conn)?;
+            self.record_historical_bundle_import(
+                &bundle,
+                source.method,
+                imported_conversations,
+                imported_messages,
+            )?;
+            self.clear_historical_bundle_progress(&bundle)?;
+
+            outcome.bundles_imported += 1;
+            outcome.conversations_imported += imported_conversations;
+            outcome.messages_imported += imported_messages;
+
+            tracing::info!(
+                path = %bundle.root_path.display(),
+                bytes = bundle.total_bytes,
+                method = source.method,
+                imported_conversations,
+                imported_messages,
+                "salvaged historical cass database bundle"
+            );
+        }
+
+        Ok(outcome)
+    }
+
     /// Delete a source by ID. Returns true if a row was deleted.
     pub fn delete_source(&self, id: &str, _cascade: bool) -> Result<bool> {
         if id == LOCAL_SOURCE_ID {
             anyhow::bail!("cannot delete the local source");
         }
-        let count = self.conn.execute_params(
-            "DELETE FROM sources WHERE id = ?1",
-            fparams![id],
-        )?;
+        let count = self
+            .conn
+            .execute_compat("DELETE FROM sources WHERE id = ?1", fparams![id])?;
         Ok(count > 0)
     }
 
@@ -2054,39 +4899,143 @@ impl FrankenStorage {
         workspace_id: Option<i64>,
         conv: &Conversation,
     ) -> Result<InsertOutcome> {
-        // Check for existing conversation with same (source_id, agent_id, external_id)
-        if let Some(ext) = &conv.external_id {
-            let existing: Option<i64> = self
-                .conn
-                .query_row_map(
-                    "SELECT id FROM conversations WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
-                    fparams![conv.source_id.as_str(), agent_id, ext.as_str()],
-                    |row| row.get_typed(0),
-                )
-                .optional()?;
-            if let Some(existing_id) = existing {
-                return self.franken_append_messages(existing_id, conv);
-            }
+        let conversation_key = conversation_merge_key(agent_id, conv);
+        let mut tx = self.conn.transaction()?;
+        let existing =
+            franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))?;
+        if let Some(existing_id) = existing {
+            let outcome = self.franken_append_messages_in_tx(&tx, existing_id, conv)?;
+            tx.commit()?;
+            return Ok(outcome);
         }
 
-        let tx = self.conn.transaction()?;
+        let conv_id = match franken_insert_conversation_or_get_existing(
+            &tx,
+            agent_id,
+            workspace_id,
+            conv,
+        )? {
+            ConversationInsertStatus::Inserted(conv_id) => conv_id,
+            ConversationInsertStatus::Existing(existing_id) => {
+                let mut existing_messages =
+                    franken_existing_message_fingerprints_by_idx(&tx, existing_id)?;
+                let mut existing_replay_fingerprints =
+                    franken_existing_message_replay_fingerprints(&tx, existing_id)?;
+                let mut inserted_indices = Vec::new();
+                let mut fts_entries = Vec::new();
+                let mut fts_pending_chars = 0usize;
+                let mut _fts_inserted_total = 0usize;
+                let mut new_chars: i64 = 0;
 
-        let conv_id = franken_insert_conversation(&tx, agent_id, workspace_id, conv)?;
-        let mut fts_entries = Vec::with_capacity(conv.messages.len());
+                for msg in &conv.messages {
+                    if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
+                        let incoming_fingerprint = message_merge_fingerprint(msg);
+                        if existing_fingerprint != &incoming_fingerprint {
+                            tracing::warn!(
+                                conversation_id = existing_id,
+                                idx = msg.idx,
+                                source_path = %conv.source_path.display(),
+                                "message idx collision encountered while merging recovered conversation; retaining canonical message variant"
+                            );
+                        }
+                        continue;
+                    }
+                    let incoming_replay = message_replay_fingerprint(msg);
+                    if existing_replay_fingerprints.contains(&incoming_replay) {
+                        tracing::debug!(
+                            conversation_id = existing_id,
+                            idx = msg.idx,
+                            source_path = %conv.source_path.display(),
+                            "skipping replay-equivalent recovered message with shifted idx"
+                        );
+                        continue;
+                    }
+                    let msg_id = franken_insert_message(&tx, existing_id, msg)?;
+                    franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+                    fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                    fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+                    if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                        || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                    {
+                        flush_pending_fts_entries(
+                            &tx,
+                            &mut fts_entries,
+                            &mut fts_pending_chars,
+                            &mut _fts_inserted_total,
+                        )?;
+                    }
+                    inserted_indices.push(msg.idx);
+                    new_chars += msg.content.len() as i64;
+                    existing_messages.insert(msg.idx, message_merge_fingerprint(msg));
+                    existing_replay_fingerprints.insert(incoming_replay);
+                }
+
+                flush_pending_fts_entries(
+                    &tx,
+                    &mut fts_entries,
+                    &mut fts_pending_chars,
+                    &mut _fts_inserted_total,
+                )?;
+
+                if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
+                    tx.execute_compat(
+                        "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
+                        fparams![last_ts, existing_id],
+                    )?;
+                }
+
+                if !inserted_indices.is_empty() {
+                    franken_update_daily_stats_in_tx(
+                        &tx,
+                        &conv.agent_slug,
+                        &conv.source_id,
+                        conversation_effective_started_at(conv),
+                        0,
+                        inserted_indices.len() as i64,
+                        new_chars,
+                    )?;
+                }
+
+                tx.commit()?;
+                return Ok(InsertOutcome {
+                    conversation_id: existing_id,
+                    inserted_indices,
+                });
+            }
+        };
+        let mut fts_entries = Vec::new();
+        let mut fts_pending_chars = 0usize;
+        let mut _fts_inserted_total = 0usize;
         let mut total_chars: i64 = 0;
         for msg in &conv.messages {
             let msg_id = franken_insert_message(&tx, conv_id, msg)?;
             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
             fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+            fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+            if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+            {
+                flush_pending_fts_entries(
+                    &tx,
+                    &mut fts_entries,
+                    &mut fts_pending_chars,
+                    &mut _fts_inserted_total,
+                )?;
+            }
             total_chars += msg.content.len() as i64;
         }
-        franken_batch_insert_fts(&tx, &fts_entries)?;
+        flush_pending_fts_entries(
+            &tx,
+            &mut fts_entries,
+            &mut fts_pending_chars,
+            &mut _fts_inserted_total,
+        )?;
 
         franken_update_daily_stats_in_tx(
             &tx,
             &conv.agent_slug,
             &conv.source_id,
-            conv.started_at,
+            conversation_effective_started_at(conv),
             1,
             conv.messages.len() as i64,
             total_chars,
@@ -2099,42 +5048,75 @@ impl FrankenStorage {
         })
     }
 
-    /// Append new messages to an existing conversation.
-    fn franken_append_messages(
+    /// Append new messages to an existing conversation within an active transaction.
+    fn franken_append_messages_in_tx(
         &self,
+        tx: &FrankenTransaction<'_>,
         conversation_id: i64,
         conv: &Conversation,
     ) -> Result<InsertOutcome> {
-        let tx = self.conn.transaction()?;
-
-        let rows = tx.query_params(
-            "SELECT MAX(idx) FROM messages WHERE conversation_id = ?1",
-            fparams![conversation_id],
-        )?;
-        let cutoff: i64 = rows
-            .first()
-            .and_then(|r| r.get_typed::<Option<i64>>(0).ok())
-            .flatten()
-            .unwrap_or(-1);
+        let mut existing_messages =
+            franken_existing_message_fingerprints_by_idx(tx, conversation_id)?;
+        let mut existing_replay_fingerprints =
+            franken_existing_message_replay_fingerprints(tx, conversation_id)?;
 
         let mut inserted_indices = Vec::new();
         let mut fts_entries = Vec::new();
+        let mut fts_pending_chars = 0usize;
+        let mut _fts_inserted_total = 0usize;
         let mut new_chars: i64 = 0;
         for msg in &conv.messages {
-            if msg.idx <= cutoff {
+            if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
+                let incoming_fingerprint = message_merge_fingerprint(msg);
+                if existing_fingerprint != &incoming_fingerprint {
+                    tracing::warn!(
+                        conversation_id,
+                        idx = msg.idx,
+                        source_path = %conv.source_path.display(),
+                        "message idx collision encountered while appending to an existing conversation; retaining canonical message variant"
+                    );
+                }
                 continue;
             }
-            let msg_id = franken_insert_message(&tx, conversation_id, msg)?;
-            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+            let incoming_replay = message_replay_fingerprint(msg);
+            if existing_replay_fingerprints.contains(&incoming_replay) {
+                tracing::debug!(
+                    conversation_id,
+                    idx = msg.idx,
+                    source_path = %conv.source_path.display(),
+                    "skipping replay-equivalent recovered message with shifted idx"
+                );
+                continue;
+            }
+            let msg_id = franken_insert_message(tx, conversation_id, msg)?;
+            franken_insert_snippets(tx, msg_id, &msg.snippets)?;
             fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+            fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+            if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+            {
+                flush_pending_fts_entries(
+                    tx,
+                    &mut fts_entries,
+                    &mut fts_pending_chars,
+                    &mut _fts_inserted_total,
+                )?;
+            }
             inserted_indices.push(msg.idx);
             new_chars += msg.content.len() as i64;
+            existing_messages.insert(msg.idx, message_merge_fingerprint(msg));
+            existing_replay_fingerprints.insert(incoming_replay);
         }
 
-        franken_batch_insert_fts(&tx, &fts_entries)?;
+        flush_pending_fts_entries(
+            tx,
+            &mut fts_entries,
+            &mut fts_pending_chars,
+            &mut _fts_inserted_total,
+        )?;
 
         if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
-            tx.execute_params(
+            tx.execute_compat(
                 "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
                 fparams![last_ts, conversation_id],
             )?;
@@ -2143,35 +5125,26 @@ impl FrankenStorage {
         if !inserted_indices.is_empty() {
             let message_count = inserted_indices.len() as i64;
             franken_update_daily_stats_in_tx(
-                &tx,
+                tx,
                 &conv.agent_slug,
                 &conv.source_id,
-                conv.started_at,
+                conversation_effective_started_at(conv),
                 0,
                 message_count,
                 new_chars,
             )?;
         }
 
-        tx.commit()?;
         Ok(InsertOutcome {
             conversation_id,
             inserted_indices,
         })
     }
 
-    /// Rebuild the FTS5 index from scratch.
+    /// Rebuild the FTS5 index from scratch (chunked to avoid OOM on large databases, #110).
     pub fn rebuild_fts(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "DELETE FROM fts_messages;
-             INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-             SELECT m.content, c.title, a.slug, w.path, c.source_path, m.created_at, m.id
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
-             JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id;",
-        )?;
-        Ok(())
+        let db_path = self.database_path()?;
+        rebuild_fts_via_rusqlite(&db_path).map(|_| ())
     }
 
     /// Fetch all messages for embedding generation.
@@ -2200,6 +5173,61 @@ impl FrankenStorage {
             .with_context(|| "fetching messages for embedding")
     }
 
+    /// Fetch messages for embedding generation that were inserted after `since_id`.
+    ///
+    /// Used by incremental semantic indexing in watch mode.
+    pub fn fetch_messages_for_embedding_since(
+        &self,
+        since_id: i64,
+    ) -> Result<Vec<MessageForEmbedding>> {
+        self.conn
+            .query_map_collect(
+                "SELECT m.id, m.created_at, c.agent_id, c.workspace_id, c.source_id, m.role, m.content
+                 FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 WHERE m.id > ?1
+                 ORDER BY m.id",
+                fparams![since_id],
+                |row| {
+                    let source_id: String = row.get_typed::<Option<String>>(4)?
+                        .unwrap_or_else(|| "local".to_string());
+                    Ok(MessageForEmbedding {
+                        message_id: row.get_typed(0)?,
+                        created_at: row.get_typed(1)?,
+                        agent_id: row.get_typed(2)?,
+                        workspace_id: row.get_typed(3)?,
+                        source_id_hash: crc32fast::hash(source_id.as_bytes()),
+                        role: row.get_typed(5)?,
+                        content: row.get_typed(6)?,
+                    })
+                },
+            )
+            .with_context(|| format!("fetching messages for embedding after id {since_id}"))
+    }
+
+    /// Get the watermark for incremental semantic embedding.
+    pub fn get_last_embedded_message_id(&self) -> Result<Option<i64>> {
+        let result: Result<String, _> = self.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = 'last_embedded_message_id'",
+            fparams![],
+            |row| row.get_typed(0),
+        );
+        match result.optional() {
+            Ok(Some(s)) => Ok(s.parse().ok()),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Set the watermark for incremental semantic embedding.
+    pub fn set_last_embedded_message_id(&self, id: i64) -> Result<()> {
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('last_embedded_message_id', ?1)",
+            fparams![id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Get embedding jobs for a database path.
     pub fn get_embedding_jobs(&self, db_path: &str) -> Result<Vec<EmbeddingJobRow>> {
         self.conn
@@ -2226,24 +5254,33 @@ impl FrankenStorage {
     }
 
     /// Create or update an embedding job.
-    pub fn upsert_embedding_job(&self, db_path: &str, model_id: &str, total_docs: i64) -> Result<i64> {
-        self.conn.execute_params(
+    pub fn upsert_embedding_job(
+        &self,
+        db_path: &str,
+        model_id: &str,
+        total_docs: i64,
+    ) -> Result<i64> {
+        self.conn.execute_compat(
             "INSERT INTO embedding_jobs(db_path, model_id, total_docs) VALUES(?1,?2,?3)
              ON CONFLICT(db_path, model_id) WHERE status IN ('pending', 'running')
              DO UPDATE SET total_docs=excluded.total_docs",
             fparams![db_path, model_id, total_docs],
         )?;
-        let rows = self.conn.query("SELECT last_insert_rowid();")?;
-        let id: i64 = rows
-            .first()
-            .and_then(|r| r.get_typed(0).ok())
-            .unwrap_or(0);
-        Ok(id)
+        self.conn
+            .query_row_map(
+                "SELECT id FROM embedding_jobs
+                 WHERE db_path = ?1 AND model_id = ?2 AND status IN ('pending', 'running')
+                 ORDER BY id DESC
+                 LIMIT 1",
+                fparams![db_path, model_id],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| "resolving embedding job id after upsert")
     }
 
     /// Mark an embedding job as started.
     pub fn start_embedding_job(&self, job_id: i64) -> Result<()> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "UPDATE embedding_jobs SET status = 'running', started_at = datetime('now') WHERE id = ?1",
             fparams![job_id],
         )?;
@@ -2252,7 +5289,7 @@ impl FrankenStorage {
 
     /// Mark an embedding job as completed.
     pub fn complete_embedding_job(&self, job_id: i64) -> Result<()> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "UPDATE embedding_jobs SET status = 'completed', completed_at = datetime('now') WHERE id = ?1",
             fparams![job_id],
         )?;
@@ -2261,7 +5298,7 @@ impl FrankenStorage {
 
     /// Mark an embedding job as failed.
     pub fn fail_embedding_job(&self, job_id: i64, error: &str) -> Result<()> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "UPDATE embedding_jobs SET status = 'failed', error_message = ?2, completed_at = datetime('now') WHERE id = ?1",
             fparams![job_id, error],
         )?;
@@ -2271,12 +5308,12 @@ impl FrankenStorage {
     /// Cancel embedding jobs for a database path.
     pub fn cancel_embedding_jobs(&self, db_path: &str, model_id: Option<&str>) -> Result<usize> {
         if let Some(mid) = model_id {
-            Ok(self.conn.execute_params(
+            Ok(self.conn.execute_compat(
                 "UPDATE embedding_jobs SET status = 'cancelled' WHERE db_path = ?1 AND model_id = ?2 AND status IN ('pending', 'running')",
                 fparams![db_path, mid],
             )?)
         } else {
-            Ok(self.conn.execute_params(
+            Ok(self.conn.execute_compat(
                 "UPDATE embedding_jobs SET status = 'cancelled' WHERE db_path = ?1 AND status IN ('pending', 'running')",
                 fparams![db_path],
             )?)
@@ -2285,7 +5322,7 @@ impl FrankenStorage {
 
     /// Update embedding job progress.
     pub fn update_job_progress(&self, job_id: i64, completed_docs: i64) -> Result<()> {
-        self.conn.execute_params(
+        self.conn.execute_compat(
             "UPDATE embedding_jobs SET completed_docs = ?2 WHERE id = ?1",
             fparams![job_id, completed_docs],
         )?;
@@ -2313,11 +5350,9 @@ impl FrankenStorage {
         // Check if we have materialized stats
         let stats_count: i64 = self
             .conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM daily_stats",
-                fparams![],
-                |row| row.get_typed(0),
-            )
+            .query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
+                row.get_typed(0)
+            })
             .unwrap_or(0);
 
         if stats_count == 0 {
@@ -2438,42 +5473,30 @@ impl FrankenStorage {
 
     /// Check health of daily stats table.
     pub fn daily_stats_health(&self) -> Result<DailyStatsHealth> {
-        let row_count: i64 = self
-            .conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM daily_stats",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap_or(0);
+        let row_count: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
 
-        let oldest_update: Option<i64> = self
-            .conn
-            .query_row_map(
-                "SELECT MIN(last_updated) FROM daily_stats",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .ok();
+        let oldest_update: Option<i64> = self.conn.query_row_map(
+            "SELECT MIN(last_updated) FROM daily_stats",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
 
-        let conversation_count: i64 = self
-            .conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM conversations",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap_or(0);
+        let conversation_count: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
 
-        let materialized_total: i64 = self
-            .conn
-            .query_row_map(
-                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
+        let materialized_total: i64 = self.conn.query_row_map(
+            "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
                  WHERE agent_slug = 'all' AND source_id = 'all'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap_or(0);
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
 
         Ok(DailyStatsHealth {
             populated: row_count > 0,
@@ -2484,6 +5507,552 @@ impl FrankenStorage {
             drift: (conversation_count - materialized_total).abs(),
         })
     }
+
+    /// Batch insert multiple conversations with full analytics (token usage,
+    /// message metrics, rollups).  Frankensqlite equivalent of
+    /// `SqliteStorage::insert_conversations_batched`.
+    pub fn insert_conversations_batched(
+        &self,
+        conversations: &[(i64, Option<i64>, &Conversation)],
+    ) -> Result<Vec<InsertOutcome>> {
+        if conversations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let pricing_table = PricingTable::franken_load(&self.conn).unwrap_or_else(|e| {
+            tracing::warn!(target: "cass::analytics::pricing", error = %e, "failed to load pricing table");
+            PricingTable { entries: Vec::new() }
+        });
+        let mut pricing_diag = PricingDiagnostics::default();
+
+        let mut tx = self.conn.transaction()?;
+        let mut outcomes = Vec::with_capacity(conversations.len());
+        let mut fts_entries = Vec::new();
+        let mut fts_pending_chars = 0usize;
+        let mut fts_inserted_total = 0usize;
+        let mut fts_count_total = 0usize;
+        let mut stats = StatsAggregator::new();
+        let mut token_stats = TokenStatsAggregator::new();
+        let mut token_entries: Vec<TokenUsageEntry> = Vec::new();
+        let mut metrics_entries: Vec<MessageMetricsEntry> = Vec::new();
+        let mut rollup_agg = AnalyticsRollupAggregator::new();
+        let mut conv_ids_to_summarize: Vec<i64> = Vec::new();
+        let mut pending_conversation_ids: HashMap<PendingConversationKey, i64> = HashMap::new();
+        let mut pending_message_fingerprints: HashMap<i64, HashMap<i64, MessageMergeFingerprint>> =
+            HashMap::new();
+        let mut pending_message_replay_fingerprints: HashMap<
+            i64,
+            HashSet<MessageReplayFingerprint>,
+        > = HashMap::new();
+
+        for &(agent_id, workspace_id, conv) in conversations {
+            let mut total_chars: i64 = 0;
+            let mut inserted_indices = Vec::with_capacity(conv.messages.len());
+            let mut inserted_messages: Vec<(i64, &Message)> =
+                Vec::with_capacity(conv.messages.len());
+            let mut session_count_delta = 1_i64;
+            let conversation_key = conversation_merge_key(agent_id, conv);
+
+            let existing_conv_id = if let Some(existing_id) =
+                pending_conversation_ids.get(&conversation_key)
+            {
+                Some(*existing_id)
+            } else {
+                let existing_id =
+                    franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))?;
+                if let Some(existing_id) = existing_id {
+                    pending_conversation_ids.insert(conversation_key.clone(), existing_id);
+                }
+                existing_id
+            };
+
+            let conv_id = if let Some(existing_id) = existing_conv_id {
+                session_count_delta = 0;
+                let mut existing_messages =
+                    if let Some(fingerprints) = pending_message_fingerprints.get(&existing_id) {
+                        fingerprints.clone()
+                    } else {
+                        let fingerprints =
+                            franken_existing_message_fingerprints_by_idx(&tx, existing_id)?;
+                        pending_message_fingerprints.insert(existing_id, fingerprints.clone());
+                        fingerprints
+                    };
+                let mut existing_replay_fingerprints = if let Some(fingerprints) =
+                    pending_message_replay_fingerprints.get(&existing_id)
+                {
+                    fingerprints.clone()
+                } else {
+                    let fingerprints =
+                        franken_existing_message_replay_fingerprints(&tx, existing_id)?;
+                    pending_message_replay_fingerprints.insert(existing_id, fingerprints.clone());
+                    fingerprints
+                };
+
+                for msg in &conv.messages {
+                    if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
+                        let incoming_fingerprint = message_merge_fingerprint(msg);
+                        if existing_fingerprint != &incoming_fingerprint {
+                            tracing::warn!(
+                                conversation_id = existing_id,
+                                idx = msg.idx,
+                                source_path = %conv.source_path.display(),
+                                "message idx collision encountered during batched conversation merge; retaining canonical message variant"
+                            );
+                        }
+                        continue;
+                    }
+                    let incoming_replay = message_replay_fingerprint(msg);
+                    if existing_replay_fingerprints.contains(&incoming_replay) {
+                        tracing::debug!(
+                            conversation_id = existing_id,
+                            idx = msg.idx,
+                            source_path = %conv.source_path.display(),
+                            "skipping replay-equivalent recovered message with shifted idx during batched merge"
+                        );
+                        continue;
+                    }
+                    let msg_id = franken_insert_message(&tx, existing_id, msg)?;
+                    franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+                    fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                    fts_count_total += 1;
+                    fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+                    if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                        || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                    {
+                        flush_pending_fts_entries(
+                            &tx,
+                            &mut fts_entries,
+                            &mut fts_pending_chars,
+                            &mut fts_inserted_total,
+                        )?;
+                    }
+                    total_chars += msg.content.len() as i64;
+                    inserted_indices.push(msg.idx);
+                    inserted_messages.push((msg_id, msg));
+                    existing_messages.insert(msg.idx, message_merge_fingerprint(msg));
+                    existing_replay_fingerprints.insert(incoming_replay);
+                }
+
+                if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
+                    tx.execute_compat(
+                        "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
+                        fparams![last_ts, existing_id],
+                    )?;
+                }
+
+                pending_message_fingerprints.insert(existing_id, existing_messages);
+                pending_message_replay_fingerprints
+                    .insert(existing_id, existing_replay_fingerprints);
+
+                existing_id
+            } else {
+                match franken_insert_conversation_or_get_existing(
+                    &tx,
+                    agent_id,
+                    workspace_id,
+                    conv,
+                )? {
+                    ConversationInsertStatus::Inserted(new_conv_id) => {
+                        pending_conversation_ids.insert(conversation_key.clone(), new_conv_id);
+                        let pending_messages =
+                            pending_message_fingerprints.entry(new_conv_id).or_default();
+                        let pending_replay_fingerprints = pending_message_replay_fingerprints
+                            .entry(new_conv_id)
+                            .or_default();
+                        for msg in &conv.messages {
+                            let incoming_replay = message_replay_fingerprint(msg);
+                            if pending_messages.contains_key(&msg.idx)
+                                || pending_replay_fingerprints.contains(&incoming_replay)
+                            {
+                                continue;
+                            }
+                            let msg_id = franken_insert_message(&tx, new_conv_id, msg)?;
+                            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+                            fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                            fts_count_total += 1;
+                            fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+                            if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                                || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                            {
+                                flush_pending_fts_entries(
+                                    &tx,
+                                    &mut fts_entries,
+                                    &mut fts_pending_chars,
+                                    &mut fts_inserted_total,
+                                )?;
+                            }
+                            total_chars += msg.content.len() as i64;
+                            inserted_indices.push(msg.idx);
+                            inserted_messages.push((msg_id, msg));
+                            pending_messages.insert(msg.idx, message_merge_fingerprint(msg));
+                            pending_replay_fingerprints.insert(incoming_replay);
+                        }
+                        new_conv_id
+                    }
+                    ConversationInsertStatus::Existing(existing_id) => {
+                        session_count_delta = 0;
+                        pending_conversation_ids.insert(conversation_key.clone(), existing_id);
+                        let mut existing_messages = if let Some(fingerprints) =
+                            pending_message_fingerprints.get(&existing_id)
+                        {
+                            fingerprints.clone()
+                        } else {
+                            let fingerprints =
+                                franken_existing_message_fingerprints_by_idx(&tx, existing_id)?;
+                            pending_message_fingerprints.insert(existing_id, fingerprints.clone());
+                            fingerprints
+                        };
+                        let mut existing_replay_fingerprints = if let Some(fingerprints) =
+                            pending_message_replay_fingerprints.get(&existing_id)
+                        {
+                            fingerprints.clone()
+                        } else {
+                            let fingerprints =
+                                franken_existing_message_replay_fingerprints(&tx, existing_id)?;
+                            pending_message_replay_fingerprints
+                                .insert(existing_id, fingerprints.clone());
+                            fingerprints
+                        };
+
+                        for msg in &conv.messages {
+                            if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
+                                let incoming_fingerprint = message_merge_fingerprint(msg);
+                                if existing_fingerprint != &incoming_fingerprint {
+                                    tracing::warn!(
+                                        conversation_id = existing_id,
+                                        idx = msg.idx,
+                                        source_path = %conv.source_path.display(),
+                                        "message idx collision encountered after duplicate conversation recovery; retaining canonical message variant"
+                                    );
+                                }
+                                continue;
+                            }
+                            let incoming_replay = message_replay_fingerprint(msg);
+                            if existing_replay_fingerprints.contains(&incoming_replay) {
+                                tracing::debug!(
+                                    conversation_id = existing_id,
+                                    idx = msg.idx,
+                                    source_path = %conv.source_path.display(),
+                                    "skipping replay-equivalent recovered message with shifted idx after duplicate conversation recovery"
+                                );
+                                continue;
+                            }
+                            let msg_id = franken_insert_message(&tx, existing_id, msg)?;
+                            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+                            fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                            fts_count_total += 1;
+                            fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+                            if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                                || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                            {
+                                flush_pending_fts_entries(
+                                    &tx,
+                                    &mut fts_entries,
+                                    &mut fts_pending_chars,
+                                    &mut fts_inserted_total,
+                                )?;
+                            }
+                            total_chars += msg.content.len() as i64;
+                            inserted_indices.push(msg.idx);
+                            inserted_messages.push((msg_id, msg));
+                            existing_messages.insert(msg.idx, message_merge_fingerprint(msg));
+                            existing_replay_fingerprints.insert(incoming_replay);
+                        }
+
+                        if let Some(last_ts) =
+                            conv.messages.iter().filter_map(|m| m.created_at).max()
+                        {
+                            tx.execute_compat(
+                                "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
+                                fparams![last_ts, existing_id],
+                            )?;
+                        }
+
+                        pending_message_fingerprints.insert(existing_id, existing_messages);
+                        pending_message_replay_fingerprints
+                            .insert(existing_id, existing_replay_fingerprints);
+
+                        existing_id
+                    }
+                }
+            };
+
+            let delta = StatsDelta {
+                session_count_delta,
+                message_count_delta: inserted_messages.len() as i64,
+                total_chars_delta: total_chars,
+            };
+
+            let effective_started_at = conversation_effective_started_at(conv);
+            let day_id = effective_started_at
+                .map(FrankenStorage::day_id_from_millis)
+                .unwrap_or(0);
+            stats.record_delta(
+                &conv.agent_slug,
+                &conv.source_id,
+                day_id,
+                delta.session_count_delta,
+                delta.message_count_delta,
+                delta.total_chars_delta,
+            );
+
+            // Extract token usage from newly inserted messages
+            let conv_day_id = day_id;
+            let mut session_model_family = String::from("unknown");
+            let mut has_any_tokens = false;
+
+            for &(message_id, msg) in &inserted_messages {
+                let role_s = role_str(&msg.role);
+                let usage = if historical_raw_json(&msg.extra_json).is_some() {
+                    crate::connectors::extract_tokens_for_agent(
+                        &conv.agent_slug,
+                        &serde_json::Value::Null,
+                        &msg.content,
+                        &role_s,
+                    )
+                } else {
+                    crate::connectors::extract_tokens_for_agent(
+                        &conv.agent_slug,
+                        &msg.extra_json,
+                        &msg.content,
+                        &role_s,
+                    )
+                };
+
+                let msg_ts = msg.created_at.or(effective_started_at).unwrap_or(0);
+                let msg_day_id = if msg_ts > 0 {
+                    FrankenStorage::day_id_from_millis(msg_ts)
+                } else {
+                    conv_day_id
+                };
+
+                let model_info = usage
+                    .model_name
+                    .as_deref()
+                    .map(crate::connectors::normalize_model);
+
+                let model_family = model_info
+                    .as_ref()
+                    .map(|i| i.family.clone())
+                    .unwrap_or_else(|| "unknown".into());
+                let model_tier = model_info
+                    .as_ref()
+                    .map(|i| i.tier.clone())
+                    .unwrap_or_else(|| "unknown".into());
+                let provider = usage
+                    .provider
+                    .clone()
+                    .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+                    .unwrap_or_else(|| "unknown".into());
+
+                if model_family != "unknown" {
+                    session_model_family = model_family.clone();
+                }
+
+                let estimated_cost = pricing_table.compute_cost(
+                    usage.model_name.as_deref(),
+                    msg_day_id,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_creation_tokens,
+                );
+                if estimated_cost.is_some() {
+                    pricing_diag.record_priced();
+                } else if usage.has_token_data() {
+                    pricing_diag.record_unpriced(usage.model_name.as_deref());
+                }
+
+                token_stats.record(
+                    &conv.agent_slug,
+                    &conv.source_id,
+                    msg_day_id,
+                    &model_family,
+                    &role_s,
+                    &usage,
+                    msg.content.len() as i64,
+                    estimated_cost.unwrap_or(0.0),
+                );
+
+                if usage.has_token_data() {
+                    has_any_tokens = true;
+                }
+
+                let content_chars = msg.content.len() as i64;
+                let content_tokens_est = content_chars / 4;
+                let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
+                let has_plan = has_plan_for_role(&role_s, &msg.content);
+
+                token_entries.push(TokenUsageEntry {
+                    message_id,
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id,
+                    source_id: conv.source_id.clone(),
+                    timestamp_ms: msg_ts,
+                    day_id: msg_day_id,
+                    model_name: usage.model_name.clone(),
+                    model_family: Some(model_family.clone()),
+                    model_tier: Some(model_tier.clone()),
+                    service_tier: usage.service_tier.clone(),
+                    provider: Some(provider.clone()),
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cache_creation_tokens: usage.cache_creation_tokens,
+                    thinking_tokens: usage.thinking_tokens,
+                    total_tokens: usage.total_tokens(),
+                    estimated_cost_usd: estimated_cost,
+                    role: role_s.clone(),
+                    content_chars,
+                    has_tool_calls: usage.has_tool_calls,
+                    tool_call_count: usage.tool_call_count,
+                    data_source: usage.data_source.as_str().to_string(),
+                });
+
+                let mm = MessageMetricsEntry {
+                    message_id,
+                    created_at_ms: msg_ts,
+                    hour_id: msg_hour_id,
+                    day_id: msg_day_id,
+                    agent_slug: conv.agent_slug.clone(),
+                    workspace_id: workspace_id.unwrap_or(0),
+                    source_id: conv.source_id.clone(),
+                    role: role_s,
+                    content_chars,
+                    content_tokens_est,
+                    model_name: usage.model_name.clone(),
+                    model_family: model_family.clone(),
+                    model_tier: model_tier.clone(),
+                    provider,
+                    api_input_tokens: usage.input_tokens,
+                    api_output_tokens: usage.output_tokens,
+                    api_cache_read_tokens: usage.cache_read_tokens,
+                    api_cache_creation_tokens: usage.cache_creation_tokens,
+                    api_thinking_tokens: usage.thinking_tokens,
+                    api_service_tier: usage.service_tier.clone(),
+                    api_data_source: usage.data_source.as_str().to_string(),
+                    tool_call_count: usage.tool_call_count as i64,
+                    has_tool_calls: usage.has_tool_calls,
+                    has_plan,
+                };
+                rollup_agg.record(&mm);
+                metrics_entries.push(mm);
+            }
+
+            if session_count_delta > 0 {
+                token_stats.record_session(
+                    &conv.agent_slug,
+                    &conv.source_id,
+                    conv_day_id,
+                    &session_model_family,
+                );
+            }
+
+            if has_any_tokens {
+                conv_ids_to_summarize.push(conv_id);
+            }
+
+            outcomes.push(InsertOutcome {
+                conversation_id: conv_id,
+                inserted_indices,
+            });
+        }
+
+        // Batch insert all FTS entries at once
+        flush_pending_fts_entries(
+            &tx,
+            &mut fts_entries,
+            &mut fts_pending_chars,
+            &mut fts_inserted_total,
+        )?;
+        if fts_count_total > 0 {
+            tracing::debug!(
+                target: "cass::perf::fts5",
+                total = fts_count_total,
+                inserted = fts_inserted_total,
+                conversations = conversations.len(),
+                "franken_batch_fts_insert_complete"
+            );
+        }
+
+        // Batched daily_stats update
+        if !stats.is_empty() {
+            let entries = stats.expand();
+            let affected = franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
+            tracing::debug!(
+                target: "cass::perf::daily_stats",
+                raw = stats.raw_entry_count(),
+                expanded = entries.len(),
+                affected = affected,
+                "franken_batched_stats_update_complete"
+            );
+        }
+
+        // Batch insert token_usage rows
+        if !token_entries.is_empty() {
+            let token_count = token_entries.len();
+            let inserted = franken_insert_token_usage_batched_in_tx(&tx, &token_entries)?;
+            tracing::debug!(
+                target: "cass::perf::token_usage",
+                total = token_count,
+                inserted = inserted,
+                "franken_batch_token_usage_insert_complete"
+            );
+        }
+
+        // Batched token_daily_stats update
+        if !token_stats.is_empty() {
+            let entries = token_stats.expand();
+            let affected = franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
+            tracing::debug!(
+                target: "cass::perf::token_daily_stats",
+                raw = token_stats.raw_entry_count(),
+                expanded = entries.len(),
+                affected = affected,
+                "franken_batched_token_stats_update_complete"
+            );
+        }
+
+        // Batch insert message_metrics rows
+        if !metrics_entries.is_empty() {
+            let mm_count = metrics_entries.len();
+            let inserted = franken_insert_message_metrics_batched_in_tx(&tx, &metrics_entries)?;
+            tracing::debug!(
+                target: "cass::perf::message_metrics",
+                total = mm_count,
+                inserted = inserted,
+                "franken_batch_message_metrics_insert_complete"
+            );
+        }
+
+        // Flush usage_hourly + usage_daily rollups
+        if !rollup_agg.is_empty() {
+            let (hourly, daily, models_daily) =
+                franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
+            tracing::debug!(
+                target: "cass::perf::usage_rollups",
+                hourly_buckets = rollup_agg.hourly_entry_count(),
+                daily_buckets = rollup_agg.daily_entry_count(),
+                models_daily_buckets = rollup_agg.models_daily_entry_count(),
+                hourly_affected = hourly,
+                daily_affected = daily,
+                models_daily_affected = models_daily,
+                "franken_batched_usage_rollups_complete"
+            );
+        }
+
+        // Update conversation-level token summaries
+        for conv_id in &conv_ids_to_summarize {
+            franken_update_conversation_token_summaries_in_tx(&tx, *conv_id)?;
+        }
+
+        tx.commit()?;
+
+        pricing_diag.log_summary();
+
+        Ok(outcomes)
+    }
 }
 
 // =========================================================================
@@ -2492,11 +6061,201 @@ impl FrankenStorage {
 
 /// Get last_insert_rowid from a frankensqlite transaction.
 fn franken_last_rowid(tx: &FrankenTransaction<'_>) -> Result<i64> {
-    let rows = tx.query("SELECT last_insert_rowid();")?;
-    Ok(rows
-        .first()
-        .and_then(|r| r.get_typed::<i64>(0).ok())
-        .unwrap_or(0))
+    tx.last_insert_rowid()
+        .ok()
+        .filter(|&id| id > 0)
+        .with_context(|| "last_insert_rowid() returned NULL or 0 after INSERT")
+}
+
+enum ConversationInsertStatus {
+    Inserted(i64),
+    Existing(i64),
+}
+
+fn franken_find_existing_conversation_by_key(
+    tx: &FrankenTransaction<'_>,
+    key: &PendingConversationKey,
+    conv: Option<&Conversation>,
+) -> Result<Option<i64>> {
+    match key {
+        PendingConversationKey::External {
+            source_id,
+            agent_id,
+            external_id,
+        } => tx
+            .query_row_map(
+                "SELECT id FROM conversations WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
+                fparams![source_id.as_str(), *agent_id, external_id.as_str()],
+                |row| row.get_typed(0),
+            )
+            .optional()
+            .map_err(Into::into),
+        PendingConversationKey::SourcePath {
+            source_id,
+            agent_id,
+            source_path,
+            started_at,
+        } => {
+            let exact_match = tx
+                .query_row_map(
+                    "SELECT c.id
+                     FROM conversations c
+                     WHERE c.source_id = ?1
+                       AND c.agent_id = ?2
+                       AND c.source_path = ?3
+                       AND ((
+                            COALESCE(
+                                c.started_at,
+                                (SELECT MIN(created_at)
+                                 FROM messages
+                                 WHERE conversation_id = c.id
+                                   AND created_at IS NOT NULL)
+                            ) IS NULL
+                            AND ?4 IS NULL
+                       ) OR COALESCE(
+                            c.started_at,
+                            (SELECT MIN(created_at)
+                             FROM messages
+                             WHERE conversation_id = c.id
+                               AND created_at IS NOT NULL)
+                       ) = ?4)
+                     ORDER BY c.id
+                     LIMIT 1",
+                    fparams![source_id.as_str(), *agent_id, source_path.as_str(), *started_at],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+            if exact_match.is_some() {
+                return Ok(exact_match);
+            }
+
+            let Some(conv) = conv else {
+                return Ok(None);
+            };
+            let incoming_fingerprints = conversation_message_fingerprints(conv);
+            if incoming_fingerprints.is_empty() {
+                return Ok(None);
+            }
+            let incoming_replay_fingerprints = conversation_message_replay_fingerprints(conv);
+
+            let candidates: Vec<(i64, Option<i64>)> = tx.query_map_collect(
+                "SELECT
+                     c.id,
+                     COALESCE(
+                         c.started_at,
+                         (SELECT MIN(created_at)
+                          FROM messages
+                          WHERE conversation_id = c.id
+                            AND created_at IS NOT NULL)
+                     ) AS effective_started_at
+                 FROM conversations c
+                 WHERE c.source_id = ?1
+                   AND c.agent_id = ?2
+                   AND c.source_path = ?3
+                 ORDER BY c.id",
+                fparams![source_id.as_str(), *agent_id, source_path.as_str()],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?;
+
+            let mut best_candidate: Option<(i64, ConversationMergeEvidence)> = None;
+            for (candidate_id, candidate_started_at) in candidates {
+                let existing_fingerprints =
+                    franken_existing_message_fingerprints(tx, candidate_id)?;
+                let existing_replay_fingerprints =
+                    replay_fingerprints_from_merge_set(&existing_fingerprints);
+                let Some(evidence) = conversation_merge_evidence(
+                    &incoming_fingerprints,
+                    &incoming_replay_fingerprints,
+                    &existing_fingerprints,
+                    &existing_replay_fingerprints,
+                    *started_at,
+                    candidate_started_at,
+                ) else {
+                    continue;
+                };
+
+                let candidate_key = (
+                    evidence.exact_overlap,
+                    evidence.replay_overlap,
+                    evidence.started_close,
+                    evidence.smaller_replay_set,
+                    std::cmp::Reverse(evidence.start_distance_ms),
+                );
+                let should_replace = best_candidate
+                    .as_ref()
+                    .map(|(_, best_evidence)| {
+                        candidate_key
+                            > (
+                                best_evidence.exact_overlap,
+                                best_evidence.replay_overlap,
+                                best_evidence.started_close,
+                                best_evidence.smaller_replay_set,
+                                std::cmp::Reverse(best_evidence.start_distance_ms),
+                            )
+                    })
+                    .unwrap_or(true);
+
+                if should_replace {
+                    best_candidate = Some((candidate_id, evidence));
+                }
+            }
+
+            Ok(best_candidate.map(|(candidate_id, _)| candidate_id))
+        }
+    }
+}
+
+fn is_conversation_identity_conflict(error: &anyhow::Error) -> bool {
+    let rendered = error.to_string();
+    rendered.contains("UNIQUE constraint failed")
+        && rendered.contains("conversations.source_id")
+        && rendered.contains("agent_id")
+        && rendered.contains("external_id")
+}
+
+fn franken_insert_conversation_or_get_existing(
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    conv: &Conversation,
+) -> Result<ConversationInsertStatus> {
+    match franken_insert_conversation(tx, agent_id, workspace_id, conv) {
+        Ok(conv_id) => Ok(ConversationInsertStatus::Inserted(conv_id)),
+        Err(error) if conv.external_id.is_some() && is_conversation_identity_conflict(&error) => {
+            let external_id = conv.external_id.as_deref().unwrap_or_default();
+            let existing_id = tx
+                .query_row_map(
+                    "SELECT id FROM conversations WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
+                    fparams![conv.source_id.as_str(), agent_id, external_id],
+                    |row| row.get_typed(0),
+                )
+                .optional()?
+                .with_context(|| {
+                    format!(
+                        "conversation insert conflicted but existing row was not found for source_id={} agent_id={} external_id={}",
+                        conv.source_id, agent_id, external_id
+                    )
+                })?;
+            tracing::warn!(
+                source_id = %conv.source_id,
+                agent_id,
+                external_id,
+                existing_id,
+                "conversation insert hit unique constraint; reusing existing row"
+            );
+            Ok(ConversationInsertStatus::Existing(existing_id))
+        }
+        Err(error) => {
+            tracing::error!(
+                source_id = %conv.source_id,
+                agent_id,
+                external_id = ?conv.external_id,
+                error = %error,
+                "franken_insert_conversation failed"
+            );
+            Err(error)
+        }
+    }
 }
 
 /// Insert a conversation into the DB within a frankensqlite transaction.
@@ -2511,7 +6270,7 @@ fn franken_insert_conversation(
     let metadata_json_str = serde_json::to_string(&conv.metadata_json)?;
     let metadata_bin_bytes = metadata_bin.as_deref();
 
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO conversations(
             agent_id, workspace_id, source_id, external_id, title, source_path,
             started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
@@ -2540,12 +6299,18 @@ fn franken_insert_message(
     conversation_id: i64,
     msg: &Message,
 ) -> Result<i64> {
-    let extra_bin = serialize_json_to_msgpack(&msg.extra_json);
-
-    let extra_json_str = serde_json::to_string(&msg.extra_json)?;
+    let (extra_json_str, extra_bin): (Cow<'_, str>, Option<Vec<u8>>) =
+        if let Some(raw) = historical_raw_json(&msg.extra_json) {
+            (Cow::Borrowed(raw), None)
+        } else {
+            (
+                Cow::Owned(serde_json::to_string(&msg.extra_json)?),
+                serialize_json_to_msgpack(&msg.extra_json),
+            )
+        };
     let extra_bin_bytes = extra_bin.as_deref();
 
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
         fparams![
@@ -2555,7 +6320,7 @@ fn franken_insert_message(
             msg.author.as_deref(),
             msg.created_at,
             msg.content.as_str(),
-            extra_json_str.as_str(),
+            extra_json_str.as_ref(),
             extra_bin_bytes
         ],
     )?;
@@ -2569,8 +6334,8 @@ fn franken_insert_snippets(
     snippets: &[Snippet],
 ) -> Result<()> {
     for snip in snippets {
-        let file_path_str = snip.file_path.as_ref().map(|p| path_to_string(p));
-        tx.execute_params(
+        let file_path_str = snip.file_path.as_ref().map(path_to_string);
+        tx.execute_compat(
             "INSERT INTO snippets(message_id, file_path, start_line, end_line, language, snippet_text)
              VALUES(?1,?2,?3,?4,?5,?6)",
             fparams![
@@ -2586,11 +6351,86 @@ fn franken_insert_snippets(
     Ok(())
 }
 
-/// Batch insert FTS5 entries within a frankensqlite transaction.
-fn franken_batch_insert_fts(
+fn franken_existing_message_fingerprints(
     tx: &FrankenTransaction<'_>,
-    entries: &[FtsEntry],
-) -> Result<usize> {
+    conversation_id: i64,
+) -> Result<HashSet<MessageMergeFingerprint>> {
+    let rows = tx.query_params(
+        "SELECT idx, role, author, created_at, content
+         FROM messages
+         WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    let mut fingerprints = HashSet::with_capacity(rows.len());
+    for row in rows {
+        let role: String = row.get_typed(1)?;
+        let content: String = row.get_typed(4)?;
+        fingerprints.insert(MessageMergeFingerprint {
+            idx: row.get_typed(0)?,
+            created_at: row.get_typed(3)?,
+            role,
+            author: row.get_typed(2)?,
+            content_hash: blake3::hash(content.as_bytes()).to_hex().to_string(),
+        });
+    }
+    Ok(fingerprints)
+}
+
+fn franken_existing_message_fingerprints_by_idx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<HashMap<i64, MessageMergeFingerprint>> {
+    let rows = tx.query_params(
+        "SELECT idx, role, author, created_at, content
+         FROM messages
+         WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    let mut fingerprints = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let idx: i64 = row.get_typed(0)?;
+        let role: String = row.get_typed(1)?;
+        let content: String = row.get_typed(4)?;
+        fingerprints.insert(
+            idx,
+            MessageMergeFingerprint {
+                idx,
+                created_at: row.get_typed(3)?,
+                role,
+                author: row.get_typed(2)?,
+                content_hash: blake3::hash(content.as_bytes()).to_hex().to_string(),
+            },
+        );
+    }
+    Ok(fingerprints)
+}
+
+fn franken_existing_message_replay_fingerprints(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<HashSet<MessageReplayFingerprint>> {
+    let rows = tx.query_params(
+        "SELECT role, author, created_at, content
+         FROM messages
+         WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    let mut fingerprints = HashSet::with_capacity(rows.len());
+    for row in rows {
+        let role: String = row.get_typed(0)?;
+        let content: String = row.get_typed(3)?;
+        fingerprints.insert(MessageReplayFingerprint {
+            created_at: row.get_typed(2)?,
+            role,
+            author: row.get_typed(1)?,
+            content_hash: blake3::hash(content.as_bytes()).to_hex().to_string(),
+        });
+    }
+    Ok(fingerprints)
+}
+
+/// Batch insert FTS5 entries within a frankensqlite transaction.
+fn franken_batch_insert_fts(tx: &FrankenTransaction<'_>, entries: &[FtsEntry]) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
@@ -2618,22 +6458,33 @@ fn franken_batch_insert_fts(
             .join(",");
 
         let sql = format!(
-            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id) VALUES {placeholders}"
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
         );
 
         let mut param_values: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 7);
         for entry in chunk {
+            param_values.push(ParamValue::from(entry.message_id));
             param_values.push(ParamValue::from(entry.content.as_str()));
             param_values.push(ParamValue::from(entry.title.as_str()));
             param_values.push(ParamValue::from(entry.agent.as_str()));
             param_values.push(ParamValue::from(entry.workspace.as_str()));
             param_values.push(ParamValue::from(entry.source_path.as_str()));
             param_values.push(ParamValue::from(entry.created_at));
-            param_values.push(ParamValue::from(entry.message_id));
         }
 
-        tx.execute_params(&sql, &param_values)?;
-        inserted += chunk.len();
+        match tx.execute_compat(&sql, &param_values) {
+            Ok(_) => {
+                inserted += chunk.len();
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    chunk_docs = chunk.len(),
+                    "frankensqlite FTS batch insert failed; deferring repair to final rusqlite FTS rebuild"
+                );
+                return Ok(inserted);
+            }
+        }
     }
 
     Ok(inserted)
@@ -2655,7 +6506,7 @@ fn franken_update_daily_stats_in_tx(
     let now = FrankenStorage::now_millis();
 
     // Update agent-specific entry
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
          VALUES(?1,?2,?3,?4,?5,?6,?7)
          ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
@@ -2667,7 +6518,7 @@ fn franken_update_daily_stats_in_tx(
     )?;
 
     // Update 'all' agent entry
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
          VALUES(?1,'all',?2,?3,?4,?5,?6)
          ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
@@ -2679,7 +6530,7 @@ fn franken_update_daily_stats_in_tx(
     )?;
 
     // Update 'all' source entry
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
          VALUES(?1,?2,'all',?3,?4,?5,?6)
          ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
@@ -2691,7 +6542,7 @@ fn franken_update_daily_stats_in_tx(
     )?;
 
     // Update global 'all'/'all' entry
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
          VALUES(?1,'all','all',?2,?3,?4,?5)
          ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
@@ -2705,160 +6556,889 @@ fn franken_update_daily_stats_in_tx(
     Ok(())
 }
 
-impl SqliteStorage {
-    pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating db directory {}", parent.display()))?;
-        }
+// -------------------------------------------------------------------------
+// Frankensqlite batch helpers
+// -------------------------------------------------------------------------
 
-        let mut conn = Connection::open(path)
-            .with_context(|| format!("opening sqlite db at {}", path.display()))?;
-
-        apply_pragmas(&mut conn)?;
-        init_meta(&mut conn)?;
-        migrate(&mut conn)?;
-
-        Ok(Self { conn })
+/// Batch upsert daily_stats within a frankensqlite transaction.
+fn franken_update_daily_stats_batched_in_tx(
+    tx: &FrankenTransaction<'_>,
+    entries: &[(i64, String, String, StatsDelta)],
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
     }
 
-    pub fn open_readonly(path: &Path) -> Result<Self> {
-        let conn = Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .with_context(|| format!("opening sqlite db readonly at {}", path.display()))?;
+    let now = FrankenStorage::now_millis();
+    let mut total_affected = 0;
 
-        apply_common_pragmas(&conn)?;
-
-        Ok(Self { conn })
+    // Keep frankensqlite UPSERTs row-wise inside the transaction. The
+    // multi-row VALUES ... ON CONFLICT form still falls back through
+    // INSERT...SELECT in fsqlite-core, which rejects UPSERT/RETURNING during
+    // real cass indexing.
+    for (day_id, agent, source, delta) in entries {
+        total_affected += tx.execute_compat(
+            "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+                 session_count = session_count + excluded.session_count,
+                 message_count = message_count + excluded.message_count,
+                 total_chars = total_chars + excluded.total_chars,
+                 last_updated = excluded.last_updated",
+            fparams![
+                *day_id,
+                agent.as_str(),
+                source.as_str(),
+                delta.session_count_delta,
+                delta.message_count_delta,
+                delta.total_chars_delta,
+                now
+            ],
+        )?;
     }
 
-    /// Open database with migration, backing up and signaling rebuild if schema is incompatible.
-    ///
-    /// This is the recommended entry point for the indexer. It handles:
-    /// - Schema version checking
-    /// - Automatic backup before destructive operations
-    /// - Cleanup of old backups
-    /// - Clear signaling when a full rebuild is required
-    ///
-    /// # Returns
-    /// - `Ok(storage)` if migration succeeded or no migration was needed
-    /// - `Err(MigrationError::RebuildRequired { .. })` if the caller should rebuild from scratch
-    ///
-    /// When `RebuildRequired` is returned, the caller should:
-    /// 1. Delete the database file (it's already backed up)
-    /// 2. Create a fresh database
-    /// 3. Re-index all conversations from source files
-    pub fn open_or_rebuild(path: &Path) -> std::result::Result<Self, MigrationError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+    Ok(total_affected)
+}
+
+/// Batch insert token_usage rows within a frankensqlite transaction.
+///
+/// Uses row-wise INSERT OR IGNORE to avoid the frankensqlite limitation where
+/// multi-row VALUES lists fall through to INSERT...SELECT, which rejects
+/// UPSERT/OR IGNORE conflict clauses.
+fn franken_insert_token_usage_batched_in_tx(
+    tx: &FrankenTransaction<'_>,
+    entries: &[TokenUsageEntry],
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let mut total_inserted = 0;
+
+    for e in entries {
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(24);
+        params_vec.push(ParamValue::from(e.message_id));
+        params_vec.push(ParamValue::from(e.conversation_id));
+        params_vec.push(ParamValue::from(e.agent_id));
+        params_vec.push(ParamValue::from(e.workspace_id));
+        params_vec.push(ParamValue::from(e.source_id.clone()));
+        params_vec.push(ParamValue::from(e.timestamp_ms));
+        params_vec.push(ParamValue::from(e.day_id));
+        params_vec.push(ParamValue::from(e.model_name.clone()));
+        params_vec.push(ParamValue::from(e.model_family.clone()));
+        params_vec.push(ParamValue::from(e.model_tier.clone()));
+        params_vec.push(ParamValue::from(e.service_tier.clone()));
+        params_vec.push(ParamValue::from(e.provider.clone()));
+        params_vec.push(ParamValue::from(e.input_tokens));
+        params_vec.push(ParamValue::from(e.output_tokens));
+        params_vec.push(ParamValue::from(e.cache_read_tokens));
+        params_vec.push(ParamValue::from(e.cache_creation_tokens));
+        params_vec.push(ParamValue::from(e.thinking_tokens));
+        params_vec.push(ParamValue::from(e.total_tokens));
+        params_vec.push(ParamValue::from(e.estimated_cost_usd));
+        params_vec.push(ParamValue::from(e.role.clone()));
+        params_vec.push(ParamValue::from(e.content_chars));
+        params_vec.push(ParamValue::from(e.has_tool_calls as i64));
+        params_vec.push(ParamValue::from(e.tool_call_count as i64));
+        params_vec.push(ParamValue::from(e.data_source.clone()));
+
+        let values = param_slice_to_values(&params_vec);
+        total_inserted += tx.execute_with_params(
+            "INSERT OR IGNORE INTO token_usage (
+                message_id, conversation_id, agent_id, workspace_id, source_id,
+                timestamp_ms, day_id,
+                model_name, model_family, model_tier, service_tier, provider,
+                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                thinking_tokens, total_tokens, estimated_cost_usd,
+                role, content_chars, has_tool_calls, tool_call_count, data_source
+            )
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+            &values,
+        )?;
+    }
+
+    Ok(total_inserted)
+}
+
+/// Batch upsert token_daily_stats within a frankensqlite transaction.
+fn franken_update_token_daily_stats_batched_in_tx(
+    tx: &FrankenTransaction<'_>,
+    entries: &[(i64, String, String, String, TokenStatsDelta)],
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let now = FrankenStorage::now_millis();
+    let mut total_affected = 0;
+
+    for (day_id, agent, source, model, delta) in entries {
+        total_affected += tx.execute_compat(
+            "INSERT INTO token_daily_stats (
+                day_id, agent_slug, source_id, model_family,
+                api_call_count, user_message_count, assistant_message_count, tool_message_count,
+                total_input_tokens, total_output_tokens, total_cache_read_tokens,
+                total_cache_creation_tokens, total_thinking_tokens, grand_total_tokens,
+                total_content_chars, total_tool_calls, estimated_cost_usd, session_count,
+                last_updated
+            )
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+            ON CONFLICT(day_id, agent_slug, source_id, model_family) DO UPDATE SET
+                api_call_count = api_call_count + excluded.api_call_count,
+                user_message_count = user_message_count + excluded.user_message_count,
+                assistant_message_count = assistant_message_count + excluded.assistant_message_count,
+                tool_message_count = tool_message_count + excluded.tool_message_count,
+                total_input_tokens = total_input_tokens + excluded.total_input_tokens,
+                total_output_tokens = total_output_tokens + excluded.total_output_tokens,
+                total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
+                total_cache_creation_tokens = total_cache_creation_tokens + excluded.total_cache_creation_tokens,
+                total_thinking_tokens = total_thinking_tokens + excluded.total_thinking_tokens,
+                grand_total_tokens = grand_total_tokens + excluded.grand_total_tokens,
+                total_content_chars = total_content_chars + excluded.total_content_chars,
+                total_tool_calls = total_tool_calls + excluded.total_tool_calls,
+                estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                session_count = session_count + excluded.session_count,
+                last_updated = excluded.last_updated",
+            fparams![
+                *day_id,
+                agent.as_str(),
+                source.as_str(),
+                model.as_str(),
+                delta.api_call_count,
+                delta.user_message_count,
+                delta.assistant_message_count,
+                delta.tool_message_count,
+                delta.total_input_tokens,
+                delta.total_output_tokens,
+                delta.total_cache_read_tokens,
+                delta.total_cache_creation_tokens,
+                delta.total_thinking_tokens,
+                delta.grand_total_tokens,
+                delta.total_content_chars,
+                delta.total_tool_calls,
+                delta.estimated_cost_usd,
+                delta.session_count,
+                now
+            ],
+        )?;
+    }
+
+    Ok(total_affected)
+}
+
+/// Batch insert message_metrics rows within a frankensqlite transaction.
+///
+/// Uses row-wise INSERT OR IGNORE to avoid the frankensqlite limitation where
+/// multi-row VALUES lists fall through to INSERT...SELECT, which rejects
+/// UPSERT/OR IGNORE conflict clauses.
+fn franken_insert_message_metrics_batched_in_tx(
+    tx: &FrankenTransaction<'_>,
+    entries: &[MessageMetricsEntry],
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let mut total_inserted = 0;
+
+    for e in entries {
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(24);
+        params_vec.push(ParamValue::from(e.message_id));
+        params_vec.push(ParamValue::from(e.created_at_ms));
+        params_vec.push(ParamValue::from(e.hour_id));
+        params_vec.push(ParamValue::from(e.day_id));
+        params_vec.push(ParamValue::from(e.agent_slug.clone()));
+        params_vec.push(ParamValue::from(e.workspace_id));
+        params_vec.push(ParamValue::from(e.source_id.clone()));
+        params_vec.push(ParamValue::from(e.role.clone()));
+        params_vec.push(ParamValue::from(e.content_chars));
+        params_vec.push(ParamValue::from(e.content_tokens_est));
+        params_vec.push(ParamValue::from(e.model_name.clone()));
+        params_vec.push(ParamValue::from(e.model_family.clone()));
+        params_vec.push(ParamValue::from(e.model_tier.clone()));
+        params_vec.push(ParamValue::from(e.provider.clone()));
+        params_vec.push(ParamValue::from(e.api_input_tokens));
+        params_vec.push(ParamValue::from(e.api_output_tokens));
+        params_vec.push(ParamValue::from(e.api_cache_read_tokens));
+        params_vec.push(ParamValue::from(e.api_cache_creation_tokens));
+        params_vec.push(ParamValue::from(e.api_thinking_tokens));
+        params_vec.push(ParamValue::from(e.api_service_tier.clone()));
+        params_vec.push(ParamValue::from(e.api_data_source.clone()));
+        params_vec.push(ParamValue::from(e.tool_call_count));
+        params_vec.push(ParamValue::from(e.has_tool_calls as i64));
+        params_vec.push(ParamValue::from(e.has_plan as i64));
+
+        let values = param_slice_to_values(&params_vec);
+        total_inserted += tx.execute_with_params(
+            "INSERT OR IGNORE INTO message_metrics (
+                message_id, created_at_ms, hour_id, day_id,
+                agent_slug, workspace_id, source_id, role,
+                content_chars, content_tokens_est,
+                model_name, model_family, model_tier, provider,
+                api_input_tokens, api_output_tokens, api_cache_read_tokens,
+                api_cache_creation_tokens, api_thinking_tokens,
+                api_service_tier, api_data_source,
+                tool_call_count, has_tool_calls, has_plan
+            )
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+            &values,
+        )?;
+    }
+
+    Ok(total_inserted)
+}
+
+/// Flush one rollup table (shared logic for hourly + daily) within a frankensqlite transaction.
+fn franken_flush_rollup_table(
+    tx: &FrankenTransaction<'_>,
+    table: &str,
+    bucket_col: &str,
+    deltas: &HashMap<(i64, String, i64, String), UsageRollupDelta>,
+    now: i64,
+) -> Result<usize> {
+    if deltas.is_empty() {
+        return Ok(0);
+    }
+
+    let mut total_affected = 0;
+
+    for ((bucket_id, agent, workspace_id, source), d) in deltas {
+        let sql = format!(
+            "INSERT INTO {table} (
+                {bucket_col}, agent_slug, workspace_id, source_id,
+                message_count, user_message_count, assistant_message_count,
+                tool_call_count, plan_message_count, plan_content_tokens_est_total,
+                plan_api_tokens_total, api_coverage_message_count,
+                content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
+                api_tokens_total, api_input_tokens_total, api_output_tokens_total,
+                api_cache_read_tokens_total, api_cache_creation_tokens_total,
+                api_thinking_tokens_total, last_updated
+            )
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
+            ON CONFLICT({bucket_col}, agent_slug, workspace_id, source_id) DO UPDATE SET
+                message_count = message_count + excluded.message_count,
+                user_message_count = user_message_count + excluded.user_message_count,
+                assistant_message_count = assistant_message_count + excluded.assistant_message_count,
+                tool_call_count = tool_call_count + excluded.tool_call_count,
+                plan_message_count = plan_message_count + excluded.plan_message_count,
+                plan_content_tokens_est_total = plan_content_tokens_est_total + excluded.plan_content_tokens_est_total,
+                plan_api_tokens_total = plan_api_tokens_total + excluded.plan_api_tokens_total,
+                api_coverage_message_count = api_coverage_message_count + excluded.api_coverage_message_count,
+                content_tokens_est_total = content_tokens_est_total + excluded.content_tokens_est_total,
+                content_tokens_est_user = content_tokens_est_user + excluded.content_tokens_est_user,
+                content_tokens_est_assistant = content_tokens_est_assistant + excluded.content_tokens_est_assistant,
+                api_tokens_total = api_tokens_total + excluded.api_tokens_total,
+                api_input_tokens_total = api_input_tokens_total + excluded.api_input_tokens_total,
+                api_output_tokens_total = api_output_tokens_total + excluded.api_output_tokens_total,
+                api_cache_read_tokens_total = api_cache_read_tokens_total + excluded.api_cache_read_tokens_total,
+                api_cache_creation_tokens_total = api_cache_creation_tokens_total + excluded.api_cache_creation_tokens_total,
+                api_thinking_tokens_total = api_thinking_tokens_total + excluded.api_thinking_tokens_total,
+                last_updated = excluded.last_updated"
+        );
+
+        total_affected += tx.execute_compat(
+            &sql,
+            fparams![
+                *bucket_id,
+                agent.as_str(),
+                *workspace_id,
+                source.as_str(),
+                d.message_count,
+                d.user_message_count,
+                d.assistant_message_count,
+                d.tool_call_count,
+                d.plan_message_count,
+                d.plan_content_tokens_est_total,
+                d.plan_api_tokens_total,
+                d.api_coverage_message_count,
+                d.content_tokens_est_total,
+                d.content_tokens_est_user,
+                d.content_tokens_est_assistant,
+                d.api_tokens_total,
+                d.api_input_tokens_total,
+                d.api_output_tokens_total,
+                d.api_cache_read_tokens_total,
+                d.api_cache_creation_tokens_total,
+                d.api_thinking_tokens_total,
+                now
+            ],
+        )?;
+    }
+
+    Ok(total_affected)
+}
+
+/// Flush usage_models_daily rollup within a frankensqlite transaction.
+fn franken_flush_model_daily_rollup_table(
+    tx: &FrankenTransaction<'_>,
+    deltas: &HashMap<(i64, String, i64, String, String, String), UsageRollupDelta>,
+    now: i64,
+) -> Result<usize> {
+    if deltas.is_empty() {
+        return Ok(0);
+    }
+
+    let mut total_affected = 0;
+
+    for ((day_id, agent, workspace_id, source, model_family, model_tier), d) in deltas {
+        total_affected += tx.execute_compat(
+            "INSERT INTO usage_models_daily (
+                day_id, agent_slug, workspace_id, source_id, model_family, model_tier,
+                message_count, user_message_count, assistant_message_count,
+                tool_call_count, plan_message_count, api_coverage_message_count,
+                content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
+                api_tokens_total, api_input_tokens_total, api_output_tokens_total,
+                api_cache_read_tokens_total, api_cache_creation_tokens_total,
+                api_thinking_tokens_total, last_updated
+            )
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
+            ON CONFLICT(day_id, agent_slug, workspace_id, source_id, model_family, model_tier) DO UPDATE SET
+                message_count = message_count + excluded.message_count,
+                user_message_count = user_message_count + excluded.user_message_count,
+                assistant_message_count = assistant_message_count + excluded.assistant_message_count,
+                tool_call_count = tool_call_count + excluded.tool_call_count,
+                plan_message_count = plan_message_count + excluded.plan_message_count,
+                api_coverage_message_count = api_coverage_message_count + excluded.api_coverage_message_count,
+                content_tokens_est_total = content_tokens_est_total + excluded.content_tokens_est_total,
+                content_tokens_est_user = content_tokens_est_user + excluded.content_tokens_est_user,
+                content_tokens_est_assistant = content_tokens_est_assistant + excluded.content_tokens_est_assistant,
+                api_tokens_total = api_tokens_total + excluded.api_tokens_total,
+                api_input_tokens_total = api_input_tokens_total + excluded.api_input_tokens_total,
+                api_output_tokens_total = api_output_tokens_total + excluded.api_output_tokens_total,
+                api_cache_read_tokens_total = api_cache_read_tokens_total + excluded.api_cache_read_tokens_total,
+                api_cache_creation_tokens_total = api_cache_creation_tokens_total + excluded.api_cache_creation_tokens_total,
+                api_thinking_tokens_total = api_thinking_tokens_total + excluded.api_thinking_tokens_total,
+                last_updated = excluded.last_updated",
+            fparams![
+                *day_id,
+                agent.as_str(),
+                *workspace_id,
+                source.as_str(),
+                model_family.as_str(),
+                model_tier.as_str(),
+                d.message_count,
+                d.user_message_count,
+                d.assistant_message_count,
+                d.tool_call_count,
+                d.plan_message_count,
+                d.api_coverage_message_count,
+                d.content_tokens_est_total,
+                d.content_tokens_est_user,
+                d.content_tokens_est_assistant,
+                d.api_tokens_total,
+                d.api_input_tokens_total,
+                d.api_output_tokens_total,
+                d.api_cache_read_tokens_total,
+                d.api_cache_creation_tokens_total,
+                d.api_thinking_tokens_total,
+                now
+            ],
+        )?;
+    }
+
+    Ok(total_affected)
+}
+
+/// Flush AnalyticsRollupAggregator deltas via frankensqlite transaction.
+fn franken_flush_analytics_rollups_in_tx(
+    tx: &FrankenTransaction<'_>,
+    agg: &AnalyticsRollupAggregator,
+) -> Result<(usize, usize, usize)> {
+    let now = FrankenStorage::now_millis();
+
+    let hourly_affected =
+        franken_flush_rollup_table(tx, "usage_hourly", "hour_id", &agg.hourly, now)?;
+    let daily_affected = franken_flush_rollup_table(tx, "usage_daily", "day_id", &agg.daily, now)?;
+    let models_daily_affected = franken_flush_model_daily_rollup_table(tx, &agg.models_daily, now)?;
+
+    Ok((hourly_affected, daily_affected, models_daily_affected))
+}
+
+/// Update conversation-level token summary columns via frankensqlite transaction.
+fn franken_update_conversation_token_summaries_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<()> {
+    tx.execute_compat(
+        "UPDATE conversations SET
+            total_input_tokens = (SELECT SUM(input_tokens) FROM token_usage WHERE conversation_id = ?1),
+            total_output_tokens = (SELECT SUM(output_tokens) FROM token_usage WHERE conversation_id = ?1),
+            total_cache_read_tokens = (SELECT SUM(cache_read_tokens) FROM token_usage WHERE conversation_id = ?1),
+            total_cache_creation_tokens = (SELECT SUM(cache_creation_tokens) FROM token_usage WHERE conversation_id = ?1),
+            grand_total_tokens = (SELECT SUM(total_tokens) FROM token_usage WHERE conversation_id = ?1),
+            estimated_cost_usd = (SELECT SUM(estimated_cost_usd) FROM token_usage WHERE conversation_id = ?1),
+            primary_model = (SELECT model_name FROM token_usage WHERE conversation_id = ?1
+                             AND model_name IS NOT NULL
+                             GROUP BY model_name ORDER BY COUNT(*) DESC LIMIT 1),
+            api_call_count = (SELECT COUNT(*) FROM token_usage WHERE conversation_id = ?1
+                              AND data_source = 'api'),
+            tool_call_count = (SELECT SUM(tool_call_count) FROM token_usage WHERE conversation_id = ?1),
+            user_message_count = (SELECT COUNT(*) FROM token_usage WHERE conversation_id = ?1
+                                  AND role = 'user'),
+            assistant_message_count = (SELECT COUNT(*) FROM token_usage WHERE conversation_id = ?1
+                                       AND role IN ('assistant', 'agent'))
+         WHERE id = ?1",
+        fparams![conversation_id],
+    )?;
+    Ok(())
+}
+
+impl FrankenStorage {
+    /// Rebuild analytics tables (message_metrics + rollups) from existing
+    /// messages in the database. Does NOT re-parse raw agent session files.
+    pub fn rebuild_analytics(&self) -> Result<AnalyticsRebuildResult> {
+        let start = Instant::now();
+
+        let total_messages: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
+        tracing::info!(
+            target: "cass::analytics",
+            total_messages,
+            "analytics_rebuild_start"
+        );
+
+        let mut tx = self.conn.transaction()?;
+
+        tx.execute("DELETE FROM message_metrics")?;
+        tx.execute("DELETE FROM usage_hourly")?;
+        tx.execute("DELETE FROM usage_daily")?;
+        tx.execute("DELETE FROM usage_models_daily")?;
+
+        const CHUNK_SIZE: i64 = 10_000;
+        let mut offset: i64 = 0;
+        let mut total_inserted: usize = 0;
+        let mut usage_hourly_rows: usize = 0;
+        let mut usage_daily_rows: usize = 0;
+        let mut usage_models_daily_rows: usize = 0;
+
+        loop {
+            #[allow(clippy::type_complexity)]
+            let rows: Vec<(
+                i64,
+                String,
+                String,
+                Option<serde_json::Value>,
+                Option<i64>,
+                Option<i64>,
+                String,
+                Option<i64>,
+                String,
+            )> = tx.query_map_collect(
+                "SELECT m.id, m.idx, m.role, m.content, m.extra_json, m.extra_bin,
+                        m.created_at,
+                        c.id AS conv_id, c.started_at AS conv_started_at,
+                        c.source_id, c.workspace_id,
+                        a.slug AS agent_slug
+                 FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 JOIN agents a ON c.agent_id = a.id
+                 ORDER BY m.id
+                 LIMIT ?1 OFFSET ?2",
+                fparams![CHUNK_SIZE, offset],
+                |row| {
+                    let msg_id: i64 = row.get_typed(0)?;
+                    let role: String = row.get_typed(2)?;
+                    let content: String = row.get_typed(3)?;
+                    let extra_json = row
+                        .get_typed::<Option<String>>(4)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .or_else(|| {
+                            row.get_typed::<Option<Vec<u8>>>(5)
+                                .ok()
+                                .flatten()
+                                .and_then(|b| rmp_serde::from_slice(&b).ok())
+                        });
+                    let msg_ts: Option<i64> = row.get_typed(6)?;
+                    let conv_started_at: Option<i64> = row.get_typed(8)?;
+                    let source_id: String = row.get_typed(9)?;
+                    let workspace_id: Option<i64> = row.get_typed(10)?;
+                    let agent_slug: String = row.get_typed(11)?;
+                    let effective_ts = msg_ts.or(conv_started_at).unwrap_or(0);
+
+                    Ok((
+                        msg_id,
+                        role,
+                        content,
+                        extra_json,
+                        Some(effective_ts),
+                        workspace_id,
+                        source_id,
+                        conv_started_at,
+                        agent_slug,
+                    ))
+                },
+            )?;
+
+            if rows.is_empty() {
+                break;
+            }
+
+            let chunk_len = rows.len();
+            let mut entries = Vec::with_capacity(chunk_len);
+            let mut rollup_agg = AnalyticsRollupAggregator::new();
+
+            for (
+                msg_id,
+                role,
+                content,
+                extra_json,
+                effective_ts,
+                workspace_id,
+                source_id,
+                _conv_started_at,
+                agent_slug,
+            ) in &rows
+            {
+                let ts = effective_ts.unwrap_or(0);
+                let day_id = Self::day_id_from_millis(ts);
+                let hour_id = Self::hour_id_from_millis(ts);
+                let content_chars = content.len() as i64;
+                let content_tokens_est = content_chars / 4;
+                let extra = extra_json
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let usage =
+                    crate::connectors::extract_tokens_for_agent(agent_slug, &extra, content, role);
+                let model_info = usage
+                    .model_name
+                    .as_deref()
+                    .map(crate::connectors::normalize_model);
+                let model_family = model_info
+                    .as_ref()
+                    .map(|i| i.family.clone())
+                    .unwrap_or_else(|| "unknown".into());
+                let model_tier = model_info
+                    .as_ref()
+                    .map(|i| i.tier.clone())
+                    .unwrap_or_else(|| "unknown".into());
+                let provider = usage
+                    .provider
+                    .clone()
+                    .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+                    .unwrap_or_else(|| "unknown".into());
+
+                let entry = MessageMetricsEntry {
+                    message_id: *msg_id,
+                    created_at_ms: ts,
+                    hour_id,
+                    day_id,
+                    agent_slug: agent_slug.clone(),
+                    workspace_id: workspace_id.unwrap_or(0),
+                    source_id: source_id.clone(),
+                    role: role.clone(),
+                    content_chars,
+                    content_tokens_est,
+                    model_name: usage.model_name.clone(),
+                    model_family,
+                    model_tier,
+                    provider,
+                    api_input_tokens: usage.input_tokens,
+                    api_output_tokens: usage.output_tokens,
+                    api_cache_read_tokens: usage.cache_read_tokens,
+                    api_cache_creation_tokens: usage.cache_creation_tokens,
+                    api_thinking_tokens: usage.thinking_tokens,
+                    api_service_tier: usage.service_tier,
+                    api_data_source: usage.data_source.as_str().to_string(),
+                    tool_call_count: usage.tool_call_count as i64,
+                    has_tool_calls: usage.has_tool_calls,
+                    has_plan: has_plan_for_role(role, content),
+                };
+                rollup_agg.record(&entry);
+                entries.push(entry);
+            }
+
+            total_inserted += franken_insert_message_metrics_batched_in_tx(&tx, &entries)?;
+            let (hourly, daily, models_daily) =
+                franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
+            usage_hourly_rows += hourly;
+            usage_daily_rows += daily;
+            usage_models_daily_rows += models_daily;
+            offset += chunk_len as i64;
+
+            tracing::debug!(
+                target: "cass::analytics",
+                offset,
+                chunk = chunk_len,
+                inserted = entries.len(),
+                total = total_inserted,
+                "analytics_rebuild_chunk"
+            );
+
+            if (chunk_len as i64) < CHUNK_SIZE {
+                break;
+            }
         }
 
-        // Check if we need to handle an incompatible schema before opening
-        if path.exists() {
-            let check_result = check_schema_compatibility(path);
-            match check_result {
-                Ok(SchemaCheck::Compatible) => {
-                    // Continue with normal open
+        tx.commit()?;
+
+        let elapsed = start.elapsed();
+        let elapsed_ms = elapsed.as_millis() as u64;
+        let msgs_per_sec = if elapsed_ms > 0 {
+            (total_inserted as f64) / (elapsed_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        tracing::info!(
+            target: "cass::analytics",
+            message_metrics_rows = total_inserted,
+            usage_hourly_rows,
+            usage_daily_rows,
+            usage_models_daily_rows,
+            elapsed_ms,
+            messages_per_sec = format!("{:.0}", msgs_per_sec),
+            "analytics_rebuild_complete"
+        );
+
+        Ok(AnalyticsRebuildResult {
+            message_metrics_rows: total_inserted,
+            usage_hourly_rows,
+            usage_daily_rows,
+            usage_models_daily_rows,
+            elapsed_ms,
+            messages_per_sec: msgs_per_sec,
+        })
+    }
+
+    /// Rebuild all daily stats from scratch.
+    pub fn rebuild_daily_stats(&self) -> Result<DailyStatsRebuildResult> {
+        const DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE: usize = 1_000;
+        const DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE: usize = 10_000;
+
+        let mut conversation_batch_size = rebuild_batch_size_env(
+            "CASS_DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE",
+            DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE,
+        );
+        let mut message_batch_size = rebuild_batch_size_env(
+            "CASS_DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE",
+            DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE,
+        );
+
+        let total_messages: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
+        let message_metrics_rows: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
+        let use_message_metrics = total_messages > 0 && total_messages == message_metrics_rows;
+
+        tracing::info!(
+            target: "cass::perf::daily_stats",
+            total_messages,
+            message_metrics_rows,
+            use_message_metrics,
+            "daily_stats rebuild selected message source"
+        );
+
+        let mut tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM daily_stats")?;
+
+        let mut last_conversation_id = 0_i64;
+        let mut conversation_batch_count = 0_usize;
+        let mut conversations_processed = 0_usize;
+        let mut messages_processed = 0_usize;
+        let mut message_batch_count = 0_usize;
+        let mut raw_entries_flushed = 0_usize;
+        let mut expanded_entries_flushed = 0_usize;
+        let message_scan_sql = if use_message_metrics {
+            "SELECT m.idx, mm.content_chars
+             FROM messages m
+             JOIN message_metrics mm ON mm.message_id = m.id
+             WHERE m.conversation_id = ?1
+               AND m.idx > ?2
+             ORDER BY m.conversation_id, m.idx
+             LIMIT ?3"
+        } else {
+            "SELECT m.idx, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
+             FROM messages m
+             WHERE m.conversation_id = ?1
+               AND m.idx > ?2
+             ORDER BY m.conversation_id, m.idx
+             LIMIT ?3"
+        };
+
+        loop {
+            let conversation_rows = match self.conn.query_with_params(
+                "SELECT c.id, c.started_at, a.slug, c.source_id
+                 FROM conversations c
+                 JOIN agents a ON c.agent_id = a.id
+                 WHERE c.id > ?1
+                 ORDER BY c.id
+                 LIMIT ?2",
+                &params_from_iter([
+                    ParamValue::from(last_conversation_id),
+                    ParamValue::from(conversation_batch_size as i64),
+                ]),
+            ) {
+                Ok(rows) => rows,
+                Err(err) if is_out_of_memory_error(&err) && conversation_batch_size > 1 => {
+                    let previous_batch_size = conversation_batch_size;
+                    conversation_batch_size = (conversation_batch_size / 2).max(1);
+                    tracing::warn!(
+                        previous_batch_size,
+                        conversation_batch_size,
+                        last_conversation_id,
+                        "daily_stats conversation scan ran out of memory; retrying with smaller batch"
+                    );
+                    continue;
                 }
-                Ok(SchemaCheck::NeedsMigration) => {
-                    // Continue with normal open, migration will handle it
-                }
-                Ok(SchemaCheck::NeedsRebuild(reason)) => {
-                    // Schema from future or otherwise incompatible - trigger rebuild
-                    let backup_path = create_backup(path)?;
-                    cleanup_old_backups(path, MAX_BACKUPS)?;
-                    remove_database_files(path)?;
-                    return Err(MigrationError::RebuildRequired {
-                        reason,
-                        backup_path,
-                    });
-                }
-                Err(_) => {
-                    // If we can't even check, it's likely corrupt - trigger rebuild
-                    let backup_path = create_backup(path)?;
-                    cleanup_old_backups(path, MAX_BACKUPS)?;
-                    remove_database_files(path)?;
-                    return Err(MigrationError::RebuildRequired {
-                        reason: "Database appears corrupted".to_string(),
-                        backup_path,
-                    });
+                Err(err) => return Err(err.into()),
+            };
+            if conversation_rows.is_empty() {
+                break;
+            }
+
+            let mut aggregate = StatsAggregator::new();
+            let mut conversation_batch_meta: Vec<(i64, i64, String, String)> =
+                Vec::with_capacity(conversation_rows.len());
+            for row in &conversation_rows {
+                let conversation_id: i64 = row.get_typed(0)?;
+                let started_at: Option<i64> = row.get_typed(1)?;
+                let agent_slug: String = row.get_typed(2)?;
+                let source_id: String = row.get_typed(3)?;
+                last_conversation_id = conversation_id;
+                let day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
+                aggregate.record_delta(&agent_slug, &source_id, day_id, 1, 0, 0);
+                conversation_batch_meta.push((conversation_id, day_id, agent_slug, source_id));
+                conversations_processed += 1;
+            }
+
+            conversation_batch_count += 1;
+            raw_entries_flushed += aggregate.raw_entry_count();
+            let entries = aggregate.expand();
+            expanded_entries_flushed += entries.len();
+            if !entries.is_empty() {
+                franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
+            }
+            if conversation_batch_count % 25 == 0 {
+                tracing::info!(
+                    target: "cass::perf::daily_stats",
+                    conversations_processed,
+                    batches = conversation_batch_count,
+                    batch_size = conversation_batch_size,
+                    last_conversation_id,
+                    "daily_stats rebuild conversation scan progress"
+                );
+            }
+            if conversation_batch_meta.is_empty() {
+                continue;
+            }
+
+            for (conversation_id, day_id, agent_slug, source_id) in conversation_batch_meta {
+                let mut cursor_message_idx = -1_i64;
+                loop {
+                    let message_rows = match self.conn.query_with_params(
+                        message_scan_sql,
+                        &params_from_iter([
+                            ParamValue::from(conversation_id),
+                            ParamValue::from(cursor_message_idx),
+                            ParamValue::from(message_batch_size as i64),
+                        ]),
+                    ) {
+                        Ok(rows) => rows,
+                        Err(err) if is_out_of_memory_error(&err) && message_batch_size > 1 => {
+                            let previous_batch_size = message_batch_size;
+                            message_batch_size = (message_batch_size / 2).max(1);
+                            tracing::warn!(
+                                previous_batch_size,
+                                message_batch_size,
+                                conversation_id,
+                                cursor_message_idx,
+                                "daily_stats message scan ran out of memory; retrying with smaller batch"
+                            );
+                            continue;
+                        }
+                        Err(err) => return Err(err.into()),
+                    };
+                    if message_rows.is_empty() {
+                        break;
+                    }
+
+                    let mut aggregate = StatsAggregator::new();
+                    for row in &message_rows {
+                        let message_idx: i64 = row.get_typed(0)?;
+                        let content_len: i64 = row.get_typed(1)?;
+                        cursor_message_idx = message_idx;
+                        aggregate.record_delta(&agent_slug, &source_id, day_id, 0, 1, content_len);
+                        messages_processed += 1;
+                    }
+
+                    message_batch_count += 1;
+                    raw_entries_flushed += aggregate.raw_entry_count();
+                    let entries = aggregate.expand();
+                    expanded_entries_flushed += entries.len();
+                    if !entries.is_empty() {
+                        franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
+                    }
+                    if message_batch_count % 50 == 0 {
+                        tracing::info!(
+                            target: "cass::perf::daily_stats",
+                            messages_processed,
+                            batches = message_batch_count,
+                            batch_size = message_batch_size,
+                            source = if use_message_metrics {
+                                "message_metrics"
+                            } else {
+                                "messages"
+                            },
+                            conversation_id,
+                            cursor_message_idx,
+                            "daily_stats rebuild message scan progress"
+                        );
+                    }
                 }
             }
         }
 
-        // Now open and migrate normally
-        let mut conn = Connection::open(path)?;
-        apply_pragmas(&mut conn).map_err(|e| MigrationError::Other(e.to_string()))?;
-        init_meta(&mut conn).map_err(|e| MigrationError::Other(e.to_string()))?;
-        migrate(&mut conn).map_err(|e| MigrationError::Other(e.to_string()))?;
-
-        Ok(Self { conn })
-    }
-
-    pub fn raw(&self) -> &Connection {
-        &self.conn
-    }
-
-    pub fn schema_version(&self) -> Result<i64> {
-        self.conn
-            .query_row(
-                "SELECT value FROM meta WHERE key='schema_version'",
-                [],
-                |row| row.get::<_, String>(0).map(|s| s.parse().unwrap_or(0)),
-            )
-            .optional()?
-            .ok_or_else(|| anyhow!("schema_version missing"))
-    }
-
-    pub fn ensure_agent(&self, agent: &Agent) -> Result<i64> {
-        let now = Self::now_millis();
-        self.conn.execute(
-            "INSERT INTO agents(slug, name, version, kind, created_at, updated_at) VALUES(?,?,?,?,?,?)
-             ON CONFLICT(slug) DO UPDATE SET name=excluded.name, version=excluded.version, kind=excluded.kind, updated_at=excluded.updated_at",
-            params![
-                &agent.slug,
-                &agent.name,
-                &agent.version,
-                agent_kind_str(agent.kind.clone()),
-                now,
-                now
-            ],
+        let rows_created: i64 =
+            tx.query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
+                row.get_typed(0)
+            })?;
+        let total_sessions: i64 = tx.query_row_map(
+            "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+            fparams![],
+            |row| row.get_typed(0),
         )?;
 
-        self.conn
-            .query_row(
-                "SELECT id FROM agents WHERE slug = ?",
-                params![&agent.slug],
-                |row| row.get(0),
-            )
-            .with_context(|| format!("fetching agent id for {}", agent.slug))
-    }
+        tx.commit()?;
 
-    pub fn ensure_workspace(&self, path: &Path, display_name: Option<&str>) -> Result<i64> {
-        let path_str = path.to_string_lossy();
-        self.conn.execute(
-            "INSERT INTO workspaces(path, display_name) VALUES(?,?)
-             ON CONFLICT(path) DO UPDATE SET display_name=COALESCE(excluded.display_name, workspaces.display_name)",
-            params![path_str, display_name],
-        )?;
+        tracing::info!(
+            target: "cass::perf::daily_stats",
+            rows_created,
+            total_sessions,
+            conversations_processed,
+            conversation_batches = conversation_batch_count,
+            conversation_batch_size,
+            message_batches = message_batch_count,
+            message_batch_size,
+            messages_processed,
+            use_message_metrics,
+            raw_entries_flushed,
+            expanded_entries_flushed,
+            "Daily stats rebuilt from conversations"
+        );
 
-        self.conn
-            .query_row(
-                "SELECT id FROM workspaces WHERE path = ?",
-                params![path_str],
-                |row| row.get(0),
-            )
-            .with_context(|| format!("fetching workspace id for {path_str}"))
+        Ok(DailyStatsRebuildResult {
+            rows_created,
+            total_sessions,
+        })
     }
 }
+
+// SqliteStorage impl block removed: SqliteStorage is now a type alias for FrankenStorage.
+// All methods are available through FrankenStorage.
 
 // -------------------------------------------------------------------------
 // IndexingCache (Opt 7.2) - N+1 Prevention for Agent/Workspace IDs
 // -------------------------------------------------------------------------
-
-use std::collections::HashMap;
 
 /// Cache for agent and workspace IDs during batch indexing.
 ///
@@ -2887,6 +7467,23 @@ pub struct IndexingCache {
     misses: u64,
 }
 
+pub trait IndexingCacheStorage {
+    fn ensure_indexing_agent(&self, agent: &Agent) -> Result<i64>;
+    fn ensure_indexing_workspace(&self, path: &Path, display_name: Option<&str>) -> Result<i64>;
+}
+
+impl IndexingCacheStorage for FrankenStorage {
+    fn ensure_indexing_agent(&self, agent: &Agent) -> Result<i64> {
+        self.ensure_agent(agent)
+    }
+
+    fn ensure_indexing_workspace(&self, path: &Path, display_name: Option<&str>) -> Result<i64> {
+        self.ensure_workspace(path, display_name)
+    }
+}
+
+// IndexingCacheStorage for SqliteStorage removed: SqliteStorage is a type alias for FrankenStorage.
+
 impl IndexingCache {
     /// Create a new empty cache.
     pub fn new() -> Self {
@@ -2910,14 +7507,17 @@ impl IndexingCache {
     ///
     /// Returns the cached ID if present, otherwise calls ensure_agent
     /// and caches the result.
-    pub fn get_or_insert_agent(&mut self, storage: &SqliteStorage, agent: &Agent) -> Result<i64> {
+    pub fn get_or_insert_agent<S>(&mut self, storage: &S, agent: &Agent) -> Result<i64>
+    where
+        S: IndexingCacheStorage + ?Sized,
+    {
         if let Some(&cached) = self.agent_ids.get(&agent.slug) {
             self.hits += 1;
             return Ok(cached);
         }
 
         self.misses += 1;
-        let id = storage.ensure_agent(agent)?;
+        let id = storage.ensure_indexing_agent(agent)?;
         self.agent_ids.insert(agent.slug.clone(), id);
         Ok(id)
     }
@@ -2928,7 +7528,7 @@ impl IndexingCache {
     /// and caches the result.
     pub fn get_or_insert_workspace(
         &mut self,
-        storage: &SqliteStorage,
+        storage: &(impl IndexingCacheStorage + ?Sized),
         path: &Path,
         display_name: Option<&str>,
     ) -> Result<i64> {
@@ -2938,7 +7538,7 @@ impl IndexingCache {
         }
 
         self.misses += 1;
-        let id = storage.ensure_workspace(path, display_name)?;
+        let id = storage.ensure_indexing_workspace(path, display_name)?;
         self.workspace_ids.insert(path.to_path_buf(), id);
         Ok(id)
     }
@@ -3594,7 +8194,7 @@ pub struct PricingEntry {
     pub output_cost_per_mtok: f64,
     pub cache_read_cost_per_mtok: Option<f64>,
     pub cache_creation_cost_per_mtok: Option<f64>,
-    /// Effective date as day_id (YYYYMMDD integer, e.g. 20251001).
+    /// Effective date as day_id (days since 2020-01-01).
     pub effective_day_id: i64,
 }
 
@@ -3656,28 +8256,32 @@ pub struct PricingTable {
 
 impl PricingTable {
     /// Load all pricing entries from the database.
-    pub fn load(conn: &rusqlite::Connection) -> Result<Self> {
-        let mut stmt = conn.prepare(
+    pub fn load(conn: &FrankenConnection) -> Result<Self> {
+        Self::franken_load(conn)
+    }
+
+    /// Load all pricing entries from a frankensqlite connection.
+    pub fn franken_load(conn: &FrankenConnection) -> Result<Self> {
+        let rows = conn.query(
             "SELECT model_pattern, provider, input_cost_per_mtok, output_cost_per_mtok,
                     cache_read_cost_per_mtok, cache_creation_cost_per_mtok, effective_date
              FROM model_pricing
              ORDER BY effective_date DESC",
         )?;
-        let entries = stmt
-            .query_map([], |row| {
-                let effective_date: String = row.get(6)?;
-                let effective_day_id = date_str_to_day_id(&effective_date);
-                Ok(PricingEntry {
-                    model_pattern: row.get(0)?,
-                    provider: row.get(1)?,
-                    input_cost_per_mtok: row.get(2)?,
-                    output_cost_per_mtok: row.get(3)?,
-                    cache_read_cost_per_mtok: row.get(4)?,
-                    cache_creation_cost_per_mtok: row.get(5)?,
-                    effective_day_id,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let effective_date: String = row.get_typed(6)?;
+            let effective_day_id = date_str_to_day_id(&effective_date)?;
+            entries.push(PricingEntry {
+                model_pattern: row.get_typed(0)?,
+                provider: row.get_typed(1)?,
+                input_cost_per_mtok: row.get_typed(2)?,
+                output_cost_per_mtok: row.get_typed(3)?,
+                cache_read_cost_per_mtok: row.get_typed(4)?,
+                cache_creation_cost_per_mtok: row.get_typed(5)?,
+                effective_day_id,
+            });
+        }
         Ok(Self { entries })
     }
 
@@ -3735,14 +8339,23 @@ impl PricingTable {
         }
 
         let mut cost = 0.0;
-        cost += input_tokens.unwrap_or(0) as f64 * pricing.input_cost_per_mtok / 1_000_000.0;
+        let cache_read = cache_read_tokens.unwrap_or(0);
+        let cache_creation = cache_creation_tokens.unwrap_or(0);
+        // input_tokens includes cache tokens as a subset; subtract them
+        // so we don't charge at both the full input rate AND the cache rate.
+        let non_cache_input = input_tokens
+            .unwrap_or(0)
+            .saturating_sub(cache_read)
+            .saturating_sub(cache_creation)
+            .max(0);
+        cost += non_cache_input as f64 * pricing.input_cost_per_mtok / 1_000_000.0;
         cost += output_tokens.unwrap_or(0) as f64 * pricing.output_cost_per_mtok / 1_000_000.0;
 
         if let Some(cache_price) = pricing.cache_read_cost_per_mtok {
-            cost += cache_read_tokens.unwrap_or(0) as f64 * cache_price / 1_000_000.0;
+            cost += cache_read as f64 * cache_price / 1_000_000.0;
         }
         if let Some(cache_price) = pricing.cache_creation_cost_per_mtok {
-            cost += cache_creation_tokens.unwrap_or(0) as f64 * cache_price / 1_000_000.0;
+            cost += cache_creation as f64 * cache_price / 1_000_000.0;
         }
 
         Some(cost)
@@ -3754,9 +8367,17 @@ impl PricingTable {
     }
 }
 
-/// Convert "YYYY-MM-DD" date string to day_id (YYYYMMDD integer).
-fn date_str_to_day_id(s: &str) -> i64 {
-    s.replace('-', "").parse::<i64>().unwrap_or(0)
+/// Convert "YYYY-MM-DD" date string to day_id (days since 2020-01-01),
+/// matching the format produced by `day_id_from_millis`.
+fn date_str_to_day_id(s: &str) -> Result<i64> {
+    use chrono::NaiveDate;
+    const EPOCH_2020: NaiveDate = match NaiveDate::from_ymd_opt(2020, 1, 1) {
+        Some(d) => d,
+        None => unreachable!(),
+    };
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map(|d| (d - EPOCH_2020).num_days())
+        .with_context(|| format!("invalid effective_date '{s}'"))
 }
 
 /// SQL LIKE pattern matcher (case-insensitive). `%` = any sequence, `_` = any single char.
@@ -3765,6 +8386,19 @@ fn sql_like_match(value: &str, pattern: &str) -> bool {
         value.to_ascii_lowercase().as_bytes(),
         pattern.to_ascii_lowercase().as_bytes(),
     )
+}
+
+/// Determine the byte length of the UTF-8 character starting at `b`.
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
 }
 
 fn sql_like_match_bytes(val: &[u8], pat: &[u8]) -> bool {
@@ -3778,1679 +8412,49 @@ fn sql_like_match_bytes(val: &[u8], pat: &[u8]) -> bool {
                 p += 1;
             }
             let rest = &pat[p..];
-            for i in 0..=val.len() {
+            // Iterate only at UTF-8 char boundaries
+            let mut i = 0;
+            while i <= val.len() {
                 if sql_like_match_bytes(&val[i..], rest) {
                     return true;
+                }
+                if i < val.len() {
+                    i += utf8_char_len(val[i]);
+                } else {
+                    break;
                 }
             }
             false
         }
-        b'_' => !val.is_empty() && sql_like_match_bytes(&val[1..], &pat[1..]),
+        b'_' => {
+            // Match one full UTF-8 character, not just one byte
+            if val.is_empty() {
+                return false;
+            }
+            let char_len = utf8_char_len(val[0]);
+            val.len() >= char_len && sql_like_match_bytes(&val[char_len..], &pat[1..])
+        }
         c => !val.is_empty() && val[0] == c && sql_like_match_bytes(&val[1..], &pat[1..]),
     }
 }
 
-impl SqliteStorage {
-    pub fn insert_conversation_tree(
-        &mut self,
-        agent_id: i64,
-        workspace_id: Option<i64>,
-        conv: &Conversation,
-    ) -> Result<InsertOutcome> {
-        // Check for existing conversation with same (source_id, agent_id, external_id)
-        if let Some(ext) = &conv.external_id
-            && let Some(existing) = self
-                .conn
-                .query_row(
-                    "SELECT id FROM conversations WHERE source_id = ? AND agent_id = ? AND external_id = ?",
-                    params![&conv.source_id, agent_id, ext],
-                    |row| row.get(0),
-                )
-                .optional()?
-        {
-            return self.append_messages(existing, conv);
-        }
-
-        let tx = self.conn.transaction()?;
-
-        let conv_id = insert_conversation(&tx, agent_id, workspace_id, conv)?;
-        let mut fts_entries = Vec::with_capacity(conv.messages.len());
-        let mut total_chars: i64 = 0;
-        for msg in &conv.messages {
-            let msg_id = insert_message(&tx, conv_id, msg)?;
-            insert_snippets(&tx, msg_id, &msg.snippets)?;
-            fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-            total_chars += msg.content.len() as i64;
-        }
-        // Batch insert FTS entries
-        batch_insert_fts_messages(&tx, &fts_entries)?;
-
-        // Update daily stats (+1 session, +N messages)
-        update_daily_stats_in_tx(
-            &tx,
-            &conv.agent_slug,
-            &conv.source_id,
-            conv.started_at,
-            1, // New session
-            conv.messages.len() as i64,
-            total_chars,
-        )?;
-
-        tx.commit()?;
-        Ok(InsertOutcome {
-            conversation_id: conv_id,
-            inserted_indices: conv.messages.iter().map(|m| m.idx).collect(),
-        })
-    }
-
-    fn append_messages(
-        &mut self,
-        conversation_id: i64,
-        conv: &Conversation,
-    ) -> Result<InsertOutcome> {
-        let tx = self.conn.transaction()?;
-
-        let max_idx: Option<i64> = tx.query_row(
-            "SELECT MAX(idx) FROM messages WHERE conversation_id = ?",
-            params![conversation_id],
-            |row| row.get::<_, Option<i64>>(0),
-        )?;
-        let cutoff = max_idx.unwrap_or(-1);
-
-        let mut inserted_indices = Vec::new();
-        let mut fts_entries = Vec::new();
-        let mut new_chars: i64 = 0;
-        for msg in &conv.messages {
-            if msg.idx <= cutoff {
-                continue;
-            }
-            let msg_id = insert_message(&tx, conversation_id, msg)?;
-            insert_snippets(&tx, msg_id, &msg.snippets)?;
-            fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-            inserted_indices.push(msg.idx);
-            new_chars += msg.content.len() as i64;
-        }
-
-        // Batch insert FTS entries
-        batch_insert_fts_messages(&tx, &fts_entries)?;
-
-        if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
-            // Use IFNULL to handle NULL ended_at values correctly.
-            // SQLite's scalar MAX(NULL, x) returns NULL, so we need to coalesce first.
-            tx.execute(
-                "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?) WHERE id = ?",
-                params![last_ts, conversation_id],
-            )?;
-        }
-
-        // Update daily stats if new messages were appended (+0 sessions, +N messages)
-        if !inserted_indices.is_empty() {
-            let message_count = inserted_indices.len() as i64;
-            update_daily_stats_in_tx(
-                &tx,
-                &conv.agent_slug,
-                &conv.source_id,
-                conv.started_at,
-                0, // Existing session
-                message_count,
-                new_chars,
-            )?;
-        }
-
-        tx.commit()?;
-        Ok(InsertOutcome {
-            conversation_id,
-            inserted_indices,
-        })
-    }
-
-    /// Insert multiple conversations in a single transaction with batch FTS indexing.
-    ///
-    /// Uses multi-value INSERT for FTS5 entries (P2 Opt 2.1) to reduce
-    /// transaction overhead and improve indexing throughput by 10-20%.
-    pub fn insert_conversations_batched(
-        &mut self,
-        conversations: &[(i64, Option<i64>, &Conversation)],
-    ) -> Result<Vec<InsertOutcome>> {
-        if conversations.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Load pricing table once for the entire batch (bead z9fse.10)
-        let pricing_table = PricingTable::load(&self.conn).unwrap_or_else(|e| {
-            tracing::warn!(target: "cass::analytics::pricing", error = %e, "failed to load pricing table");
-            PricingTable { entries: Vec::new() }
-        });
-        let mut pricing_diag = PricingDiagnostics::default();
-
-        let tx = self.conn.transaction()?;
-        let mut outcomes = Vec::with_capacity(conversations.len());
-        let mut fts_entries = Vec::new();
-        let mut stats = StatsAggregator::new();
-        let mut token_stats = TokenStatsAggregator::new();
-        let mut token_entries: Vec<TokenUsageEntry> = Vec::new();
-        let mut metrics_entries: Vec<MessageMetricsEntry> = Vec::new();
-        let mut rollup_agg = AnalyticsRollupAggregator::new();
-        let mut conv_ids_to_summarize: Vec<i64> = Vec::new();
-
-        // Process all conversations, collecting FTS entries and token data
-        for &(agent_id, workspace_id, conv) in conversations {
-            let (outcome, delta) = insert_conversation_in_tx_batched(
-                &tx,
-                agent_id,
-                workspace_id,
-                conv,
-                &mut fts_entries,
-            )?;
-            if delta.session_count_delta != 0
-                || delta.message_count_delta != 0
-                || delta.total_chars_delta != 0
-            {
-                let day_id = conv
-                    .started_at
-                    .map(SqliteStorage::day_id_from_millis)
-                    .unwrap_or(0);
-                stats.record_delta(
-                    &conv.agent_slug,
-                    &conv.source_id,
-                    day_id,
-                    delta.session_count_delta,
-                    delta.message_count_delta,
-                    delta.total_chars_delta,
-                );
-            }
-
-            // Extract token usage from newly inserted messages
-            let has_new_messages = !outcome.inserted_indices.is_empty();
-            if has_new_messages {
-                let conv_day_id = conv
-                    .started_at
-                    .map(SqliteStorage::day_id_from_millis)
-                    .unwrap_or(0);
-
-                // Track primary model for session-level stats
-                let mut session_model_family = String::from("unknown");
-                let mut has_any_tokens = false;
-
-                // For each newly inserted message, extract tokens and create entries
-                // We need the message_id from the DB. Query inserted messages by conv+idx.
-                for msg in &conv.messages {
-                    if !outcome.inserted_indices.contains(&msg.idx) {
-                        continue;
-                    }
-
-                    let role_s = role_str(&msg.role);
-                    let usage = crate::connectors::extract_tokens_for_agent(
-                        &conv.agent_slug,
-                        &msg.extra_json,
-                        &msg.content,
-                        &role_s,
-                    );
-
-                    // Look up message_id from DB
-                    let msg_id: Option<i64> = tx
-                        .query_row(
-                            "SELECT id FROM messages WHERE conversation_id = ? AND idx = ?",
-                            params![outcome.conversation_id, msg.idx],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-
-                    let Some(message_id) = msg_id else {
-                        continue;
-                    };
-
-                    let msg_ts = msg.created_at.or(conv.started_at).unwrap_or(0);
-                    let msg_day_id = if msg_ts > 0 {
-                        SqliteStorage::day_id_from_millis(msg_ts)
-                    } else {
-                        conv_day_id
-                    };
-
-                    // Normalize model for aggregation
-                    let model_info = usage
-                        .model_name
-                        .as_deref()
-                        .map(crate::connectors::normalize_model);
-
-                    let model_family = model_info
-                        .as_ref()
-                        .map(|i| i.family.clone())
-                        .unwrap_or_else(|| "unknown".into());
-                    let model_tier = model_info
-                        .as_ref()
-                        .map(|i| i.tier.clone())
-                        .unwrap_or_else(|| "unknown".into());
-                    let provider = usage
-                        .provider
-                        .clone()
-                        .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
-                        .unwrap_or_else(|| "unknown".into());
-
-                    if model_family != "unknown" {
-                        session_model_family = model_family.clone();
-                    }
-
-                    // Compute estimated cost from pricing table (bead z9fse.10)
-                    let estimated_cost = pricing_table.compute_cost(
-                        usage.model_name.as_deref(),
-                        msg_day_id,
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        usage.cache_read_tokens,
-                        usage.cache_creation_tokens,
-                    );
-                    if estimated_cost.is_some() {
-                        pricing_diag.record_priced();
-                    } else if usage.has_token_data() {
-                        pricing_diag.record_unpriced(usage.model_name.as_deref());
-                    }
-
-                    // Feed into token stats aggregator
-                    token_stats.record(
-                        &conv.agent_slug,
-                        &conv.source_id,
-                        msg_day_id,
-                        &model_family,
-                        &role_s,
-                        &usage,
-                        msg.content.len() as i64,
-                        estimated_cost.unwrap_or(0.0),
-                    );
-
-                    if usage.has_token_data() {
-                        has_any_tokens = true;
-                    }
-
-                    let content_chars = msg.content.len() as i64;
-                    let content_tokens_est = content_chars / 4;
-                    let msg_hour_id = SqliteStorage::hour_id_from_millis(msg_ts);
-                    let has_plan = has_plan_for_role(&role_s, &msg.content);
-
-                    // Build token_usage row
-                    token_entries.push(TokenUsageEntry {
-                        message_id,
-                        conversation_id: outcome.conversation_id,
-                        agent_id,
-                        workspace_id,
-                        source_id: conv.source_id.clone(),
-                        timestamp_ms: msg_ts,
-                        day_id: msg_day_id,
-                        model_name: usage.model_name.clone(),
-                        model_family: Some(model_family.clone()),
-                        model_tier: Some(model_tier.clone()),
-                        service_tier: usage.service_tier.clone(),
-                        provider: Some(provider.clone()),
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                        cache_read_tokens: usage.cache_read_tokens,
-                        cache_creation_tokens: usage.cache_creation_tokens,
-                        thinking_tokens: usage.thinking_tokens,
-                        total_tokens: usage.total_tokens(),
-                        estimated_cost_usd: estimated_cost,
-                        role: role_s.clone(),
-                        content_chars,
-                        has_tool_calls: usage.has_tool_calls,
-                        tool_call_count: usage.tool_call_count,
-                        data_source: usage.data_source.as_str().to_string(),
-                    });
-
-                    // Build message_metrics row and feed rollup aggregator
-                    let mm = MessageMetricsEntry {
-                        message_id,
-                        created_at_ms: msg_ts,
-                        hour_id: msg_hour_id,
-                        day_id: msg_day_id,
-                        agent_slug: conv.agent_slug.clone(),
-                        workspace_id: workspace_id.unwrap_or(0),
-                        source_id: conv.source_id.clone(),
-                        role: role_s,
-                        content_chars,
-                        content_tokens_est,
-                        model_name: usage.model_name.clone(),
-                        model_family: model_family.clone(),
-                        model_tier: model_tier.clone(),
-                        provider,
-                        api_input_tokens: usage.input_tokens,
-                        api_output_tokens: usage.output_tokens,
-                        api_cache_read_tokens: usage.cache_read_tokens,
-                        api_cache_creation_tokens: usage.cache_creation_tokens,
-                        api_thinking_tokens: usage.thinking_tokens,
-                        api_service_tier: usage.service_tier.clone(),
-                        api_data_source: usage.data_source.as_str().to_string(),
-                        tool_call_count: usage.tool_call_count as i64,
-                        has_tool_calls: usage.has_tool_calls,
-                        has_plan,
-                    };
-                    rollup_agg.record(&mm);
-                    metrics_entries.push(mm);
-                }
-
-                // Record session count in token stats (once per new conversation)
-                if delta.session_count_delta > 0 {
-                    token_stats.record_session(
-                        &conv.agent_slug,
-                        &conv.source_id,
-                        conv_day_id,
-                        &session_model_family,
-                    );
-                }
-
-                // Mark conversation for summary update if it has any token data
-                if has_any_tokens {
-                    conv_ids_to_summarize.push(outcome.conversation_id);
-                }
-            }
-
-            outcomes.push(outcome);
-        }
-
-        // Batch insert all FTS entries at once
-        let fts_count = fts_entries.len();
-        if fts_count > 0 {
-            let inserted = batch_insert_fts_messages(&tx, &fts_entries)?;
-            tracing::debug!(
-                target: "cass::perf::fts5",
-                total = fts_count,
-                inserted = inserted,
-                conversations = conversations.len(),
-                "batch_fts_insert_complete"
-            );
-        }
-
-        // Batched daily_stats update (avoid N*4 upserts).
-        if !stats.is_empty() {
-            let entries = stats.expand();
-            let affected = update_daily_stats_batched_in_tx(&tx, &entries)?;
-            tracing::debug!(
-                target: "cass::perf::daily_stats",
-                raw = stats.raw_entry_count(),
-                expanded = entries.len(),
-                affected = affected,
-                "batched_stats_update_complete"
-            );
-        }
-
-        // Batch insert token_usage rows
-        if !token_entries.is_empty() {
-            let token_count = token_entries.len();
-            let inserted = insert_token_usage_batched_in_tx(&tx, &token_entries)?;
-            tracing::debug!(
-                target: "cass::perf::token_usage",
-                total = token_count,
-                inserted = inserted,
-                "batch_token_usage_insert_complete"
-            );
-        }
-
-        // Batched token_daily_stats update
-        if !token_stats.is_empty() {
-            let entries = token_stats.expand();
-            let affected = update_token_daily_stats_batched_in_tx(&tx, &entries)?;
-            tracing::debug!(
-                target: "cass::perf::token_daily_stats",
-                raw = token_stats.raw_entry_count(),
-                expanded = entries.len(),
-                affected = affected,
-                "batched_token_stats_update_complete"
-            );
-        }
-
-        // Batch insert message_metrics rows
-        if !metrics_entries.is_empty() {
-            let mm_count = metrics_entries.len();
-            let inserted = insert_message_metrics_batched_in_tx(&tx, &metrics_entries)?;
-            tracing::debug!(
-                target: "cass::perf::message_metrics",
-                total = mm_count,
-                inserted = inserted,
-                "batch_message_metrics_insert_complete"
-            );
-        }
-
-        // Flush usage_hourly + usage_daily rollups
-        if !rollup_agg.is_empty() {
-            let (hourly, daily, models_daily) = flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
-            tracing::debug!(
-                target: "cass::perf::usage_rollups",
-                hourly_buckets = rollup_agg.hourly_entry_count(),
-                daily_buckets = rollup_agg.daily_entry_count(),
-                models_daily_buckets = rollup_agg.models_daily_entry_count(),
-                hourly_affected = hourly,
-                daily_affected = daily,
-                models_daily_affected = models_daily,
-                "batched_usage_rollups_complete"
-            );
-        }
-
-        // Update conversation-level token summaries
-        for conv_id in &conv_ids_to_summarize {
-            update_conversation_token_summaries_in_tx(&tx, *conv_id)?;
-        }
-
-        tx.commit()?;
-
-        // Log pricing coverage diagnostics (bead z9fse.10)
-        pricing_diag.log_summary();
-
-        Ok(outcomes)
-    }
-
-    pub fn list_agents(&self) -> Result<Vec<Agent>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, slug, name, version, kind FROM agents ORDER BY slug")?;
-        let rows = stmt.query_map([], |row| {
-            let kind: String = row.get(4)?;
-            Ok(Agent {
-                id: Some(row.get(0)?),
-                slug: row.get(1)?,
-                name: row.get(2)?,
-                version: row.get(3)?,
-                kind: match kind.as_str() {
-                    "cli" => AgentKind::Cli,
-                    "vscode" => AgentKind::VsCode,
-                    _ => AgentKind::Hybrid,
-                },
-            })
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
-    pub fn list_workspaces(&self) -> Result<Vec<crate::model::types::Workspace>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, path, display_name FROM workspaces ORDER BY path")?;
-        let rows = stmt.query_map([], |row| {
-            Ok(crate::model::types::Workspace {
-                id: Some(row.get(0)?),
-                path: Path::new(&row.get::<_, String>(1)?).to_path_buf(),
-                display_name: row.get::<_, Option<String>>(2)?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
-    pub fn list_conversations(&self, limit: i64, offset: i64) -> Result<Vec<Conversation>> {
-        let mut stmt = self.conn.prepare(
-            r"SELECT c.id, a.slug, w.path, c.external_id, c.title, c.source_path,
-                       c.started_at, c.ended_at, c.approx_tokens, c.metadata_json,
-                       c.source_id, c.origin_host, c.metadata_bin
-                FROM conversations c
-                JOIN agents a ON c.agent_id = a.id
-                LEFT JOIN workspaces w ON c.workspace_id = w.id
-                ORDER BY c.started_at IS NULL, c.started_at DESC, c.id DESC
-                LIMIT ? OFFSET ?",
-        )?;
-
-        let rows = stmt.query_map(params![limit, offset], |row| {
-            Ok(Conversation {
-                id: Some(row.get(0)?),
-                agent_slug: row.get(1)?,
-                workspace: row
-                    .get::<_, Option<String>>(2)?
-                    .map(|p| Path::new(&p).to_path_buf()),
-                external_id: row.get(3)?,
-                title: row.get(4)?,
-                source_path: Path::new(&row.get::<_, String>(5)?).to_path_buf(),
-                started_at: row.get(6)?,
-                ended_at: row.get(7)?,
-                approx_tokens: row.get(8)?,
-                // Read from binary column first (idx 12), fallback to JSON (idx 9)
-                metadata_json: read_metadata_compat(row, 9, 12),
-                messages: Vec::new(),
-                source_id: row
-                    .get::<_, String>(10)
-                    .unwrap_or_else(|_| "local".to_string()),
-                origin_host: row.get(11)?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
-    pub fn fetch_messages(&self, conversation_id: i64) -> Result<Vec<Message>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin FROM messages WHERE conversation_id = ? ORDER BY idx",
-        )?;
-        let rows = stmt.query_map(params![conversation_id], |row| {
-            let role: String = row.get(2)?;
-            Ok(Message {
-                id: Some(row.get(0)?),
-                idx: row.get(1)?,
-                role: match role.as_str() {
-                    "user" => MessageRole::User,
-                    "agent" | "assistant" => MessageRole::Agent,
-                    "tool" => MessageRole::Tool,
-                    "system" => MessageRole::System,
-                    other => MessageRole::Other(other.to_string()),
-                },
-                author: row.get::<_, Option<String>>(3)?,
-                created_at: row.get::<_, Option<i64>>(4)?,
-                content: row.get(5)?,
-                // Read from binary column first (idx 7), fallback to JSON (idx 6)
-                extra_json: read_metadata_compat(row, 6, 7),
-                snippets: Vec::new(),
-            })
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
-    /// Fetch all messages with their conversation metadata for semantic indexing.
-    ///
-    /// Returns MessageForEmbedding records with all metadata needed for vector indexing.
-    pub fn fetch_messages_for_embedding(&self) -> Result<Vec<MessageForEmbedding>> {
-        let mut stmt = self.conn.prepare(
-            r"SELECT m.id, m.created_at, c.agent_id, c.workspace_id, c.source_id, m.role, m.content
-              FROM messages m
-              JOIN conversations c ON m.conversation_id = c.id
-              ORDER BY m.id",
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            let source_id_str: String = row
-                .get::<_, Option<String>>(4)?
-                .unwrap_or_else(|| "local".to_string());
-            // CRC32 hash of source_id string for compact storage
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(source_id_str.as_bytes());
-            let source_id_hash = hasher.finalize();
-
-            Ok(MessageForEmbedding {
-                message_id: row.get(0)?,
-                created_at: row.get(1)?,
-                agent_id: row.get(2)?,
-                workspace_id: row.get(3)?,
-                source_id_hash,
-                role: row.get(5)?,
-                content: row.get(6)?,
-            })
-        })?;
-
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
-    /// Insert or update an embedding job, returning the job ID.
-    pub fn upsert_embedding_job(
-        &self,
-        db_path: &str,
-        model_id: &str,
-        total_docs: i64,
-    ) -> Result<i64> {
-        // Cancel any existing pending/running jobs for this db_path+model_id
-        self.conn.execute(
-            "UPDATE embedding_jobs SET status = 'cancelled', completed_at = datetime('now')
-             WHERE db_path = ?1 AND model_id = ?2 AND status IN ('pending', 'running')",
-            params![db_path, model_id],
-        )?;
-        self.conn.execute(
-            "INSERT INTO embedding_jobs (db_path, model_id, status, total_docs)
-             VALUES (?1, ?2, 'pending', ?3)",
-            params![db_path, model_id, total_docs],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Mark an embedding job as running.
-    pub fn start_embedding_job(&self, job_id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE embedding_jobs SET status = 'running', started_at = datetime('now') WHERE id = ?1",
-            params![job_id],
-        )?;
-        Ok(())
-    }
-
-    /// Mark an embedding job as completed.
-    pub fn complete_embedding_job(&self, job_id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE embedding_jobs SET status = 'completed', completed_at = datetime('now') WHERE id = ?1",
-            params![job_id],
-        )?;
-        Ok(())
-    }
-
-    /// Mark an embedding job as failed with an error message.
-    pub fn fail_embedding_job(&self, job_id: i64, error: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE embedding_jobs SET status = 'failed', error_message = ?2, completed_at = datetime('now') WHERE id = ?1",
-            params![job_id, error],
-        )?;
-        Ok(())
-    }
-
-    /// Cancel pending/running embedding jobs for a db_path, optionally filtered by model_id.
-    pub fn cancel_embedding_jobs(&self, db_path: &str, model_id: Option<&str>) -> Result<usize> {
-        let count = if let Some(mid) = model_id {
-            self.conn.execute(
-                "UPDATE embedding_jobs SET status = 'cancelled', completed_at = datetime('now')
-                 WHERE db_path = ?1 AND model_id = ?2 AND status IN ('pending', 'running')",
-                params![db_path, mid],
-            )?
-        } else {
-            self.conn.execute(
-                "UPDATE embedding_jobs SET status = 'cancelled', completed_at = datetime('now')
-                 WHERE db_path = ?1 AND status IN ('pending', 'running')",
-                params![db_path],
-            )?
-        };
-        Ok(count)
-    }
-
-    /// Update the progress of an embedding job.
-    pub fn update_job_progress(&self, job_id: i64, completed_docs: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE embedding_jobs SET completed_docs = ?2 WHERE id = ?1",
-            params![job_id, completed_docs],
-        )?;
-        Ok(())
-    }
-
-    /// Get all embedding jobs for a given db_path.
-    pub fn get_embedding_jobs(&self, db_path: &str) -> Result<Vec<EmbeddingJobRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, db_path, model_id, status, total_docs, completed_docs,
-                    error_message, created_at, started_at, completed_at
-             FROM embedding_jobs WHERE db_path = ?1 ORDER BY id DESC",
-        )?;
-        let rows = stmt.query_map(params![db_path], |row| {
-            Ok(EmbeddingJobRow {
-                id: row.get(0)?,
-                db_path: row.get(1)?,
-                model_id: row.get(2)?,
-                status: row.get(3)?,
-                total_docs: row.get(4)?,
-                completed_docs: row.get(5)?,
-                error_message: row.get(6)?,
-                created_at: row.get(7)?,
-                started_at: row.get(8)?,
-                completed_at: row.get(9)?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
-    pub fn rebuild_fts(&mut self) -> Result<()> {
-        self.conn.execute("DELETE FROM fts_messages", [])?;
-        self.conn.execute_batch(
-            r"INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-               SELECT m.content, c.title, a.slug, w.path, c.source_path, m.created_at, m.id
-               FROM messages m
-               JOIN conversations c ON m.conversation_id = c.id
-               JOIN agents a ON c.agent_id = a.id
-               LEFT JOIN workspaces w ON c.workspace_id = w.id;",
-        )?;
-        Ok(())
-    }
-
-    /// Get the timestamp of the last successful scan (milliseconds since epoch).
-    /// Returns None if no scan has been recorded yet.
-    pub fn get_last_scan_ts(&self) -> Result<Option<i64>> {
-        let ts: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'last_scan_ts'",
-                [],
-                |row| {
-                    let s: String = row.get(0)?;
-                    Ok(s.parse().ok())
-                },
-            )
-            .optional()?
-            .flatten();
-        Ok(ts)
-    }
-
-    /// Set the timestamp of the last successful scan (milliseconds since epoch).
-    pub fn set_last_scan_ts(&mut self, ts: i64) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES('last_scan_ts', ?)",
-            params![ts.to_string()],
-        )?;
-        Ok(())
-    }
-
-    /// Set the timestamp of the last successful index completion (milliseconds since epoch).
-    pub fn set_last_indexed_at(&mut self, ts: i64) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES('last_indexed_at', ?)",
-            params![ts.to_string()],
-        )?;
-        Ok(())
-    }
-
-    /// Get current time as milliseconds since epoch.
-    pub fn now_millis() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0)
-    }
-
-    // -------------------------------------------------------------------------
-    // Source CRUD operations
-    // -------------------------------------------------------------------------
-
-    /// Get a source by ID.
-    pub fn get_source(&self, id: &str) -> Result<Option<Source>> {
-        self.conn
-            .query_row(
-                "SELECT id, kind, host_label, machine_id, platform, config_json, created_at, updated_at
-                 FROM sources WHERE id = ?",
-                params![id],
-                |row| {
-                    let kind_str: String = row.get(1)?;
-                    let config_json_str: Option<String> = row.get(5)?;
-                    Ok(Source {
-                        id: row.get(0)?,
-                        kind: SourceKind::parse(&kind_str).unwrap_or_default(),
-                        host_label: row.get(2)?,
-                        machine_id: row.get(3)?,
-                        platform: row.get(4)?,
-                        config_json: config_json_str
-                            .and_then(|s| serde_json::from_str(&s).ok()),
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
-                    })
-                },
-            )
-            .optional()
-            .with_context(|| format!("fetching source with id '{id}'"))
-    }
-
-    /// List all sources.
-    pub fn list_sources(&self) -> Result<Vec<Source>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, kind, host_label, machine_id, platform, config_json, created_at, updated_at
-             FROM sources ORDER BY id",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let kind_str: String = row.get(1)?;
-            let config_json_str: Option<String> = row.get(5)?;
-            Ok(Source {
-                id: row.get(0)?,
-                kind: SourceKind::parse(&kind_str).unwrap_or_default(),
-                host_label: row.get(2)?,
-                machine_id: row.get(3)?,
-                platform: row.get(4)?,
-                config_json: config_json_str.and_then(|s| serde_json::from_str(&s).ok()),
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-            })
-        })?;
-
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
-    /// Get list of unique source IDs (for P4.4 TUI source filter menu).
-    /// Returns source IDs ordered by ID, excluding 'local' which is always present.
-    pub fn get_source_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT DISTINCT id FROM sources WHERE id != 'local' ORDER BY id")?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
-    /// Create or update a source.
-    pub fn upsert_source(&self, source: &Source) -> Result<()> {
-        let now = Self::now_millis();
-        let config_json_str = source
-            .config_json
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-
-        self.conn.execute(
-            "INSERT INTO sources(id, kind, host_label, machine_id, platform, config_json, created_at, updated_at)
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
-                kind = excluded.kind,
-                host_label = excluded.host_label,
-                machine_id = excluded.machine_id,
-                platform = excluded.platform,
-                config_json = excluded.config_json,
-                updated_at = excluded.updated_at",
-            params![
-                source.id,
-                source.kind.as_str(),
-                source.host_label,
-                source.machine_id,
-                source.platform,
-                config_json_str,
-                source.created_at.unwrap_or(now),
-                now
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Delete a source by ID.
-    ///
-    /// If `cascade` is true, also deletes all conversations from this source.
-    /// Note: Currently conversations don't have a source_id column, so cascade
-    /// is a no-op until P1.3 is implemented.
-    pub fn delete_source(&self, id: &str, _cascade: bool) -> Result<bool> {
-        // Prevent deletion of the local source
-        if id == LOCAL_SOURCE_ID {
-            return Err(anyhow!("cannot delete the local source"));
-        }
-
-        let rows_affected = self
-            .conn
-            .execute("DELETE FROM sources WHERE id = ?", params![id])?;
-
-        Ok(rows_affected > 0)
-    }
-
-    // -------------------------------------------------------------------------
-    // Daily Stats (Opt 3.2) - Materialized Aggregates for O(1) Range Queries
-    // -------------------------------------------------------------------------
-
-    /// Epoch offset: Days are counted from 2020-01-01 (Unix timestamp 1577836800).
-    const EPOCH_2020_SECS: i64 = 1577836800;
-
-    /// Convert a millisecond timestamp to a day_id (days since 2020-01-01).
-    pub fn day_id_from_millis(timestamp_ms: i64) -> i64 {
-        let secs = timestamp_ms / 1000;
-        (secs - Self::EPOCH_2020_SECS).div_euclid(86400)
-    }
-
-    /// Convert a millisecond timestamp to an hour_id (hours since 2020-01-01 00:00 UTC).
-    pub fn hour_id_from_millis(timestamp_ms: i64) -> i64 {
-        let secs = timestamp_ms / 1000;
-        (secs - Self::EPOCH_2020_SECS).div_euclid(3600)
-    }
-
-    /// Convert a day_id back to a timestamp (milliseconds, start of day UTC).
-    pub fn millis_from_day_id(day_id: i64) -> i64 {
-        (Self::EPOCH_2020_SECS + day_id * 86400) * 1000
-    }
-
-    /// Convert an hour_id back to a timestamp (milliseconds, start of hour UTC).
-    pub fn millis_from_hour_id(hour_id: i64) -> i64 {
-        (Self::EPOCH_2020_SECS + hour_id * 3600) * 1000
-    }
-
-    /// Get session count for a date range using materialized stats.
-    /// Returns (count, is_from_cache) - is_from_cache is true if from daily_stats.
-    ///
-    /// If daily_stats table is empty or stale, falls back to COUNT(*) query.
-    pub fn count_sessions_in_range(
-        &self,
-        start_ts_ms: Option<i64>,
-        end_ts_ms: Option<i64>,
-        agent_slug: Option<&str>,
-        source_id: Option<&str>,
-    ) -> Result<(i64, bool)> {
-        let agent = agent_slug.unwrap_or("all");
-        let source = source_id.unwrap_or("all");
-
-        // Check if we have materialized stats
-        let stats_count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM daily_stats", [], |r| r.get(0))
-            .unwrap_or(0);
-
-        if stats_count == 0 {
-            // Fall back to direct COUNT(*)
-            return self.count_sessions_direct(start_ts_ms, end_ts_ms, agent_slug, source_id);
-        }
-
-        // Use materialized stats
-        let start_day = start_ts_ms.map(Self::day_id_from_millis);
-        let end_day = end_ts_ms.map(Self::day_id_from_millis);
-
-        let count: i64 = match (start_day, end_day) {
-            (Some(start), Some(end)) => self.conn.query_row(
-                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
-                 WHERE day_id BETWEEN ? AND ? AND agent_slug = ? AND source_id = ?",
-                params![start, end, agent, source],
-                |r| r.get(0),
-            )?,
-            (Some(start), None) => self.conn.query_row(
-                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
-                 WHERE day_id >= ? AND agent_slug = ? AND source_id = ?",
-                params![start, agent, source],
-                |r| r.get(0),
-            )?,
-            (None, Some(end)) => self.conn.query_row(
-                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
-                 WHERE day_id <= ? AND agent_slug = ? AND source_id = ?",
-                params![end, agent, source],
-                |r| r.get(0),
-            )?,
-            (None, None) => self.conn.query_row(
-                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
-                 WHERE agent_slug = ? AND source_id = ?",
-                params![agent, source],
-                |r| r.get(0),
-            )?,
-        };
-
-        Ok((count, true))
-    }
-
-    /// Direct COUNT(*) query as fallback when daily_stats is empty.
-    fn count_sessions_direct(
-        &self,
-        start_ts_ms: Option<i64>,
-        end_ts_ms: Option<i64>,
-        agent_slug: Option<&str>,
-        source_id: Option<&str>,
-    ) -> Result<(i64, bool)> {
-        let mut sql = "SELECT COUNT(*) FROM conversations c
-                       JOIN agents a ON c.agent_id = a.id WHERE 1=1"
-            .to_string();
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-        if let Some(start) = start_ts_ms {
-            sql.push_str(" AND c.started_at >= ?");
-            params_vec.push(Box::new(start));
-        }
-        if let Some(end) = end_ts_ms {
-            sql.push_str(" AND c.started_at <= ?");
-            params_vec.push(Box::new(end));
-        }
-        if let Some(agent) = agent_slug
-            && agent != "all"
-        {
-            sql.push_str(" AND a.slug = ?");
-            params_vec.push(Box::new(agent.to_string()));
-        }
-        if let Some(source) = source_id
-            && source != "all"
-        {
-            sql.push_str(" AND c.source_id = ?");
-            params_vec.push(Box::new(source.to_string()));
-        }
-
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|b| b.as_ref()).collect();
-        let count: i64 = self
-            .conn
-            .query_row(&sql, params_refs.as_slice(), |r| r.get(0))?;
-        Ok((count, false))
-    }
-
-    /// Get daily histogram data for a date range.
-    pub fn get_daily_histogram(
-        &self,
-        start_ts_ms: i64,
-        end_ts_ms: i64,
-        agent_slug: Option<&str>,
-        source_id: Option<&str>,
-    ) -> Result<Vec<DailyCount>> {
-        let start_day = Self::day_id_from_millis(start_ts_ms);
-        let end_day = Self::day_id_from_millis(end_ts_ms);
-        let agent = agent_slug.unwrap_or("all");
-        let source = source_id.unwrap_or("all");
-
-        let mut stmt = self.conn.prepare(
-            "SELECT day_id, session_count, message_count, total_chars
-             FROM daily_stats
-             WHERE day_id BETWEEN ? AND ? AND agent_slug = ? AND source_id = ?
-             ORDER BY day_id",
-        )?;
-
-        let rows = stmt.query_map(params![start_day, end_day, agent, source], |row| {
-            Ok(DailyCount {
-                day_id: row.get(0)?,
-                sessions: row.get(1)?,
-                messages: row.get(2)?,
-                chars: row.get(3)?,
-            })
-        })?;
-
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
-    // -------------------------------------------------------------------------
-    // Analytics Rebuild / Backfill (bead z9fse.4)
-    // -------------------------------------------------------------------------
-
-    /// Rebuild analytics tables (message_metrics + rollups) from existing
-    /// messages in the database. Does NOT re-parse raw agent session files.
-    ///
-    /// Algorithm:
-    /// 1. Clear message_metrics, usage_hourly, usage_daily, usage_models_daily in a transaction
-    /// 2. Stream messages joined with conversation/agent dims in chunks
-    /// 3. For each message, call extract_tokens_for_agent and build MessageMetricsEntry
-    /// 4. Batch insert message_metrics rows
-    /// 5. Populate rollups via SQL aggregation from message_metrics
-    pub fn rebuild_analytics(&mut self) -> Result<AnalyticsRebuildResult> {
-        let start = Instant::now();
-
-        // Count total messages for progress reporting
-        let total_messages: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM messages", [], |row| {
-                    row.get::<_, i64>(0)
-                })?;
-        tracing::info!(
-            target: "cass::analytics",
-            total_messages,
-            "analytics_rebuild_start"
-        );
-
-        let tx = self.conn.transaction()?;
-
-        // Step 1: Clear analytics tables
-        tx.execute("DELETE FROM message_metrics", [])?;
-        tx.execute("DELETE FROM usage_hourly", [])?;
-        tx.execute("DELETE FROM usage_daily", [])?;
-        tx.execute("DELETE FROM usage_models_daily", [])?;
-
-        // Step 2: Stream messages in chunks, extract metrics, batch insert
-        const CHUNK_SIZE: i64 = 10_000;
-        let mut offset: i64 = 0;
-        let mut total_inserted: usize = 0;
-
-        loop {
-            // Fetch a chunk of messages with their conversation/agent dims
-            let mut stmt = tx.prepare(
-                "SELECT m.id, m.idx, m.role, m.content, m.extra_json, m.extra_bin,
-                        m.created_at,
-                        c.id AS conv_id, c.started_at AS conv_started_at,
-                        c.source_id, c.workspace_id,
-                        a.slug AS agent_slug
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 JOIN agents a ON c.agent_id = a.id
-                 ORDER BY m.id
-                 LIMIT ? OFFSET ?",
-            )?;
-
-            #[allow(clippy::type_complexity)]
-            let rows: Vec<(
-                i64,
-                String,
-                String,
-                Option<serde_json::Value>,
-                Option<i64>,
-                Option<i64>,
-                String,
-                Option<i64>,
-                String,
-            )> = stmt
-                .query_map(params![CHUNK_SIZE, offset], |row| {
-                    let msg_id: i64 = row.get(0)?;
-                    let role: String = row.get(2)?;
-                    let content: String = row.get(3)?;
-                    // Try extra_json first, fall back to deserializing extra_bin
-                    let extra_json: Option<serde_json::Value> = row
-                        .get::<_, Option<String>>(4)?
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .or_else(|| {
-                            row.get::<_, Option<Vec<u8>>>(5)
-                                .ok()
-                                .flatten()
-                                .and_then(|b| rmp_serde::from_slice(&b).ok())
-                        });
-                    let msg_ts: Option<i64> = row.get(6)?;
-                    let conv_started_at: Option<i64> = row.get(8)?;
-                    let source_id: String = row.get(9)?;
-                    let workspace_id: Option<i64> = row.get(10)?;
-                    let agent_slug: String = row.get(11)?;
-
-                    let effective_ts = msg_ts.or(conv_started_at).unwrap_or(0);
-
-                    Ok((
-                        msg_id,
-                        role,
-                        content,
-                        extra_json,
-                        Some(effective_ts),
-                        workspace_id,
-                        source_id,
-                        conv_started_at,
-                        agent_slug,
-                    ))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            if rows.is_empty() {
-                break;
-            }
-
-            let chunk_len = rows.len();
-            let mut entries = Vec::with_capacity(chunk_len);
-
-            for (
-                msg_id,
-                role,
-                content,
-                extra_json,
-                effective_ts,
-                workspace_id,
-                source_id,
-                _conv_started_at,
-                agent_slug,
-            ) in &rows
-            {
-                let ts = effective_ts.unwrap_or(0);
-                let day_id = Self::day_id_from_millis(ts);
-                let hour_id = Self::hour_id_from_millis(ts);
-                let content_chars = content.len() as i64;
-                let content_tokens_est = content_chars / 4;
-
-                let extra = extra_json
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let usage =
-                    crate::connectors::extract_tokens_for_agent(agent_slug, &extra, content, role);
-                let model_info = usage
-                    .model_name
-                    .as_deref()
-                    .map(crate::connectors::normalize_model);
-                let model_family = model_info
-                    .as_ref()
-                    .map(|i| i.family.clone())
-                    .unwrap_or_else(|| "unknown".into());
-                let model_tier = model_info
-                    .as_ref()
-                    .map(|i| i.tier.clone())
-                    .unwrap_or_else(|| "unknown".into());
-                let provider = usage
-                    .provider
-                    .clone()
-                    .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
-                    .unwrap_or_else(|| "unknown".into());
-
-                entries.push(MessageMetricsEntry {
-                    message_id: *msg_id,
-                    created_at_ms: ts,
-                    hour_id,
-                    day_id,
-                    agent_slug: agent_slug.clone(),
-                    workspace_id: workspace_id.unwrap_or(0),
-                    source_id: source_id.clone(),
-                    role: role.clone(),
-                    content_chars,
-                    content_tokens_est,
-                    model_name: usage.model_name.clone(),
-                    model_family,
-                    model_tier,
-                    provider,
-                    api_input_tokens: usage.input_tokens,
-                    api_output_tokens: usage.output_tokens,
-                    api_cache_read_tokens: usage.cache_read_tokens,
-                    api_cache_creation_tokens: usage.cache_creation_tokens,
-                    api_thinking_tokens: usage.thinking_tokens,
-                    api_service_tier: usage.service_tier,
-                    api_data_source: usage.data_source.as_str().to_string(),
-                    tool_call_count: usage.tool_call_count as i64,
-                    has_tool_calls: usage.has_tool_calls,
-                    has_plan: has_plan_for_role(role, content),
-                });
-            }
-
-            let inserted = insert_message_metrics_batched_in_tx(&tx, &entries)?;
-            total_inserted += inserted;
-            offset += chunk_len as i64;
-
-            tracing::debug!(
-                target: "cass::analytics",
-                offset,
-                chunk = chunk_len,
-                inserted,
-                total = total_inserted,
-                "analytics_rebuild_chunk"
-            );
-
-            if (chunk_len as i64) < CHUNK_SIZE {
-                break;
-            }
-        }
-
-        // Step 3: Populate rollups via SQL aggregation from message_metrics
-        let now_ms = Self::now_millis();
-
-        let hourly_rows = tx.execute(
-            "INSERT INTO usage_hourly (
-                    hour_id, agent_slug, workspace_id, source_id,
-                    message_count, user_message_count, assistant_message_count,
-                    tool_call_count, plan_message_count, plan_content_tokens_est_total,
-                    plan_api_tokens_total, api_coverage_message_count,
-                    content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
-                    api_tokens_total, api_input_tokens_total, api_output_tokens_total,
-                    api_cache_read_tokens_total, api_cache_creation_tokens_total,
-                    api_thinking_tokens_total, last_updated
-                )
-                SELECT
-                    hour_id, agent_slug, workspace_id, source_id,
-                    COUNT(*),
-                    SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN role IN ('assistant', 'agent') THEN 1 ELSE 0 END),
-                    SUM(tool_call_count),
-                    SUM(has_plan),
-                    SUM(CASE WHEN has_plan = 1 THEN content_tokens_est ELSE 0 END),
-                    SUM(
-                        CASE
-                            WHEN has_plan = 1 AND api_data_source = 'api'
-                                THEN COALESCE(api_input_tokens, 0)
-                                    + COALESCE(api_output_tokens, 0)
-                                    + COALESCE(api_cache_read_tokens, 0)
-                                    + COALESCE(api_cache_creation_tokens, 0)
-                                    + COALESCE(api_thinking_tokens, 0)
-                            ELSE 0
-                        END
-                    ),
-                    SUM(CASE WHEN api_data_source = 'api' THEN 1 ELSE 0 END),
-                    SUM(content_tokens_est),
-                    SUM(CASE WHEN role = 'user' THEN content_tokens_est ELSE 0 END),
-                    SUM(CASE WHEN role IN ('assistant', 'agent') THEN content_tokens_est ELSE 0 END),
-                    SUM(COALESCE(api_input_tokens, 0) + COALESCE(api_output_tokens, 0) + COALESCE(api_cache_read_tokens, 0) + COALESCE(api_cache_creation_tokens, 0) + COALESCE(api_thinking_tokens, 0)),
-                    SUM(COALESCE(api_input_tokens, 0)),
-                    SUM(COALESCE(api_output_tokens, 0)),
-                    SUM(COALESCE(api_cache_read_tokens, 0)),
-                    SUM(COALESCE(api_cache_creation_tokens, 0)),
-                    SUM(COALESCE(api_thinking_tokens, 0)),
-                    ?1
-                FROM message_metrics
-                GROUP BY hour_id, agent_slug, workspace_id, source_id",
-            params![now_ms],
-        )?;
-
-        let daily_rows = tx.execute(
-            "INSERT INTO usage_daily (
-                    day_id, agent_slug, workspace_id, source_id,
-                    message_count, user_message_count, assistant_message_count,
-                    tool_call_count, plan_message_count, plan_content_tokens_est_total,
-                    plan_api_tokens_total, api_coverage_message_count,
-                    content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
-                    api_tokens_total, api_input_tokens_total, api_output_tokens_total,
-                    api_cache_read_tokens_total, api_cache_creation_tokens_total,
-                    api_thinking_tokens_total, last_updated
-                )
-                SELECT
-                    day_id, agent_slug, workspace_id, source_id,
-                    COUNT(*),
-                    SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN role IN ('assistant', 'agent') THEN 1 ELSE 0 END),
-                    SUM(tool_call_count),
-                    SUM(has_plan),
-                    SUM(CASE WHEN has_plan = 1 THEN content_tokens_est ELSE 0 END),
-                    SUM(
-                        CASE
-                            WHEN has_plan = 1 AND api_data_source = 'api'
-                                THEN COALESCE(api_input_tokens, 0)
-                                    + COALESCE(api_output_tokens, 0)
-                                    + COALESCE(api_cache_read_tokens, 0)
-                                    + COALESCE(api_cache_creation_tokens, 0)
-                                    + COALESCE(api_thinking_tokens, 0)
-                            ELSE 0
-                        END
-                    ),
-                    SUM(CASE WHEN api_data_source = 'api' THEN 1 ELSE 0 END),
-                    SUM(content_tokens_est),
-                    SUM(CASE WHEN role = 'user' THEN content_tokens_est ELSE 0 END),
-                    SUM(CASE WHEN role IN ('assistant', 'agent') THEN content_tokens_est ELSE 0 END),
-                    SUM(COALESCE(api_input_tokens, 0) + COALESCE(api_output_tokens, 0) + COALESCE(api_cache_read_tokens, 0) + COALESCE(api_cache_creation_tokens, 0) + COALESCE(api_thinking_tokens, 0)),
-                    SUM(COALESCE(api_input_tokens, 0)),
-                    SUM(COALESCE(api_output_tokens, 0)),
-                    SUM(COALESCE(api_cache_read_tokens, 0)),
-                    SUM(COALESCE(api_cache_creation_tokens, 0)),
-                    SUM(COALESCE(api_thinking_tokens, 0)),
-                    ?1
-                FROM message_metrics
-                GROUP BY day_id, agent_slug, workspace_id, source_id",
-            params![now_ms],
-        )?;
-
-        let models_daily_rows = tx.execute(
-            "INSERT INTO usage_models_daily (
-                    day_id, agent_slug, workspace_id, source_id, model_family, model_tier,
-                    message_count, user_message_count, assistant_message_count,
-                    tool_call_count, plan_message_count, api_coverage_message_count,
-                    content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
-                    api_tokens_total, api_input_tokens_total, api_output_tokens_total,
-                    api_cache_read_tokens_total, api_cache_creation_tokens_total,
-                    api_thinking_tokens_total, last_updated
-                )
-                SELECT
-                    day_id,
-                    agent_slug,
-                    workspace_id,
-                    source_id,
-                    COALESCE(NULLIF(model_family, ''), 'unknown'),
-                    COALESCE(NULLIF(model_tier, ''), 'unknown'),
-                    COUNT(*),
-                    SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN role IN ('assistant', 'agent') THEN 1 ELSE 0 END),
-                    SUM(tool_call_count),
-                    SUM(has_plan),
-                    SUM(CASE WHEN api_data_source = 'api' THEN 1 ELSE 0 END),
-                    SUM(content_tokens_est),
-                    SUM(CASE WHEN role = 'user' THEN content_tokens_est ELSE 0 END),
-                    SUM(CASE WHEN role IN ('assistant', 'agent') THEN content_tokens_est ELSE 0 END),
-                    SUM(COALESCE(api_input_tokens, 0) + COALESCE(api_output_tokens, 0) + COALESCE(api_cache_read_tokens, 0) + COALESCE(api_cache_creation_tokens, 0) + COALESCE(api_thinking_tokens, 0)),
-                    SUM(COALESCE(api_input_tokens, 0)),
-                    SUM(COALESCE(api_output_tokens, 0)),
-                    SUM(COALESCE(api_cache_read_tokens, 0)),
-                    SUM(COALESCE(api_cache_creation_tokens, 0)),
-                    SUM(COALESCE(api_thinking_tokens, 0)),
-                    ?1
-                FROM message_metrics
-                GROUP BY
-                    day_id,
-                    agent_slug,
-                    workspace_id,
-                    source_id,
-                    COALESCE(NULLIF(model_family, ''), 'unknown'),
-                    COALESCE(NULLIF(model_tier, ''), 'unknown')",
-            params![now_ms],
-        )?;
-
-        tx.commit()?;
-
-        let elapsed = start.elapsed();
-        let elapsed_ms = elapsed.as_millis() as u64;
-        let msgs_per_sec = if elapsed_ms > 0 {
-            (total_inserted as f64) / (elapsed_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
-
-        tracing::info!(
-            target: "cass::analytics",
-            message_metrics_rows = total_inserted,
-            usage_hourly_rows = hourly_rows,
-            usage_daily_rows = daily_rows,
-            usage_models_daily_rows = models_daily_rows,
-            elapsed_ms,
-            messages_per_sec = format!("{:.0}", msgs_per_sec),
-            "analytics_rebuild_complete"
-        );
-
-        Ok(AnalyticsRebuildResult {
-            message_metrics_rows: total_inserted,
-            usage_hourly_rows: hourly_rows,
-            usage_daily_rows: daily_rows,
-            usage_models_daily_rows: models_daily_rows,
-            elapsed_ms,
-            messages_per_sec: msgs_per_sec,
-        })
-    }
-
-    /// Rebuild all daily stats from scratch.
-    /// Use this for recovery or when stats appear to be out of sync.
-    pub fn rebuild_daily_stats(&mut self) -> Result<DailyStatsRebuildResult> {
-        let tx = self.conn.transaction()?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
-
-        // Clear existing stats
-        tx.execute("DELETE FROM daily_stats", [])?;
-
-        // Rebuild from conversations table - per agent, per source
-        // Note: COALESCE wraps the entire day_id calculation to match Rust's unwrap_or(0) behavior
-        // for conversations with NULL started_at timestamps
-        tx.execute(
-            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-              SELECT
-                  COALESCE(
-                  CASE
-                    WHEN (c.started_at / 1000 - 1577836800) >= 0 THEN (c.started_at / 1000 - 1577836800) / 86400
-                    ELSE (c.started_at / 1000 - 1577836800 - 86399) / 86400
-                  END,
-                0) as day_id,
-                  a.slug as agent_slug,
-                  c.source_id,
-                  COUNT(DISTINCT c.id) as session_count,
-                  COUNT(m.id) as message_count,
-                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
-                  ? as last_updated
-              FROM conversations c
-              JOIN agents a ON c.agent_id = a.id
-              LEFT JOIN messages m ON m.conversation_id = c.id
-              GROUP BY day_id, a.slug, c.source_id",
-            params![now],
-        )?;
-
-        // Add 'all' agent aggregates for each source
-        tx.execute(
-            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-              SELECT
-                  COALESCE(
-                  CASE
-                    WHEN (c.started_at / 1000 - 1577836800) >= 0 THEN (c.started_at / 1000 - 1577836800) / 86400
-                    ELSE (c.started_at / 1000 - 1577836800 - 86399) / 86400
-                  END,
-                0) as day_id,
-                  'all',
-                  c.source_id,
-                  COUNT(DISTINCT c.id) as session_count,
-                  COUNT(m.id) as message_count,
-                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
-                  ? as last_updated
-              FROM conversations c
-              LEFT JOIN messages m ON m.conversation_id = c.id
-              GROUP BY day_id, c.source_id",
-            params![now],
-        )?;
-
-        // Add per-agent aggregates for 'all' sources
-        tx.execute(
-            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-              SELECT
-                  COALESCE(
-                  CASE
-                    WHEN (c.started_at / 1000 - 1577836800) >= 0 THEN (c.started_at / 1000 - 1577836800) / 86400
-                    ELSE (c.started_at / 1000 - 1577836800 - 86399) / 86400
-                  END,
-                0) as day_id,
-                  a.slug,
-                  'all',
-                  COUNT(DISTINCT c.id) as session_count,
-                  COUNT(m.id) as message_count,
-                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
-                  ? as last_updated
-              FROM conversations c
-              JOIN agents a ON c.agent_id = a.id
-              LEFT JOIN messages m ON m.conversation_id = c.id
-              GROUP BY day_id, a.slug",
-            params![now],
-        )?;
-
-        // Add global 'all'/'all' aggregates
-        tx.execute(
-            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-              SELECT
-                  COALESCE(
-                  CASE
-                    WHEN (c.started_at / 1000 - 1577836800) >= 0 THEN (c.started_at / 1000 - 1577836800) / 86400
-                    ELSE (c.started_at / 1000 - 1577836800 - 86399) / 86400
-                  END,
-                0) as day_id,
-                  'all',
-                  'all',
-                  COUNT(DISTINCT c.id) as session_count,
-                  COUNT(m.id) as message_count,
-                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
-                  ? as last_updated
-              FROM conversations c
-              LEFT JOIN messages m ON m.conversation_id = c.id
-              GROUP BY day_id",
-            params![now],
-        )?;
-
-        let rows_created: i64 =
-            tx.query_row("SELECT COUNT(*) FROM daily_stats", [], |r| r.get(0))?;
-        let total_sessions: i64 = tx.query_row(
-            "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
-            [],
-            |r| r.get(0),
-        )?;
-
-        tx.commit()?;
-
-        tracing::info!(
-            target: "cass::perf::daily_stats",
-            rows_created = rows_created,
-            total_sessions = total_sessions,
-            "Daily stats rebuilt from conversations"
-        );
-
-        Ok(DailyStatsRebuildResult {
-            rows_created,
-            total_sessions,
-        })
-    }
-
-    /// Flush aggregated stats deltas to daily_stats table in a single batch.
-    ///
-    /// Uses multi-value INSERT with ON CONFLICT for efficient upserts.
-    /// This is the batched alternative to `update_daily_stats_in_tx` which
-    /// does 4 writes per conversation.
-    ///
-    /// # Arguments
-    /// * `entries` - Expanded entries from `StatsAggregator::expand()`.
-    ///   Each tuple is (day_id, agent_slug, source_id, delta).
-    ///
-    /// # Returns
-    /// Number of rows affected (inserted + updated).
-    pub fn update_daily_stats_batched(
-        &mut self,
-        entries: &[(i64, String, String, StatsDelta)],
-    ) -> Result<usize> {
-        if entries.is_empty() {
-            return Ok(0);
-        }
-
-        let now = Self::now_millis();
-        let tx = self.conn.transaction()?;
-
-        // SQLite supports up to 999 variables per statement (though 32766 in newer versions).
-        // With 7 variables per row, we can safely batch ~100 rows.
-        const BATCH_SIZE: usize = 100;
-        let mut total_affected = 0;
-
-        for chunk in entries.chunks(BATCH_SIZE) {
-            // Build multi-value INSERT statement
-            let placeholders: String = (0..chunk.len())
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            let sql = format!(
-                "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-                 VALUES {}
-                 ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
-                     session_count = session_count + excluded.session_count,
-                     message_count = message_count + excluded.message_count,
-                     total_chars = total_chars + excluded.total_chars,
-                     last_updated = excluded.last_updated",
-                placeholders
-            );
-
-            // Flatten parameters for rusqlite
-            let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 7);
-
-            for (day_id, agent, source, delta) in chunk {
-                params_vec.push((*day_id).into());
-                params_vec.push(agent.clone().into());
-                params_vec.push(source.clone().into());
-                params_vec.push(delta.session_count_delta.into());
-                params_vec.push(delta.message_count_delta.into());
-                params_vec.push(delta.total_chars_delta.into());
-                params_vec.push(now.into());
-            }
-
-            let affected = tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
-            total_affected += affected;
-        }
-
-        tx.commit()?;
-
-        tracing::debug!(
-            target: "cass::perf::daily_stats",
-            entries = entries.len(),
-            affected = total_affected,
-            "batched_stats_update_complete"
-        );
-
-        Ok(total_affected)
-    }
-
-    /// Check if daily_stats are populated and reasonably fresh.
-    pub fn daily_stats_health(&self) -> Result<DailyStatsHealth> {
-        let row_count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM daily_stats", [], |r| r.get(0))
-            .unwrap_or(0);
-
-        let oldest_update: Option<i64> = self
-            .conn
-            .query_row("SELECT MIN(last_updated) FROM daily_stats", [], |r| {
-                r.get(0)
-            })
-            .ok();
-
-        let conversation_count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-            .unwrap_or(0);
-
-        // Get materialized total
-        let materialized_total: i64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
-                 WHERE agent_slug = 'all' AND source_id = 'all'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-
-        Ok(DailyStatsHealth {
-            populated: row_count > 0,
-            row_count,
-            oldest_update_ms: oldest_update,
-            conversation_count,
-            materialized_total,
-            drift: (conversation_count - materialized_total).abs(),
-        })
-    }
+fn rebuild_batch_size_env(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
+
+fn is_out_of_memory_error(err: &impl std::fmt::Display) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("out of memory")
+}
+
+// Second SqliteStorage impl block removed: SqliteStorage is now a type alias for FrankenStorage.
+// All methods (insert_conversation_tree, list_agents, list_conversations, etc.) are
+// available through FrankenStorage.
 
 /// Daily count data for histogram display.
 #[derive(Debug, Clone)]
@@ -5490,337 +8494,12 @@ pub struct DailyStatsHealth {
     pub drift: i64,
 }
 
-/// Update daily stats within a transaction.
-/// Handles incrementing session_count, message_count, and total_chars for:
-/// - Specific agent + source
-/// - All agents + specific source
-/// - Specific agent + all sources
-/// - All agents + all sources
-fn update_daily_stats_in_tx(
-    tx: &Transaction<'_>,
-    agent_slug: &str,
-    source_id: &str,
-    started_at_ms: Option<i64>,
-    session_count_delta: i64,
-    message_count: i64,
-    total_chars: i64,
-) -> Result<()> {
-    if session_count_delta == 0 && message_count == 0 && total_chars == 0 {
-        return Ok(());
-    }
-
-    let day_id = started_at_ms
-        .map(SqliteStorage::day_id_from_millis)
-        .unwrap_or(0);
-    let now = SqliteStorage::now_millis();
-
-    let mut unique_updates = Vec::with_capacity(4);
-
-    // Add specific entry if neither is "all"
-    if agent_slug != "all" && source_id != "all" {
-        unique_updates.push((agent_slug, source_id));
-    }
-
-    // Add "all agents" entry for this source
-    if source_id != "all" {
-        unique_updates.push(("all", source_id));
-    }
-
-    // Add "all sources" entry for this agent
-    if agent_slug != "all" {
-        unique_updates.push((agent_slug, "all"));
-    }
-
-    // Always add global total
-    unique_updates.push(("all", "all"));
-
-    for (agent, source) in unique_updates {
-        tx.execute(
-            "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
-                 session_count = session_count + excluded.session_count,
-                 message_count = message_count + excluded.message_count,
-                 total_chars = total_chars + excluded.total_chars,
-                 last_updated = excluded.last_updated",
-            params![day_id, agent, source, session_count_delta, message_count, total_chars, now],
-        )?;
-    }
-
-    Ok(())
-}
-
-fn apply_pragmas(conn: &mut Connection) -> Result<()> {
-    conn.execute_batch(
-        r"
-        PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
-        PRAGMA wal_autocheckpoint = 1000;
-        ",
-    )?;
-    apply_common_pragmas(conn)
-}
-
-fn apply_common_pragmas(conn: &Connection) -> Result<()> {
-    conn.busy_timeout(Duration::from_secs(5))?;
-    conn.execute_batch(
-        r"
-        PRAGMA temp_store = MEMORY;
-        PRAGMA cache_size = -65536; -- 64MB
-        PRAGMA mmap_size = 268435456; -- 256MB
-        PRAGMA foreign_keys = ON;
-        ",
-    )?;
-    Ok(())
-}
-
-fn init_meta(conn: &mut Connection) -> Result<()> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        [],
-    )?;
-
-    let existing: Option<i64> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get::<_, String>(0).map(|s| s.parse().unwrap_or(0)),
-        )
-        .optional()?;
-
-    if existing.is_none() {
-        // Start at version 0 so migrate() applies full schema on first open.
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', 0)",
-            [],
-        )?;
-    }
-
-    Ok(())
-}
-
-fn migrate(conn: &mut Connection) -> Result<()> {
-    let current: i64 = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get::<_, String>(0).map(|s| s.parse().unwrap_or(0)),
-        )
-        .optional()?
-        .unwrap_or(0);
-
-    if current == SCHEMA_VERSION {
-        return Ok(());
-    }
-
-    // Disable foreign keys for the migration transaction (needed for V5 table recreation).
-    // PRAGMA foreign_keys is a no-op inside a transaction, so we must set it before.
-    conn.execute("PRAGMA foreign_keys = OFF", [])?;
-
-    let tx = conn.transaction()?;
-
-    match current {
-        0 => {
-            tx.execute_batch(MIGRATION_V1)?;
-            tx.execute_batch(MIGRATION_V2)?;
-            tx.execute_batch(MIGRATION_V3)?;
-            tx.execute_batch(MIGRATION_V4)?;
-            tx.execute_batch(MIGRATION_V5)?;
-            tx.execute_batch(MIGRATION_V6)?;
-            tx.execute_batch(MIGRATION_V7)?;
-            tx.execute_batch(MIGRATION_V8)?;
-            tx.execute_batch(MIGRATION_V9)?;
-            tx.execute_batch(MIGRATION_V10)?;
-            tx.execute_batch(MIGRATION_V11)?;
-            tx.execute_batch(MIGRATION_V12)?;
-        }
-        1 => {
-            tx.execute_batch(MIGRATION_V2)?;
-            tx.execute_batch(MIGRATION_V3)?;
-            tx.execute_batch(MIGRATION_V4)?;
-            tx.execute_batch(MIGRATION_V5)?;
-            tx.execute_batch(MIGRATION_V6)?;
-            tx.execute_batch(MIGRATION_V7)?;
-            tx.execute_batch(MIGRATION_V8)?;
-            tx.execute_batch(MIGRATION_V9)?;
-            tx.execute_batch(MIGRATION_V10)?;
-            tx.execute_batch(MIGRATION_V11)?;
-            tx.execute_batch(MIGRATION_V12)?;
-        }
-        2 => {
-            tx.execute_batch(MIGRATION_V3)?;
-            tx.execute_batch(MIGRATION_V4)?;
-            tx.execute_batch(MIGRATION_V5)?;
-            tx.execute_batch(MIGRATION_V6)?;
-            tx.execute_batch(MIGRATION_V7)?;
-            tx.execute_batch(MIGRATION_V8)?;
-            tx.execute_batch(MIGRATION_V9)?;
-            tx.execute_batch(MIGRATION_V10)?;
-            tx.execute_batch(MIGRATION_V11)?;
-            tx.execute_batch(MIGRATION_V12)?;
-        }
-        3 => {
-            tx.execute_batch(MIGRATION_V4)?;
-            tx.execute_batch(MIGRATION_V5)?;
-            tx.execute_batch(MIGRATION_V6)?;
-            tx.execute_batch(MIGRATION_V7)?;
-            tx.execute_batch(MIGRATION_V8)?;
-            tx.execute_batch(MIGRATION_V9)?;
-            tx.execute_batch(MIGRATION_V10)?;
-            tx.execute_batch(MIGRATION_V11)?;
-            tx.execute_batch(MIGRATION_V12)?;
-        }
-        4 => {
-            tx.execute_batch(MIGRATION_V5)?;
-            tx.execute_batch(MIGRATION_V6)?;
-            tx.execute_batch(MIGRATION_V7)?;
-            tx.execute_batch(MIGRATION_V8)?;
-            tx.execute_batch(MIGRATION_V9)?;
-            tx.execute_batch(MIGRATION_V10)?;
-            tx.execute_batch(MIGRATION_V11)?;
-            tx.execute_batch(MIGRATION_V12)?;
-        }
-        5 => {
-            tx.execute_batch(MIGRATION_V6)?;
-            tx.execute_batch(MIGRATION_V7)?;
-            tx.execute_batch(MIGRATION_V8)?;
-            tx.execute_batch(MIGRATION_V9)?;
-            tx.execute_batch(MIGRATION_V10)?;
-            tx.execute_batch(MIGRATION_V11)?;
-            tx.execute_batch(MIGRATION_V12)?;
-        }
-        6 => {
-            tx.execute_batch(MIGRATION_V7)?;
-            tx.execute_batch(MIGRATION_V8)?;
-            tx.execute_batch(MIGRATION_V9)?;
-            tx.execute_batch(MIGRATION_V10)?;
-            tx.execute_batch(MIGRATION_V11)?;
-            tx.execute_batch(MIGRATION_V12)?;
-        }
-        7 => {
-            tx.execute_batch(MIGRATION_V8)?;
-            tx.execute_batch(MIGRATION_V9)?;
-            tx.execute_batch(MIGRATION_V10)?;
-            tx.execute_batch(MIGRATION_V11)?;
-            tx.execute_batch(MIGRATION_V12)?;
-        }
-        8 => {
-            tx.execute_batch(MIGRATION_V9)?;
-            tx.execute_batch(MIGRATION_V10)?;
-            tx.execute_batch(MIGRATION_V11)?;
-            tx.execute_batch(MIGRATION_V12)?;
-        }
-        9 => {
-            tx.execute_batch(MIGRATION_V10)?;
-            tx.execute_batch(MIGRATION_V11)?;
-            tx.execute_batch(MIGRATION_V12)?;
-        }
-        10 => {
-            tx.execute_batch(MIGRATION_V11)?;
-            tx.execute_batch(MIGRATION_V12)?;
-        }
-        11 => {
-            tx.execute_batch(MIGRATION_V12)?;
-        }
-        12 => {}
-        13 => {}
-        v => return Err(anyhow!("unsupported schema version {v}")),
-    }
-
-    if current < 13 {
-        tx.execute_batch(MIGRATION_V13)?;
-    }
-
-    tx.execute(
-        "UPDATE meta SET value = ? WHERE key = 'schema_version'",
-        params![SCHEMA_VERSION.to_string()],
-    )?;
-
-    tx.commit()?;
-
-    // Re-enable foreign keys after migration
-    conn.execute("PRAGMA foreign_keys = ON", [])?;
-
-    Ok(())
-}
-
-fn insert_conversation(
-    tx: &Transaction<'_>,
-    agent_id: i64,
-    workspace_id: Option<i64>,
-    conv: &Conversation,
-) -> Result<i64> {
-    // Serialize metadata to both JSON (for compatibility) and binary (for efficiency)
-    let metadata_bin = serialize_json_to_msgpack(&conv.metadata_json);
-
-    tx.execute(
-        "INSERT INTO conversations(
-            agent_id, workspace_id, source_id, external_id, title, source_path,
-            started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        params![
-            agent_id,
-            workspace_id,
-            &conv.source_id,
-            conv.external_id,
-            conv.title,
-            path_to_string(&conv.source_path),
-            conv.started_at,
-            conv.ended_at,
-            conv.approx_tokens,
-            serde_json::to_string(&conv.metadata_json)?,
-            conv.origin_host,
-            metadata_bin
-        ],
-    )?;
-    Ok(tx.last_insert_rowid())
-}
-
-fn insert_message(tx: &Transaction<'_>, conversation_id: i64, msg: &Message) -> Result<i64> {
-    // Serialize extra to both JSON (for compatibility) and binary (for efficiency)
-    let extra_bin = serialize_json_to_msgpack(&msg.extra_json);
-
-    tx.execute(
-        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
-         VALUES(?,?,?,?,?,?,?,?)",
-        params![
-            conversation_id,
-            msg.idx,
-            role_str(&msg.role),
-            msg.author,
-            msg.created_at,
-            msg.content,
-            serde_json::to_string(&msg.extra_json)?,
-            extra_bin
-        ],
-    )?;
-    Ok(tx.last_insert_rowid())
-}
-
-fn insert_snippets(tx: &Transaction<'_>, message_id: i64, snippets: &[Snippet]) -> Result<()> {
-    for snip in snippets {
-        tx.execute(
-            "INSERT INTO snippets(message_id, file_path, start_line, end_line, language, snippet_text)
-             VALUES(?,?,?,?,?,?)",
-            params![
-                message_id,
-                snip.file_path.as_ref().map(path_to_string),
-                snip.start_line,
-                snip.end_line,
-                snip.language,
-                snip.snippet_text,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
 // -------------------------------------------------------------------------
 // FTS5 Batch Insert (P2 Opt 2.1)
 // -------------------------------------------------------------------------
 
-/// Batch size for FTS5 inserts. With 7 columns per row and SQLite's
-/// SQLITE_MAX_VARIABLE_NUMBER default of 999, max batch is ~142 rows.
+/// Batch size for FTS5 inserts. With 7 columns per row (rowid + 6 cols) and
+/// SQLite's SQLITE_MAX_VARIABLE_NUMBER default of 999, max batch is ~142 rows.
 /// Using 100 for safety margin and memory efficiency.
 const FTS5_BATCH_SIZE: usize = 100;
 
@@ -5855,786 +8534,22 @@ impl FtsEntry {
     }
 }
 
-/// Batch insert FTS5 entries for better performance.
-///
-/// Uses multi-value INSERT to reduce transaction overhead and
-/// SQLite statement preparation costs.
-fn batch_insert_fts_messages(tx: &Transaction<'_>, entries: &[FtsEntry]) -> Result<usize> {
-    if entries.is_empty() {
-        return Ok(0);
-    }
-
-    let mut inserted = 0;
-
-    for chunk in entries.chunks(FTS5_BATCH_SIZE) {
-        // Build multi-value INSERT
-        let placeholders: String = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let base = i * 7;
-                format!(
-                    "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6,
-                    base + 7
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let sql = format!(
-            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id) VALUES {}",
-            placeholders
-        );
-
-        // Flatten parameters
-        // Capacity: chunk.len() * 7
-        let mut params_refs: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 7);
-        for entry in chunk {
-            params_refs.push(&entry.content);
-            params_refs.push(&entry.title);
-            params_refs.push(&entry.agent);
-            params_refs.push(&entry.workspace);
-            params_refs.push(&entry.source_path);
-            params_refs.push(&entry.created_at);
-            params_refs.push(&entry.message_id);
-        }
-
-        if let Err(e) = tx.execute(&sql, params_refs.as_slice()) {
-            // FTS is best-effort; log and continue
-            tracing::debug!(
-                batch_size = chunk.len(),
-                error = %e,
-                "fts_batch_insert_failed"
-            );
-            // Fall back to individual inserts for this batch
-            for entry in chunk {
-                if let Err(e2) = tx.execute(
-                    "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-                     VALUES(?,?,?,?,?,?,?)",
-                    params![
-                        entry.content,
-                        entry.title,
-                        entry.agent,
-                        entry.workspace,
-                        entry.source_path,
-                        entry.created_at,
-                        entry.message_id
-                    ],
-                ) {
-                    tracing::debug!(
-                        message_id = entry.message_id,
-                        error = %e2,
-                        "fts_insert_skipped"
-                    );
-                } else {
-                    inserted += 1;
-                }
-            }
-        } else {
-            inserted += chunk.len();
-        }
-    }
-
-    Ok(inserted)
-}
-
-/// Insert or update a single conversation within an existing transaction.
-/// Used by insert_conversations_batched to process multiple conversations efficiently.
-/// Collects FTS entries into the provided vector for batch insertion.
-fn insert_conversation_in_tx_batched(
-    tx: &Transaction<'_>,
-    agent_id: i64,
-    workspace_id: Option<i64>,
-    conv: &Conversation,
-    fts_entries: &mut Vec<FtsEntry>,
-) -> Result<(InsertOutcome, StatsDelta)> {
-    // Check for existing conversation with same (source_id, agent_id, external_id)
-    if let Some(ext) = &conv.external_id {
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM conversations WHERE source_id = ? AND agent_id = ? AND external_id = ?",
-                params![&conv.source_id, agent_id, ext],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        if let Some(conversation_id) = existing {
-            // Append messages to existing conversation
-            let max_idx: Option<i64> = tx.query_row(
-                "SELECT MAX(idx) FROM messages WHERE conversation_id = ?",
-                params![conversation_id],
-                |row| row.get::<_, Option<i64>>(0),
-            )?;
-            let cutoff = max_idx.unwrap_or(-1);
-
-            let mut inserted_indices = Vec::new();
-            let mut new_chars: i64 = 0;
-            for msg in &conv.messages {
-                if msg.idx <= cutoff {
-                    continue;
-                }
-                let msg_id = insert_message(tx, conversation_id, msg)?;
-                insert_snippets(tx, msg_id, &msg.snippets)?;
-                // Collect FTS entry instead of inserting immediately
-                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                inserted_indices.push(msg.idx);
-                new_chars += msg.content.len() as i64;
-            }
-
-            // Update metadata fields and ended_at
-            if !inserted_indices.is_empty() {
-                // Update ended_at
-                if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
-                    tx.execute(
-                        "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?) WHERE id = ?",
-                        params![last_ts, conversation_id],
-                    )?;
-                }
-
-                // Update metadata, approx_tokens, etc.
-                // We overwrite with new metadata assuming the scanner produces complete/updated metadata.
-                let metadata_bin = serialize_json_to_msgpack(&conv.metadata_json);
-                tx.execute(
-                    "UPDATE conversations SET 
-                        title = COALESCE(?, title),
-                        approx_tokens = COALESCE(?, approx_tokens),
-                        metadata_json = ?,
-                        metadata_bin = ?,
-                        origin_host = COALESCE(?, origin_host)
-                     WHERE id = ?",
-                    params![
-                        conv.title,
-                        conv.approx_tokens,
-                        serde_json::to_string(&conv.metadata_json)?,
-                        metadata_bin,
-                        conv.origin_host,
-                        conversation_id
-                    ],
-                )?;
-
-                // Note: Daily stats update skipped here to prevent double counting.
-                // The caller (ingest_batch) handles stats aggregation efficiently.
-            }
-
-            let delta = StatsDelta {
-                session_count_delta: 0,
-                message_count_delta: inserted_indices.len() as i64,
-                total_chars_delta: new_chars,
-            };
-
-            return Ok((
-                InsertOutcome {
-                    conversation_id,
-                    inserted_indices,
-                },
-                delta,
-            ));
-        }
-    }
-
-    // Insert new conversation
-    let conv_id = insert_conversation(tx, agent_id, workspace_id, conv)?;
-    let mut total_chars: i64 = 0;
-    for msg in &conv.messages {
-        let msg_id = insert_message(tx, conv_id, msg)?;
-        insert_snippets(tx, msg_id, &msg.snippets)?;
-        // Collect FTS entry instead of inserting immediately
-        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-        total_chars += msg.content.len() as i64;
-    }
-
-    // Note: Daily stats update skipped here to prevent double counting.
-    // The caller (ingest_batch) handles stats aggregation efficiently.
-
-    let delta = StatsDelta {
-        session_count_delta: 1,
-        message_count_delta: conv.messages.len() as i64,
-        total_chars_delta: total_chars,
-    };
-
-    Ok((
-        InsertOutcome {
-            conversation_id: conv_id,
-            inserted_indices: conv.messages.iter().map(|m| m.idx).collect(),
-        },
-        delta,
-    ))
-}
-
-/// Upsert daily_stats deltas inside an existing transaction.
-///
-/// This mirrors `SqliteStorage::update_daily_stats_batched` but avoids starting a
-/// nested transaction so callers can keep all writes (conversations/messages/fts/stats)
-/// atomic.
-fn update_daily_stats_batched_in_tx(
-    tx: &Transaction<'_>,
-    entries: &[(i64, String, String, StatsDelta)],
-) -> Result<usize> {
-    if entries.is_empty() {
-        return Ok(0);
-    }
-
-    let now = SqliteStorage::now_millis();
-    const BATCH_SIZE: usize = 100;
-    let mut total_affected = 0;
-
-    for chunk in entries.chunks(BATCH_SIZE) {
-        let placeholders: String = (0..chunk.len())
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let sql = format!(
-            "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-             VALUES {}
-             ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
-                 session_count = session_count + excluded.session_count,
-                 message_count = message_count + excluded.message_count,
-                 total_chars = total_chars + excluded.total_chars,
-                 last_updated = excluded.last_updated",
-            placeholders
-        );
-
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 7);
-        for (day_id, agent, source, delta) in chunk {
-            params_vec.push((*day_id).into());
-            params_vec.push(agent.clone().into());
-            params_vec.push(source.clone().into());
-            params_vec.push(delta.session_count_delta.into());
-            params_vec.push(delta.message_count_delta.into());
-            params_vec.push(delta.total_chars_delta.into());
-            params_vec.push(now.into());
-        }
-
-        total_affected += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
-    }
-
-    Ok(total_affected)
-}
-
-// -------------------------------------------------------------------------
-// Token Usage Batch Insert
-// -------------------------------------------------------------------------
-
-/// Batch insert token_usage rows inside an existing transaction.
-fn insert_token_usage_batched_in_tx(
-    tx: &Transaction<'_>,
-    entries: &[TokenUsageEntry],
-) -> Result<usize> {
-    if entries.is_empty() {
-        return Ok(0);
-    }
-
-    // 24 columns per row; SQLite limit ~999 params → batch ~41 rows, use 35 for safety
-    const BATCH_SIZE: usize = 35;
-    let mut total_inserted = 0;
-
-    for chunk in entries.chunks(BATCH_SIZE) {
-        let placeholders: String = (0..chunk.len())
-            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let sql = format!(
-            "INSERT OR IGNORE INTO token_usage (
-                message_id, conversation_id, agent_id, workspace_id, source_id,
-                timestamp_ms, day_id,
-                model_name, model_family, model_tier, service_tier, provider,
-                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-                thinking_tokens, total_tokens, estimated_cost_usd,
-                role, content_chars, has_tool_calls, tool_call_count, data_source
-            )
-            VALUES {}",
-            placeholders
-        );
-
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 24);
-        for e in chunk {
-            params_vec.push(e.message_id.into());
-            params_vec.push(e.conversation_id.into());
-            params_vec.push(e.agent_id.into());
-            params_vec.push(
-                e.workspace_id
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(e.source_id.clone().into());
-            params_vec.push(e.timestamp_ms.into());
-            params_vec.push(e.day_id.into());
-            params_vec.push(
-                e.model_name
-                    .clone()
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.model_family
-                    .clone()
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.model_tier
-                    .clone()
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.service_tier
-                    .clone()
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.provider
-                    .clone()
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.input_tokens
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.output_tokens
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.cache_read_tokens
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.cache_creation_tokens
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.thinking_tokens
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.total_tokens
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.estimated_cost_usd
-                    .map(rusqlite::types::Value::Real)
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(e.role.clone().into());
-            params_vec.push(e.content_chars.into());
-            params_vec.push((e.has_tool_calls as i64).into());
-            params_vec.push((e.tool_call_count as i64).into());
-            params_vec.push(e.data_source.clone().into());
-        }
-
-        total_inserted += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
-    }
-
-    Ok(total_inserted)
-}
-
-/// Batch upsert token_daily_stats deltas inside an existing transaction.
-fn update_token_daily_stats_batched_in_tx(
-    tx: &Transaction<'_>,
-    entries: &[(i64, String, String, String, TokenStatsDelta)],
-) -> Result<usize> {
-    if entries.is_empty() {
-        return Ok(0);
-    }
-
-    let now = SqliteStorage::now_millis();
-    const BATCH_SIZE: usize = 25; // 19 params per row → ~52 rows max, use 25 for safety
-
-    let mut total_affected = 0;
-
-    for chunk in entries.chunks(BATCH_SIZE) {
-        let placeholders: String = (0..chunk.len())
-            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let sql = format!(
-            "INSERT INTO token_daily_stats (
-                day_id, agent_slug, source_id, model_family,
-                api_call_count, user_message_count, assistant_message_count, tool_message_count,
-                total_input_tokens, total_output_tokens, total_cache_read_tokens,
-                total_cache_creation_tokens, total_thinking_tokens, grand_total_tokens,
-                total_content_chars, total_tool_calls, estimated_cost_usd, session_count,
-                last_updated
-            )
-            VALUES {}
-            ON CONFLICT(day_id, agent_slug, source_id, model_family) DO UPDATE SET
-                api_call_count = api_call_count + excluded.api_call_count,
-                user_message_count = user_message_count + excluded.user_message_count,
-                assistant_message_count = assistant_message_count + excluded.assistant_message_count,
-                tool_message_count = tool_message_count + excluded.tool_message_count,
-                total_input_tokens = total_input_tokens + excluded.total_input_tokens,
-                total_output_tokens = total_output_tokens + excluded.total_output_tokens,
-                total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
-                total_cache_creation_tokens = total_cache_creation_tokens + excluded.total_cache_creation_tokens,
-                total_thinking_tokens = total_thinking_tokens + excluded.total_thinking_tokens,
-                grand_total_tokens = grand_total_tokens + excluded.grand_total_tokens,
-                total_content_chars = total_content_chars + excluded.total_content_chars,
-                total_tool_calls = total_tool_calls + excluded.total_tool_calls,
-                estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
-                session_count = session_count + excluded.session_count,
-                last_updated = excluded.last_updated",
-            placeholders
-        );
-
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 19);
-        for (day_id, agent, source, model, delta) in chunk {
-            params_vec.push((*day_id).into());
-            params_vec.push(agent.clone().into());
-            params_vec.push(source.clone().into());
-            params_vec.push(model.clone().into());
-            params_vec.push(delta.api_call_count.into());
-            params_vec.push(delta.user_message_count.into());
-            params_vec.push(delta.assistant_message_count.into());
-            params_vec.push(delta.tool_message_count.into());
-            params_vec.push(delta.total_input_tokens.into());
-            params_vec.push(delta.total_output_tokens.into());
-            params_vec.push(delta.total_cache_read_tokens.into());
-            params_vec.push(delta.total_cache_creation_tokens.into());
-            params_vec.push(delta.total_thinking_tokens.into());
-            params_vec.push(delta.grand_total_tokens.into());
-            params_vec.push(delta.total_content_chars.into());
-            params_vec.push(delta.total_tool_calls.into());
-            params_vec.push(rusqlite::types::Value::Real(delta.estimated_cost_usd));
-            params_vec.push(delta.session_count.into());
-            params_vec.push(now.into());
-        }
-
-        total_affected += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
-    }
-
-    Ok(total_affected)
-}
-
-/// Batch insert message_metrics rows inside an existing transaction.
-/// Uses INSERT OR IGNORE (message_id is PK, skip duplicates on re-index).
-fn insert_message_metrics_batched_in_tx(
-    tx: &Transaction<'_>,
-    entries: &[MessageMetricsEntry],
-) -> Result<usize> {
-    if entries.is_empty() {
-        return Ok(0);
-    }
-
-    // 24 columns per row → ~41 rows max, use 30 for safety
-    const BATCH_SIZE: usize = 30;
-    let mut total_inserted = 0;
-
-    for chunk in entries.chunks(BATCH_SIZE) {
-        let placeholders: String = (0..chunk.len())
-            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let sql = format!(
-            "INSERT OR IGNORE INTO message_metrics (
-                message_id, created_at_ms, hour_id, day_id,
-                agent_slug, workspace_id, source_id, role,
-                content_chars, content_tokens_est,
-                model_name, model_family, model_tier, provider,
-                api_input_tokens, api_output_tokens, api_cache_read_tokens,
-                api_cache_creation_tokens, api_thinking_tokens,
-                api_service_tier, api_data_source,
-                tool_call_count, has_tool_calls, has_plan
-            )
-            VALUES {}",
-            placeholders
-        );
-
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 24);
-        for e in chunk {
-            params_vec.push(e.message_id.into());
-            params_vec.push(e.created_at_ms.into());
-            params_vec.push(e.hour_id.into());
-            params_vec.push(e.day_id.into());
-            params_vec.push(e.agent_slug.clone().into());
-            params_vec.push(e.workspace_id.into());
-            params_vec.push(e.source_id.clone().into());
-            params_vec.push(e.role.clone().into());
-            params_vec.push(e.content_chars.into());
-            params_vec.push(e.content_tokens_est.into());
-            params_vec.push(
-                e.model_name
-                    .clone()
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(e.model_family.clone().into());
-            params_vec.push(e.model_tier.clone().into());
-            params_vec.push(e.provider.clone().into());
-            params_vec.push(
-                e.api_input_tokens
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.api_output_tokens
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.api_cache_read_tokens
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.api_cache_creation_tokens
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.api_thinking_tokens
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(
-                e.api_service_tier
-                    .clone()
-                    .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
-            params_vec.push(e.api_data_source.clone().into());
-            params_vec.push(e.tool_call_count.into());
-            params_vec.push((e.has_tool_calls as i64).into());
-            params_vec.push((e.has_plan as i64).into());
-        }
-
-        total_inserted += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
-    }
-
-    Ok(total_inserted)
-}
-
-/// Flush AnalyticsRollupAggregator deltas to usage_hourly and usage_daily tables.
-/// Uses INSERT...ON CONFLICT DO UPDATE for additive rollup semantics.
-fn flush_analytics_rollups_in_tx(
-    tx: &Transaction<'_>,
-    agg: &AnalyticsRollupAggregator,
-) -> Result<(usize, usize, usize)> {
-    let now = SqliteStorage::now_millis();
-
-    let hourly_affected = flush_rollup_table(tx, "usage_hourly", "hour_id", &agg.hourly, now)?;
-    let daily_affected = flush_rollup_table(tx, "usage_daily", "day_id", &agg.daily, now)?;
-    let models_daily_affected = flush_model_daily_rollup_table(tx, &agg.models_daily, now)?;
-
-    Ok((hourly_affected, daily_affected, models_daily_affected))
-}
-
-/// Flush one rollup table (shared logic for hourly + daily).
-fn flush_rollup_table(
-    tx: &Transaction<'_>,
-    table: &str,
-    bucket_col: &str,
-    deltas: &HashMap<(i64, String, i64, String), UsageRollupDelta>,
-    now: i64,
-) -> Result<usize> {
-    if deltas.is_empty() {
-        return Ok(0);
-    }
-
-    // 22 params per row → ~44 rows max, use 30 for safety
-    const BATCH_SIZE: usize = 30;
-    let mut total_affected = 0;
-
-    let entries: Vec<_> = deltas.iter().collect();
-
-    for chunk in entries.chunks(BATCH_SIZE) {
-        let placeholders: String = (0..chunk.len())
-            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let sql = format!(
-            "INSERT INTO {table} (
-                {bucket_col}, agent_slug, workspace_id, source_id,
-                message_count, user_message_count, assistant_message_count,
-                tool_call_count, plan_message_count, plan_content_tokens_est_total,
-                plan_api_tokens_total, api_coverage_message_count,
-                content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
-                api_tokens_total, api_input_tokens_total, api_output_tokens_total,
-                api_cache_read_tokens_total, api_cache_creation_tokens_total,
-                api_thinking_tokens_total, last_updated
-            )
-            VALUES {placeholders}
-            ON CONFLICT({bucket_col}, agent_slug, workspace_id, source_id) DO UPDATE SET
-                message_count = message_count + excluded.message_count,
-                user_message_count = user_message_count + excluded.user_message_count,
-                assistant_message_count = assistant_message_count + excluded.assistant_message_count,
-                tool_call_count = tool_call_count + excluded.tool_call_count,
-                plan_message_count = plan_message_count + excluded.plan_message_count,
-                plan_content_tokens_est_total = plan_content_tokens_est_total + excluded.plan_content_tokens_est_total,
-                plan_api_tokens_total = plan_api_tokens_total + excluded.plan_api_tokens_total,
-                api_coverage_message_count = api_coverage_message_count + excluded.api_coverage_message_count,
-                content_tokens_est_total = content_tokens_est_total + excluded.content_tokens_est_total,
-                content_tokens_est_user = content_tokens_est_user + excluded.content_tokens_est_user,
-                content_tokens_est_assistant = content_tokens_est_assistant + excluded.content_tokens_est_assistant,
-                api_tokens_total = api_tokens_total + excluded.api_tokens_total,
-                api_input_tokens_total = api_input_tokens_total + excluded.api_input_tokens_total,
-                api_output_tokens_total = api_output_tokens_total + excluded.api_output_tokens_total,
-                api_cache_read_tokens_total = api_cache_read_tokens_total + excluded.api_cache_read_tokens_total,
-                api_cache_creation_tokens_total = api_cache_creation_tokens_total + excluded.api_cache_creation_tokens_total,
-                api_thinking_tokens_total = api_thinking_tokens_total + excluded.api_thinking_tokens_total,
-                last_updated = excluded.last_updated"
-        );
-
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 22);
-        for &((bucket_id, agent, workspace_id, source), d) in chunk {
-            params_vec.push((*bucket_id).into());
-            params_vec.push(agent.clone().into());
-            params_vec.push((*workspace_id).into());
-            params_vec.push(source.clone().into());
-            params_vec.push(d.message_count.into());
-            params_vec.push(d.user_message_count.into());
-            params_vec.push(d.assistant_message_count.into());
-            params_vec.push(d.tool_call_count.into());
-            params_vec.push(d.plan_message_count.into());
-            params_vec.push(d.plan_content_tokens_est_total.into());
-            params_vec.push(d.plan_api_tokens_total.into());
-            params_vec.push(d.api_coverage_message_count.into());
-            params_vec.push(d.content_tokens_est_total.into());
-            params_vec.push(d.content_tokens_est_user.into());
-            params_vec.push(d.content_tokens_est_assistant.into());
-            params_vec.push(d.api_tokens_total.into());
-            params_vec.push(d.api_input_tokens_total.into());
-            params_vec.push(d.api_output_tokens_total.into());
-            params_vec.push(d.api_cache_read_tokens_total.into());
-            params_vec.push(d.api_cache_creation_tokens_total.into());
-            params_vec.push(d.api_thinking_tokens_total.into());
-            params_vec.push(now.into());
-        }
-
-        total_affected += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
-    }
-
-    Ok(total_affected)
-}
-
-fn flush_model_daily_rollup_table(
-    tx: &Transaction<'_>,
-    deltas: &HashMap<(i64, String, i64, String, String, String), UsageRollupDelta>,
-    now: i64,
-) -> Result<usize> {
-    if deltas.is_empty() {
-        return Ok(0);
-    }
-
-    // 22 params per row, keep conservative batch size.
-    const BATCH_SIZE: usize = 25;
-    let mut total_affected = 0;
-
-    let entries: Vec<_> = deltas.iter().collect();
-
-    for chunk in entries.chunks(BATCH_SIZE) {
-        let placeholders: String = (0..chunk.len())
-            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let sql = format!(
-            "INSERT INTO usage_models_daily (
-                day_id, agent_slug, workspace_id, source_id, model_family, model_tier,
-                message_count, user_message_count, assistant_message_count,
-                tool_call_count, plan_message_count, api_coverage_message_count,
-                content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
-                api_tokens_total, api_input_tokens_total, api_output_tokens_total,
-                api_cache_read_tokens_total, api_cache_creation_tokens_total,
-                api_thinking_tokens_total, last_updated
-            )
-            VALUES {placeholders}
-            ON CONFLICT(day_id, agent_slug, workspace_id, source_id, model_family, model_tier) DO UPDATE SET
-                message_count = message_count + excluded.message_count,
-                user_message_count = user_message_count + excluded.user_message_count,
-                assistant_message_count = assistant_message_count + excluded.assistant_message_count,
-                tool_call_count = tool_call_count + excluded.tool_call_count,
-                plan_message_count = plan_message_count + excluded.plan_message_count,
-                api_coverage_message_count = api_coverage_message_count + excluded.api_coverage_message_count,
-                content_tokens_est_total = content_tokens_est_total + excluded.content_tokens_est_total,
-                content_tokens_est_user = content_tokens_est_user + excluded.content_tokens_est_user,
-                content_tokens_est_assistant = content_tokens_est_assistant + excluded.content_tokens_est_assistant,
-                api_tokens_total = api_tokens_total + excluded.api_tokens_total,
-                api_input_tokens_total = api_input_tokens_total + excluded.api_input_tokens_total,
-                api_output_tokens_total = api_output_tokens_total + excluded.api_output_tokens_total,
-                api_cache_read_tokens_total = api_cache_read_tokens_total + excluded.api_cache_read_tokens_total,
-                api_cache_creation_tokens_total = api_cache_creation_tokens_total + excluded.api_cache_creation_tokens_total,
-                api_thinking_tokens_total = api_thinking_tokens_total + excluded.api_thinking_tokens_total,
-                last_updated = excluded.last_updated"
-        );
-
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 22);
-        for &((day_id, agent, workspace_id, source, model_family, model_tier), d) in chunk {
-            params_vec.push((*day_id).into());
-            params_vec.push(agent.clone().into());
-            params_vec.push((*workspace_id).into());
-            params_vec.push(source.clone().into());
-            params_vec.push(model_family.clone().into());
-            params_vec.push(model_tier.clone().into());
-            params_vec.push(d.message_count.into());
-            params_vec.push(d.user_message_count.into());
-            params_vec.push(d.assistant_message_count.into());
-            params_vec.push(d.tool_call_count.into());
-            params_vec.push(d.plan_message_count.into());
-            params_vec.push(d.api_coverage_message_count.into());
-            params_vec.push(d.content_tokens_est_total.into());
-            params_vec.push(d.content_tokens_est_user.into());
-            params_vec.push(d.content_tokens_est_assistant.into());
-            params_vec.push(d.api_tokens_total.into());
-            params_vec.push(d.api_input_tokens_total.into());
-            params_vec.push(d.api_output_tokens_total.into());
-            params_vec.push(d.api_cache_read_tokens_total.into());
-            params_vec.push(d.api_cache_creation_tokens_total.into());
-            params_vec.push(d.api_thinking_tokens_total.into());
-            params_vec.push(now.into());
-        }
-
-        total_affected += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
-    }
-
-    Ok(total_affected)
-}
-
-/// Update conversation-level token summary columns from token_usage data.
-fn update_conversation_token_summaries_in_tx(
-    tx: &Transaction<'_>,
-    conversation_id: i64,
+const FTS_ENTRY_BATCH_MAX_DOCS: usize = 512;
+const FTS_ENTRY_BATCH_MAX_CHARS: usize = 1024 * 1024;
+
+fn flush_pending_fts_entries(
+    tx: &FrankenTransaction<'_>,
+    entries: &mut Vec<FtsEntry>,
+    pending_chars: &mut usize,
+    inserted_total: &mut usize,
 ) -> Result<()> {
-    tx.execute(
-        "UPDATE conversations SET
-            total_input_tokens = (SELECT SUM(input_tokens) FROM token_usage WHERE conversation_id = ?1),
-            total_output_tokens = (SELECT SUM(output_tokens) FROM token_usage WHERE conversation_id = ?1),
-            total_cache_read_tokens = (SELECT SUM(cache_read_tokens) FROM token_usage WHERE conversation_id = ?1),
-            total_cache_creation_tokens = (SELECT SUM(cache_creation_tokens) FROM token_usage WHERE conversation_id = ?1),
-            grand_total_tokens = (SELECT SUM(total_tokens) FROM token_usage WHERE conversation_id = ?1),
-            estimated_cost_usd = (SELECT SUM(estimated_cost_usd) FROM token_usage WHERE conversation_id = ?1),
-            primary_model = (SELECT model_name FROM token_usage WHERE conversation_id = ?1
-                             AND model_name IS NOT NULL
-                             GROUP BY model_name ORDER BY COUNT(*) DESC LIMIT 1),
-            api_call_count = (SELECT COUNT(*) FROM token_usage WHERE conversation_id = ?1
-                              AND data_source = 'api'),
-            tool_call_count = (SELECT SUM(tool_call_count) FROM token_usage WHERE conversation_id = ?1),
-            user_message_count = (SELECT COUNT(*) FROM token_usage WHERE conversation_id = ?1
-                                  AND role = 'user'),
-            assistant_message_count = (SELECT COUNT(*) FROM token_usage WHERE conversation_id = ?1
-                                       AND role IN ('assistant', 'agent'))
-         WHERE id = ?1",
-        params![conversation_id],
-    )?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    *inserted_total += franken_batch_insert_fts(tx, entries)?;
+    entries.clear();
+    *pending_chars = 0;
     Ok(())
 }
 
@@ -6714,7 +8629,7 @@ mod tests {
     }
 
     #[test]
-    fn create_backup_creates_timestamped_file() {
+    fn create_backup_creates_named_file() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         std::fs::write(&db_path, b"test data").unwrap();
@@ -6731,6 +8646,147 @@ mod tests {
                 .unwrap()
                 .contains("backup")
         );
+    }
+
+    #[test]
+    fn create_backup_paths_are_unique() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        std::fs::write(&db_path, b"test data").unwrap();
+
+        let first = create_backup(&db_path).unwrap().unwrap();
+        let second = create_backup(&db_path).unwrap().unwrap();
+
+        assert_ne!(first, second);
+        assert!(first.exists());
+        assert!(second.exists());
+    }
+
+    #[test]
+    fn lexical_rebuild_messages_query_uses_conversation_idx_access_path() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("conv-1".into()),
+            title: Some("Lexical rebuild".into()),
+            source_path: PathBuf::from("/tmp/conv-1.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_010),
+                    content: "first".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: Some("assistant".into()),
+                    created_at: Some(1_700_000_000_020),
+                    content: "second".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        let conversation_id = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                fparams!["conv-1"],
+                |row| row.get_typed::<i64>(0),
+            )
+            .unwrap();
+
+        let opcodes: Vec<String> = storage
+            .conn
+            .query_map_collect(
+                "EXPLAIN \
+                 SELECT id, idx, role, author, created_at, content \
+                 FROM messages \
+                 WHERE conversation_id = ?1 ORDER BY idx",
+                fparams![conversation_id],
+                |row| row.get_typed(1),
+            )
+            .unwrap();
+
+        assert!(
+            opcodes.iter().any(|opcode| opcode == "SeekGE"),
+            "expected lexical rebuild message fetch to seek into the conversation_id/idx access path, got {opcodes:?}"
+        );
+        assert!(
+            !opcodes.iter().any(|opcode| opcode == "SorterOpen"),
+            "expected lexical rebuild message fetch to avoid sorter temp b-trees, got {opcodes:?}"
+        );
+    }
+
+    #[test]
+    fn schema_check_rebuild_classification_ignores_transient_errors() {
+        assert!(!schema_check_error_requires_rebuild(
+            &frankensqlite::FrankenError::Busy
+        ));
+        assert!(!schema_check_error_requires_rebuild(
+            &frankensqlite::FrankenError::CannotOpen {
+                path: PathBuf::from("/tmp/test.db"),
+            }
+        ));
+        assert!(!schema_check_error_requires_rebuild(
+            &frankensqlite::FrankenError::Io(std::io::Error::other("disk hiccup"))
+        ));
+    }
+
+    #[test]
+    fn schema_check_rebuild_classification_keeps_corruption_errors() {
+        assert!(schema_check_error_requires_rebuild(
+            &frankensqlite::FrankenError::DatabaseCorrupt {
+                detail: "bad header".to_string(),
+            }
+        ));
+        assert!(schema_check_error_requires_rebuild(
+            &frankensqlite::FrankenError::WalCorrupt {
+                detail: "bad wal".to_string(),
+            }
+        ));
+        assert!(schema_check_error_requires_rebuild(
+            &frankensqlite::FrankenError::NotADatabase {
+                path: PathBuf::from("/tmp/test.db"),
+            }
+        ));
+        assert!(schema_check_error_requires_rebuild(
+            &frankensqlite::FrankenError::ShortRead {
+                expected: 4096,
+                actual: 64,
+            }
+        ));
     }
 
     #[test]
@@ -6769,7 +8825,163 @@ mod tests {
             .filter(|e| e.file_name().to_str().unwrap_or("").contains("backup"))
             .collect();
 
-        assert!(backups.len() <= 3);
+        assert_eq!(backups.len(), 3);
+    }
+
+    #[test]
+    fn cleanup_old_backups_ignores_wal_and_shm_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        for i in 0..3 {
+            let backup_name = format!("test.db.backup.{}", 1000 + i);
+            let backup_path = dir.path().join(&backup_name);
+            std::fs::write(&backup_path, format!("backup {i}")).unwrap();
+            std::fs::write(format!("{}-wal", backup_path.display()), b"wal").unwrap();
+            std::fs::write(format!("{}-shm", backup_path.display()), b"shm").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        cleanup_old_backups(&db_path, 2).unwrap();
+
+        let mut roots = Vec::new();
+        let mut wals = Vec::new();
+        let mut shms = Vec::new();
+        for entry in std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with("-wal") {
+                wals.push(name);
+            } else if name.ends_with("-shm") {
+                shms.push(name);
+            } else if name.contains("backup") {
+                roots.push(name);
+            }
+        }
+
+        assert_eq!(roots.len(), 2, "should keep two backup roots");
+        assert_eq!(
+            wals.len(),
+            2,
+            "should keep WAL sidecars only for retained backups"
+        );
+        assert_eq!(
+            shms.len(),
+            2,
+            "should keep SHM sidecars only for retained backups"
+        );
+    }
+
+    #[test]
+    fn move_database_bundle_moves_database_and_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let backup_path = dir.path().join("test.db.corrupt");
+
+        std::fs::write(&db_path, b"db").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-wal"), b"wal").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-shm"), b"shm").unwrap();
+
+        let moved = move_database_bundle(&db_path, &backup_path).unwrap();
+        assert_eq!(
+            moved,
+            DatabaseBundleMoveResult {
+                database: true,
+                wal: true,
+                shm: true
+            }
+        );
+        assert!(moved.moved_any());
+
+        assert!(!db_path.exists());
+        assert!(!database_sidecar_path(&db_path, "-wal").exists());
+        assert!(!database_sidecar_path(&db_path, "-shm").exists());
+
+        assert_eq!(std::fs::read(&backup_path).unwrap(), b"db");
+        assert_eq!(
+            std::fs::read(database_sidecar_path(&backup_path, "-wal")).unwrap(),
+            b"wal"
+        );
+        assert_eq!(
+            std::fs::read(database_sidecar_path(&backup_path, "-shm")).unwrap(),
+            b"shm"
+        );
+    }
+
+    #[test]
+    fn move_database_bundle_preserves_orphan_sidecars_without_main_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let backup_path = dir.path().join("test.db.corrupt");
+
+        std::fs::write(database_sidecar_path(&db_path, "-wal"), b"wal").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-shm"), b"shm").unwrap();
+
+        let moved = move_database_bundle(&db_path, &backup_path).unwrap();
+        assert_eq!(
+            moved,
+            DatabaseBundleMoveResult {
+                database: false,
+                wal: true,
+                shm: true
+            }
+        );
+        assert!(moved.moved_any());
+        assert!(!db_path.exists());
+        assert!(!database_sidecar_path(&db_path, "-wal").exists());
+        assert!(!database_sidecar_path(&db_path, "-shm").exists());
+        assert_eq!(
+            std::fs::read(database_sidecar_path(&backup_path, "-wal")).unwrap(),
+            b"wal"
+        );
+        assert_eq!(
+            std::fs::read(database_sidecar_path(&backup_path, "-shm")).unwrap(),
+            b"shm"
+        );
+    }
+
+    #[test]
+    fn cleanup_old_backups_ignores_backup_named_directories() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        for i in 0..3 {
+            let backup_name = format!("test.db.backup.{}", 1000 + i);
+            std::fs::write(dir.path().join(&backup_name), format!("backup {i}")).unwrap();
+        }
+        std::fs::create_dir(dir.path().join("test.db.backup.directory")).unwrap();
+
+        cleanup_old_backups(&db_path, 2).unwrap();
+
+        let mut backup_files = Vec::new();
+        let mut backup_dirs = Vec::new();
+        for entry in std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("test.db.backup.") {
+                continue;
+            }
+            if entry.path().is_dir() {
+                backup_dirs.push(name);
+            } else {
+                backup_files.push(name);
+            }
+        }
+
+        assert_eq!(
+            backup_files.len(),
+            2,
+            "only real backup files count toward retention"
+        );
+        assert_eq!(
+            backup_dirs.len(),
+            1,
+            "backup-named directories should be ignored"
+        );
     }
 
     // =========================================================================
@@ -6784,7 +8996,7 @@ mod tests {
 
         let storage = SqliteStorage::open(&db_path).unwrap();
         assert!(db_path.exists());
-        drop(storage);
+        storage.close().unwrap();
     }
 
     #[test]
@@ -6846,6 +9058,31 @@ mod tests {
         assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
+    #[test]
+    fn open_or_rebuild_does_not_treat_non_database_paths_as_corruption() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("db_dir");
+        std::fs::create_dir(&db_path).unwrap();
+
+        let result = SqliteStorage::open_or_rebuild(&db_path);
+
+        match result {
+            Err(MigrationError::Database(_)) | Err(MigrationError::Io(_)) => {}
+            Err(MigrationError::RebuildRequired { reason, .. }) => {
+                panic!("should not rebuild non-database path: {reason}")
+            }
+            Err(MigrationError::Other(msg)) => {
+                panic!("should preserve underlying open error, got Other: {msg}")
+            }
+            Ok(_) => panic!("directory path must not open as a database"),
+        }
+
+        assert!(
+            db_path.is_dir(),
+            "non-database directory must be left in place"
+        );
+    }
+
     // =========================================================================
     // Schema version tests (bead yln.4)
     // =========================================================================
@@ -6860,7 +9097,7 @@ mod tests {
     }
 
     // =========================================================================
-    // V13 Analytics schema smoke test (bead z9fse.11)
+    // Current analytics/schema smoke test (bead z9fse.11)
     // =========================================================================
 
     #[test]
@@ -6869,32 +9106,33 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
 
-        // Schema version should be 13
+        // Schema version should be current.
         let version = storage.schema_version().unwrap();
-        assert_eq!(version, 13, "Schema version must be 13 after migration");
+        assert_eq!(
+            version, CURRENT_SCHEMA_VERSION,
+            "Schema version must match CURRENT_SCHEMA_VERSION after migration"
+        );
 
         let conn = storage.raw();
 
         // Helper: collect column names from PRAGMA table_info
-        fn col_names(conn: &Connection, table: &str) -> Vec<String> {
-            let mut stmt = conn
-                .prepare(&format!("PRAGMA table_info({})", table))
-                .unwrap();
-            stmt.query_map([], |row| row.get::<_, String>(1))
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
+        fn col_names(conn: &FrankenConnection, table: &str) -> Vec<String> {
+            conn.query_map_collect(
+                &format!("PRAGMA table_info({})", table),
+                fparams![],
+                |row: &FrankenRow| row.get_typed(1),
+            )
+            .unwrap()
         }
 
         // Helper: collect index names from PRAGMA index_list
-        fn idx_names(conn: &Connection, table: &str) -> Vec<String> {
-            let mut stmt = conn
-                .prepare(&format!("PRAGMA index_list({})", table))
-                .unwrap();
-            stmt.query_map([], |row| row.get::<_, String>(1))
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
+        fn idx_names(conn: &FrankenConnection, table: &str) -> Vec<String> {
+            conn.query_map_collect(
+                &format!("PRAGMA index_list({})", table),
+                fparams![],
+                |row: &FrankenRow| row.get_typed(1),
+            )
+            .unwrap()
         }
 
         // Verify message_metrics table exists with expected columns
@@ -7027,25 +9265,40 @@ mod tests {
     }
 
     #[test]
+    fn day_and_hour_ids_floor_negative_millis() {
+        // One millisecond before the Unix epoch should still floor into the
+        // previous second/hour/day rather than truncating toward zero.
+        let ts_ms = -1_i64;
+        let expected_secs = -1_i64;
+        let epoch_2020_secs = 1_577_836_800_i64;
+
+        assert_eq!(
+            SqliteStorage::day_id_from_millis(ts_ms),
+            (expected_secs - epoch_2020_secs).div_euclid(86_400)
+        );
+        assert_eq!(
+            SqliteStorage::hour_id_from_millis(ts_ms),
+            (expected_secs - epoch_2020_secs).div_euclid(3_600)
+        );
+    }
+
+    #[test]
     fn migration_v13_from_v10() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
 
         // Open at v10 first by faking it
         {
-            let mut conn = Connection::open(&db_path).unwrap();
+            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
             conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
             )
             .unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '10')",
-                [],
-            )
-            .unwrap();
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '10')")
+                .unwrap();
             // Apply V1-V10 so schema is correct
-            let tx = conn.transaction().unwrap();
+            let mut tx = conn.transaction().unwrap();
             tx.execute_batch(MIGRATION_V1).unwrap();
             tx.execute_batch(MIGRATION_V2).unwrap();
             tx.execute_batch(MIGRATION_V3).unwrap();
@@ -7056,26 +9309,26 @@ mod tests {
             tx.execute_batch(MIGRATION_V8).unwrap();
             tx.execute_batch(MIGRATION_V9).unwrap();
             tx.execute_batch(MIGRATION_V10).unwrap();
-            tx.execute(
-                "UPDATE meta SET value = '10' WHERE key = 'schema_version'",
-                [],
-            )
-            .unwrap();
+            tx.execute("UPDATE meta SET value = '10' WHERE key = 'schema_version'")
+                .unwrap();
             tx.commit().unwrap();
         }
 
-        // Now open with SqliteStorage — should auto-migrate to v13
+        // Now open with SqliteStorage — should auto-migrate to current schema
         let storage = SqliteStorage::open(&db_path).unwrap();
         let version = storage.schema_version().unwrap();
-        assert_eq!(version, 13, "Should have migrated from v10 to v13");
+        assert_eq!(
+            version, CURRENT_SCHEMA_VERSION,
+            "Should have migrated from v10 to the current schema"
+        );
 
         // Verify new tables exist
         let count: i64 = storage
             .raw()
-            .query_row(
+            .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('message_metrics', 'usage_hourly', 'usage_daily', 'usage_models_daily')",
-                [],
-                |row| row.get::<_, i64>(0),
+                &[],
+                |row: &FrankenRow| row.get_typed::<i64>(0),
             )
             .unwrap();
         assert_eq!(count, 4, "All 4 analytics tables should exist");
@@ -7092,7 +9345,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
-        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = SqliteStorage::open(&db_path).unwrap();
 
         // Register agent + workspace
         let agent = Agent {
@@ -7181,34 +9434,33 @@ mod tests {
 
         // Verify message_metrics rows
         let mm_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM message_metrics", [], |row| {
-                row.get::<_, i64>(0)
+            .query_row_map("SELECT COUNT(*) FROM message_metrics", &[], |row| {
+                row.get_typed::<i64>(0)
             })
             .unwrap();
         assert_eq!(mm_count, 3, "Should have 3 message_metrics rows");
 
         // Verify hour_id and day_id are correct
-        let mut stmt = conn
-            .prepare("SELECT hour_id, day_id, role, content_tokens_est, has_plan, api_data_source, model_family, model_tier, provider FROM message_metrics ORDER BY message_id")
-            .unwrap();
         #[allow(clippy::type_complexity)]
-        let rows: Vec<(i64, i64, String, i64, i64, String, String, String, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                ))
-            })
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
+        let rows: Vec<(i64, i64, String, i64, i64, String, String, String, String)> = conn
+            .query_map_collect(
+                "SELECT hour_id, day_id, role, content_tokens_est, has_plan, api_data_source, model_family, model_tier, provider FROM message_metrics ORDER BY message_id",
+                fparams![],
+                |row: &FrankenRow| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
+                        row.get_typed(6)?,
+                        row.get_typed(7)?,
+                        row.get_typed(8)?,
+                    ))
+                },
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 3);
         // All messages in the same hour/day
@@ -7247,20 +9499,20 @@ mod tests {
             i64,
             i64,
         ) = conn
-            .query_row(
+            .query_row_map(
                 "SELECT message_count, user_message_count, assistant_message_count, plan_message_count,
                         plan_content_tokens_est_total, plan_api_tokens_total, api_coverage_message_count
                  FROM usage_hourly WHERE hour_id = ?",
-                params![expected_hour],
-                |row| {
+                fparams![expected_hour],
+                |row: &FrankenRow| {
                     Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
+                        row.get_typed(6)?,
                     ))
                 },
             )
@@ -7284,10 +9536,10 @@ mod tests {
 
         // Verify usage_daily rollup matches hourly (same day)
         let (ud_msg, ud_api_cov): (i64, i64) = conn
-            .query_row(
+            .query_row_map(
                 "SELECT message_count, api_coverage_message_count FROM usage_daily WHERE day_id = ?",
-                params![expected_day],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                fparams![expected_day],
+                |row: &FrankenRow| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )
             .unwrap();
         assert_eq!(ud_msg, 3, "Daily rollup should match hourly");
@@ -7298,10 +9550,10 @@ mod tests {
 
         // Verify the API input tokens from message_metrics (only API-sourced)
         let api_only_input: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COALESCE(SUM(api_input_tokens), 0) FROM message_metrics WHERE day_id = ? AND api_data_source = 'api'",
-                params![expected_day],
-                |row| row.get::<_, i64>(0),
+                fparams![expected_day],
+                |row: &FrankenRow| row.get_typed::<i64>(0),
             )
             .unwrap();
         assert_eq!(
@@ -7311,39 +9563,39 @@ mod tests {
 
         // Verify rollups match summed message_metrics
         let mm_total_content_est: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT SUM(content_tokens_est) FROM message_metrics WHERE day_id = ?",
-                params![expected_day],
-                |row| row.get::<_, i64>(0),
+                fparams![expected_day],
+                |row| row.get_typed::<i64>(0),
             )
             .unwrap();
         let mm_plan_content_est: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COALESCE(SUM(content_tokens_est), 0) FROM message_metrics WHERE day_id = ? AND has_plan = 1",
-                params![expected_day],
-                |row| row.get::<_, i64>(0),
+                fparams![expected_day],
+                |row: &FrankenRow| row.get_typed::<i64>(0),
             )
             .unwrap();
         let mm_plan_api_total: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COALESCE(SUM(COALESCE(api_input_tokens, 0) + COALESCE(api_output_tokens, 0) + COALESCE(api_cache_read_tokens, 0) + COALESCE(api_cache_creation_tokens, 0) + COALESCE(api_thinking_tokens, 0)), 0)
                  FROM message_metrics WHERE day_id = ? AND has_plan = 1 AND api_data_source = 'api'",
-                params![expected_day],
-                |row| row.get::<_, i64>(0),
+                fparams![expected_day],
+                |row: &FrankenRow| row.get_typed::<i64>(0),
             )
             .unwrap();
         let ud_content_est: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT content_tokens_est_total FROM usage_daily WHERE day_id = ?",
-                params![expected_day],
-                |row| row.get::<_, i64>(0),
+                fparams![expected_day],
+                |row| row.get_typed::<i64>(0),
             )
             .unwrap();
         let (ud_plan_content_est, ud_plan_api_total): (i64, i64) = conn
-            .query_row(
+            .query_row_map(
                 "SELECT plan_content_tokens_est_total, plan_api_tokens_total FROM usage_daily WHERE day_id = ?",
-                params![expected_day],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                fparams![expected_day],
+                |row: &FrankenRow| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )
             .unwrap();
         assert_eq!(
@@ -7367,12 +9619,12 @@ mod tests {
             i64,
             i64,
         ) = conn
-            .query_row(
+            .query_row_map(
                 "SELECT message_count, user_message_count, assistant_message_count, api_tokens_total, api_coverage_message_count
                  FROM usage_models_daily
                  WHERE day_id = ? AND model_family = 'claude' AND model_tier = 'opus'",
-                params![expected_day],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                fparams![expected_day],
+                |row: &FrankenRow| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?, row.get_typed(4)?)),
             )
             .unwrap();
         assert_eq!(claude_msg, 1);
@@ -7382,11 +9634,11 @@ mod tests {
         assert_eq!(claude_api_cov, 1);
 
         let unknown_msg: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT message_count FROM usage_models_daily
                  WHERE day_id = ? AND model_family = 'unknown' AND model_tier = 'unknown'",
-                params![expected_day],
-                |row| row.get(0),
+                fparams![expected_day],
+                |row| row.get_typed(0),
             )
             .unwrap();
         assert_eq!(
@@ -7552,7 +9804,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
-        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = SqliteStorage::open(&db_path).unwrap();
 
         // Register agent
         let agent = Agent {
@@ -7636,24 +9888,30 @@ mod tests {
         // Save original analytics state
         let conn = storage.raw();
         let orig_mm: i64 = conn
-            .query_row("SELECT COUNT(*) FROM message_metrics", [], |row| row.get(0))
+            .query_row_map("SELECT COUNT(*) FROM message_metrics", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         let orig_hourly: i64 = conn
-            .query_row("SELECT COUNT(*) FROM usage_hourly", [], |row| row.get(0))
+            .query_row_map("SELECT COUNT(*) FROM usage_hourly", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         let orig_daily: i64 = conn
-            .query_row("SELECT COUNT(*) FROM usage_daily", [], |row| row.get(0))
+            .query_row_map("SELECT COUNT(*) FROM usage_daily", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         let orig_models_daily: i64 = conn
-            .query_row("SELECT COUNT(*) FROM usage_models_daily", [], |row| {
-                row.get(0)
+            .query_row_map("SELECT COUNT(*) FROM usage_models_daily", &[], |row| {
+                row.get_typed(0)
             })
             .unwrap();
         let orig_api_input: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COALESCE(SUM(api_input_tokens), 0) FROM message_metrics WHERE api_data_source = 'api'",
-                [],
-                |row| row.get(0),
+                &[],
+                |row: &FrankenRow| row.get_typed(0),
             )
             .unwrap();
 
@@ -7663,14 +9921,16 @@ mod tests {
         assert!(orig_models_daily > 0);
 
         // Destroy analytics tables (simulate corruption)
-        conn.execute("DELETE FROM message_metrics", []).unwrap();
-        conn.execute("DELETE FROM usage_hourly", []).unwrap();
-        conn.execute("DELETE FROM usage_daily", []).unwrap();
-        conn.execute("DELETE FROM usage_models_daily", []).unwrap();
+        conn.execute("DELETE FROM message_metrics").unwrap();
+        conn.execute("DELETE FROM usage_hourly").unwrap();
+        conn.execute("DELETE FROM usage_daily").unwrap();
+        conn.execute("DELETE FROM usage_models_daily").unwrap();
 
         // Verify they're empty
         let zero: i64 = conn
-            .query_row("SELECT COUNT(*) FROM message_metrics", [], |row| row.get(0))
+            .query_row_map("SELECT COUNT(*) FROM message_metrics", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(zero, 0);
 
@@ -7689,7 +9949,9 @@ mod tests {
         // Verify rebuilt data matches
         let conn = storage.raw();
         let rebuilt_mm: i64 = conn
-            .query_row("SELECT COUNT(*) FROM message_metrics", [], |row| row.get(0))
+            .query_row_map("SELECT COUNT(*) FROM message_metrics", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(
             rebuilt_mm, orig_mm,
@@ -7697,7 +9959,9 @@ mod tests {
         );
 
         let rebuilt_hourly: i64 = conn
-            .query_row("SELECT COUNT(*) FROM usage_hourly", [], |row| row.get(0))
+            .query_row_map("SELECT COUNT(*) FROM usage_hourly", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(
             rebuilt_hourly, orig_hourly,
@@ -7705,13 +9969,15 @@ mod tests {
         );
 
         let rebuilt_daily: i64 = conn
-            .query_row("SELECT COUNT(*) FROM usage_daily", [], |row| row.get(0))
+            .query_row_map("SELECT COUNT(*) FROM usage_daily", &[], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(rebuilt_daily, orig_daily, "Rebuilt daily rows should match");
 
         let rebuilt_models_daily: i64 = conn
-            .query_row("SELECT COUNT(*) FROM usage_models_daily", [], |row| {
-                row.get(0)
+            .query_row_map("SELECT COUNT(*) FROM usage_models_daily", &[], |row| {
+                row.get_typed(0)
             })
             .unwrap();
         assert_eq!(
@@ -7721,10 +9987,10 @@ mod tests {
 
         // Verify API token data preserved through rebuild
         let rebuilt_api_input: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COALESCE(SUM(api_input_tokens), 0) FROM message_metrics WHERE api_data_source = 'api'",
-                [],
-                |row| row.get(0),
+                &[],
+                |row: &FrankenRow| row.get_typed(0),
             )
             .unwrap();
         assert_eq!(
@@ -7741,19 +10007,19 @@ mod tests {
             i64,
             i64,
         ) = conn
-            .query_row(
+            .query_row_map(
                 "SELECT message_count, user_message_count, assistant_message_count, plan_message_count,
                         plan_content_tokens_est_total, plan_api_tokens_total
                  FROM usage_hourly WHERE hour_id = ?",
-                params![expected_hour],
-                |row| {
+                fparams![expected_hour],
+                |row: &FrankenRow| {
                     Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
                     ))
                 },
             )
@@ -7766,13 +10032,2572 @@ mod tests {
         assert!(uh_plan_api > 0);
 
         let ud_msg: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT message_count FROM usage_daily WHERE day_id = ?",
-                params![expected_day],
-                |row| row.get(0),
+                fparams![expected_day],
+                |row| row.get_typed(0),
             )
             .unwrap();
         assert_eq!(ud_msg, 3);
+    }
+
+    #[test]
+    fn insert_conversations_batched_flushes_large_fts_batches() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let content = "y".repeat(4096);
+        let messages: Vec<_> = (0..1_200)
+            .map(|i| Message {
+                id: None,
+                idx: i,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: Some(1_700_000_000_000 + i),
+                content: format!("{i}-{content}"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            })
+            .collect();
+        let conv = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("fts-large-batch".into()),
+            title: Some("FTS Large Batch".into()),
+            source_path: PathBuf::from("/tmp/rollout.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_999),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let outcomes = storage
+            .insert_conversations_batched(&[(agent_id, None, &conv)])
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].inserted_indices.len(), conv.messages.len());
+
+        let message_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let fts_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+
+        assert_eq!(message_count, conv.messages.len() as i64);
+        assert_eq!(fts_count, conv.messages.len() as i64);
+    }
+
+    #[test]
+    fn rebuild_daily_stats_recomputes_materialized_totals_without_monolithic_group_by() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let started_at = 1_700_000_000_000_i64;
+        let day_id = FrankenStorage::day_id_from_millis(started_at);
+        let hour_id = FrankenStorage::hour_id_from_millis(started_at);
+
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 0, 0)",
+                fparams![1_i64, "codex", "Codex", "cli"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 0, 0)",
+                fparams![2_i64, "claude", "Claude", "cli"],
+            )
+            .unwrap();
+
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, NULL, NULL)",
+                fparams![
+                    1_i64,
+                    1_i64,
+                    LOCAL_SOURCE_ID,
+                    "daily-a",
+                    "Daily A",
+                    "/tmp/daily-a.jsonl",
+                    started_at,
+                    started_at + 200,
+                    "{}"
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, NULL, NULL)",
+                fparams![
+                    2_i64,
+                    2_i64,
+                    LOCAL_SOURCE_ID,
+                    "daily-b",
+                    "Daily B",
+                    "/tmp/daily-b.jsonl",
+                    started_at,
+                    started_at + 300,
+                    "{}"
+                ],
+            )
+            .unwrap();
+
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![1_i64, 1_i64, 0_i64, "user", started_at, "hello"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![2_i64, 1_i64, 1_i64, "assistant", started_at + 100, "response"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![3_i64, 2_i64, 0_i64, "user", started_at + 50, "abc"],
+            )
+            .unwrap();
+
+        for (message_id, agent_slug, role, content_len) in [
+            (1_i64, "codex", "user", 5_i64),
+            (2_i64, "codex", "assistant", 8_i64),
+            (3_i64, "claude", "user", 3_i64),
+        ] {
+            storage
+                .conn
+                .execute_compat(
+                    "INSERT INTO message_metrics (
+                        message_id, created_at_ms, hour_id, day_id, agent_slug, workspace_id, source_id,
+                        role, content_chars, content_tokens_est, api_input_tokens, api_output_tokens,
+                        api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens,
+                        api_service_tier, api_data_source, tool_call_count, has_tool_calls, has_plan,
+                        model_name, model_family, model_tier, provider
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                        ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?14, ?15,
+                        ?16, ?17, ?18, ?19, ?20,
+                        ?21, ?22, ?23, ?24
+                     )",
+                    fparams![
+                        message_id,
+                        started_at,
+                        hour_id,
+                        day_id,
+                        agent_slug,
+                        0_i64,
+                        LOCAL_SOURCE_ID,
+                        role,
+                        content_len,
+                        content_len / 4,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        "",
+                        "estimated",
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        "",
+                        "unknown",
+                        "unknown",
+                        "unknown"
+                    ],
+                )
+                .unwrap();
+        }
+
+        storage.conn.execute("DELETE FROM daily_stats").unwrap();
+
+        let rebuilt = storage.rebuild_daily_stats().unwrap();
+        assert_eq!(rebuilt.total_sessions, 2);
+
+        let health = storage.daily_stats_health().unwrap();
+        assert_eq!(health.conversation_count, 2);
+        assert_eq!(health.materialized_total, 2);
+        assert_eq!(health.drift, 0);
+
+        let total_messages: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT message_count FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(total_messages, 3);
+    }
+
+    #[test]
+    fn rebuild_daily_stats_preserves_byte_counts_with_message_metrics() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let content = "ASCII🙂é漢字";
+        let expected_bytes = content.len() as i64;
+        let started_at = 1_704_067_200_000_i64;
+        let day_id = FrankenStorage::day_id_from_millis(started_at);
+        let hour_id = FrankenStorage::hour_id_from_millis(started_at);
+
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 0, 0)",
+                fparams![1_i64, "tester", "Tester", "cli"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL, NULL)",
+                fparams![
+                    1_i64,
+                    1_i64,
+                    LOCAL_SOURCE_ID,
+                    "unicode-metrics",
+                    "Unicode Metrics",
+                    "/tmp/unicode-metrics.jsonl",
+                    started_at,
+                    "{}"
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![1_i64, 1_i64, 0_i64, "user", started_at, content],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO message_metrics (
+                    message_id, created_at_ms, hour_id, day_id, agent_slug, workspace_id, source_id,
+                    role, content_chars, content_tokens_est, api_input_tokens, api_output_tokens,
+                    api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens,
+                    api_service_tier, api_data_source, tool_call_count, has_tool_calls, has_plan,
+                    model_name, model_family, model_tier, provider
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                    ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15,
+                    ?16, ?17, ?18, ?19, ?20,
+                    ?21, ?22, ?23, ?24
+                 )",
+                fparams![
+                    1_i64,
+                    started_at,
+                    hour_id,
+                    day_id,
+                    "tester",
+                    0_i64,
+                    LOCAL_SOURCE_ID,
+                    "user",
+                    expected_bytes,
+                    expected_bytes / 4,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    "",
+                    "estimated",
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    "",
+                    "unknown",
+                    "unknown",
+                    "unknown"
+                ],
+            )
+            .unwrap();
+
+        let mut tx = storage.conn.transaction().unwrap();
+        franken_update_daily_stats_in_tx(
+            &tx,
+            "tester",
+            LOCAL_SOURCE_ID,
+            Some(started_at),
+            1,
+            1,
+            expected_bytes,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let inline_total: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT total_chars FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(inline_total, expected_bytes);
+
+        storage.conn.execute("DELETE FROM daily_stats").unwrap();
+
+        let rebuilt = storage.rebuild_daily_stats().unwrap();
+        assert_eq!(rebuilt.total_sessions, 1);
+
+        let rebuilt_total: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT total_chars FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(rebuilt_total, expected_bytes);
+    }
+
+    #[test]
+    fn rebuild_daily_stats_raw_fallback_preserves_byte_counts() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let content = "fallback🙂é漢字";
+        let expected_bytes = content.len() as i64;
+        let started_at = 1_704_067_200_000_i64;
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 0, 0)",
+                fparams![1_i64, "tester", "Tester", "cli"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL, NULL)",
+                fparams![
+                    1_i64,
+                    1_i64,
+                    LOCAL_SOURCE_ID,
+                    "unicode-fallback",
+                    "Unicode Fallback",
+                    "/tmp/unicode-fallback.jsonl",
+                    started_at,
+                    "{}"
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![1_i64, 1_i64, 0_i64, "assistant", started_at, content],
+            )
+            .unwrap();
+
+        let mut tx = storage.conn.transaction().unwrap();
+        franken_update_daily_stats_in_tx(
+            &tx,
+            "tester",
+            LOCAL_SOURCE_ID,
+            Some(started_at),
+            1,
+            1,
+            expected_bytes,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        storage.conn.execute("DELETE FROM daily_stats").unwrap();
+
+        let rebuilt = storage.rebuild_daily_stats().unwrap();
+        assert_eq!(rebuilt.total_sessions, 1);
+
+        let rebuilt_total: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT total_chars FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(rebuilt_total, expected_bytes);
+    }
+
+    #[test]
+    fn insert_conversations_batched_appends_duplicate_external_id() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let base_conv = |messages: Vec<Message>| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("shared-session".into()),
+            title: Some("Shared Session".into()),
+            source_path: PathBuf::from("/tmp/rollout.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_999),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let conv_a = base_conv(vec![
+            Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "first".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+            Message {
+                id: None,
+                idx: 1,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: Some(1_700_000_000_100),
+                content: "second".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+        ]);
+        let conv_b = base_conv(vec![
+            Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "first".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+            Message {
+                id: None,
+                idx: 1,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: Some(1_700_000_000_100),
+                content: "second".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+            Message {
+                id: None,
+                idx: 2,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_200),
+                content: "third".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+            Message {
+                id: None,
+                idx: 3,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: Some(1_700_000_000_300),
+                content: "fourth".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+        ]);
+
+        let outcomes = storage
+            .insert_conversations_batched(&[(agent_id, None, &conv_a), (agent_id, None, &conv_b)])
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].inserted_indices, vec![0, 1]);
+        assert_eq!(outcomes[1].inserted_indices, vec![2, 3]);
+        assert_eq!(outcomes[0].conversation_id, outcomes[1].conversation_id);
+
+        let conversation_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let message_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+
+        assert_eq!(conversation_count, 1);
+        assert_eq!(message_count, 4);
+    }
+
+    #[test]
+    fn franken_insert_conversation_or_get_existing_recovers_unique_conflict() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let conv = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("recover-duplicate".into()),
+            title: Some("Recover Duplicate".into()),
+            source_path: PathBuf::from("/tmp/rollout.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "hello".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let tx = storage.conn.transaction().unwrap();
+        let inserted_id = franken_insert_conversation(&tx, agent_id, None, &conv).unwrap();
+
+        let resolved =
+            franken_insert_conversation_or_get_existing(&tx, agent_id, None, &conv).unwrap();
+
+        match resolved {
+            ConversationInsertStatus::Existing(existing_id) => {
+                assert_eq!(existing_id, inserted_id);
+            }
+            ConversationInsertStatus::Inserted(new_id) => {
+                panic!("expected existing conversation id, got freshly inserted {new_id}");
+            }
+        }
+
+        let conversation_count: i64 = tx
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(conversation_count, 1);
+    }
+
+    #[test]
+    fn insert_conversations_batched_merges_duplicate_external_id_with_gaps() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let base_conv = |messages: Vec<Message>| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("shared-session-gap".into()),
+            title: Some("Shared Session Gap".into()),
+            source_path: PathBuf::from("/tmp/rollout.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_999),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let conv_a = base_conv(vec![
+            Message {
+                id: None,
+                idx: 2,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_200),
+                content: "third".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+            Message {
+                id: None,
+                idx: 3,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: Some(1_700_000_000_300),
+                content: "fourth".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+        ]);
+        let conv_b = base_conv(vec![
+            Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "first".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+            Message {
+                id: None,
+                idx: 1,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: Some(1_700_000_000_100),
+                content: "second".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+            Message {
+                id: None,
+                idx: 3,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: Some(1_700_000_000_300),
+                content: "fourth".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+        ]);
+
+        let outcomes = storage
+            .insert_conversations_batched(&[(agent_id, None, &conv_a), (agent_id, None, &conv_b)])
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].inserted_indices, vec![2, 3]);
+        assert_eq!(outcomes[1].inserted_indices, vec![0, 1]);
+        assert_eq!(outcomes[0].conversation_id, outcomes[1].conversation_id);
+
+        let stored_indices: Vec<i64> = storage
+            .conn
+            .query_map_collect("SELECT idx FROM messages ORDER BY idx", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(stored_indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn insert_conversation_tree_merges_duplicate_external_id_with_gaps() {
+        use crate::connectors::{NormalizedConversation, NormalizedMessage};
+        use crate::indexer::persist::map_to_internal;
+        use crate::model::types::{Agent, AgentKind};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let base_conv = |messages: Vec<NormalizedMessage>| NormalizedConversation {
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("tree-gap-session".into()),
+            title: Some("Tree Gap Session".into()),
+            source_path: PathBuf::from("/tmp/tree.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_999),
+            metadata: serde_json::Value::Null,
+            messages,
+        };
+
+        let conv_a = map_to_internal(&base_conv(vec![
+            NormalizedMessage {
+                idx: 2,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1_700_000_000_200),
+                content: "third".into(),
+                extra: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+            NormalizedMessage {
+                idx: 3,
+                role: "assistant".into(),
+                author: None,
+                created_at: Some(1_700_000_000_300),
+                content: "fourth".into(),
+                extra: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+        ]));
+        let conv_b = map_to_internal(&base_conv(vec![
+            NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "first".into(),
+                extra: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+            NormalizedMessage {
+                idx: 1,
+                role: "assistant".into(),
+                author: None,
+                created_at: Some(1_700_000_000_100),
+                content: "second".into(),
+                extra: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+            NormalizedMessage {
+                idx: 3,
+                role: "assistant".into(),
+                author: None,
+                created_at: Some(1_700_000_000_300),
+                content: "fourth".into(),
+                extra: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+        ]));
+
+        let first = storage
+            .insert_conversation_tree(agent_id, None, &conv_a)
+            .unwrap();
+        let second = storage
+            .insert_conversation_tree(agent_id, None, &conv_b)
+            .unwrap();
+
+        assert_eq!(first.inserted_indices, vec![2, 3]);
+        assert_eq!(second.inserted_indices, vec![0, 1]);
+        assert_eq!(first.conversation_id, second.conversation_id);
+
+        let stored_indices: Vec<i64> = storage
+            .conn
+            .query_map_collect("SELECT idx FROM messages ORDER BY idx", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(stored_indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn insert_conversation_tree_merges_duplicate_source_path_without_external_id() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let base_conv = |messages: Vec<Message>| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: None,
+            title: Some("Source Path Merge".into()),
+            source_path: PathBuf::from("/tmp/shared-session.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_999),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let first = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &base_conv(vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_000),
+                        content: "first".into(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_100),
+                        content: "second".into(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                ]),
+            )
+            .unwrap();
+
+        let second = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &base_conv(vec![
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_100),
+                        content: "second".into(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 2,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_200),
+                        content: "third".into(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(first.conversation_id, second.conversation_id);
+        assert_eq!(first.inserted_indices, vec![0, 1]);
+        assert_eq!(second.inserted_indices, vec![2]);
+
+        let stored_indices: Vec<i64> = storage
+            .conn
+            .query_map_collect("SELECT idx FROM messages ORDER BY idx", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(stored_indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn insert_conversation_tree_merges_source_path_duplicates_with_start_drift() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let base_conv = |started_at: Option<i64>, messages: Vec<Message>| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: None,
+            title: Some("Drift Merge".into()),
+            source_path: PathBuf::from("/tmp/drift-session.jsonl"),
+            started_at,
+            ended_at: Some(1_700_000_000_999),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let first = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &base_conv(
+                    Some(1_700_000_000_000),
+                    vec![
+                        Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_700_000_000_000),
+                            content: "first".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 1,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: Some(1_700_000_000_100),
+                            content: "second".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                    ],
+                ),
+            )
+            .unwrap();
+
+        let second = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &base_conv(
+                    Some(1_700_000_004_000),
+                    vec![
+                        Message {
+                            id: None,
+                            idx: 1,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: Some(1_700_000_000_100),
+                            content: "second".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 2,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_700_000_004_200),
+                            content: "third".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                    ],
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(first.conversation_id, second.conversation_id);
+        assert_eq!(second.inserted_indices, vec![2]);
+    }
+
+    #[test]
+    fn insert_conversation_tree_keeps_single_message_overlap_sessions_separate() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let make_conv = |started_at: i64, idx: i64, content: &str| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: None,
+            title: Some("Partial overlap".into()),
+            source_path: PathBuf::from("/tmp/reused-session.jsonl"),
+            started_at: Some(started_at),
+            ended_at: Some(started_at + 500),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(started_at),
+                content: content.into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    messages: vec![
+                        Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_700_000_000_000),
+                            content: "shared opener".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 1,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: Some(1_700_000_000_100),
+                            content: "first session unique".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                    ],
+                    ..make_conv(1_700_000_000_000, 0, "unused")
+                },
+            )
+            .unwrap();
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &make_conv(1_700_000_900_000, 0, "shared opener"),
+            )
+            .unwrap();
+
+        let conversation_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(conversation_count, 2);
+    }
+
+    #[test]
+    fn insert_conversation_tree_keeps_distinct_source_path_sessions_separate() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let make_conv = |started_at: i64, created_at: i64, content: &str| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: None,
+            title: Some("Same Path Different Session".into()),
+            source_path: PathBuf::from("/tmp/reused-session.jsonl"),
+            started_at: Some(started_at),
+            ended_at: Some(started_at + 500),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(created_at),
+                content: content.into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &make_conv(1_700_000_000_000, 1_700_000_000_000, "first session"),
+            )
+            .unwrap();
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &make_conv(1_700_000_900_000, 1_700_000_900_000, "second session"),
+            )
+            .unwrap();
+
+        let conversation_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(conversation_count, 2);
+    }
+
+    #[test]
+    fn insert_conversation_tree_merges_replay_equivalent_messages_with_shifted_idx() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let make_conv = |started_at: i64, messages: Vec<Message>| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: None,
+            title: Some("Shifted replay".into()),
+            source_path: PathBuf::from("/tmp/replay-session.jsonl"),
+            started_at: Some(started_at),
+            ended_at: Some(started_at + 500),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let first = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &make_conv(
+                    1_700_000_000_000,
+                    vec![
+                        Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_700_000_000_000),
+                            content: "first".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 1,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: Some(1_700_000_000_100),
+                            content: "second".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                    ],
+                ),
+            )
+            .unwrap();
+
+        let second = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &make_conv(
+                    1_700_000_900_000,
+                    vec![
+                        Message {
+                            id: None,
+                            idx: 10,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_700_000_000_000),
+                            content: "first".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 11,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: Some(1_700_000_000_100),
+                            content: "second".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 12,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_700_000_000_200),
+                            content: "third".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                    ],
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(first.conversation_id, second.conversation_id);
+        assert_eq!(second.inserted_indices, vec![12]);
+
+        let stored_indices: Vec<i64> = storage
+            .conn
+            .query_map_collect(
+                "SELECT idx FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+                fparams![first.conversation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(stored_indices, vec![0, 1, 12]);
+    }
+
+    #[test]
+    fn salvage_historical_databases_imports_backups_once_and_merges_overlap() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        fn seed_historical_db(db_path: &Path, conversations: &[Conversation]) {
+            if let Some(parent) = db_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let storage = SqliteStorage::open(db_path).unwrap();
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("0.2.3".into()),
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            for conv in conversations {
+                storage
+                    .insert_conversation_tree(agent_id, None, conv)
+                    .unwrap();
+            }
+        }
+
+        fn base_conv(source_path: &str, messages: Vec<Message>) -> Conversation {
+            Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: None,
+                title: Some("Recovered".into()),
+                source_path: PathBuf::from(source_path),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_999),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages,
+                source_id: "local".into(),
+                origin_host: None,
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&canonical_db).unwrap();
+
+        let overlapping_a = base_conv(
+            "/tmp/shared-history.jsonl",
+            vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_000),
+                    content: "first".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: Some(1_700_000_000_100),
+                    content: "second".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+        );
+        let overlapping_b = base_conv(
+            "/tmp/shared-history.jsonl",
+            vec![
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: Some(1_700_000_000_100),
+                    content: "second".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 2,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_200),
+                    content: "third".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+        );
+        let unique = Conversation {
+            source_path: PathBuf::from("/tmp/unique-history.jsonl"),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_001_000),
+                content: "unique".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            started_at: Some(1_700_000_001_000),
+            ended_at: Some(1_700_000_001_100),
+            ..base_conv("/tmp/unique-history.jsonl", Vec::new())
+        };
+
+        seed_historical_db(
+            &dir.path()
+                .join("backups/agent_search.db.20260322T020200.bak"),
+            &[overlapping_a.clone()],
+        );
+        seed_historical_db(
+            &dir.path().join("agent_search.corrupt.20260324_212907"),
+            &[overlapping_b, unique],
+        );
+
+        let first = storage.salvage_historical_databases(&canonical_db).unwrap();
+        assert_eq!(first.bundles_considered, 2);
+        assert_eq!(first.bundles_imported, 2);
+        assert_eq!(first.messages_imported, 4);
+
+        let conversations = storage.list_conversations(10, 0).unwrap();
+        assert_eq!(conversations.len(), 2);
+
+        let shared_id = conversations
+            .iter()
+            .find(|conv| conv.source_path == PathBuf::from("/tmp/shared-history.jsonl"))
+            .and_then(|conv| conv.id)
+            .unwrap();
+        let shared_indices: Vec<i64> = storage
+            .fetch_messages(shared_id)
+            .unwrap()
+            .into_iter()
+            .map(|msg| msg.idx)
+            .collect();
+        assert_eq!(shared_indices, vec![0, 1, 2]);
+
+        let second = storage.salvage_historical_databases(&canonical_db).unwrap();
+        assert_eq!(second.bundles_imported, 0);
+        assert_eq!(second.messages_imported, 0);
+    }
+
+    #[test]
+    fn historical_salvage_retry_splits_single_conversation_until_it_fits() {
+        use crate::model::types::{Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let mut attempts: Vec<Vec<usize>> = Vec::new();
+        let entry = HistoricalBatchEntry {
+            source_row_id: 77,
+            agent_id: 1,
+            workspace_id: None,
+            conversation: Conversation {
+                id: None,
+                agent_slug: "gemini".into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some("conv-77".into()),
+                title: Some("Large recovered conversation".into()),
+                source_path: PathBuf::from("/tmp/history.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_999),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: (0..4)
+                    .map(|idx| Message {
+                        id: None,
+                        idx,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_000 + idx),
+                        content: format!("message-{idx}"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    })
+                    .collect(),
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            },
+        };
+
+        let totals = SqliteStorage::import_historical_batch_with_retry(
+            std::slice::from_ref(&entry),
+            &mut |batch| {
+                attempts.push(
+                    batch
+                        .iter()
+                        .map(|entry| entry.conversation.messages.len())
+                        .collect(),
+                );
+                let total_messages: usize = batch
+                    .iter()
+                    .map(|entry| entry.conversation.messages.len())
+                    .sum();
+                if total_messages > 1 {
+                    Err(anyhow!("out of memory"))
+                } else {
+                    Ok(HistoricalBatchImportTotals {
+                        inserted_source_rows: batch.len(),
+                        inserted_messages: total_messages,
+                    })
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            totals,
+            HistoricalBatchImportTotals {
+                inserted_source_rows: 1,
+                inserted_messages: 4,
+            }
+        );
+        assert_eq!(attempts.first().cloned(), Some(vec![4]));
+        assert!(
+            attempts.iter().filter(|sizes| sizes == &&vec![1]).count() >= 4,
+            "expected recursive fallback to reach one-message slices"
+        );
+    }
+
+    #[test]
+    fn salvage_historical_databases_resumes_from_progress_checkpoint() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        fn seed_historical_db(db_path: &Path, conversations: &[Conversation]) {
+            if let Some(parent) = db_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let storage = SqliteStorage::open(db_path).unwrap();
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("0.2.3".into()),
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            for conv in conversations {
+                storage
+                    .insert_conversation_tree(agent_id, None, conv)
+                    .unwrap();
+            }
+        }
+
+        fn make_conv(source_path: &str, idx_seed: i64) -> Conversation {
+            Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some(format!("conv-{idx_seed}")),
+                title: Some(format!("Recovered {idx_seed}")),
+                source_path: PathBuf::from(source_path),
+                started_at: Some(1_700_000_000_000 + idx_seed),
+                ended_at: Some(1_700_000_000_100 + idx_seed),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + idx_seed),
+                    content: format!("message-{idx_seed}"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        let backup_db = dir
+            .path()
+            .join("backups/agent_search.db.20260322T020200.bak");
+        let storage = SqliteStorage::open(&canonical_db).unwrap();
+        let conv_a = make_conv("/tmp/one.jsonl", 1);
+        let conv_b = make_conv("/tmp/two.jsonl", 2);
+        let conv_c = make_conv("/tmp/three.jsonl", 3);
+        seed_historical_db(
+            &backup_db,
+            &[conv_a.clone(), conv_b.clone(), conv_c.clone()],
+        );
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        storage
+            .insert_conversation_tree(agent_id, None, &conv_a)
+            .unwrap();
+
+        let bundle = discover_historical_database_bundles(&canonical_db)
+            .into_iter()
+            .find(|bundle| bundle.root_path == backup_db)
+            .unwrap();
+        let first_row_id: i64 = rusqlite::Connection::open(&backup_db)
+            .unwrap()
+            .query_row(
+                "SELECT id FROM conversations WHERE source_path = ?1",
+                ["/tmp/one.jsonl"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        storage
+            .record_historical_bundle_progress(&bundle, "direct-readonly", first_row_id, 50, 99)
+            .unwrap();
+
+        let outcome = storage.salvage_historical_databases(&canonical_db).unwrap();
+        assert_eq!(outcome.bundles_imported, 1);
+        assert_eq!(outcome.conversations_imported, 52);
+        assert_eq!(outcome.messages_imported, 101);
+        assert_eq!(storage.list_conversations(10, 0).unwrap().len(), 3);
+
+        let progress_key = SqliteStorage::historical_bundle_progress_key(&bundle);
+        let progress_left: Option<String> = storage
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![progress_key.as_str()],
+                |row| row.get_typed(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            progress_left.is_none(),
+            "completed salvage should clear bundle progress"
+        );
+
+        let second = storage.salvage_historical_databases(&canonical_db).unwrap();
+        assert_eq!(second.bundles_imported, 0);
+        assert_eq!(second.messages_imported, 0);
+    }
+
+    #[test]
+    fn list_conversations_for_lexical_rebuild_uses_stable_id_order() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let make_conv = |source_path: &str, started_at: i64| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some(source_path.to_string()),
+            title: Some(source_path.to_string()),
+            source_path: PathBuf::from(source_path),
+            started_at: Some(started_at),
+            ended_at: Some(started_at + 1),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(started_at),
+                content: format!("message for {source_path}"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let conv_a = make_conv("/tmp/a.jsonl", 3_000);
+        let conv_b = make_conv("/tmp/b.jsonl", 1_000);
+        let conv_c = make_conv("/tmp/c.jsonl", 2_000);
+
+        storage
+            .insert_conversation_tree(agent_id, None, &conv_a)
+            .unwrap();
+        storage
+            .insert_conversation_tree(agent_id, None, &conv_b)
+            .unwrap();
+        storage
+            .insert_conversation_tree(agent_id, None, &conv_c)
+            .unwrap();
+
+        let user_order: Vec<PathBuf> = storage
+            .list_conversations(10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|conv| conv.source_path)
+            .collect();
+        assert_eq!(
+            user_order,
+            vec![
+                PathBuf::from("/tmp/a.jsonl"),
+                PathBuf::from("/tmp/c.jsonl"),
+                PathBuf::from("/tmp/b.jsonl"),
+            ]
+        );
+
+        let rebuild_order: Vec<PathBuf> = storage
+            .list_conversations_for_lexical_rebuild(10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|conv| conv.source_path)
+            .collect();
+        assert_eq!(
+            rebuild_order,
+            vec![
+                PathBuf::from("/tmp/a.jsonl"),
+                PathBuf::from("/tmp/b.jsonl"),
+                PathBuf::from("/tmp/c.jsonl"),
+            ]
+        );
+    }
+
+    #[test]
+    fn seed_canonical_from_best_historical_bundle_copies_data_and_resets_runtime_meta() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        let source_db = dir
+            .path()
+            .join("backups/agent_search.db.20260322T020200.bak");
+
+        fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+
+        let source = SqliteStorage::open(&source_db).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = source.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("seed-conv".into()),
+            title: Some("Historical seed".into()),
+            source_path: PathBuf::from("/tmp/historical-seed.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::json!({"seed": true}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Agent,
+                author: Some("assistant".into()),
+                created_at: Some(1_700_000_000_050),
+                content: "seeded message".into(),
+                extra_json: serde_json::json!({"usage": {"total_tokens": 12}}),
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        source
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        source.set_last_scan_ts(123).unwrap();
+        source.set_last_indexed_at(456).unwrap();
+        source.set_last_embedded_message_id(789).unwrap();
+        source
+            .conn
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams!["historical_bundle_salvaged:stale", "{\"stale\":true}"],
+            )
+            .unwrap();
+        drop(source);
+
+        let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+        let legacy = rusqlite::Connection::open(&source_db).unwrap();
+        legacy
+            .execute_batch(
+                "DROP TABLE IF EXISTS fts_messages;
+             UPDATE meta SET value = '13' WHERE key = 'schema_version';
+             DELETE FROM _schema_migrations WHERE version = 14;
+             PRAGMA writable_schema = ON;",
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                [duplicate_legacy_fts_sql],
+            )
+            .unwrap();
+        legacy
+            .execute_batch("PRAGMA writable_schema = OFF;")
+            .unwrap();
+        legacy
+            .execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
+                     content,
+                     title,
+                     agent,
+                     workspace,
+                     source_path,
+                     created_at UNINDEXED,
+                     message_id UNINDEXED,
+                     tokenize='porter'
+                 );
+                 INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+                 SELECT
+                     m.content,
+                     c.title,
+                     a.slug,
+                     w.path,
+                     c.source_path,
+                     m.created_at,
+                     m.id
+                 FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN workspaces w ON c.workspace_id = w.id;",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let duplicated_source = open_historical_bundle_readonly(&source_db).unwrap();
+        let duplicated_source_fts_entries: i64 = duplicated_source
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            duplicated_source_fts_entries, 2,
+            "test fixture should reproduce the duplicate legacy fts_messages rows"
+        );
+        let duplicated_source_message_count: i64 = duplicated_source
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(duplicated_source_message_count, 1);
+        drop(duplicated_source);
+
+        let fresh = SqliteStorage::open(&canonical_db).unwrap();
+        drop(fresh);
+
+        let outcome = seed_canonical_from_best_historical_bundle(&canonical_db)
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.bundles_imported, 1);
+        assert_eq!(outcome.conversations_imported, 1);
+        assert_eq!(outcome.messages_imported, 1);
+
+        let readonly = rusqlite::Connection::open_with_flags(
+            format!("file:{}?mode=ro&immutable=1", canonical_db.display()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        let readonly_message_count: i64 = readonly
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(readonly_message_count, 1);
+
+        let seeded = SqliteStorage::open(&canonical_db).unwrap();
+        assert_eq!(
+            seeded
+                .count_sessions_in_range(None, None, None, None)
+                .unwrap()
+                .0,
+            1
+        );
+        let message_count: i64 = seeded
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(message_count, 1);
+        assert_eq!(seeded.get_last_scan_ts().unwrap(), None);
+        assert_eq!(seeded.get_last_embedded_message_id().unwrap(), None);
+
+        let last_indexed: Option<String> = seeded
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = 'last_indexed_at'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(last_indexed.is_none());
+
+        let salvage_keys: Vec<String> = seeded
+            .conn
+            .query_map_collect(
+                "SELECT key FROM meta WHERE key LIKE 'historical_bundle_salvaged:%' ORDER BY key",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(salvage_keys.len(), 1);
+
+        let reopened_readonly = rusqlite::Connection::open_with_flags(
+            format!("file:{}?mode=ro&immutable=1", canonical_db.display()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        let reopened_fts_entries: i64 = reopened_readonly
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            reopened_fts_entries, 1,
+            "seeded canonical db should keep a single stock-SQLite fts_messages schema row"
+        );
+        let reopened_message_count: i64 = reopened_readonly
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(reopened_message_count, 1);
+
+        let franken_seeded = FrankenStorage::open(&canonical_db).unwrap();
+        let franken_fts_count: i64 = franken_seeded
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(
+            franken_fts_count, 1,
+            "seeded canonical db should keep fts_messages queryable via frankensqlite"
+        );
+    }
+
+    #[test]
+    fn failed_baseline_seed_preserves_existing_canonical_bundle() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        let source_db = dir
+            .path()
+            .join("backups/agent_search.db.20260325T120000Z.bad-seed.bak");
+
+        fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+
+        let canonical = SqliteStorage::open(&canonical_db).unwrap();
+        canonical
+            .conn
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams!["sentinel", "keep-me"],
+            )
+            .unwrap();
+        drop(canonical);
+
+        let source = SqliteStorage::open(&source_db).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = source.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("bad-seed-conv".into()),
+            title: Some("Bad seed".into()),
+            source_path: PathBuf::from("/tmp/bad-seed.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::json!({"seed": "bad"}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Agent,
+                author: Some("assistant".into()),
+                created_at: Some(1_700_000_000_050),
+                content: "this seed should fail".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        source
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        drop(source);
+
+        let legacy = rusqlite::Connection::open(&source_db).unwrap();
+        legacy
+            .execute(
+                "UPDATE meta SET value = '12' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let err = seed_canonical_from_best_historical_bundle(&canonical_db).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("schema_version 12 is too old for baseline import"),
+            "unexpected seed error: {err:#}"
+        );
+
+        let reopened = SqliteStorage::open(&canonical_db).unwrap();
+        let sentinel: Option<String> = reopened
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = 'sentinel'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(sentinel.as_deref(), Some("keep-me"));
+
+        let conversation_count: i64 = reopened
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(conversation_count, 0);
+
+        let readonly = rusqlite::Connection::open_with_flags(
+            format!("file:{}?mode=ro&immutable=1", canonical_db.display()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        let readonly_conversation_count: i64 = readonly
+            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(readonly_conversation_count, 0);
+    }
+
+    #[test]
+    fn fetch_messages_for_lexical_rebuild_skips_extra_json() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("lexical-rebuild-test".into()),
+            title: Some("Lexical rebuild".into()),
+            source_path: PathBuf::from("/tmp/lexical-rebuild.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Agent,
+                author: Some("assistant".into()),
+                created_at: Some(1_700_000_000_050),
+                content: "indexed text".into(),
+                extra_json: serde_json::json!({
+                    "usage": { "total_tokens": 1234 },
+                    "irrelevant_blob": "still preserved in canonical storage"
+                }),
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let inserted = storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        let conversation_id = inserted.conversation_id;
+
+        let stored = storage.fetch_messages(conversation_id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].extra_json.is_null());
+
+        let lexical = storage
+            .fetch_messages_for_lexical_rebuild(conversation_id)
+            .unwrap();
+        assert_eq!(lexical.len(), 1);
+        assert_eq!(lexical[0].content, "indexed text");
+        assert_eq!(lexical[0].author.as_deref(), Some("assistant"));
+        assert!(lexical[0].extra_json.is_null());
+    }
+
+    #[test]
+    fn fetch_messages_for_lexical_rebuild_batch_groups_and_orders_messages() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let first = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("lexical-batch-1".into()),
+            title: Some("Lexical batch 1".into()),
+            source_path: PathBuf::from("/tmp/lexical-batch-1.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_010),
+                    content: "first-a".into(),
+                    extra_json: serde_json::json!({"opaque": true}),
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: Some("assistant".into()),
+                    created_at: Some(1_700_000_000_020),
+                    content: "first-b".into(),
+                    extra_json: serde_json::json!({"opaque": true}),
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let second = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("lexical-batch-2".into()),
+            title: Some("Lexical batch 2".into()),
+            source_path: PathBuf::from("/tmp/lexical-batch-2.jsonl"),
+            started_at: Some(1_700_000_000_200),
+            ended_at: Some(1_700_000_000_300),
+            approx_tokens: Some(84),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Tool,
+                author: Some("tool".into()),
+                created_at: Some(1_700_000_000_210),
+                content: "second-a".into(),
+                extra_json: serde_json::json!({"opaque": true}),
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let first_id = storage
+            .insert_conversation_tree(agent_id, None, &first)
+            .unwrap()
+            .conversation_id;
+        let second_id = storage
+            .insert_conversation_tree(agent_id, None, &second)
+            .unwrap()
+            .conversation_id;
+
+        let lexical = storage
+            .fetch_messages_for_lexical_rebuild_batch(&[second_id, first_id])
+            .unwrap();
+
+        let first_messages = lexical.get(&first_id).expect("first conversation");
+        assert_eq!(first_messages.len(), 2);
+        assert_eq!(first_messages[0].content, "first-a");
+        assert_eq!(first_messages[1].content, "first-b");
+        assert!(
+            first_messages
+                .iter()
+                .all(|message| message.extra_json.is_null())
+        );
+
+        let second_messages = lexical.get(&second_id).expect("second conversation");
+        assert_eq!(second_messages.len(), 1);
+        assert_eq!(second_messages[0].content, "second-a");
+        assert!(second_messages[0].extra_json.is_null());
+    }
+
+    #[test]
+    fn discover_historical_database_bundles_prefers_larger_archives_first() {
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        fs::write(&canonical_db, b"canonical").unwrap();
+
+        let smaller = dir.path().join("agent_search.corrupt.small");
+        fs::write(&smaller, vec![0_u8; 32]).unwrap();
+
+        let backups_dir = dir.path().join("backups");
+        fs::create_dir_all(&backups_dir).unwrap();
+        let larger = backups_dir.join("agent_search.db.20260322T020200.bak");
+        fs::write(&larger, vec![0_u8; 128]).unwrap();
+
+        let bundles = discover_historical_database_bundles(&canonical_db);
+        let ordered_paths: Vec<PathBuf> =
+            bundles.into_iter().map(|bundle| bundle.root_path).collect();
+
+        assert_eq!(ordered_paths, vec![larger, smaller]);
+    }
+
+    #[test]
+    fn discover_historical_database_bundles_prefers_queryable_direct_bundles_first() {
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        fs::write(&canonical_db, b"canonical").unwrap();
+
+        let larger_corrupt = dir.path().join("agent_search.corrupt.20260324_212907");
+        fs::write(&larger_corrupt, vec![0_u8; 4096]).unwrap();
+
+        let backups_dir = dir.path().join("backups");
+        fs::create_dir_all(&backups_dir).unwrap();
+        let smaller_healthy = backups_dir.join("agent_search.db.20260322T020200.bak");
+        let conn = rusqlite::Connection::open(&smaller_healthy).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, source_path TEXT);
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 conversation_id INTEGER NOT NULL,
+                 idx INTEGER NOT NULL,
+                 content TEXT
+             );
+             INSERT INTO conversations(id, source_path) VALUES (1, '/tmp/history.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, content)
+             VALUES (1, 1, 0, 'seed');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let bundles = discover_historical_database_bundles(&canonical_db);
+        let ordered_paths: Vec<PathBuf> = bundles
+            .iter()
+            .map(|bundle| bundle.root_path.clone())
+            .collect();
+
+        assert_eq!(ordered_paths, vec![smaller_healthy, larger_corrupt]);
+        assert!(bundles[0].supports_direct_readonly);
+        assert!(!bundles[1].supports_direct_readonly);
+    }
+
+    #[test]
+    fn discover_historical_database_bundles_includes_repair_lab_and_snapshots_named_roots() {
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        fs::write(&canonical_db, b"canonical").unwrap();
+
+        let repair_lab_dir = dir.path().join("repair-lab").join("live-copy");
+        fs::create_dir_all(&repair_lab_dir).unwrap();
+        let repair_lab_db = repair_lab_dir.join("agent_search.db");
+        fs::write(&repair_lab_db, vec![0_u8; 96]).unwrap();
+        fs::write(
+            repair_lab_dir.join("agent_search.rebuild-test.db"),
+            vec![0_u8; 192],
+        )
+        .unwrap();
+
+        let snapshots_dir = dir.path().join("snapshots").join("20260324T013201Z");
+        fs::create_dir_all(&snapshots_dir).unwrap();
+        let snapshot_db = snapshots_dir.join("agent_search.db");
+        fs::write(&snapshot_db, vec![0_u8; 64]).unwrap();
+
+        let bundles = discover_historical_database_bundles(&canonical_db);
+        let ordered_paths: Vec<PathBuf> =
+            bundles.into_iter().map(|bundle| bundle.root_path).collect();
+
+        assert!(ordered_paths.contains(&repair_lab_db));
+        assert!(ordered_paths.contains(&snapshot_db));
+        assert!(
+            !ordered_paths
+                .iter()
+                .any(|path| path.file_name().and_then(|name| name.to_str())
+                    == Some("agent_search.rebuild-test.db"))
+        );
+    }
+
+    #[test]
+    fn discover_historical_database_bundles_prefers_healthy_backup_over_replay_priority() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        fs::write(&canonical_db, b"canonical").unwrap();
+
+        let replay_dir = dir
+            .path()
+            .join("repair-lab")
+            .join("replay-20260324T070101Z");
+        fs::create_dir_all(&replay_dir).unwrap();
+        let replay_db = replay_dir.join("agent_search.db");
+        let replay_storage = SqliteStorage::open(&replay_db).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = replay_storage.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("replay-conv".into()),
+            title: Some("Replay bundle".into()),
+            source_path: PathBuf::from("/tmp/replay.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Agent,
+                author: Some("assistant".into()),
+                created_at: Some(1_700_000_000_050),
+                content: "replay message".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        replay_storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        drop(replay_storage);
+
+        let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+        let replay_legacy = rusqlite::Connection::open(&replay_db).unwrap();
+        replay_legacy
+            .execute_batch(
+                "DROP TABLE IF EXISTS fts_messages;
+                 UPDATE meta SET value = '13' WHERE key = 'schema_version';
+                 DELETE FROM _schema_migrations WHERE version = 14;
+                 PRAGMA writable_schema = ON;",
+            )
+            .unwrap();
+        replay_legacy
+            .execute(
+                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                [duplicate_legacy_fts_sql],
+            )
+            .unwrap();
+        replay_legacy
+            .execute_batch(
+                "PRAGMA writable_schema = OFF;
+                 CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
+                     content,
+                     title,
+                     agent,
+                     workspace,
+                     source_path,
+                     created_at UNINDEXED,
+                     message_id UNINDEXED,
+                     tokenize='porter'
+                 );
+                 INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+                 SELECT
+                     m.content,
+                     c.title,
+                     a.slug,
+                     w.path,
+                     c.source_path,
+                     m.created_at,
+                     m.id
+                 FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN workspaces w ON c.workspace_id = w.id;",
+            )
+            .unwrap();
+        drop(replay_legacy);
+
+        let backups_dir = dir.path().join("backups");
+        fs::create_dir_all(&backups_dir).unwrap();
+        let clean_backup = backups_dir.join("agent_search.db.20260322T020200.bak");
+        let clean_storage = SqliteStorage::open(&clean_backup).unwrap();
+        let clean_agent_id = clean_storage.ensure_agent(&agent).unwrap();
+        clean_storage
+            .insert_conversation_tree(clean_agent_id, None, &conversation)
+            .unwrap();
+        drop(clean_storage);
+
+        let bundles = discover_historical_database_bundles(&canonical_db);
+        let ordered_paths: Vec<PathBuf> = bundles
+            .iter()
+            .map(|bundle| bundle.root_path.clone())
+            .collect();
+
+        assert_eq!(ordered_paths[0], clean_backup);
+        assert_eq!(ordered_paths[1], replay_db);
+        assert_eq!(
+            bundles[0].probe.schema_version,
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(bundles[0].probe.fts_schema_rows, Some(1));
+        assert!(bundles[0].probe.fts_queryable);
+        assert_eq!(bundles[1].probe.schema_version, Some(13));
+        assert_eq!(bundles[1].probe.fts_schema_rows, Some(2));
+    }
+
+    #[test]
+    fn ensure_fts_consistency_via_rusqlite_catches_up_missing_rows() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-catchup.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("fts-catchup".into()),
+            title: Some("FTS catchup".into()),
+            source_path: PathBuf::from("/tmp/fts-catchup.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_050),
+                content: "initial message".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        drop(storage);
+
+        rebuild_fts_via_rusqlite(&db_path).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conversation_id: i64 = conn
+            .query_row("SELECT id FROM conversations LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
+             VALUES(2, ?1, 1, 'assistant', 'assistant', 1700000000060, 'authentication catchup', NULL, NULL)",
+            rusqlite::params![conversation_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let repair = ensure_fts_consistency_via_rusqlite(&db_path).unwrap();
+        assert_eq!(
+            repair,
+            FtsConsistencyRepair::IncrementalCatchUp {
+                inserted_rows: 1,
+                total_rows: 2
+            }
+        );
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let auth_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'authentication'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(auth_hits, 1);
     }
 
     // =========================================================================
@@ -8030,7 +12855,7 @@ mod tests {
     fn set_and_get_last_scan_ts() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
-        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = SqliteStorage::open(&db_path).unwrap();
 
         let expected_ts = 1700000000000_i64;
         storage.set_last_scan_ts(expected_ts).unwrap();
@@ -8083,6 +12908,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_historical_json_column_preserves_large_payloads_as_raw_json() {
+        let raw = format!("{{\"blob\":\"{}\"}}", "x".repeat(1_000_000));
+
+        let value = parse_historical_json_column(Some(raw.clone()));
+
+        assert_eq!(historical_raw_json(&value), Some(raw.as_str()));
+        assert_eq!(json_value_size_hint(&value), raw.len());
+    }
+
+    #[test]
+    fn parse_historical_json_column_preserves_small_payloads_as_raw_json() {
+        let raw = String::from("{\"ok\":true,\"n\":1}");
+
+        let value = parse_historical_json_column(Some(raw.clone()));
+
+        assert_eq!(historical_raw_json(&value), Some(raw.as_str()));
+    }
+
+    #[test]
     fn msgpack_serializes_non_empty_array() {
         let value = serde_json::json!([1, 2, 3]);
         let bytes = serialize_json_to_msgpack(&value).expect("should serialize array");
@@ -8120,10 +12964,9 @@ mod tests {
         // Verify metadata_bin column exists
         let has_metadata_bin: bool = storage
             .raw()
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('conversations') WHERE name = 'metadata_bin'",
-                [],
-                |r| r.get::<_, i64>(0).map(|c| c > 0),
+            .query_row_map(
+                "SELECT COUNT(*) FROM pragma_table_info('conversations') WHERE name = 'metadata_bin'", &[],
+                |r: &FrankenRow| Ok(r.get_typed::<i64>(0)? > 0),
             )
             .unwrap();
         assert!(
@@ -8134,10 +12977,10 @@ mod tests {
         // Verify extra_bin column exists
         let has_extra_bin: bool = storage
             .raw()
-            .query_row(
+            .query_row_map(
                 "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'extra_bin'",
-                [],
-                |r| r.get::<_, i64>(0).map(|c| c > 0),
+                &[],
+                |r: &FrankenRow| Ok(r.get_typed::<i64>(0)? > 0),
             )
             .unwrap();
         assert!(has_extra_bin, "messages should have extra_bin column");
@@ -8214,23 +13057,26 @@ mod tests {
     }
 
     // =========================================================================
-    // LazyDb tests (bd-1ueu)
+    // LazyFrankenDb tests (bd-1ueu)
     // =========================================================================
 
     #[test]
-    fn lazy_db_not_open_before_get() {
+    fn lazy_franken_db_not_open_before_get() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("lazy_test.db");
 
         // Create a real DB so the path exists
         let _storage = SqliteStorage::open(&db_path).unwrap();
 
-        let lazy = LazyDb::new(db_path);
-        assert!(!lazy.is_open(), "LazyDb must not open on construction");
+        let lazy = LazyFrankenDb::new(db_path);
+        assert!(
+            !lazy.is_open(),
+            "LazyFrankenDb must not open on construction"
+        );
     }
 
     #[test]
-    fn lazy_db_opens_on_first_get() {
+    fn lazy_franken_db_opens_on_first_get() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("lazy_test.db");
 
@@ -8238,27 +13084,29 @@ mod tests {
         let _storage = SqliteStorage::open(&db_path).unwrap();
         drop(_storage);
 
-        let lazy = LazyDb::new(db_path);
+        let lazy = LazyFrankenDb::new(db_path);
         assert!(!lazy.is_open());
 
         let conn = lazy.get("test").expect("should open successfully");
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |r| {
+                r.get_typed(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
         drop(conn);
 
-        assert!(lazy.is_open(), "LazyDb must be open after get()");
+        assert!(lazy.is_open(), "LazyFrankenDb must be open after get()");
     }
 
     #[test]
-    fn lazy_db_reuses_connection() {
+    fn lazy_franken_db_reuses_connection() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("lazy_test.db");
         let _storage = SqliteStorage::open(&db_path).unwrap();
         drop(_storage);
 
-        let lazy = LazyDb::new(db_path);
+        let lazy = LazyFrankenDb::new(db_path);
 
         // First access opens
         {
@@ -8271,18 +13119,20 @@ mod tests {
         {
             let conn = lazy.get("second").unwrap();
             let count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM test_tbl", [], |r| r.get(0))
+                .query_row_map("SELECT COUNT(*) FROM test_tbl", fparams![], |r| {
+                    r.get_typed(0)
+                })
                 .unwrap();
             assert_eq!(count, 0);
         }
     }
 
     #[test]
-    fn lazy_db_not_found_error() {
+    fn lazy_franken_db_not_found_error() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("nonexistent.db");
 
-        let lazy = LazyDb::new(db_path);
+        let lazy = LazyFrankenDb::new(db_path);
         let result = lazy.get("test");
         assert!(result.is_err());
         assert!(
@@ -8292,9 +13142,9 @@ mod tests {
     }
 
     #[test]
-    fn lazy_db_path_accessor() {
+    fn lazy_franken_db_path_accessor() {
         let path = PathBuf::from("/tmp/test_lazy.db");
-        let lazy = LazyDb::new(path.clone());
+        let lazy = LazyFrankenDb::new(path.clone());
         assert_eq!(lazy.path(), path.as_path());
     }
 
@@ -8327,13 +13177,17 @@ mod tests {
 
     #[test]
     fn date_str_to_day_id_converts_correctly() {
-        assert_eq!(date_str_to_day_id("2025-10-01"), 20251001);
-        assert_eq!(date_str_to_day_id("2024-04-01"), 20240401);
-        assert_eq!(date_str_to_day_id("invalid"), 0);
+        // 2025-10-01 is 2100 days after 2020-01-01
+        assert_eq!(date_str_to_day_id("2025-10-01").unwrap(), 2100);
+        // 2024-04-01 is 1552 days after 2020-01-01
+        assert_eq!(date_str_to_day_id("2024-04-01").unwrap(), 1552);
+        assert!(date_str_to_day_id("invalid").is_err());
     }
 
     #[test]
     fn pricing_table_lookup_selects_matching_entry() {
+        let effective_day = date_str_to_day_id("2025-10-01").unwrap();
+        let lookup_day = date_str_to_day_id("2026-02-06").unwrap();
         let table = PricingTable {
             entries: vec![
                 PricingEntry {
@@ -8343,7 +13197,7 @@ mod tests {
                     output_cost_per_mtok: 75.0,
                     cache_read_cost_per_mtok: Some(1.5),
                     cache_creation_cost_per_mtok: Some(18.75),
-                    effective_day_id: 20251001,
+                    effective_day_id: effective_day,
                 },
                 PricingEntry {
                     model_pattern: "claude-sonnet-4%".into(),
@@ -8352,24 +13206,26 @@ mod tests {
                     output_cost_per_mtok: 15.0,
                     cache_read_cost_per_mtok: Some(0.3),
                     cache_creation_cost_per_mtok: Some(3.75),
-                    effective_day_id: 20251001,
+                    effective_day_id: effective_day,
                 },
             ],
         };
 
-        let result = table.lookup("claude-opus-4-20260101", 20260206);
+        let result = table.lookup("claude-opus-4-20260101", lookup_day);
         assert!(result.is_some());
         assert_eq!(result.unwrap().input_cost_per_mtok, 15.0);
 
-        let result = table.lookup("claude-sonnet-4-latest", 20260206);
+        let result = table.lookup("claude-sonnet-4-latest", lookup_day);
         assert!(result.is_some());
         assert_eq!(result.unwrap().input_cost_per_mtok, 3.0);
 
-        assert!(table.lookup("unknown-model", 20260206).is_none());
+        assert!(table.lookup("unknown-model", lookup_day).is_none());
     }
 
     #[test]
     fn pricing_table_lookup_respects_effective_date() {
+        let effective_day_1 = date_str_to_day_id("2025-10-01").unwrap();
+        let effective_day_2 = date_str_to_day_id("2026-01-01").unwrap();
         let table = PricingTable {
             entries: vec![
                 PricingEntry {
@@ -8379,7 +13235,7 @@ mod tests {
                     output_cost_per_mtok: 75.0,
                     cache_read_cost_per_mtok: None,
                     cache_creation_cost_per_mtok: None,
-                    effective_day_id: 20251001,
+                    effective_day_id: effective_day_1,
                 },
                 PricingEntry {
                     model_pattern: "claude-opus-4%".into(),
@@ -8388,27 +13244,33 @@ mod tests {
                     output_cost_per_mtok: 60.0,
                     cache_read_cost_per_mtok: None,
                     cache_creation_cost_per_mtok: None,
-                    effective_day_id: 20260101,
+                    effective_day_id: effective_day_2,
                 },
             ],
         };
 
         // Before price drop
-        let result = table.lookup("claude-opus-4", 20251101);
+        let result = table.lookup("claude-opus-4", date_str_to_day_id("2025-11-01").unwrap());
         assert!(result.is_some());
         assert_eq!(result.unwrap().input_cost_per_mtok, 15.0);
 
         // After price drop
-        let result = table.lookup("claude-opus-4", 20260201);
+        let result = table.lookup("claude-opus-4", date_str_to_day_id("2026-02-01").unwrap());
         assert!(result.is_some());
         assert_eq!(result.unwrap().input_cost_per_mtok, 12.0);
 
         // Before all pricing
-        assert!(table.lookup("claude-opus-4", 20240101).is_none());
+        assert!(
+            table
+                .lookup("claude-opus-4", date_str_to_day_id("2024-01-01").unwrap())
+                .is_none()
+        );
     }
 
     #[test]
     fn pricing_table_lookup_specificity_tiebreak() {
+        let effective_day = date_str_to_day_id("2025-01-01").unwrap();
+        let lookup_day = date_str_to_day_id("2026-01-01").unwrap();
         let table = PricingTable {
             entries: vec![
                 PricingEntry {
@@ -8418,7 +13280,7 @@ mod tests {
                     output_cost_per_mtok: 30.0,
                     cache_read_cost_per_mtok: None,
                     cache_creation_cost_per_mtok: None,
-                    effective_day_id: 20250101,
+                    effective_day_id: effective_day,
                 },
                 PricingEntry {
                     model_pattern: "gpt-4-turbo%".into(),
@@ -8427,24 +13289,25 @@ mod tests {
                     output_cost_per_mtok: 15.0,
                     cache_read_cost_per_mtok: None,
                     cache_creation_cost_per_mtok: None,
-                    effective_day_id: 20250101,
+                    effective_day_id: effective_day,
                 },
             ],
         };
 
         // Longer pattern wins for specific model
-        let result = table.lookup("gpt-4-turbo-2025", 20260101);
+        let result = table.lookup("gpt-4-turbo-2025", lookup_day);
         assert!(result.is_some());
         assert_eq!(result.unwrap().input_cost_per_mtok, 5.0);
 
         // Shorter pattern matches broader model
-        let result = table.lookup("gpt-4o", 20260101);
+        let result = table.lookup("gpt-4o", lookup_day);
         assert!(result.is_some());
         assert_eq!(result.unwrap().input_cost_per_mtok, 10.0);
     }
 
     #[test]
     fn pricing_table_compute_cost_basic() {
+        let effective_day = date_str_to_day_id("2025-10-01").unwrap();
         let table = PricingTable {
             entries: vec![PricingEntry {
                 model_pattern: "claude-opus-4%".into(),
@@ -8453,13 +13316,13 @@ mod tests {
                 output_cost_per_mtok: 75.0,
                 cache_read_cost_per_mtok: Some(1.5),
                 cache_creation_cost_per_mtok: Some(18.75),
-                effective_day_id: 20251001,
+                effective_day_id: effective_day,
             }],
         };
 
         let cost = table.compute_cost(
             Some("claude-opus-4-latest"),
-            20260206,
+            date_str_to_day_id("2026-02-06").unwrap(),
             Some(1000),
             Some(500),
             None,
@@ -8472,6 +13335,7 @@ mod tests {
 
     #[test]
     fn pricing_table_compute_cost_with_cache() {
+        let effective_day = date_str_to_day_id("2025-10-01").unwrap();
         let table = PricingTable {
             entries: vec![PricingEntry {
                 model_pattern: "claude-opus-4%".into(),
@@ -8480,13 +13344,13 @@ mod tests {
                 output_cost_per_mtok: 75.0,
                 cache_read_cost_per_mtok: Some(1.5),
                 cache_creation_cost_per_mtok: Some(18.75),
-                effective_day_id: 20251001,
+                effective_day_id: effective_day,
             }],
         };
 
         let cost = table.compute_cost(
             Some("claude-opus-4-latest"),
-            20260206,
+            date_str_to_day_id("2026-02-06").unwrap(),
             Some(1_000_000),
             Some(100_000),
             Some(500_000),
@@ -8501,6 +13365,8 @@ mod tests {
 
     #[test]
     fn pricing_table_compute_cost_returns_none_for_unknown_model() {
+        let effective_day = date_str_to_day_id("2025-10-01").unwrap();
+        let lookup_day = date_str_to_day_id("2026-02-06").unwrap();
         let table = PricingTable {
             entries: vec![PricingEntry {
                 model_pattern: "claude-opus-4%".into(),
@@ -8509,7 +13375,7 @@ mod tests {
                 output_cost_per_mtok: 75.0,
                 cache_read_cost_per_mtok: None,
                 cache_creation_cost_per_mtok: None,
-                effective_day_id: 20251001,
+                effective_day_id: effective_day,
             }],
         };
 
@@ -8517,7 +13383,7 @@ mod tests {
             table
                 .compute_cost(
                     Some("unknown-model"),
-                    20260206,
+                    lookup_day,
                     Some(1000),
                     Some(500),
                     None,
@@ -8527,12 +13393,12 @@ mod tests {
         );
         assert!(
             table
-                .compute_cost(None, 20260206, Some(1000), Some(500), None, None)
+                .compute_cost(None, lookup_day, Some(1000), Some(500), None, None)
                 .is_none()
         );
         assert!(
             table
-                .compute_cost(Some("claude-opus-4"), 20260206, None, None, None, None)
+                .compute_cost(Some("claude-opus-4"), lookup_day, None, None, None, None)
                 .is_none()
         );
     }
@@ -8546,13 +13412,44 @@ mod tests {
         let table = PricingTable::load(&storage.conn).unwrap();
         assert!(!table.is_empty());
 
-        let opus = table.lookup("claude-opus-4-latest", 20260206);
+        let lookup_day = date_str_to_day_id("2026-02-06").unwrap();
+
+        let opus = table.lookup("claude-opus-4-latest", lookup_day);
         assert!(opus.is_some());
         assert_eq!(opus.unwrap().input_cost_per_mtok, 15.0);
 
-        let flash = table.lookup("gemini-2.0-flash-001", 20260206);
+        let flash = table.lookup("gemini-2.0-flash-001", lookup_day);
         assert!(flash.is_some());
         assert_eq!(flash.unwrap().input_cost_per_mtok, 0.075);
+    }
+
+    #[test]
+    fn pricing_table_load_rejects_invalid_effective_date() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO model_pricing (
+                    model_pattern, provider, input_cost_per_mtok, output_cost_per_mtok,
+                    cache_read_cost_per_mtok, cache_creation_cost_per_mtok, effective_date
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                fparams![
+                    "broken-model%",
+                    "test",
+                    1.0_f64,
+                    2.0_f64,
+                    Option::<f64>::None,
+                    Option::<f64>::None,
+                    "not-a-date"
+                ],
+            )
+            .unwrap();
+
+        let err = PricingTable::load(&storage.conn).unwrap_err();
+        assert!(err.to_string().contains("invalid effective_date"));
     }
 
     #[test]
@@ -8626,7 +13523,10 @@ mod tests {
         }
 
         // V4 sources table.
-        assert!(table_names.contains(&"sources".to_string()), "missing sources table");
+        assert!(
+            table_names.contains(&"sources".to_string()),
+            "missing sources table"
+        );
 
         // V8 daily_stats table.
         assert!(
@@ -8648,21 +13548,33 @@ mod tests {
             );
         }
 
-        // _schema_migrations tracking table should exist with 1 entry (combined V13).
+        // Fresh frankensqlite databases should record both applied migrations:
+        // the combined V13 base schema and the V14 contentless FTS upgrade.
         let rows = storage
             .raw()
             .query("SELECT COUNT(*) FROM _schema_migrations;")
             .unwrap();
         let count: i64 = rows.first().unwrap().get_typed(0).unwrap();
-        assert_eq!(count, 1, "_schema_migrations should have 1 entry (combined V13)");
+        assert_eq!(
+            count, 2,
+            "_schema_migrations should record the V13 base schema and V14 FTS migration"
+        );
 
-        // The single entry should be version 13.
+        // The latest applied migration should be the current schema version.
         let rows = storage
             .raw()
-            .query("SELECT version FROM _schema_migrations;")
+            .query("SELECT version FROM _schema_migrations ORDER BY version;")
             .unwrap();
-        let version: i64 = rows.first().unwrap().get_typed(0).unwrap();
-        assert_eq!(version, 13, "_schema_migrations entry should be version 13");
+        let versions: Vec<i64> = rows
+            .iter()
+            .map(|row| row.get_typed(0))
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            versions,
+            vec![13, 14],
+            "_schema_migrations should contain v13 and v14"
+        );
     }
 
     #[test]
@@ -8735,17 +13647,21 @@ mod tests {
         conn.execute(
             "CREATE TABLE _schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT 'now');",
         ).unwrap();
-        conn.execute(
-            "INSERT INTO _schema_migrations (version, name) VALUES (1, 'test');",
-        ).unwrap();
+        conn.execute("INSERT INTO _schema_migrations (version, name) VALUES (1, 'test');")
+            .unwrap();
 
         // Transition should be a no-op.
         transition_from_meta_version(&conn).unwrap();
 
         // Should still have exactly 1 entry.
-        let rows = conn.query("SELECT COUNT(*) FROM _schema_migrations;").unwrap();
+        let rows = conn
+            .query("SELECT COUNT(*) FROM _schema_migrations;")
+            .unwrap();
         let count: i64 = rows.first().unwrap().get_typed(0).unwrap();
-        assert_eq!(count, 1, "transition should not re-run on already-transitioned DB");
+        assert_eq!(
+            count, 1,
+            "transition should not re-run on already-transitioned DB"
+        );
     }
 
     #[test]
@@ -8758,10 +13674,172 @@ mod tests {
         transition_from_meta_version(&conn).unwrap();
 
         // _schema_migrations should NOT have been created.
+        let res = conn.query("SELECT * FROM \"_schema_migrations\";");
+        assert!(
+            res.is_err(),
+            "transition should not create _schema_migrations on fresh DB"
+        );
+    }
+
+    #[test]
+    fn franken_transition_with_fts_virtual_table_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_transition_with_fts.db");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '13');
+             CREATE TABLE conversations (id INTEGER PRIMARY KEY);
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                 content,
+                 title,
+                 agent,
+                 workspace,
+                 source_path,
+                 created_at,
+                 content='',
+                 tokenize='porter unicode61'
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = FrankenConnection::open(db_path.to_string_lossy().to_string()).unwrap();
+        transition_from_meta_version(&conn).unwrap();
+
         let rows = conn
-            .query("SELECT name FROM sqlite_master WHERE type='table' AND name='_schema_migrations';")
+            .query("SELECT version FROM _schema_migrations ORDER BY version;")
             .unwrap();
-        assert!(rows.is_empty(), "transition should not create _schema_migrations on fresh DB");
+        let versions: Vec<i64> = rows.iter().filter_map(|r| r.get_typed(0).ok()).collect();
+        assert_eq!(versions, (1..=13).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn franken_storage_open_legacy_v13_with_fts_virtual_table_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_open_legacy_v13_with_fts.db");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '13');
+             CREATE TABLE agents (
+                 id INTEGER PRIMARY KEY,
+                 slug TEXT NOT NULL
+             );
+             CREATE TABLE workspaces (
+                 id INTEGER PRIMARY KEY,
+                 path TEXT NOT NULL
+             );
+             CREATE TABLE conversations (
+                 id INTEGER PRIMARY KEY,
+                 agent_id INTEGER NOT NULL,
+                 workspace_id INTEGER,
+                 title TEXT,
+                 source_path TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 conversation_id INTEGER NOT NULL,
+                 idx INTEGER NOT NULL,
+                 role TEXT NOT NULL,
+                 author TEXT,
+                 created_at INTEGER,
+                 content TEXT NOT NULL,
+                 extra_json TEXT,
+                 extra_bin BLOB
+             );
+             INSERT INTO agents(id, slug) VALUES (1, 'codex');
+             INSERT INTO workspaces(id, path) VALUES (1, '/data/projects/coding_agent_session_search');
+             INSERT INTO conversations(id, agent_id, workspace_id, title, source_path)
+             VALUES (1, 1, 1, 'legacy session', '/tmp/legacy.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content)
+             VALUES (1, 1, 0, 'user', 'tester', 1710000000000, 'legacy content');
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                 content,
+                 title,
+                 agent,
+                 workspace,
+                 source_path,
+                 created_at,
+                 message_id,
+                 content='',
+                 tokenize='porter unicode61'
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        let rows = storage
+            .raw()
+            .query("SELECT version FROM _schema_migrations ORDER BY version;")
+            .unwrap();
+        let versions: Vec<i64> = rows.iter().filter_map(|r| r.get_typed(0).ok()).collect();
+        assert_eq!(versions, (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn franken_storage_open_repairs_missing_analytics_tables_when_version_markers_lie() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_repair_missing_analytics.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        }
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS usage_models_daily;
+                 DROP TABLE IF EXISTS usage_daily;
+                 DROP TABLE IF EXISTS usage_hourly;
+                 DROP TABLE IF EXISTS message_metrics;
+                 DROP TABLE IF EXISTS token_daily_stats;
+                 DROP TABLE IF EXISTS token_usage;
+                 DROP TABLE IF EXISTS model_pricing;
+                 DROP TABLE IF EXISTS embedding_jobs;
+                 DROP TABLE IF EXISTS daily_stats;",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                rusqlite::params![CURRENT_SCHEMA_VERSION.to_string()],
+            )
+            .unwrap();
+        }
+
+        let repaired = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(repaired.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        let analytics_count: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table'
+                   AND name IN (
+                     'daily_stats',
+                     'embedding_jobs',
+                     'token_usage',
+                     'token_daily_stats',
+                     'model_pricing',
+                     'message_metrics',
+                     'usage_hourly',
+                     'usage_daily',
+                     'usage_models_daily'
+                   )",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            analytics_count, 9,
+            "open() should recreate the missing analytics tables even when schema_version already says current"
+        );
     }
 
     #[test]
@@ -8771,7 +13849,272 @@ mod tests {
         let result = runner.run(&conn).unwrap();
 
         assert!(result.was_fresh);
-        assert_eq!(result.applied, vec![13], "should apply combined V13");
-        assert_eq!(result.current, 13);
+        assert_eq!(
+            result.applied,
+            vec![13, 14],
+            "should apply combined V13 + FTS contentless V14"
+        );
+        assert_eq!(result.current, 14);
+    }
+
+    #[test]
+    fn franken_insert_conversations_batched_populates_analytics_rollups() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use frankensqlite::compat::{ConnectionExt, RowExt};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("franken-index.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: Some("1.0".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let ts_ms = 1_770_551_400_000_i64;
+        let usage_json = serde_json::json!({
+            "message": {
+                "model": "claude-opus-4-6",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 25,
+                    "cache_creation_input_tokens": 10,
+                    "service_tier": "standard"
+                }
+            }
+        });
+
+        let conv = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("franken-batch-upsert".into()),
+            title: Some("Franken batch upsert".into()),
+            source_path: PathBuf::from("/tmp/franken.jsonl"),
+            started_at: Some(ts_ms),
+            ended_at: Some(ts_ms + 60_000),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(ts_ms),
+                    content: "Please make a plan.".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: vec![],
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: Some(ts_ms + 30_000),
+                    content: "## Plan\n\n1. Reproduce\n2. Patch\n3. Verify".into(),
+                    extra_json: usage_json,
+                    snippets: vec![],
+                },
+            ],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let outcomes = storage
+            .insert_conversations_batched(&[(agent_id, None, &conv)])
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].inserted_indices, vec![0, 1]);
+
+        let conn = storage.raw();
+        let daily_stats_rows: i64 = conn
+            .query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let token_daily_rows: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM token_daily_stats",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let usage_daily_rows: i64 = conn
+            .query_row_map("SELECT COUNT(*) FROM usage_daily", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let model_daily_rows: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM usage_models_daily",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        assert!(daily_stats_rows > 0, "daily_stats should be populated");
+        assert!(
+            token_daily_rows > 0,
+            "token_daily_stats should be populated"
+        );
+        assert!(usage_daily_rows > 0, "usage_daily should be populated");
+        assert!(
+            model_daily_rows > 0,
+            "usage_models_daily should be populated"
+        );
+    }
+
+    // =========================================================================
+    // FrankenConnectionManager tests (bead 3rlf8)
+    // =========================================================================
+
+    #[test]
+    fn connection_manager_creates_readers() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cm.db");
+
+        // Create the DB first
+        let fs = FrankenStorage::open(&db_path).unwrap();
+        drop(fs);
+
+        let config = ConnectionManagerConfig {
+            reader_count: 3,
+            max_writers: 2,
+        };
+        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
+        assert_eq!(mgr.reader_count(), 3);
+        assert_eq!(mgr.max_writers(), 2);
+    }
+
+    #[test]
+    fn connection_manager_reader_round_robin() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cm.db");
+
+        let fs = FrankenStorage::open(&db_path).unwrap();
+        drop(fs);
+
+        let config = ConnectionManagerConfig {
+            reader_count: 2,
+            max_writers: 1,
+        };
+        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
+
+        // Reader index should advance (round-robin)
+        let idx_before = mgr.reader_idx.load(std::sync::atomic::Ordering::Relaxed);
+        let _r1 = mgr.reader();
+        let idx_after = mgr.reader_idx.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(idx_after, idx_before + 1, "reader index should advance");
+    }
+
+    #[test]
+    fn connection_manager_writer_reads_and_writes() {
+        use frankensqlite::compat::RowExt;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cm.db");
+
+        let fs = FrankenStorage::open(&db_path).unwrap();
+        drop(fs);
+
+        let mgr = FrankenConnectionManager::new(&db_path, Default::default()).unwrap();
+
+        // Acquire writer and insert data
+        {
+            let mut guard = mgr.writer().unwrap();
+            guard
+                .storage()
+                .raw()
+                .execute("CREATE TABLE IF NOT EXISTS cm_test (id INTEGER PRIMARY KEY, val TEXT)")
+                .unwrap();
+            guard
+                .storage()
+                .raw()
+                .execute("INSERT INTO cm_test (val) VALUES ('hello')")
+                .unwrap();
+            guard.mark_committed();
+        }
+
+        // Verify via reader (returns MutexGuard<SendFrankenConnection>)
+        let reader_guard = mgr.reader();
+        let rows = reader_guard.query("SELECT val FROM cm_test").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_typed::<String>(0).unwrap(), "hello");
+    }
+
+    #[test]
+    fn connection_manager_writer_guard_drops_releases_slot() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cm.db");
+
+        let fs = FrankenStorage::open(&db_path).unwrap();
+        drop(fs);
+
+        let config = ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 1,
+        };
+        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
+
+        // Acquire and release writer
+        {
+            let mut guard = mgr.writer().unwrap();
+            guard.mark_committed();
+        }
+
+        // Should be able to acquire again (slot released)
+        let mut guard2 = mgr.writer().unwrap();
+        guard2.mark_committed();
+    }
+
+    #[test]
+    fn connection_manager_concurrent_writer_works() {
+        use frankensqlite::compat::RowExt;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cm.db");
+
+        let fs = FrankenStorage::open(&db_path).unwrap();
+        drop(fs);
+
+        let config = ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 2,
+        };
+        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
+
+        {
+            let mut guard = mgr.concurrent_writer().unwrap();
+            guard
+                .storage()
+                .raw()
+                .execute("CREATE TABLE IF NOT EXISTS cm_conc (id INTEGER PRIMARY KEY, val TEXT)")
+                .unwrap();
+            guard
+                .storage()
+                .raw()
+                .execute("INSERT INTO cm_conc (val) VALUES ('concurrent')")
+                .unwrap();
+            guard.mark_committed();
+        }
+
+        let reader_guard = mgr.reader();
+        let rows = reader_guard.query("SELECT val FROM cm_conc").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_typed::<String>(0).unwrap(), "concurrent");
+    }
+
+    #[test]
+    fn connection_manager_default_config() {
+        let config = ConnectionManagerConfig::default();
+        assert_eq!(config.reader_count, 4);
+        assert!(config.max_writers > 0);
     }
 }

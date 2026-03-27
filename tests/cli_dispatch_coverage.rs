@@ -8,11 +8,13 @@
 //! export, export-html, sources subcommands, models subcommands.
 
 use assert_cmd::Command;
+use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use predicates::prelude::*;
 use predicates::str::contains;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// Create a base command with isolated test environment.
@@ -29,12 +31,90 @@ fn base_cmd(temp_home: &Path) -> Command {
     cmd
 }
 
-/// Create base command without HOME isolation (for simple tests).
+/// Create base command without HOME isolation (for simple tests), but with isolated XDG_DATA_HOME.
 fn simple_cmd() -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
     cmd.env("NO_COLOR", "1");
+
+    // Create an isolated empty database with schema to avoid hitting the real user DB
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_dir = tmp.path().join("coding-agent-search");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("agent_search.db");
+
+    // Initialize the schema
+    let fs = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+    drop(fs);
+
+    cmd.env("XDG_DATA_HOME", tmp.path());
+
+    // Leak the temp dir so it survives the command execution
+    std::mem::forget(tmp);
+
     cmd
+}
+
+fn sample_agent(slug: &str, name: &str) -> Agent {
+    Agent {
+        id: None,
+        slug: slug.to_string(),
+        name: name.to_string(),
+        version: None,
+        kind: AgentKind::Cli,
+    }
+}
+
+fn sample_message(idx: i64, role: MessageRole, ts: i64, content: &str) -> Message {
+    Message {
+        id: None,
+        idx,
+        role,
+        author: None,
+        created_at: Some(ts),
+        content: content.to_string(),
+        extra_json: json!({}),
+        snippets: Vec::new(),
+    }
+}
+
+fn make_codex_session(root: &Path, content: &str, ts: u64) {
+    let sessions = root.join("sessions/2024/12/01");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-test.jsonl");
+    let sample = format!(
+        r#"{{"type": "event_msg", "timestamp": {ts}, "payload": {{"type": "user_message", "message": "{content}"}}}}
+{{"type": "response_item", "timestamp": {}, "payload": {{"role": "assistant", "content": "{content}_response"}}}}
+"#,
+        ts + 1000
+    );
+    fs::write(file, sample).unwrap();
+}
+
+fn sample_conversation(
+    agent_slug: &str,
+    workspace: &Path,
+    source_path: &Path,
+    external_id: &str,
+    title: &str,
+    started_at: i64,
+    messages: Vec<Message>,
+) -> Conversation {
+    Conversation {
+        id: None,
+        agent_slug: agent_slug.to_string(),
+        workspace: Some(workspace.to_path_buf()),
+        external_id: Some(external_id.to_string()),
+        title: Some(title.to_string()),
+        source_path: source_path.to_path_buf(),
+        started_at: Some(started_at),
+        ended_at: messages.last().and_then(|msg| msg.created_at),
+        approx_tokens: None,
+        metadata_json: json!({}),
+        messages,
+        source_id: "local".to_string(),
+        origin_host: None,
+    }
 }
 
 // =============================================================================
@@ -268,6 +348,99 @@ fn doctor_help_shows_options() {
         .stdout(contains("Diagnose"))
         .stdout(contains("--fix"))
         .stdout(contains("--verbose"));
+}
+
+#[test]
+fn doctor_fix_quarantines_corrupted_database_bundle_sidecars() {
+    let tmp = TempDir::new().unwrap();
+    let temp_home = tmp.path();
+    let data_dir = temp_home.join("data");
+    let codex_home = temp_home.join(".codex");
+    fs::create_dir_all(&data_dir).unwrap();
+    make_codex_session(&codex_home, "doctor sidecar recovery", 1_733_011_200_000);
+
+    let db_path = data_dir.join("agent_search.db");
+    let corrupt_bytes = b"not a sqlite database".to_vec();
+    let wal_bytes = b"stale wal bytes".to_vec();
+    let shm_bytes = b"stale shm bytes".to_vec();
+    fs::write(&db_path, &corrupt_bytes).unwrap();
+    fs::write(data_dir.join("agent_search.db-wal"), &wal_bytes).unwrap();
+    fs::write(data_dir.join("agent_search.db-shm"), &shm_bytes).unwrap();
+
+    let doctor = base_cmd(temp_home)
+        .current_dir(temp_home)
+        .args([
+            "doctor",
+            "--fix",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("doctor command");
+    let doctor_json: Value = serde_json::from_slice(&doctor.stdout).expect("valid doctor json");
+    assert_eq!(
+        doctor_json.get("auto_fix_applied").and_then(Value::as_bool),
+        Some(true),
+        "doctor should at least quarantine the corrupted bundle\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+
+    let entries: Vec<String> = fs::read_dir(&data_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+
+    let backup_root = entries
+        .iter()
+        .find(|name| {
+            name.starts_with("agent_search.corrupt.")
+                && !name.ends_with("-wal")
+                && !name.ends_with("-shm")
+        })
+        .cloned()
+        .expect("doctor should quarantine the corrupt database root");
+    let backup_root_path = data_dir.join(&backup_root);
+    assert_eq!(fs::read(&backup_root_path).unwrap(), corrupt_bytes);
+    assert_eq!(
+        fs::read(format!("{}-wal", backup_root_path.display())).unwrap(),
+        wal_bytes
+    );
+    assert_eq!(
+        fs::read(format!("{}-shm", backup_root_path.display())).unwrap(),
+        shm_bytes
+    );
+
+    let live_wal = data_dir.join("agent_search.db-wal");
+    if live_wal.exists() {
+        assert_ne!(fs::read(&live_wal).unwrap(), wal_bytes);
+    }
+    let live_shm = data_dir.join("agent_search.db-shm");
+    if live_shm.exists() {
+        assert_ne!(fs::read(&live_shm).unwrap(), shm_bytes);
+    }
+
+    let health = base_cmd(temp_home)
+        .current_dir(temp_home)
+        .args(["health", "--json", "--data-dir", data_dir.to_str().unwrap()])
+        .output()
+        .expect("health command");
+    assert!(
+        health.status.success(),
+        "health should succeed once stale sidecars are quarantined\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&health.stdout),
+        String::from_utf8_lossy(&health.stderr)
+    );
+    let health_json: Value = serde_json::from_slice(&health.stdout).expect("valid health json");
+    assert_eq!(
+        health_json
+            .get("db")
+            .and_then(|db| db.get("opened"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
 }
 
 // =============================================================================
@@ -710,6 +883,268 @@ fn parse_context_with_limit() {
         }
         other => panic!("expected context command, got {other:?}"),
     }
+}
+
+#[test]
+fn parse_sessions_with_workspace_and_limit() {
+    let cli = Cli::try_parse_from([
+        "cass",
+        "sessions",
+        "--workspace",
+        "/path/to/project",
+        "--limit",
+        "3",
+        "--json",
+    ])
+    .expect("parse sessions with workspace and limit");
+    match cli.command {
+        Some(Commands::Sessions {
+            workspace,
+            current,
+            limit,
+            json,
+            ..
+        }) => {
+            assert_eq!(workspace.unwrap().to_str().unwrap(), "/path/to/project");
+            assert!(!current);
+            assert_eq!(limit, Some(3));
+            assert!(json);
+        }
+        other => panic!("expected sessions command, got {other:?}"),
+    }
+}
+
+#[test]
+fn sessions_json_reports_recent_and_current_workspace_sessions() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace_a = tmp.path().join("workspace-a");
+    let workspace_a_nested = workspace_a.join("src");
+    let workspace_b = tmp.path().join("workspace-b");
+    fs::create_dir_all(&workspace_a_nested).unwrap();
+    fs::create_dir_all(&workspace_b).unwrap();
+
+    let session_a_old = tmp.path().join("claude-old.jsonl");
+    let session_a_new = tmp.path().join("claude-new.jsonl");
+    let session_b = tmp.path().join("codex.jsonl");
+    fs::write(&session_a_old, "{\"session\":\"old\"}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    fs::write(&session_a_new, "{\"session\":\"new\"}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    fs::write(&session_b, "{\"session\":\"other\"}\n").unwrap();
+
+    let claude_id = storage
+        .ensure_agent(&sample_agent("claude_code", "Claude Code"))
+        .unwrap();
+    let codex_id = storage
+        .ensure_agent(&sample_agent("codex", "Codex"))
+        .unwrap();
+    let workspace_a_id = storage
+        .ensure_workspace(&workspace_a, Some("workspace-a"))
+        .unwrap();
+    let workspace_b_id = storage
+        .ensure_workspace(&workspace_b, Some("workspace-b"))
+        .unwrap();
+
+    storage
+        .insert_conversation_tree(
+            claude_id,
+            Some(workspace_a_id),
+            &sample_conversation(
+                "claude_code",
+                &workspace_a,
+                &session_a_old,
+                "claude-old",
+                "Old Claude Session",
+                1_700_000_000_000,
+                vec![
+                    sample_message(0, MessageRole::User, 1_700_000_000_000, "old question"),
+                    sample_message(1, MessageRole::Agent, 1_700_000_000_001, "old answer"),
+                ],
+            ),
+        )
+        .unwrap();
+    storage
+        .insert_conversation_tree(
+            claude_id,
+            Some(workspace_a_id),
+            &sample_conversation(
+                "claude_code",
+                &workspace_a,
+                &session_a_new,
+                "claude-new",
+                "Newest Claude Session",
+                1_700_000_100_000,
+                vec![
+                    sample_message(0, MessageRole::User, 1_700_000_100_000, "new question"),
+                    sample_message(1, MessageRole::Agent, 1_700_000_100_001, "new answer"),
+                ],
+            ),
+        )
+        .unwrap();
+    storage
+        .insert_conversation_tree(
+            codex_id,
+            Some(workspace_b_id),
+            &sample_conversation(
+                "codex",
+                &workspace_b,
+                &session_b,
+                "codex-other",
+                "Other Workspace Session",
+                1_700_000_200_000,
+                vec![
+                    sample_message(0, MessageRole::User, 1_700_000_200_000, "other question"),
+                    sample_message(1, MessageRole::Agent, 1_700_000_200_001, "other answer"),
+                ],
+            ),
+        )
+        .unwrap();
+
+    let mut all_cmd = base_cmd(tmp.path());
+    all_cmd.args([
+        "sessions",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    let all_output = all_cmd.assert().success().get_output().clone();
+    let all_json: Value = serde_json::from_slice(&all_output.stdout).expect("valid sessions json");
+    let all_sessions = all_json["sessions"].as_array().expect("sessions array");
+    assert_eq!(all_sessions.len(), 3, "should list all recent sessions");
+    assert_eq!(
+        all_sessions[0]["path"].as_str().unwrap(),
+        session_b.to_string_lossy(),
+        "most recently modified file should come first"
+    );
+    assert_eq!(all_sessions[0]["message_count"], 2);
+    assert_eq!(all_sessions[0]["human_turns"], 1);
+    assert!(all_sessions[0]["size_bytes"].is_number());
+
+    let mut current_cmd = base_cmd(tmp.path());
+    current_cmd.current_dir(&workspace_a_nested);
+    current_cmd.args([
+        "sessions",
+        "--current",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    let current_output = current_cmd.assert().success().get_output().clone();
+    let current_json: Value =
+        serde_json::from_slice(&current_output.stdout).expect("valid current sessions json");
+    let current_sessions = current_json["sessions"].as_array().expect("sessions array");
+    assert_eq!(
+        current_sessions.len(),
+        1,
+        "--current should return one best match"
+    );
+    assert_eq!(
+        current_sessions[0]["path"].as_str().unwrap(),
+        session_a_new.to_string_lossy(),
+        "current workspace should resolve to newest matching workspace session"
+    );
+    assert_eq!(
+        current_sessions[0]["workspace"].as_str().unwrap(),
+        workspace_a.to_string_lossy()
+    );
+}
+
+#[test]
+fn sessions_current_prefers_closest_workspace_over_newer_parent_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace_root = tmp.path().join("repo");
+    let workspace_nested = workspace_root.join("apps/web");
+    let cwd = workspace_nested.join("src/components");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let nested_session_path = tmp.path().join("nested.jsonl");
+    let root_session_path = tmp.path().join("root.jsonl");
+    fs::write(&nested_session_path, "{\"session\":\"nested\"}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    fs::write(&root_session_path, "{\"session\":\"root\"}\n").unwrap();
+
+    let claude_id = storage
+        .ensure_agent(&sample_agent("claude_code", "Claude Code"))
+        .unwrap();
+    let workspace_root_id = storage
+        .ensure_workspace(&workspace_root, Some("repo"))
+        .unwrap();
+    let workspace_nested_id = storage
+        .ensure_workspace(&workspace_nested, Some("repo-web"))
+        .unwrap();
+
+    storage
+        .insert_conversation_tree(
+            claude_id,
+            Some(workspace_nested_id),
+            &sample_conversation(
+                "claude_code",
+                &workspace_nested,
+                &nested_session_path,
+                "nested-session",
+                "Nested Session",
+                1_700_000_100_000,
+                vec![
+                    sample_message(0, MessageRole::User, 1_700_000_100_000, "nested question"),
+                    sample_message(1, MessageRole::Agent, 1_700_000_100_001, "nested answer"),
+                ],
+            ),
+        )
+        .unwrap();
+    storage
+        .insert_conversation_tree(
+            claude_id,
+            Some(workspace_root_id),
+            &sample_conversation(
+                "claude_code",
+                &workspace_root,
+                &root_session_path,
+                "root-session",
+                "Root Session",
+                1_700_000_200_000,
+                vec![
+                    sample_message(0, MessageRole::User, 1_700_000_200_000, "root question"),
+                    sample_message(1, MessageRole::Agent, 1_700_000_200_001, "root answer"),
+                ],
+            ),
+        )
+        .unwrap();
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.current_dir(&cwd);
+    cmd.args([
+        "sessions",
+        "--current",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid current sessions json");
+    let sessions = json["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1, "--current should default to one session");
+    assert_eq!(
+        sessions[0]["path"].as_str().unwrap(),
+        nested_session_path.to_string_lossy(),
+        "closest matching workspace should win over a newer parent workspace session"
+    );
+    assert_eq!(
+        sessions[0]["workspace"].as_str().unwrap(),
+        workspace_nested.to_string_lossy()
+    );
 }
 
 #[test]
@@ -1258,6 +1693,74 @@ fn analytics_rebuild_json_envelope_structure() {
             "rebuild error should describe the missing DB: {stderr}"
         );
     }
+}
+
+#[test]
+fn analytics_validate_reports_query_failure_for_malformed_schema() {
+    let tmp_home = TempDir::new().expect("temp home");
+    let data_dir = tmp_home.path().join("cass_data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let db_path = data_dir.join("agent_search.db");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("create sqlite db");
+    conn.execute_batch(
+        "CREATE TABLE message_metrics (day_id INTEGER);
+         CREATE TABLE usage_daily (day_id INTEGER);
+         INSERT INTO usage_daily (day_id) VALUES (20254);",
+    )
+    .expect("create malformed analytics tables");
+    drop(conn);
+
+    let mut cmd = base_cmd(tmp_home.path());
+    cmd.args([
+        "analytics",
+        "validate",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid analytics validate JSON");
+
+    assert_eq!(json["command"], "analytics/validate");
+    let checks = json["data"]["checks"].as_array().expect("checks array");
+    let query_failure = checks
+        .iter()
+        .find(|check| check["id"] == "track_a.query_exec")
+        .expect("track_a query failure should be reported");
+
+    assert_eq!(query_failure["ok"], false);
+    assert_eq!(query_failure["severity"], "error");
+    assert!(
+        query_failure["details"]
+            .as_str()
+            .unwrap()
+            .contains("Track A invariant query failed")
+    );
+    assert_eq!(json["data"]["perf"]["timeseries"]["within_budget"], false);
+    assert!(
+        json["data"]["perf"]["timeseries"]["error"]
+            .as_str()
+            .is_some_and(|error| !error.trim().is_empty())
+    );
+    assert!(
+        json["data"]["perf"]["timeseries"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("failed")
+    );
+    assert_eq!(json["data"]["perf"]["breakdown"]["within_budget"], false);
+    assert!(
+        json["data"]["perf"]["breakdown"]["error"]
+            .as_str()
+            .is_some_and(|error| !error.trim().is_empty())
+    );
+    assert!(
+        json["data"]["summary"]["errors"].as_u64().unwrap_or(0) >= 1,
+        "malformed analytics schema should surface at least one error"
+    );
 }
 
 #[test]

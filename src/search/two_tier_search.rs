@@ -109,9 +109,9 @@ impl TwoTierConfig {
         }
 
         if let Ok(val) = dotenvy::var("CASS_TWO_TIER_QUALITY_WEIGHT")
-            && let Ok(weight) = val.parse()
+            && let Ok(weight) = val.parse::<f32>()
         {
-            cfg.quality_weight = weight;
+            cfg.quality_weight = weight.clamp(0.0, 1.0);
         }
 
         if let Ok(val) = dotenvy::var("CASS_TWO_TIER_MAX_REFINEMENT")
@@ -144,7 +144,7 @@ impl TwoTierConfig {
         FsTwoTierConfig {
             quality_weight: f64::from(self.quality_weight),
             fast_only: self.fast_only,
-            ..FsTwoTierConfig::default()
+            ..FsTwoTierConfig::optimized().with_env_overrides()
         }
     }
 }
@@ -417,10 +417,13 @@ impl TwoTierIndex {
                 let mut results: Vec<ScoredResult> = scores
                     .iter()
                     .enumerate()
-                    .map(|(idx, &score)| ScoredResult {
-                        idx,
-                        message_id: self.message_ids[idx],
-                        score,
+                    .filter_map(|(idx, &score)| {
+                        let message_id = *self.message_ids.get(idx)?;
+                        Some(ScoredResult {
+                            idx,
+                            message_id,
+                            score,
+                        })
                     })
                     .collect();
                 results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
@@ -497,12 +500,12 @@ pub struct ScoredResult {
 /// Search phase result for progressive display.
 #[derive(Debug, Clone)]
 pub enum SearchPhase {
-    /// Initial fast results.
+    /// Initial results from fast embeddings.
     Initial {
         results: Vec<ScoredResult>,
         latency_ms: u64,
     },
-    /// Refined quality results.
+    /// Refined results from quality embeddings (if daemon available).
     Refined {
         results: Vec<ScoredResult>,
         latency_ms: u64,
@@ -708,10 +711,14 @@ impl<'a, D: DaemonClient> Iterator for TwoTierSearchIter<'a, D> {
                                 for (idx, fast) in fast_results.iter().enumerate() {
                                     let score = if idx < quality_norm.len() {
                                         let fast_s = fast_norm.get(idx).copied().unwrap_or(0.0);
-                                        let quality_s = quality_norm[idx];
+                                        let quality_s =
+                                            quality_norm.get(idx).copied().unwrap_or(0.0);
                                         (1.0 - weight) * fast_s + weight * quality_s
                                     } else {
-                                        fast_norm.get(idx).copied().unwrap_or(fast.score)
+                                        // Unrefined documents get a penalized score that assumes 0.0 for quality
+                                        // to preserve their original ranking but place them appropriately below
+                                        // high-quality refined items.
+                                        fast_norm.get(idx).copied().unwrap_or(0.0) * (1.0 - weight)
                                     };
                                     blended.push(ScoredResult {
                                         idx: fast.idx,
@@ -768,15 +775,38 @@ pub fn normalize_scores(scores: &[f32]) -> Vec<f32> {
         return Vec::new();
     }
 
-    let min = scores.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for &s in scores {
+        if s.is_finite() {
+            min = f32::min(min, s);
+            max = f32::max(max, s);
+        }
+    }
+
+    if min.is_infinite() || max.is_infinite() {
+        return vec![0.0; scores.len()];
+    }
+
     let range = max - min;
 
     if range.abs() < f32::EPSILON {
-        return vec![1.0; scores.len()];
+        return scores
+            .iter()
+            .map(|&s| if s.is_finite() { 1.0 } else { 0.0 })
+            .collect();
     }
 
-    scores.iter().map(|&s| (s - min) / range).collect()
+    scores
+        .iter()
+        .map(|&s| {
+            if s.is_finite() {
+                (s - min) / range
+            } else {
+                0.0
+            }
+        })
+        .collect()
 }
 
 /// Blend two score vectors with the given weight for the second vector.
@@ -1016,6 +1046,29 @@ mod tests {
         for n in &normalized {
             assert!((n - 1.0).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn test_score_normalization_constant_with_nan_keeps_nan_zeroed() {
+        let scores = vec![f32::NAN, 0.5, 0.5];
+        let normalized = normalize_scores(&scores);
+
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0], 0.0);
+        assert!((normalized[1] - 1.0).abs() < 0.001);
+        assert!((normalized[2] - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_score_normalization_with_infinite_values_keeps_non_finite_zeroed() {
+        let scores = vec![f32::NEG_INFINITY, 2.0, f32::INFINITY, 4.0];
+        let normalized = normalize_scores(&scores);
+
+        assert_eq!(normalized.len(), 4);
+        assert_eq!(normalized[0], 0.0);
+        assert_eq!(normalized[2], 0.0);
+        assert!((normalized[1] - 0.0).abs() < 0.001);
+        assert!((normalized[3] - 1.0).abs() < 0.001);
     }
 
     #[test]

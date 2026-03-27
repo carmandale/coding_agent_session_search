@@ -30,6 +30,7 @@ import {
 // Module state
 let settingsContainer = null;
 let onSessionReset = null;
+let settingsRenderEpoch = 0;
 
 function getEffectiveStorageMode() {
     const mode = getStorageMode();
@@ -45,12 +46,13 @@ function getEffectiveStorageMode() {
  * @param {Object} options - Configuration options
  * @param {Function} options.onSessionReset - Callback when session is reset
  */
-export function initSettings(container, options = {}) {
+export async function initSettings(container, options = {}) {
+    settingsRenderEpoch += 1;
     settingsContainer = container;
     onSessionReset = options.onSessionReset || null;
 
     // Initial render
-    render();
+    await render();
 }
 
 /**
@@ -59,12 +61,23 @@ export function initSettings(container, options = {}) {
 export async function render() {
     if (!settingsContainer) return;
 
+    const epoch = settingsRenderEpoch;
+    const targetContainer = settingsContainer;
+
     const currentMode = getEffectiveStorageMode();
     const opfsAvailable = isOPFSAvailable();
     const opfsEnabled = opfsAvailable && isOpfsEnabled();
     const stats = await getStorageStats();
 
-    settingsContainer.innerHTML = `
+    if (
+        epoch !== settingsRenderEpoch
+        || settingsContainer !== targetContainer
+        || !targetContainer?.isConnected
+    ) {
+        return;
+    }
+
+    targetContainer.innerHTML = `
         <div class="panel settings-panel">
             <header class="panel-header">
                 <h2>Settings</h2>
@@ -123,8 +136,8 @@ export async function render() {
                     <h3>Database Caching (OPFS)</h3>
                     ${opfsAvailable ? `
                         <p class="settings-description">
-                            Cache the decrypted database locally for faster loading.
-                            The cache is encrypted at rest and tied to this browser.
+                            Cache the decrypted database locally for faster browsing after unlock.
+                            This cache stays in this browser profile until you clear it.
                         </p>
 
                         <div class="setting-item">
@@ -258,63 +271,71 @@ export async function render() {
     `;
 
     // Set up event handlers
-    setupEventHandlers();
+    setupEventHandlers(targetContainer);
+}
+
+async function rerenderSettingsUI(reason) {
+    try {
+        await render();
+    } catch (err) {
+        console.error(`[Settings] Failed to rerender settings after ${reason}:`, err);
+    }
 }
 
 /**
  * Set up settings event handlers
  */
-function setupEventHandlers() {
+function setupEventHandlers(root) {
     // Storage mode radio buttons
-    const modeRadios = settingsContainer.querySelectorAll('input[name="storage-mode"]');
+    const modeRadios = root.querySelectorAll('input[name="storage-mode"]');
     modeRadios.forEach(radio => {
         radio.addEventListener('change', handleStorageModeChange);
     });
 
     // OPFS toggle
-    const opfsToggle = document.getElementById('opfs-toggle');
+    const opfsToggle = root.querySelector('#opfs-toggle');
     if (opfsToggle) {
         opfsToggle.addEventListener('change', handleOPFSToggle);
     }
 
     // Clear current storage
-    const clearCurrentBtn = document.getElementById('clear-current-cache-btn');
+    const clearCurrentBtn = root.querySelector('#clear-current-cache-btn');
     if (clearCurrentBtn) {
         clearCurrentBtn.addEventListener('click', handleClearCurrentStorage);
     }
 
     // Clear OPFS
-    const clearOPFSBtn = document.getElementById('clear-opfs-btn');
+    const clearOPFSBtn = root.querySelector('#clear-opfs-btn');
     if (clearOPFSBtn) {
         clearOPFSBtn.addEventListener('click', handleClearOPFS);
     }
 
     // Clear SW cache
-    const clearSWBtn = document.getElementById('clear-sw-cache-btn');
+    const clearSWBtn = root.querySelector('#clear-sw-cache-btn');
     if (clearSWBtn) {
         clearSWBtn.addEventListener('click', handleClearSWCache);
     }
 
     // Clear all
-    const clearAllBtn = document.getElementById('clear-all-btn');
+    const clearAllBtn = root.querySelector('#clear-all-btn');
     if (clearAllBtn) {
         clearAllBtn.addEventListener('click', handleClearAll);
     }
 
     // Lock session
-    const lockBtn = document.getElementById('lock-session-btn');
+    const lockBtn = root.querySelector('#lock-session-btn');
     if (lockBtn) {
         lockBtn.addEventListener('click', handleLockSession);
     }
 
     // Reset session
-    const resetBtn = document.getElementById('reset-session-btn');
+    const resetBtn = root.querySelector('#reset-session-btn');
     if (resetBtn) {
         resetBtn.addEventListener('click', handleResetSession);
     }
 
     // Theme select
-    const themeSelect = document.getElementById('theme-select');
+    const themeSelect = root.querySelector('#theme-select');
     if (themeSelect) {
         // Load saved theme
         let savedTheme = 'auto';
@@ -356,9 +377,7 @@ async function handleStorageModeChange(e) {
             'Continue?'
         );
         if (!confirmed) {
-            // Reset radio to current mode
-            const currentRadio = settingsContainer.querySelector(`input[name="storage-mode"][value="${currentMode}"]`);
-            if (currentRadio) currentRadio.checked = true;
+            await rerenderSettingsUI('storage mode cancellation');
             return;
         }
     }
@@ -367,10 +386,11 @@ async function handleStorageModeChange(e) {
         await setStorageMode(newMode);
         window.dispatchEvent(new CustomEvent('cass:session-mode-change', { detail: { mode: newMode } }));
         showNotification(`Storage mode changed to ${newMode}`, 'success');
-        render(); // Re-render to update UI
+        await render();
     } catch (err) {
         console.error('[Settings] Failed to change storage mode:', err);
         showNotification('Failed to change storage mode', 'error');
+        await rerenderSettingsUI('storage mode change failure');
     }
 }
 
@@ -388,7 +408,7 @@ async function handleOPFSToggle(e) {
         );
 
         if (!confirmed) {
-            e.target.checked = false;
+            await rerenderSettingsUI('OPFS enable cancellation');
             return;
         }
 
@@ -397,22 +417,35 @@ async function handleOPFSToggle(e) {
             showNotification('OPFS caching enabled', 'success');
         } catch (err) {
             console.error('[Settings] Failed to enable OPFS:', err);
-            e.target.checked = false;
             showNotification('Failed to enable OPFS caching', 'error');
+            await rerenderSettingsUI('OPFS enable failure');
+            return;
         }
     } else {
         // Switching away from OPFS - clear it first
         try {
-            await clearOPFS();
+            const opfsCleared = await clearOPFS();
+            if (!opfsCleared) {
+                showNotification('Failed to disable OPFS caching because cached files could not be fully cleared', 'error');
+                await render();
+                return;
+            }
             setOpfsEnabled(false);
             showNotification('OPFS caching disabled and cleared', 'success');
         } catch (err) {
             console.error('[Settings] Failed to disable OPFS:', err);
             showNotification('Failed to disable OPFS caching', 'error');
+            await rerenderSettingsUI('OPFS disable failure');
+            return;
         }
     }
 
-    render(); // Re-render to update UI
+    try {
+        await render();
+    } catch (err) {
+        console.error('[Settings] Failed to refresh settings after OPFS toggle:', err);
+        showNotification('Failed to refresh settings', 'error');
+    }
 }
 
 /**
@@ -425,9 +458,20 @@ async function handleClearCurrentStorage() {
     if (!confirmed) return;
 
     try {
-        await clearCurrentStorage();
+        const storageCleared = await clearCurrentStorage();
+        if (!storageCleared) {
+            showNotification('Failed to clear current storage', 'error');
+            return;
+        }
+
+        if (mode === StorageMode.MEMORY && onSessionReset) {
+            onSessionReset('clear-current-storage');
+            showNotification('Current memory storage cleared and session locked', 'success');
+            return;
+        }
+
         showNotification('Current storage cleared', 'success');
-        render();
+        await render();
     } catch (err) {
         console.error('[Settings] Failed to clear storage:', err);
         showNotification('Failed to clear storage', 'error');
@@ -439,16 +483,21 @@ async function handleClearCurrentStorage() {
  */
 async function handleClearOPFS() {
     const confirmed = confirm(
-        'Clear OPFS cache?\n\n' +
-        'The cached database will be deleted. You\'ll need to decrypt again on next visit.'
+        'Clear this archive\'s OPFS cache?\n\n' +
+        'This archive\'s cached database will be deleted. You\'ll need to decrypt again on next visit.'
     );
 
     if (!confirmed) return;
 
     try {
-        await clearOPFS();
+        const opfsCleared = await clearOPFS();
+        if (!opfsCleared) {
+            showNotification('Failed to clear OPFS cache', 'error');
+            return;
+        }
+
         showNotification('OPFS cache cleared', 'success');
-        render();
+        await render();
     } catch (err) {
         console.error('[Settings] Failed to clear OPFS:', err);
         showNotification('Failed to clear OPFS', 'error');
@@ -460,14 +509,18 @@ async function handleClearOPFS() {
  */
 async function handleClearSWCache() {
     const confirmed = confirm(
-        'Clear Service Worker cache?\n\n' +
-        'Static assets will be re-downloaded on next visit.'
+        'Clear this archive\'s Service Worker cache?\n\n' +
+        'This archive\'s static assets will be re-downloaded on next visit.'
     );
 
     if (!confirmed) return;
 
     try {
-        await clearServiceWorkerCache();
+        const cacheCleared = await clearServiceWorkerCache();
+        if (!cacheCleared) {
+            showNotification('Failed to clear Service Worker cache', 'error');
+            return;
+        }
         showNotification('Service Worker cache cleared', 'success');
     } catch (err) {
         console.error('[Settings] Failed to clear SW cache:', err);
@@ -480,23 +533,39 @@ async function handleClearSWCache() {
  */
 async function handleClearAll() {
     const confirmed = confirm(
-        'Clear ALL data?\n\n' +
+        'Clear all data for this archive?\n\n' +
         'This will clear:\n' +
-        '- All storage (memory, session, local, OPFS)\n' +
-        '- Service Worker caches\n\n' +
+        '- This archive\'s storage (memory, session, local, OPFS)\n' +
+        '- This archive\'s Service Worker caches\n\n' +
         'This cannot be undone.'
     );
 
     if (!confirmed) return;
 
     try {
-        await clearAllStorage();
+        const storageCleared = await clearAllStorage();
         await setStorageMode(StorageMode.MEMORY);
         setOpfsEnabled(false);
         window.dispatchEvent(new CustomEvent('cass:session-mode-change', { detail: { mode: StorageMode.MEMORY } }));
-        await clearServiceWorkerCache();
-        showNotification('All data cleared', 'success');
-        render();
+        if (onSessionReset) {
+            onSessionReset('clear-all');
+        }
+
+        const cacheCleared = await clearServiceWorkerCache();
+        if (!storageCleared || !cacheCleared) {
+            const failedSteps = [];
+            if (!storageCleared) {
+                failedSteps.push('stored data');
+            }
+            if (!cacheCleared) {
+                failedSteps.push('Service Worker cache');
+            }
+
+            showNotification(`Archive data cleared and session locked, but ${failedSteps.join(' and ')} could not be fully cleared`, 'error');
+            return;
+        }
+
+        showNotification('All data cleared and session locked', 'success');
     } catch (err) {
         console.error('[Settings] Failed to clear all:', err);
         showNotification('Failed to clear all data', 'error');
@@ -526,10 +595,10 @@ function handleLockSession() {
  */
 async function handleResetSession() {
     const confirmed = confirm(
-        'Reset EVERYTHING?\n\n' +
+        'Reset this archive?\n\n' +
         'This will:\n' +
-        '- Clear all data\n' +
-        '- Unregister all Service Workers\n' +
+        '- Clear this archive\'s data\n' +
+        '- Unregister this archive\'s Service Worker\n' +
         '- Reload the page\n\n' +
         'Are you sure?'
     );
@@ -537,12 +606,30 @@ async function handleResetSession() {
     if (!confirmed) return;
 
     try {
-        await clearAllStorage();
-        await clearServiceWorkerCache();
-        await unregisterServiceWorker();
-
+        const storageCleared = await clearAllStorage();
+        await setStorageMode(StorageMode.MEMORY);
+        setOpfsEnabled(false);
+        window.dispatchEvent(new CustomEvent('cass:session-mode-change', { detail: { mode: StorageMode.MEMORY } }));
         if (onSessionReset) {
             onSessionReset('reset');
+        }
+
+        const cacheCleared = await clearServiceWorkerCache();
+        const swUnregistered = await unregisterServiceWorker();
+        if (!storageCleared || !cacheCleared || !swUnregistered) {
+            const failedSteps = [];
+            if (!storageCleared) {
+                failedSteps.push('stored data');
+            }
+            if (!cacheCleared) {
+                failedSteps.push('Service Worker cache');
+            }
+            if (!swUnregistered) {
+                failedSteps.push('Service Worker registration');
+            }
+
+            showNotification(`Archive data cleared and session locked, but ${failedSteps.join(' and ')} could not be fully reset`, 'error');
+            return;
         }
 
         showNotification('Resetting...', 'success');
@@ -599,8 +686,15 @@ function showNotification(message, type = 'info') {
     }, 3000);
 }
 
+export function cleanupSettings() {
+    settingsRenderEpoch += 1;
+    settingsContainer = null;
+    onSessionReset = null;
+}
+
 // Export module
 export default {
     initSettings,
     render,
+    cleanupSettings,
 };

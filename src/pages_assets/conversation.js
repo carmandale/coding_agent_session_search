@@ -7,6 +7,13 @@
  */
 
 import { getConversation, getConversationMessages, checkMemoryPressure, getMemoryUsage } from './database.js';
+import {
+    createAttachmentElement,
+    getMessageAttachments,
+    initAttachments,
+    reset as resetAttachments,
+} from './attachments.js';
+import { copyTextToClipboard } from './share.js';
 import { VariableHeightVirtualList } from './virtual-list.js';
 
 // Virtual scrolling configuration
@@ -39,12 +46,20 @@ const SANITIZE_CONFIG = {
     FORBID_TAGS: ['script', 'style', 'iframe', 'object', 'embed', 'form', 'input'],
     FORBID_ATTR: ['onerror', 'onclick', 'onload', 'onmouseover', 'style'],
 };
+const ALLOWED_TAGS = new Set(SANITIZE_CONFIG.ALLOWED_TAGS);
+const ALLOWED_ATTR = new Set([...SANITIZE_CONFIG.ALLOWED_ATTR, 'target', 'rel']);
+const FORBID_TAGS = new Set(SANITIZE_CONFIG.FORBID_TAGS);
+const FORBID_ATTR = new Set(SANITIZE_CONFIG.FORBID_ATTR);
 
 // Module state
 let currentConversation = null;
 let currentMessages = [];
 let onBack = null;
 let messageVirtualList = null; // Virtual list for long conversations
+let attachmentState = createAttachmentState();
+let activeConversationLoadId = 0;
+let documentKeydownHandler = null;
+let copyFeedbackTimeoutId = null;
 
 // DOM element references
 let elements = {
@@ -61,6 +76,8 @@ let elements = {
 export function initConversationViewer(container, backCallback) {
     elements.container = container;
     onBack = backCallback;
+    window.removeEventListener('cass:lock', handleArchiveLock);
+    window.addEventListener('cass:lock', handleArchiveLock);
 }
 
 /**
@@ -69,48 +86,132 @@ export function initConversationViewer(container, backCallback) {
  * @param {number|null} highlightMessageId - Message ID to highlight/scroll to
  */
 export async function loadConversation(conversationId, highlightMessageId = null) {
-    // Check if conversation is already in cache
-    if (loadedConversations.has(conversationId)) {
-        const cached = loadedConversations.get(conversationId);
-        // Move to end of map (most recently used)
-        loadedConversations.delete(conversationId);
-        loadedConversations.set(conversationId, cached);
-        currentConversation = cached.conversation;
-        currentMessages = cached.messages;
-        console.debug(`[Conversation] Using cached conversation ${conversationId}`);
-    } else {
-        // Unload oldest conversation if at limit
-        if (loadedConversations.size >= MEMORY_CONFIG.MAX_LOADED_CONVERSATIONS) {
-            unloadOldestConversation();
+    const loadId = ++activeConversationLoadId;
+    try {
+        let conversation;
+        let messages;
+
+        // Check if conversation is already in cache
+        if (loadedConversations.has(conversationId)) {
+            const cached = loadedConversations.get(conversationId);
+            // Move to end of map (most recently used)
+            loadedConversations.delete(conversationId);
+            loadedConversations.set(conversationId, cached);
+            conversation = cached.conversation;
+            messages = cached.messages;
+            console.debug(`[Conversation] Using cached conversation ${conversationId}`);
+        } else {
+            // Unload oldest conversation if at limit
+            if (loadedConversations.size >= MEMORY_CONFIG.MAX_LOADED_CONVERSATIONS) {
+                unloadOldestConversation();
+            }
+
+            // Load conversation metadata
+            conversation = getConversation(conversationId);
+
+            if (!conversation) {
+                if (loadId === activeConversationLoadId) {
+                    showError('Conversation not found');
+                }
+                return;
+            }
+
+            // Load messages
+            messages = getConversationMessages(conversationId);
+
+            // Cache the loaded data
+            loadedConversations.set(conversationId, {
+                conversation,
+                messages,
+                loadedAt: Date.now(),
+            });
+            console.debug(`[Conversation] Loaded and cached conversation ${conversationId} (cache size: ${loadedConversations.size})`);
         }
 
-        // Load conversation metadata
-        currentConversation = getConversation(conversationId);
+        // Check memory pressure
+        if (checkMemoryPressure()) {
+            showMemoryWarning();
+        }
 
-        if (!currentConversation) {
-            showError('Conversation not found');
+        await ensureAttachmentsReady(loadId);
+
+        if (loadId !== activeConversationLoadId) {
             return;
         }
 
-        // Load messages
-        currentMessages = getConversationMessages(conversationId);
+        currentConversation = conversation;
+        currentMessages = messages;
 
-        // Cache the loaded data
-        loadedConversations.set(conversationId, {
-            conversation: currentConversation,
-            messages: currentMessages,
-            loadedAt: Date.now(),
-        });
-        console.debug(`[Conversation] Loaded and cached conversation ${conversationId} (cache size: ${loadedConversations.size})`);
+        // Render the view
+        render(conversation, messages, highlightMessageId);
+    } catch (error) {
+        if (loadId !== activeConversationLoadId) {
+            return;
+        }
+
+        console.error(`[Conversation] Failed to load conversation ${conversationId}:`, error);
+        teardownDocumentListeners();
+        destroyVirtualList();
+        currentConversation = null;
+        currentMessages = [];
+        showError('Failed to load conversation');
+    }
+}
+
+function createAttachmentState() {
+    return {
+        ready: false,
+        available: false,
+        dek: null,
+        exportId: null,
+    };
+}
+
+async function ensureAttachmentsReady(loadId = activeConversationLoadId) {
+    const state = attachmentState;
+
+    if (state.ready) {
+        return state.available;
     }
 
-    // Check memory pressure
-    if (checkMemoryPressure()) {
-        showMemoryWarning();
+    const session = window.cassSession;
+    const dekBase64 = session?.dek;
+    const exportIdBase64 = session?.config?.export_id;
+
+    if (!dekBase64 || !exportIdBase64) {
+        if (state === attachmentState && loadId === activeConversationLoadId) {
+            state.ready = true;
+            state.available = false;
+        }
+        return false;
     }
 
-    // Render the view
-    render(currentConversation, currentMessages, highlightMessageId);
+    try {
+        const dek = base64ToBytes(dekBase64);
+        const exportId = base64ToBytes(exportIdBase64);
+        const manifest = await initAttachments(dek, exportId);
+
+        if (state !== attachmentState || loadId !== activeConversationLoadId) {
+            return false;
+        }
+
+        state.dek = dek;
+        state.exportId = exportId;
+        state.available = Boolean(manifest?.entries?.length);
+        state.ready = true;
+        return state.available;
+    } catch (error) {
+        if (state !== attachmentState || loadId !== activeConversationLoadId) {
+            return false;
+        }
+        if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {
+            return false;
+        }
+        console.warn('[Conversation] Attachment manifest unavailable:', error);
+        state.ready = false;
+        state.available = false;
+        return false;
+    }
 }
 
 /**
@@ -219,6 +320,7 @@ function renderVirtualMessages(messages, highlightId) {
 function renderDirectMessages(messages, highlightId) {
     const html = messages.map((msg, idx) => renderMessage(msg, idx, msg.id === highlightId)).join('');
     elements.messagesList.innerHTML = html;
+    hydrateDirectMessageAttachments(messages);
 
     // Apply syntax highlighting
     applySyntaxHighlighting();
@@ -253,6 +355,8 @@ function createMessageElement(message, index, isHighlighted = false) {
             ${renderedContent}
         </div>
     `;
+
+    appendAttachmentsToMessage(article, message);
 
     // Apply syntax highlighting after element is created
     requestAnimationFrame(() => {
@@ -325,10 +429,71 @@ function renderMessage(message, index, isHighlighted = false) {
     `;
 }
 
+function hydrateDirectMessageAttachments(messages) {
+    if (!attachmentState.available) {
+        return;
+    }
+
+    const byId = new Map(messages.map(message => [String(message.id), message]));
+    const renderedMessages = elements.messagesList.querySelectorAll('.message[data-message-id]');
+
+    renderedMessages.forEach(messageElement => {
+        const message = byId.get(messageElement.dataset.messageId);
+        if (message) {
+            appendAttachmentsToMessage(messageElement, message);
+        }
+    });
+}
+
+function appendAttachmentsToMessage(messageElement, message) {
+    if (!attachmentState.available) {
+        return;
+    }
+
+    const attachments = getMessageAttachments(message.id);
+    if (!attachments.length) {
+        return;
+    }
+
+    const contentElement = messageElement.querySelector('.message-content');
+    if (!contentElement || contentElement.querySelector('.message-attachments')) {
+        return;
+    }
+
+    const attachmentsContainer = document.createElement('div');
+    attachmentsContainer.className = 'message-attachments';
+
+    const label = document.createElement('div');
+    label.className = 'message-attachments-label';
+    label.textContent = attachments.length === 1 ? 'Attachment' : 'Attachments';
+    attachmentsContainer.appendChild(label);
+
+    attachments.forEach(entry => {
+        attachmentsContainer.appendChild(
+            createAttachmentElement(entry, attachmentState.dek, attachmentState.exportId)
+        );
+    });
+
+    contentElement.appendChild(attachmentsContainer);
+}
+
+function handleArchiveLock() {
+    activeConversationLoadId += 1;
+    currentConversation = null;
+    currentMessages = [];
+    teardownDocumentListeners();
+    destroyVirtualList();
+    clearAllCache();
+    attachmentState = createAttachmentState();
+    resetAttachments();
+}
+
 /**
  * Set up event listeners
  */
 function setupEventListeners() {
+    teardownDocumentListeners();
+
     // Back button
     const backBtn = document.getElementById('back-btn');
     backBtn?.addEventListener('click', () => {
@@ -344,13 +509,19 @@ function setupEventListeners() {
     });
 
     // Escape key to go back
-    const handleKeydown = (e) => {
+    documentKeydownHandler = (e) => {
         if (e.key === 'Escape' && onBack) {
             onBack();
-            document.removeEventListener('keydown', handleKeydown);
         }
     };
-    document.addEventListener('keydown', handleKeydown);
+    document.addEventListener('keydown', documentKeydownHandler);
+}
+
+function teardownDocumentListeners() {
+    if (documentKeydownHandler) {
+        document.removeEventListener('keydown', documentKeydownHandler);
+        documentKeydownHandler = null;
+    }
 }
 
 /**
@@ -372,6 +543,33 @@ function renderMarkdown(content) {
 
     // Fallback: simple markdown-like rendering
     return sanitizeHtml(simpleMarkdown(content));
+}
+
+function base64ToBytes(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+}
+
+export function sanitizeDestinationUrl(value) {
+    const url = typeof value === 'string' ? value.trim() : String(value ?? '').trim();
+    const normalized = Array.from(url)
+        .filter(ch => !/\s/.test(ch) && !/[\u0000-\u001F\u007F]/.test(ch))
+        .join('')
+        .toLowerCase();
+
+    if (
+        normalized.startsWith('javascript:')
+        || normalized.startsWith('vbscript:')
+        || normalized.startsWith('data:')
+    ) {
+        return '#';
+    }
+
+    return url;
 }
 
 /**
@@ -404,8 +602,10 @@ function simpleMarkdown(text) {
     html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
 
     // Links
-    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g,
-        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => {
+        const safeHref = escapeHtml(sanitizeDestinationUrl(href));
+        return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    });
 
     // Line breaks
     html = html.replace(/\n\n/g, '</p><p>');
@@ -434,18 +634,35 @@ function sanitizeHtml(html) {
     const template = document.createElement('template');
     template.innerHTML = html;
 
-    // Remove script tags and event handlers
-    const scripts = template.content.querySelectorAll('script, style, iframe, object, embed');
-    scripts.forEach(el => el.remove());
-
-    // Remove event handlers
-    const allElements = template.content.querySelectorAll('*');
+    const allElements = Array.from(template.content.querySelectorAll('*'));
     allElements.forEach(el => {
+        const tag = el.tagName.toLowerCase();
+        if (FORBID_TAGS.has(tag)) {
+            el.remove();
+            return;
+        }
+
+        if (!ALLOWED_TAGS.has(tag)) {
+            el.replaceWith(...Array.from(el.childNodes));
+            return;
+        }
+
         Array.from(el.attributes).forEach(attr => {
-            if (attr.name.startsWith('on') || attr.name === 'style') {
+            const name = attr.name.toLowerCase();
+            if (name.startsWith('on') || FORBID_ATTR.has(name) || !ALLOWED_ATTR.has(name)) {
                 el.removeAttribute(attr.name);
+                return;
+            }
+
+            if (name === 'href') {
+                el.setAttribute('href', sanitizeDestinationUrl(attr.value));
             }
         });
+
+        if (tag === 'a') {
+            el.setAttribute('target', '_blank');
+            el.setAttribute('rel', 'noopener noreferrer');
+        }
     });
 
     return template.innerHTML;
@@ -497,7 +714,10 @@ async function copyConversation() {
     const text = formatConversationAsText(currentConversation, currentMessages);
 
     try {
-        await navigator.clipboard.writeText(text);
+        const copied = await copyTextToClipboard(text);
+        if (!copied) {
+            throw new Error('Clipboard copy failed');
+        }
         showCopyFeedback('Copied!');
     } catch (error) {
         console.error('[Conversation] Copy failed:', error);
@@ -538,10 +758,22 @@ function formatConversationAsText(conv, messages) {
 function showCopyFeedback(message) {
     const copyBtn = document.getElementById('copy-btn');
     if (copyBtn) {
-        const originalText = copyBtn.innerHTML;
+        if (!copyBtn.dataset.defaultLabel) {
+            copyBtn.dataset.defaultLabel = copyBtn.innerHTML;
+        }
+
+        if (copyFeedbackTimeoutId !== null) {
+            clearTimeout(copyFeedbackTimeoutId);
+            copyFeedbackTimeoutId = null;
+        }
+
+        const defaultLabel = copyBtn.dataset.defaultLabel;
         copyBtn.innerHTML = message;
-        setTimeout(() => {
-            copyBtn.innerHTML = originalText;
+        copyFeedbackTimeoutId = window.setTimeout(() => {
+            if (copyBtn.isConnected) {
+                copyBtn.innerHTML = defaultLabel;
+            }
+            copyFeedbackTimeoutId = null;
         }, 2000);
     }
 }
@@ -575,8 +807,9 @@ function showError(message) {
  * Format agent name for display
  */
 function formatAgentName(agent) {
-    if (!agent) return 'Unknown';
-    return agent.charAt(0).toUpperCase() + agent.slice(1);
+    if (agent === undefined || agent === null || agent === '') return 'Unknown';
+    const value = String(agent);
+    return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 /**
@@ -773,12 +1006,19 @@ export function getCacheStats() {
  * Clear the viewer
  */
 export function clearViewer() {
+    activeConversationLoadId += 1;
     // Clean up virtual list
     destroyVirtualList();
+    teardownDocumentListeners();
 
     currentConversation = null;
     currentMessages = [];
     elements.container.innerHTML = '';
+}
+
+export function cleanupConversationViewer() {
+    window.removeEventListener('cass:lock', handleArchiveLock);
+    clearViewer();
 }
 
 /**
@@ -797,6 +1037,7 @@ export default {
     getCurrentConversationId,
     getCurrentConversation,
     clearViewer,
+    cleanupConversationViewer,
     clearAllCache,
     clearOldConversations,
     getCacheStats,

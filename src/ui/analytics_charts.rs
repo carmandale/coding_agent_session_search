@@ -196,7 +196,7 @@ impl AnalyticsChartData {
 /// Gracefully returns empty data if the database is unavailable or tables
 /// are missing.
 pub fn load_chart_data(
-    db: &crate::storage::sqlite::SqliteStorage,
+    db: &crate::storage::sqlite::FrankenStorage,
     filters: &super::app::AnalyticsFilterState,
     group_by: crate::analytics::GroupBy,
 ) -> AnalyticsChartData {
@@ -219,31 +219,56 @@ pub fn load_chart_data(
     };
 
     let mut data = AnalyticsChartData::default();
+    let mut load_errors: Vec<String> = Vec::new();
 
     // Agent breakdown (Track A — usage_daily).
-    if let Ok(result) = analytics::query::query_breakdown(
+    match analytics::query::query_breakdown(
         conn,
         &filter,
         analytics::Dim::Agent,
         analytics::Metric::ApiTotal,
         20,
     ) {
-        data.agent_count = result.rows.len();
-        data.agent_tokens = result
-            .rows
-            .iter()
-            .map(|r| (r.key.clone(), r.value as f64))
-            .collect();
-        data.total_api_tokens = result.rows.iter().map(|r| r.value).sum();
+        Ok(result) => {
+            data.agent_count = result.rows.len();
+            data.agent_tokens = result
+                .rows
+                .iter()
+                .map(|r| (r.key.clone(), r.value as f64))
+                .collect();
+            data.total_api_tokens = result.rows.iter().map(|r| r.value).sum();
+        }
+        Err(e) => {
+            tracing::warn!(query = "agent_tokens", error = %e, "analytics query failed");
+            load_errors.push(format!("agent_tokens: {e}"));
+        }
+    }
+
+    // Helper to log analytics query errors.
+    macro_rules! try_analytics {
+        ($label:expr, $expr:expr, $errors:ident) => {
+            match $expr {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(query = $label, error = %e, "analytics query failed");
+                    $errors.push(format!("{}: {e}", $label));
+                    None
+                }
+            }
+        };
     }
 
     // Agent message counts.
-    if let Ok(result) = analytics::query::query_breakdown(
-        conn,
-        &filter,
-        analytics::Dim::Agent,
-        analytics::Metric::MessageCount,
-        20,
+    if let Some(result) = try_analytics!(
+        "agent_messages",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Agent,
+            analytics::Metric::MessageCount,
+            20,
+        ),
+        load_errors
     ) {
         data.agent_messages = result
             .rows
@@ -254,12 +279,16 @@ pub fn load_chart_data(
     }
 
     // Workspace breakdown (Track A — usage_daily).
-    if let Ok(result) = analytics::query::query_breakdown(
-        conn,
-        &filter,
-        analytics::Dim::Workspace,
-        analytics::Metric::ApiTotal,
-        20,
+    if let Some(result) = try_analytics!(
+        "workspace_tokens",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Workspace,
+            analytics::Metric::ApiTotal,
+            20,
+        ),
+        load_errors
     ) {
         data.workspace_tokens = result
             .rows
@@ -267,12 +296,16 @@ pub fn load_chart_data(
             .map(|r| (r.key.clone(), r.value as f64))
             .collect();
     }
-    if let Ok(result) = analytics::query::query_breakdown(
-        conn,
-        &filter,
-        analytics::Dim::Workspace,
-        analytics::Metric::MessageCount,
-        20,
+    if let Some(result) = try_analytics!(
+        "workspace_messages",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Workspace,
+            analytics::Metric::MessageCount,
+            20,
+        ),
+        load_errors
     ) {
         data.workspace_messages = result
             .rows
@@ -282,12 +315,16 @@ pub fn load_chart_data(
     }
 
     // Source breakdown (Track A — usage_daily).
-    if let Ok(result) = analytics::query::query_breakdown(
-        conn,
-        &filter,
-        analytics::Dim::Source,
-        analytics::Metric::ApiTotal,
-        20,
+    if let Some(result) = try_analytics!(
+        "source_tokens",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Source,
+            analytics::Metric::ApiTotal,
+            20,
+        ),
+        load_errors
     ) {
         data.source_tokens = result
             .rows
@@ -295,12 +332,16 @@ pub fn load_chart_data(
             .map(|r| (r.key.clone(), r.value as f64))
             .collect();
     }
-    if let Ok(result) = analytics::query::query_breakdown(
-        conn,
-        &filter,
-        analytics::Dim::Source,
-        analytics::Metric::MessageCount,
-        20,
+    if let Some(result) = try_analytics!(
+        "source_messages",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Source,
+            analytics::Metric::MessageCount,
+            20,
+        ),
+        load_errors
     ) {
         data.source_messages = result
             .rows
@@ -310,7 +351,11 @@ pub fn load_chart_data(
     }
 
     // Tool usage — load full rows for the enhanced tools table.
-    if let Ok(result) = analytics::query::query_tools(conn, &filter, group_by, 50) {
+    if let Some(result) = try_analytics!(
+        "tools",
+        analytics::query::query_tools(conn, &filter, group_by, 50),
+        load_errors
+    ) {
         data.agent_tool_calls = result
             .rows
             .iter()
@@ -321,12 +366,20 @@ pub fn load_chart_data(
     }
 
     // Per-session scatter points (messages vs API tokens).
-    if let Ok(points) = analytics::query::query_session_scatter(conn, &filter, 600) {
+    if let Some(points) = try_analytics!(
+        "session_scatter",
+        analytics::query::query_session_scatter(conn, &filter, 600),
+        load_errors
+    ) {
         data.session_scatter = points;
     }
 
     // Daily timeseries (for sparklines and line chart).
-    if let Ok(result) = analytics::query::query_tokens_timeseries(conn, &filter, group_by) {
+    if let Some(result) = try_analytics!(
+        "timeseries",
+        analytics::query::query_tokens_timeseries(conn, &filter, group_by),
+        load_errors
+    ) {
         data.daily_tokens = result
             .buckets
             .iter()
@@ -376,12 +429,16 @@ pub fn load_chart_data(
     }
 
     // Model breakdown (Track B — token_daily_stats).
-    if let Ok(result) = analytics::query::query_breakdown(
-        conn,
-        &filter,
-        analytics::Dim::Model,
-        analytics::Metric::ApiTotal,
-        20,
+    if let Some(result) = try_analytics!(
+        "model_tokens",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Model,
+            analytics::Metric::ApiTotal,
+            20,
+        ),
+        load_errors
     ) {
         data.model_tokens = result
             .rows
@@ -391,17 +448,25 @@ pub fn load_chart_data(
     }
 
     // Coverage percentage.
-    if let Ok(status) = analytics::query::query_status(conn, &filter) {
+    if let Some(status) = try_analytics!(
+        "status",
+        analytics::query::query_status(conn, &filter),
+        load_errors
+    ) {
         data.coverage_pct = status.coverage.api_token_coverage_pct;
     }
 
     // Per-agent plan message breakdown.
-    if let Ok(result) = analytics::query::query_breakdown(
-        conn,
-        &filter,
-        analytics::Dim::Agent,
-        analytics::Metric::PlanCount,
-        20,
+    if let Some(result) = try_analytics!(
+        "plan_messages",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Agent,
+            analytics::Metric::PlanCount,
+            20,
+        ),
+        load_errors
     ) {
         data.agent_plan_messages = result
             .rows
@@ -410,20 +475,24 @@ pub fn load_chart_data(
             .collect();
     }
 
+    // Log summary of load errors.
+    if !load_errors.is_empty() {
+        tracing::warn!(
+            error_count = load_errors.len(),
+            errors = ?load_errors,
+            "analytics load_chart_data had query failures — data may appear empty"
+        );
+    }
+
     // Derive plan share percentages from totals.
     if data.total_messages > 0 {
         data.plan_message_pct =
             data.total_plan_messages as f64 / data.total_messages as f64 * 100.0;
     }
     if data.total_api_tokens > 0 {
-        // Plan API token share: sum of plan API tokens from timeseries totals.
-        // The totals are loaded from Track A timeseries above.
-        // We use daily_plan_messages as a proxy — a more accurate plan_api_tokens_total
-        // would require Track A plan_api_tokens_total column (from z9fse.14).
         let plan_token_total: f64 = data.daily_plan_messages.iter().map(|(_, v)| *v).sum();
-        if plan_token_total > 0.0 && data.total_messages > 0 {
-            // Approximate: plan share ≈ plan messages / total messages (token-weighted approx).
-            data.plan_api_token_share = plan_token_total / data.total_messages as f64 * 100.0;
+        if plan_token_total > 0.0 && data.total_api_tokens > 0 {
+            data.plan_api_token_share = plan_token_total / data.total_api_tokens as f64 * 100.0;
         }
     }
 
@@ -431,17 +500,16 @@ pub fn load_chart_data(
 }
 
 fn resolve_workspace_filter_ids(
-    conn: &rusqlite::Connection,
+    conn: &frankensqlite::Connection,
     workspaces: &std::collections::HashSet<String>,
 ) -> Vec<i64> {
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+
     if workspaces.is_empty() {
         return Vec::new();
     }
 
     let mut ids = Vec::new();
-    let mut stmt = conn
-        .prepare("SELECT id FROM workspaces WHERE path = ?1")
-        .ok();
 
     for workspace in workspaces {
         if let Ok(id) = workspace.parse::<i64>()
@@ -450,9 +518,11 @@ fn resolve_workspace_filter_ids(
             ids.push(id);
         }
 
-        if let Some(stmt) = stmt.as_mut()
-            && let Ok(id) = stmt.query_row([workspace.as_str()], |row| row.get::<_, i64>(0))
-            && !ids.contains(&id)
+        if let Ok(id) = conn.query_row_map(
+            "SELECT id FROM workspaces WHERE path = ?1",
+            &[ParamValue::from(workspace.as_str())],
+            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+        ) && !ids.contains(&id)
         {
             ids.push(id);
         }
@@ -490,6 +560,34 @@ pub fn render_dashboard(
         };
         let mut lines: Vec<ftui::text::Line<'static>> = Vec::new();
         lines.push(ftui::text::Line::from(""));
+        if area.height >= 14 && area.width >= 40 {
+            lines.push(ftui::text::Line::from_spans(vec![
+                ftui::text::Span::styled("         ▆", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled("                      █", ftui::Style::new().fg(muted)),
+            ]));
+            lines.push(ftui::text::Line::from_spans(vec![
+                ftui::text::Span::styled("        ▄█", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled("   ▆                  █", ftui::Style::new().fg(muted)),
+            ]));
+            lines.push(ftui::text::Line::from_spans(vec![
+                ftui::text::Span::styled("   ▆   ▄██", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled("  ▄█▄     ▆           █", ftui::Style::new().fg(muted)),
+            ]));
+            lines.push(ftui::text::Line::from_spans(vec![
+                ftui::text::Span::styled("  ▄█  ▄███", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled(" ▄███    ▄█▄     ▆    █", ftui::Style::new().fg(muted)),
+            ]));
+            lines.push(ftui::text::Line::from_spans(vec![
+                ftui::text::Span::styled(" ▄██▄ ████", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled(" █████  ▄███    ▄█▄   █", ftui::Style::new().fg(muted)),
+            ]));
+            lines.push(ftui::text::Line::from_spans(vec![
+                ftui::text::Span::styled("██████████", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled("███████████████████████", ftui::Style::new().fg(muted)),
+            ]));
+            lines.push(ftui::text::Line::from(""));
+        }
+
         lines.push(ftui::text::Line::from_spans(vec![
             ftui::text::Span::styled(
                 "No analytics data yet",
@@ -545,22 +643,33 @@ pub fn render_dashboard(
 
     let cc = ChartColors::for_theme(dark_mode);
 
+    let wide_mode = area.width >= 130;
+
     // Compute exact height needed for agent bar chart (1 row per agent).
     let agent_count = data.agent_tokens.len().min(8);
-    let bar_rows = if agent_count > 0 {
+    let ws_count = data.workspace_tokens.len().min(8);
+
+    let agent_rows = if agent_count > 0 {
         agent_count as u16 + 1
     } else {
         0
-    }; // +1 for header
-    let has_bar = bar_rows > 0 && area.height >= 6 + bar_rows + 4;
+    };
+    let ws_rows = if ws_count > 0 { ws_count as u16 + 1 } else { 0 };
+
+    let max_bar_rows = if wide_mode {
+        agent_rows.max(ws_rows)
+    } else {
+        agent_rows
+    };
+    let has_bar = max_bar_rows > 0 && area.height >= 6 + max_bar_rows + 4;
 
     let chunks = if has_bar {
         Flex::vertical()
             .constraints([
-                Constraint::Fixed(6),        // KPI tile grid
-                Constraint::Fixed(bar_rows), // Top agents bar chart (exact fit)
-                Constraint::Fixed(2),        // Aggregate sparkline (label + bars)
-                Constraint::Min(0),          // Remaining space
+                Constraint::Fixed(6),            // KPI tile grid
+                Constraint::Fixed(max_bar_rows), // Top bar charts (exact fit)
+                Constraint::Fixed(2),            // Aggregate sparkline (label + bars)
+                Constraint::Min(0),              // Remaining space
             ])
             .split(area)
     } else {
@@ -576,100 +685,132 @@ pub fn render_dashboard(
     // ── KPI Tile Grid ──────────────────────────────────────────
     render_kpi_tiles(data, chunks[0], frame, dark_mode);
 
-    // ── Top Agents Bar Chart (manual rendering with full labels) ──
+    // ── Top Bar Charts (manual rendering with full labels) ──
     if has_bar {
         let bar_area = chunks[1];
-        let max_val = data
-            .agent_tokens
-            .iter()
-            .take(8)
-            .map(|(_, v)| *v)
-            .fold(0.0_f64, f64::max);
 
-        // Compute label width: longest agent name, capped at 14 chars.
-        let label_w = data
-            .agent_tokens
-            .iter()
-            .take(8)
-            .map(|(name, _)| name.len().min(14))
-            .max()
-            .unwrap_or(6) as u16;
+        let (agent_area, ws_area) = if wide_mode {
+            let cols = Flex::horizontal()
+                .constraints([Constraint::Percentage(50.0), Constraint::Percentage(50.0)])
+                .split(bar_area);
+            (cols[0], Some(cols[1]))
+        } else {
+            (bar_area, None)
+        };
 
-        // Header row.
-        let header = format!(" {:label_w$}  tokens", "Agent", label_w = label_w as usize);
-        let header_line = ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
-            header,
-            ftui::Style::new().fg(cc.muted),
-        )]);
-        Paragraph::new(header_line).render(
-            Rect {
-                x: bar_area.x,
-                y: bar_area.y,
-                width: bar_area.width,
-                height: 1,
-            },
-            frame,
-        );
-
-        // Value column width for right-aligned numbers.
-        let val_col = 8_u16; // e.g. "  2.4B "
-        let bar_start = bar_area.x + 1 + label_w + 1; // " label "
-        let bar_end = bar_area.right().saturating_sub(val_col);
-        let bar_max_w = bar_end.saturating_sub(bar_start) as f64;
-
-        for (i, (name, val)) in data.agent_tokens.iter().take(8).enumerate() {
-            let y = bar_area.y + 1 + i as u16;
-            if y >= bar_area.bottom() {
-                break;
-            }
-
-            let color = agent_color(i);
-            let truncated_name: String = name.chars().take(label_w as usize).collect();
-            let val_str = format_compact(*val as i64);
-
-            // Render label.
-            let label_span = ftui::text::Span::styled(
-                format!(" {:<label_w$}", truncated_name, label_w = label_w as usize),
-                ftui::Style::new().fg(cc.axis),
-            );
-            Paragraph::new(ftui::text::Line::from_spans(vec![label_span])).render(
-                Rect {
-                    x: bar_area.x,
-                    y,
-                    width: label_w + 1,
-                    height: 1,
-                },
-                frame,
-            );
-
-            // Render bar (minimum 1 char for non-zero values so every agent is visible).
-            let bar_len = if max_val > 0.0 && *val > 0.0 {
-                ((val / max_val) * bar_max_w).round().max(1.0) as u16
-            } else {
-                0
-            };
-            for dx in 0..bar_len {
-                let x = bar_start + dx;
-                if x < bar_end {
-                    let mut cell = ftui::render::cell::Cell::from_char('\u{2588}');
-                    cell.fg = color;
-                    frame.buffer.set_fast(x, y, cell);
+        // Inner function to render a mini bar chart.
+        let mut render_mini_bar =
+            |items: &[(String, f64)], area: Rect, header_label: &str, use_agent_colors: bool| {
+                if area.is_empty() || items.is_empty() {
+                    return;
                 }
-            }
+                let max_val = items
+                    .iter()
+                    .take(8)
+                    .map(|(_, v)| *v)
+                    .fold(0.0_f64, f64::max);
+                let label_w = items
+                    .iter()
+                    .take(8)
+                    .map(|(name, _)| display_width(name).min(14))
+                    .max()
+                    .unwrap_or(6) as u16;
 
-            // Render value at right edge.
-            let val_span =
-                ftui::text::Span::styled(format!(" {val_str}"), ftui::Style::new().fg(cc.muted));
-            let val_x = bar_end;
-            Paragraph::new(ftui::text::Line::from_spans(vec![val_span])).render(
-                Rect {
-                    x: val_x,
-                    y,
-                    width: val_col.min(bar_area.right().saturating_sub(val_x)),
-                    height: 1,
-                },
-                frame,
-            );
+                let header = format!(
+                    " {:label_w$}  tokens",
+                    header_label,
+                    label_w = label_w as usize
+                );
+                let header_line = ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    header,
+                    ftui::Style::new().fg(cc.muted),
+                )]);
+                Paragraph::new(header_line).render(
+                    Rect {
+                        x: area.x,
+                        y: area.y,
+                        width: area.width,
+                        height: 1,
+                    },
+                    frame,
+                );
+
+                let val_col = 8_u16;
+                let bar_start = area.x + 1 + label_w + 1;
+                let bar_end = area.right().saturating_sub(val_col);
+                if bar_end <= bar_start {
+                    return;
+                }
+                let bar_max_w = bar_end.saturating_sub(bar_start) as f64;
+
+                for (i, (name, val)) in items.iter().take(8).enumerate() {
+                    let y = area.y + 1 + i as u16;
+                    if y >= area.bottom() {
+                        break;
+                    }
+                    let color = if use_agent_colors {
+                        agent_color(i)
+                    } else {
+                        cc.emphasis
+                    };
+
+                    // Correctly handle display width for truncation
+                    let truncated_name = shorten_label(name, label_w as usize);
+                    let val_str = format_compact(*val as i64);
+
+                    // To avoid padding issues with wide characters, we calculate exactly how many
+                    // spaces are needed instead of relying on the std::fmt width padder which uses chars
+                    let current_w = display_width(&truncated_name);
+                    let pad_w = (label_w as usize).saturating_sub(current_w);
+                    let pad = " ".repeat(pad_w);
+
+                    let label_span = ftui::text::Span::styled(
+                        format!(" {truncated_name}{pad}"),
+                        ftui::Style::new().fg(cc.axis),
+                    );
+                    Paragraph::new(ftui::text::Line::from_spans(vec![label_span])).render(
+                        Rect {
+                            x: area.x,
+                            y,
+                            width: label_w + 1,
+                            height: 1,
+                        },
+                        frame,
+                    );
+
+                    let bar_len = if max_val > 0.0 && *val > 0.0 {
+                        ((val / max_val) * bar_max_w).round().max(1.0) as u16
+                    } else {
+                        0
+                    };
+                    for dx in 0..bar_len {
+                        let x = bar_start + dx;
+                        if x < bar_end {
+                            let mut cell = ftui::render::cell::Cell::from_char('\u{2588}');
+                            cell.fg = color;
+                            frame.buffer.set_fast(x, y, cell);
+                        }
+                    }
+
+                    let val_span = ftui::text::Span::styled(
+                        format!(" {val_str}"),
+                        ftui::Style::new().fg(cc.muted),
+                    );
+                    Paragraph::new(ftui::text::Line::from_spans(vec![val_span])).render(
+                        Rect {
+                            x: bar_end,
+                            y,
+                            width: val_col.min(area.right().saturating_sub(bar_end)),
+                            height: 1,
+                        },
+                        frame,
+                    );
+                }
+            };
+
+        render_mini_bar(&data.agent_tokens, agent_area, "Agent", true);
+        if let Some(w_area) = ws_area {
+            render_mini_bar(&data.workspace_tokens, w_area, "Workspace", false);
         }
     }
 
@@ -935,6 +1076,42 @@ pub fn render_explorer(
     let cc = ChartColors::for_theme(dark_mode);
 
     if metric_data.is_empty() {
+        if area.height >= 12 && area.width >= 40 {
+            let accent = if dark_mode {
+                PackedRgba::rgb(90, 180, 255)
+            } else {
+                PackedRgba::rgb(20, 100, 200)
+            };
+            let primary = if dark_mode {
+                PackedRgba::rgb(60, 120, 200)
+            } else {
+                PackedRgba::rgb(40, 80, 160)
+            };
+
+            let lines = vec![
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "             ▃▄▅▇██▇▅▄▃             ",
+                    ftui::Style::new().fg(accent),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "         ▂▄▆████████████▆▄▂         ",
+                    ftui::Style::new().fg(primary),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "       ▃▆██████████████████▆▃       ",
+                    ftui::Style::new().fg(cc.muted),
+                )]),
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    " No analytics timeseries yet. If data exists, cass is rebuilding automatically.",
+                    ftui::Style::new().fg(cc.axis).bold(),
+                )]),
+            ];
+            Paragraph::new(ftui::text::Text::from_lines(lines)).render(area, frame);
+            return;
+        }
+
         Paragraph::new(
             " No analytics timeseries yet. If data exists, cass is rebuilding automatically.",
         )
@@ -1212,11 +1389,6 @@ fn render_explorer_line_canvas(
         }
     }
 
-    for window in primary_points.windows(2) {
-        let (x0, y0) = to_px(window[0].0, window[0].1);
-        let (x1, y1) = to_px(window[1].0, window[1].1);
-        painter.line_colored(x0, y0, x1, y1, Some(primary_color));
-    }
     if let Some((x, y)) = primary_points.first() {
         let (px, py) = to_px(*x, *y);
         painter.point_colored(px, py, primary_color);
@@ -1668,7 +1840,8 @@ fn parse_day_label(label: &str) -> Option<(i32, u32, u32)> {
 fn weekday_index(y: i32, m: u32, d: u32) -> usize {
     static T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
     let y = if m < 3 { y - 1 } else { y };
-    let dow = (y + y / 4 - y / 100 + y / 400 + T[m as usize - 1] + d as i32) % 7;
+    let m_idx = (m as usize).clamp(1, 12) - 1;
+    let dow = (y + y / 4 - y / 100 + y / 400 + T[m_idx] + d as i32) % 7;
     // Sakamoto gives Sun=0, Mon=1 … Sat=6; convert to Mon=0 … Sun=6.
     ((dow + 6) % 7) as usize
 }
@@ -1687,6 +1860,62 @@ pub fn render_heatmap(
     let cc = ChartColors::for_theme(dark_mode);
 
     if series.is_empty() {
+        if area.height >= 12 && area.width >= 40 {
+            let muted = if dark_mode {
+                PackedRgba::rgb(120, 125, 140)
+            } else {
+                PackedRgba::rgb(100, 105, 115)
+            };
+            let accent = if dark_mode {
+                PackedRgba::rgb(90, 180, 255)
+            } else {
+                PackedRgba::rgb(20, 100, 200)
+            };
+            let primary = if dark_mode {
+                PackedRgba::rgb(60, 120, 200)
+            } else {
+                PackedRgba::rgb(40, 80, 160)
+            };
+            let lines = vec![
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ░░░ ▒▒▒ ▓▓▓ ███ ▓▓▓ ▒▒▒ ░░░",
+                    ftui::Style::new().fg(muted),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ▒▒▒ ▓▓▓ ███ ███ ███ ▓▓▓ ▒▒▒",
+                    ftui::Style::new().fg(primary),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ▓▓▓ ███ ███ ███ ███ ███ ▓▓▓",
+                    ftui::Style::new().fg(accent),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ███ ███ ███ ███ ███ ███ ███",
+                    ftui::Style::new().fg(accent),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ▓▓▓ ███ ███ ███ ███ ███ ▓▓▓",
+                    ftui::Style::new().fg(accent),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ▒▒▒ ▓▓▓ ███ ███ ███ ▓▓▓ ▒▒▒",
+                    ftui::Style::new().fg(primary),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ░░░ ▒▒▒ ▓▓▓ ███ ▓▓▓ ▒▒▒ ░░░",
+                    ftui::Style::new().fg(muted),
+                )]),
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    " No daily data available for this view yet.",
+                    ftui::Style::new().fg(cc.axis).bold(),
+                )]),
+            ];
+            Paragraph::new(ftui::text::Text::from_lines(lines)).render(area, frame);
+            return;
+        }
+
         Paragraph::new(" No daily data available for this view yet.")
             .style(ftui::Style::new().fg(cc.subtle))
             .render(area, frame);
@@ -2019,6 +2248,47 @@ pub fn render_breakdowns(
             " No {} breakdown data for the current filters.",
             tab.label()
         );
+
+        if area.height >= 12 && area.width >= 40 {
+            let accent = if dark_mode {
+                PackedRgba::rgb(90, 180, 255)
+            } else {
+                PackedRgba::rgb(20, 100, 200)
+            };
+            let primary = if dark_mode {
+                PackedRgba::rgb(60, 120, 200)
+            } else {
+                PackedRgba::rgb(40, 80, 160)
+            };
+
+            let lines = vec![
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("   ██████████      ", ftui::Style::new().fg(accent)),
+                    ftui::text::Span::styled("   ██████████      ", ftui::Style::new().fg(primary)),
+                ]),
+                ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("   ████████████    ", ftui::Style::new().fg(accent)),
+                    ftui::text::Span::styled("   ██████████████  ", ftui::Style::new().fg(primary)),
+                ]),
+                ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("   ████████████████", ftui::Style::new().fg(accent)),
+                    ftui::text::Span::styled("   ████████        ", ftui::Style::new().fg(primary)),
+                ]),
+                ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("   ██████          ", ftui::Style::new().fg(accent)),
+                    ftui::text::Span::styled("   ████████████████", ftui::Style::new().fg(primary)),
+                ]),
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    msg,
+                    ftui::Style::new().fg(cc.axis).bold(),
+                )]),
+            ];
+            Paragraph::new(ftui::text::Text::from_lines(lines)).render(area, frame);
+            return;
+        }
+
         Paragraph::new(msg)
             .style(ftui::Style::new().fg(cc.subtle))
             .render(area, frame);
@@ -2042,11 +2312,15 @@ pub fn render_breakdowns(
         height: layout[1].height,
     };
 
+    // Determine how many rows we can fit (max 25 to avoid overwhelm).
+    // BarChart uses 1 row per group + some overhead.
+    let max_items = (content.height as usize).saturating_sub(2).clamp(8, 25);
+
     // For Model tab, show a single tokens-only chart (no message counts).
     if matches!(tab, BreakdownTab::Model) {
         let groups: Vec<BarGroup<'_>> = tokens
             .iter()
-            .take(10)
+            .take(max_items)
             .map(|(name, val)| BarGroup::new(name, vec![*val]))
             .collect();
         let colors: Vec<PackedRgba> = (0..groups.len()).map(color_fn).collect();
@@ -2066,7 +2340,7 @@ pub fn render_breakdowns(
     {
         let token_rows: Vec<(String, f64)> = tokens
             .iter()
-            .take(8)
+            .take(max_items)
             .map(|(name, val)| (shorten_label(name, 20), *val))
             .collect();
         let groups: Vec<BarGroup<'_>> = token_rows
@@ -2085,7 +2359,7 @@ pub fn render_breakdowns(
     {
         let message_rows: Vec<(String, f64)> = messages
             .iter()
-            .take(8)
+            .take(max_items)
             .map(|(name, val)| (shorten_label(name, 20), *val))
             .collect();
         let groups: Vec<BarGroup<'_>> = message_rows
@@ -2129,18 +2403,27 @@ fn model_color(idx: usize) -> PackedRgba {
     MODEL_COLORS[idx % MODEL_COLORS.len()]
 }
 
-fn truncate_with_ellipsis(input: &str, width: usize) -> String {
-    if width == 0 {
+fn truncate_with_ellipsis(input: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
         return String::new();
     }
-    let char_count = input.chars().count();
-    if char_count <= width {
+    if display_width(input) <= max_cols {
         return input.to_string();
     }
-    if width == 1 {
+    if max_cols == 1 {
         return "\u{2026}".to_string();
     }
-    let mut out: String = input.chars().take(width - 1).collect();
+    let budget = max_cols - 1;
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in input.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
     out.push('\u{2026}');
     out
 }
@@ -2173,23 +2456,34 @@ fn render_breakdown_tabs(
 }
 
 /// Shorten a label (e.g., workspace path) to fit in `max_len` characters.
-fn shorten_label(s: &str, max_len: usize) -> String {
-    if max_len == 0 {
+fn shorten_label(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
         return String::new();
     }
-    if s.chars().count() <= max_len {
+    if display_width(s) <= max_cols {
         return s.to_string();
     }
     if s.contains('/') {
         let last = s.rsplit('/').next().unwrap_or(s);
-        if last.chars().count() <= max_len {
+        if display_width(last) <= max_cols {
             return last.to_string();
         }
     }
-    if max_len == 1 {
+    if max_cols == 1 {
         return "\u{2026}".to_string();
     }
-    let mut truncated: String = s.chars().take(max_len - 1).collect();
+    // Take characters until we would exceed the column budget (minus 1 for ellipsis).
+    let budget = max_cols - 1;
+    let mut truncated = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        truncated.push(ch);
+        w += cw;
+    }
     truncated.push('\u{2026}');
     truncated
 }
@@ -2215,6 +2509,50 @@ pub fn render_tools(
     let cc = ChartColors::for_theme(dark_mode);
 
     if data.tool_rows.is_empty() {
+        if area.height >= 12 && area.width >= 40 {
+            let accent = if dark_mode {
+                PackedRgba::rgb(90, 180, 255)
+            } else {
+                PackedRgba::rgb(20, 100, 200)
+            };
+            let primary = if dark_mode {
+                PackedRgba::rgb(60, 120, 200)
+            } else {
+                PackedRgba::rgb(40, 80, 160)
+            };
+
+            let lines = vec![
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   Agent                 Calls   Msgs   Tokens   Trend  ",
+                    ftui::Style::new().fg(cc.muted),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ██████████               ██     ██       ██     ███  ",
+                    ftui::Style::new().fg(primary),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ████████████             ██     ██       ██     ███  ",
+                    ftui::Style::new().fg(accent),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ██████                   ██     ██       ██     ███  ",
+                    ftui::Style::new().fg(primary),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ████████                 ██     ██       ██     ███  ",
+                    ftui::Style::new().fg(accent),
+                )]),
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    " No tool usage data available for the current filters.",
+                    ftui::Style::new().fg(cc.axis).bold(),
+                )]),
+            ];
+            Paragraph::new(ftui::text::Text::from_lines(lines)).render(area, frame);
+            return;
+        }
+
         Paragraph::new(" No tool usage data available for the current filters.")
             .style(ftui::Style::new().fg(cc.subtle))
             .render(area, frame);
@@ -2304,25 +2642,32 @@ fn tools_header_line(width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let compact = format!(
-        " {:<10} {:>5} {:>5} {:>8} {:>5}",
-        "Agent", "Calls", "Msgs", "Tokens", "Share"
-    );
+
+    let w = width;
+
     if width < 56 {
+        let name_w: usize = 10;
+        let label = "Agent";
+        let current_w = display_width(label);
+        let pad_w = name_w.saturating_sub(current_w);
+        let pad = " ".repeat(pad_w);
+
+        let compact = format!(
+            " {}{} {:>5} {:>5} {:>8} {:>5}",
+            label, pad, "Calls", "Msgs", "Tokens", "Share"
+        );
         return truncate_with_ellipsis(&compact, width);
     }
 
-    let w = width;
     let name_w = (w * 28 / 100).clamp(8, 24);
+    let label = "Agent";
+    let current_w = display_width(label);
+    let pad_w = name_w.saturating_sub(current_w);
+    let pad = " ".repeat(pad_w);
+
     let line = format!(
-        " {:<name_w$} {:>8} {:>8} {:>10} {:>8} {:>6}",
-        "Agent",
-        "Calls",
-        "Msgs",
-        "API Tok",
-        "Calls/1K",
-        "Share",
-        name_w = name_w,
+        " {}{} {:>8} {:>8} {:>10} {:>8} {:>6}",
+        label, pad, "Calls", "Msgs", "API Tok", "Calls/1K", "Share",
     );
     truncate_with_ellipsis(&line, width)
 }
@@ -2336,10 +2681,18 @@ fn tools_row_line(row: &crate::analytics::ToolRow, pct_share: f64, width: usize)
         .tool_calls_per_1k_api_tokens
         .map(|v| format!("{v:.2}"))
         .unwrap_or_else(|| "\u{2014}".to_string());
+
     if width < 56 {
+        let name_w: usize = 10;
+        let truncated_name = shorten_label(&row.key, name_w);
+        let current_w = display_width(&truncated_name);
+        let pad_w = name_w.saturating_sub(current_w);
+        let pad = " ".repeat(pad_w);
+
         let line = format!(
-            " {:<10} {:>5} {:>5} {:>8} {:>4.0}%",
-            shorten_label(&row.key, 10),
+            " {}{} {:>5} {:>5} {:>8} {:>4.0}%",
+            truncated_name,
+            pad,
             format_compact(row.tool_call_count),
             format_compact(row.message_count),
             format_compact(row.api_tokens_total),
@@ -2347,17 +2700,23 @@ fn tools_row_line(row: &crate::analytics::ToolRow, pct_share: f64, width: usize)
         );
         return truncate_with_ellipsis(&line, width);
     }
+
     let w = width;
     let name_w = (w * 28 / 100).clamp(8, 24);
+    let truncated_name = shorten_label(&row.key, name_w);
+    let current_w = display_width(&truncated_name);
+    let pad_w = name_w.saturating_sub(current_w);
+    let pad = " ".repeat(pad_w);
+
     let line = format!(
-        " {:<name_w$} {:>8} {:>8} {:>10} {:>8} {:>5.1}%",
-        shorten_label(&row.key, name_w),
+        " {}{} {:>8} {:>8} {:>10} {:>8} {:>5.1}%",
+        truncated_name,
+        pad,
         format_number(row.tool_call_count),
         format_number(row.message_count),
         format_compact(row.api_tokens_total),
         per_1k,
         pct_share,
-        name_w = name_w,
     );
     truncate_with_ellipsis(&line, width)
 }
@@ -2540,11 +2899,15 @@ pub fn render_coverage(
         let w = chunks[1].width as usize;
         // Header.
         let header = if w < 48 {
-            format!(" {:<12} {:>8} {:>6}", "Agent", "Tokens", "Msgs")
+            let lbl = "Agent";
+            let pad = " ".repeat(12_usize.saturating_sub(display_width(lbl)));
+            format!(" {}{} {:>8} {:>6}", lbl, pad, "Tokens", "Msgs")
         } else {
+            let lbl = "Agent";
+            let pad = " ".repeat(16_usize.saturating_sub(display_width(lbl)));
             format!(
-                " {:<16} {:>12} {:>10} {:>8}",
-                "Agent", "API Tokens", "Messages", "Data"
+                " {}{} {:>12} {:>10} {:>8}",
+                lbl, pad, "API Tokens", "Messages", "Data"
             )
         };
         let header_trunc = coverage_truncate(&header, w);
@@ -2582,16 +2945,24 @@ pub fn render_coverage(
                 PackedRgba::rgb(255, 200, 0)
             };
             let row_text = if w < 48 {
+                let name_w = 12;
+                let t_name = coverage_truncate(agent, name_w);
+                let pad = " ".repeat(name_w.saturating_sub(display_width(&t_name)));
                 format!(
-                    " {:<12} {:>8} {:>6}",
-                    coverage_truncate(agent, 12),
+                    " {}{} {:>8} {:>6}",
+                    t_name,
+                    pad,
                     format_compact(*tokens as i64),
                     format_compact(msgs as i64),
                 )
             } else {
+                let name_w = 16;
+                let t_name = coverage_truncate(agent, name_w);
+                let pad = " ".repeat(name_w.saturating_sub(display_width(&t_name)));
                 format!(
-                    " {:<16} {:>12} {:>10} {:>8}",
-                    coverage_truncate(agent, 16),
+                    " {}{} {:>12} {:>10} {:>8}",
+                    t_name,
+                    pad,
                     format_compact(*tokens as i64),
                     format_compact(msgs as i64),
                     "",
@@ -2659,6 +3030,38 @@ pub fn render_coverage(
             .gradient(PackedRgba::rgb(60, 60, 120), PackedRgba::rgb(80, 200, 80));
         sparkline.render(spark_area, frame);
     } else {
+        if chunks[2].height >= 8 && chunks[2].width >= 40 {
+            let accent = if dark_mode {
+                PackedRgba::rgb(90, 180, 255)
+            } else {
+                PackedRgba::rgb(20, 100, 200)
+            };
+            let primary = if dark_mode {
+                PackedRgba::rgb(60, 120, 200)
+            } else {
+                PackedRgba::rgb(40, 80, 160)
+            };
+
+            let lines = vec![
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ▂▂▃▄▅▆▇██████████████▇▆▅▄▃▂▂   ",
+                    ftui::Style::new().fg(accent),
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    "   ████████████████████████████   ",
+                    ftui::Style::new().fg(primary),
+                )]),
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    " No daily data for sparkline",
+                    ftui::Style::new().fg(cc.axis).bold(),
+                )]),
+            ];
+            Paragraph::new(ftui::text::Text::from_lines(lines)).render(chunks[2], frame);
+            return;
+        }
+
         Paragraph::new(" No daily data for sparkline")
             .style(ftui::Style::new().fg(cc.subtle))
             .render(chunks[2], frame);
@@ -2862,10 +3265,12 @@ fn format_number(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensqlite::compat::ConnectionExt;
+    use frankensqlite::params;
 
     #[test]
     fn resolve_workspace_filter_ids_supports_paths_and_numeric_ids() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = frankensqlite::Connection::open(":memory:").unwrap();
         conn.execute_batch(
             "CREATE TABLE workspaces (
                 id INTEGER PRIMARY KEY,
@@ -2873,14 +3278,14 @@ mod tests {
             );",
         )
         .unwrap();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
-            rusqlite::params![1_i64, "/workspace/one"],
+            params![1_i64, "/workspace/one"],
         )
         .unwrap();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
-            rusqlite::params![2_i64, "/workspace/two"],
+            params![2_i64, "/workspace/two"],
         )
         .unwrap();
 
@@ -2899,7 +3304,7 @@ mod tests {
     fn load_chart_data_applies_workspace_path_filter() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("analytics_filters.db");
-        let storage = crate::storage::sqlite::SqliteStorage::open(&db_path).unwrap();
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
 
         let ws_a = storage
             .ensure_workspace(std::path::Path::new("/workspace/a"), None)
@@ -2913,20 +3318,20 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let conn = storage.raw();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO usage_daily (
                 day_id, agent_slug, workspace_id, source_id,
                 message_count, tool_call_count, api_tokens_total, last_updated
              ) VALUES (?1, 'codex', ?2, 'local', 10, 2, 1000, ?3)",
-            rusqlite::params![20260220_i64, ws_a, now_ms],
+            params![20260220_i64, ws_a, now_ms],
         )
         .unwrap();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO usage_daily (
                 day_id, agent_slug, workspace_id, source_id,
                 message_count, tool_call_count, api_tokens_total, last_updated
              ) VALUES (?1, 'codex', ?2, 'local', 20, 4, 2000, ?3)",
-            rusqlite::params![20260220_i64, ws_b, now_ms],
+            params![20260220_i64, ws_b, now_ms],
         )
         .unwrap();
 

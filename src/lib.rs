@@ -22,12 +22,12 @@ use anyhow::Result;
 use base64::prelude::*;
 use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
+use fs2::FileExt;
 use indexer::IndexOptions;
-use semver::Version;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -46,6 +46,41 @@ fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty())
+}
+
+fn with_frankensqlite_connection<T, F>(
+    db_path: &Path,
+    context: &str,
+    op: F,
+) -> std::result::Result<T, frankensqlite::FrankenError>
+where
+    F: FnOnce(&frankensqlite::Connection) -> std::result::Result<T, frankensqlite::FrankenError>,
+{
+    let mut conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+    let result = op(&conn);
+    let close_result = conn.close_in_place();
+    match (result, close_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(value), Err(close_err)) => {
+            warn!(
+                error = %close_err,
+                db_path = %db_path.display(),
+                "{context}: close_in_place failed; falling back to best-effort close"
+            );
+            conn.close_best_effort_in_place();
+            Ok(value)
+        }
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(close_err)) => {
+            warn!(
+                error = %close_err,
+                db_path = %db_path.display(),
+                "{context}: close_in_place failed after error; falling back to best-effort close"
+            );
+            conn.close_best_effort_in_place();
+            Err(err)
+        }
+    }
 }
 
 /// Command-line interface.
@@ -154,6 +189,12 @@ pub enum Commands {
         /// Trigger a single watch cycle for specific paths (comma-separated or repeated)
         #[arg(long, value_delimiter = ',', num_args = 1..)]
         watch_once: Option<Vec<PathBuf>>,
+
+        /// Minimum seconds between watch scan cycles (default: 30).
+        /// Prevents high CPU usage from tight-loop scanning when filesystem
+        /// events arrive continuously.
+        #[arg(long, default_value_t = 30)]
+        watch_interval: u64,
 
         /// Build semantic vector index after text indexing
         #[arg(long)]
@@ -479,6 +520,24 @@ pub enum Commands {
         #[arg(long, default_value_t = 5)]
         limit: usize,
     },
+    /// List recent sessions, with optional workspace/current-session filtering
+    Sessions {
+        /// Filter to sessions for this workspace/project directory
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        workspace: Option<PathBuf>,
+        /// Resolve the current workspace automatically and return the most recent match
+        #[arg(long, default_value_t = false)]
+        current: bool,
+        /// Maximum sessions to return (defaults: 10, or 1 with --current)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
     /// Export a conversation to markdown or other formats
     Export {
         /// Path to session file
@@ -492,6 +551,9 @@ pub enum Commands {
         /// Include tool use details in export
         #[arg(long)]
         include_tools: bool,
+        /// Include skill content in export (default: stripped for privacy)
+        #[arg(long)]
+        include_skills: bool,
     },
     /// Export session as beautiful, self-contained HTML (with optional encryption)
     #[command(name = "export-html")]
@@ -530,6 +592,12 @@ pub enum Commands {
         /// Disable CDN references (fully offline, larger file)
         #[arg(long)]
         no_cdns: bool,
+
+        /// Include skill content in export (default: stripped for privacy).
+        /// Skills injected by Claude Code/Codex contain proprietary SKILL.md
+        /// content that should not appear in shared/published exports.
+        #[arg(long)]
+        include_skills: bool,
 
         /// Default theme (dark or light)
         #[arg(long, default_value = "dark")]
@@ -1569,6 +1637,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         ("q", "search"),
         ("lookup", "search"),
         ("grep", "search"),
+        ("session", "sessions"),
         // Stats aliases
         ("ls", "stats"),
         ("list", "stats"),
@@ -1778,6 +1847,76 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     (normalized, note)
 }
 
+/// Build a helpful error message when a command group (e.g. `analytics`, `sources`,
+/// `models`, `import`) is invoked without a required subcommand.
+fn format_missing_subcommand_error(args: &[String]) -> String {
+    // Find the bare command group name from the args (skip program name and flags).
+    let group = args
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
+
+    let (subcommands, examples): (&[&str], &[&str]) = match group {
+        "analytics" => (
+            &["status", "tokens", "tools", "models", "rebuild", "validate"],
+            &[
+                "cass analytics status --json",
+                "cass analytics tokens --days 7 --group-by day --json",
+                "cass analytics rebuild --json",
+            ],
+        ),
+        "sources" => (
+            &[
+                "list", "add", "remove", "doctor", "sync", "mappings", "discover", "setup",
+            ],
+            &[
+                "cass sources list --json",
+                "cass sources add user@host --name myserver",
+                "cass sources doctor --json",
+            ],
+        ),
+        "models" => (
+            &["status", "install", "verify", "remove", "check-update"],
+            &[
+                "cass models status --json",
+                "cass models install --model all-minilm-l6-v2",
+                "cass models verify --json",
+            ],
+        ),
+        "import" => (
+            &["chatgpt"],
+            &["cass import chatgpt /path/to/conversations.json"],
+        ),
+        _ => (&[], &["cass --help"]),
+    };
+
+    let mut msg = format!(
+        "Missing required subcommand. Run `cass {} --help` for usage.",
+        group
+    );
+
+    if !subcommands.is_empty() {
+        msg.push_str(&format!(
+            "\n\nAvailable subcommands for `cass {}`:\n",
+            group
+        ));
+        for sc in subcommands {
+            msg.push_str(&format!("  {}\n", sc));
+        }
+    }
+
+    if !examples.is_empty() {
+        msg.push_str("\nExamples:\n");
+        for ex in examples {
+            msg.push_str(&format!("  {}\n", ex));
+        }
+    }
+
+    msg
+}
+
 /// Build a friendly parse error with actionable, context-aware examples for AI agents.
 ///
 /// This function analyzes what the agent was likely trying to do and provides
@@ -1864,6 +2003,8 @@ fn detect_command_intent(raw_str: &str) -> String {
         || raw_str.contains("grep")
     {
         "search for sessions or messages".to_string()
+    } else if raw_str.contains("session") || raw_str.contains("current") {
+        "discover or list session files".to_string()
     } else if raw_str.contains("doc") || raw_str.contains("help") || raw_str.contains("robot") {
         "get robot-mode documentation".to_string()
     } else if raw_str.contains("stats") || raw_str.contains("ls") || raw_str.contains("list") {
@@ -1897,6 +2038,12 @@ fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
             "cass search \"database\" --robot --since 2024-01-01",
             "cass search \"TODO\" --robot --workspace /path/to/project",
         ]
+    } else if intent.contains("session") {
+        vec![
+            "cass sessions --current --json",
+            "cass sessions --workspace /path/to/project --json --limit 5",
+            "cass sessions --json --limit 10",
+        ]
     } else if intent.contains("documentation") {
         vec![
             "cass robot-docs commands",
@@ -1907,9 +2054,8 @@ fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
     } else if intent.contains("statistics") || intent.contains("list") {
         vec![
             "cass stats --robot",
-            "cass stats --robot --agent claude",
-            "cass stats --robot --workspace /path",
-            "cass stats --robot --since 2024-01-01",
+            "cass stats --robot --source local",
+            "cass stats --robot --by-source",
         ]
     } else if intent.contains("index") {
         vec![
@@ -1919,16 +2065,15 @@ fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
         ]
     } else if intent.contains("view") {
         vec![
-            "cass view <session-id> --robot",
-            "cass view <session-id> --robot --full",
-            "cass view <session-id> --robot --fields content,timestamp",
+            "cass view <session-path> --robot",
+            "cass view <session-path> -n 42 --json",
         ]
     } else if intent.contains("capabilities") {
         vec!["cass capabilities --json", "cass introspect --json"]
     } else if intent.contains("diagnostics") {
         vec!["cass diag --robot", "cass diag --robot --verbose"]
     } else if intent.contains("status") {
-        vec!["cass status --robot", "cass status --robot --watch"]
+        vec!["cass status --robot"]
     } else if intent.contains("health") {
         vec!["cass health --json"]
     } else {
@@ -2225,6 +2370,15 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
             ) {
                 err.exit();
             }
+
+            // Handle bare subcommand invocations (e.g. `cass analytics` without a
+            // sub-subcommand).  Clap reports MissingSubcommand for these; we turn
+            // that into a targeted hint listing the available sub-subcommands.
+            if err.kind() == ErrorKind::MissingSubcommand {
+                let msg = format_missing_subcommand_error(&normalized_args);
+                return Err(CliError::usage(msg, None));
+            }
+
             // Attempt heuristic recovery
             if let Some((recovered_args, note)) = heuristic_parse_recovery(&err, &normalized_args) {
                 // Try parsing again with recovered args
@@ -2415,7 +2569,60 @@ async fn execute_cli(
     } else if cli.verbose {
         EnvFilter::new("debug")
     } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            // Suppress frankensqlite internal telemetry that spams at INFO level.
+            // EnvFilter uses "::" as the hierarchy separator, so "fsqlite=warn" covers
+            // fsqlite::runtime, fsqlite::cx, etc.  Crate-level targets like fsqlite_vdbe
+            // and fsqlite_core need their own directives.  Custom dot-separated targets
+            // (fsqlite.statement_reuse, fsqlite.compat, etc.) are NOT matched by the
+            // hierarchical prefix, so each must be listed explicitly.
+            EnvFilter::new(concat!(
+                "info",
+                // Hierarchical (::) targets
+                ",fsqlite=warn",
+                ",fsqlite_core=warn",
+                ",fsqlite_vdbe=warn",
+                ",fsqlite_mvcc=warn",
+                ",fsqlite_pager=warn",
+                ",fsqlite_func=warn",
+                ",fsqlite_vfs=warn",
+                ",fsqlite_wal=warn",
+                ",fsqlite_c_api=warn",
+                ",fsqlite_planner=warn",
+                ",fsqlite_types=warn",
+                ",fsqlite_observability=warn",
+                // Dot-separated custom targets
+                ",fsqlite.compat=warn",
+                ",fsqlite.compat_trace=warn",
+                ",fsqlite.statement_reuse=warn",
+                ",fsqlite.statement=warn",
+                ",fsqlite.execution=warn",
+                ",fsqlite.execute_path=warn",
+                ",fsqlite.plan=warn",
+                ",fsqlite.planner=warn",
+                ",fsqlite.planner_runtime=warn",
+                ",fsqlite.parse=warn",
+                ",fsqlite.provenance=warn",
+                ",fsqlite.dp=warn",
+                ",fsqlite.udf=warn",
+                ",fsqlite.vdbe=warn",
+                ",fsqlite.rcu=warn",
+                ",fsqlite.seqlock=warn",
+                ",fsqlite.left_right=warn",
+                ",fsqlite.flat_combine=warn",
+                ",fsqlite.commit_combine=warn",
+                ",fsqlite.snapshot_publication=warn",
+                ",fsqlite.wal_publication=warn",
+                ",fsqlite.storage_wiring=warn",
+                ",fsqlite.cx_propagation=warn",
+                ",fsqlite.sketch_telemetry=warn",
+                ",fsqlite.time_travel=warn",
+                ",fsqlite.trace_export=warn",
+                ",fsqlite.txn_slot=warn",
+                ",fsqlite.evidence=warn",
+                ",fsqlite.lab_schedule=warn",
+            ))
+        })
     };
 
     match &command {
@@ -2570,6 +2777,7 @@ async fn execute_cli(
                     force_rebuild,
                     watch,
                     watch_once,
+                    watch_interval,
                     data_dir,
                     semantic,
                     build_hnsw,
@@ -2583,6 +2791,7 @@ async fn execute_cli(
                         force_rebuild,
                         watch,
                         watch_once,
+                        watch_interval,
                         data_dir,
                         semantic,
                         build_hnsw,
@@ -2666,12 +2875,23 @@ async fn execute_cli(
                     }
 
                     // Build semantic options from new flags
+                    let tier_mode = if two_tier {
+                        crate::search::query::SemanticTierMode::Progressive
+                    } else if fast_only {
+                        crate::search::query::SemanticTierMode::FastOnly
+                    } else if quality_only {
+                        crate::search::query::SemanticTierMode::QualityOnly
+                    } else {
+                        crate::search::query::SemanticTierMode::Single
+                    };
+
                     let semantic_opts = SemanticSearchOptions {
                         model: model.clone(),
                         rerank,
                         reranker: reranker.clone(),
                         use_daemon: daemon && !no_daemon,
                         approximate,
+                        tier_mode,
                     };
 
                     run_cli_search(
@@ -2801,6 +3021,10 @@ async fn execute_cli(
                             retryable: false,
                         })?;
 
+                        if include_attachments {
+                            pages_config.bundle.include_attachments = true;
+                        }
+
                         if let Some(target) = target {
                             pages_config.deployment.target = target.as_config_value().to_string();
                         }
@@ -2902,15 +3126,7 @@ async fn execute_cli(
                         }
 
                         // Get database path
-                        let db_path = cli.db.clone().unwrap_or_else(|| {
-                            directories::ProjectDirs::from(
-                                "com",
-                                "dicklesworthstone",
-                                "coding-agent-search",
-                            )
-                            .map(|dirs| dirs.data_dir().join("agent_search.db"))
-                            .unwrap_or_else(default_db_path)
-                        });
+                        let db_path = cli.db.clone().unwrap_or_else(default_db_path);
 
                         // Convert config to WizardState and run export
                         let wizard_state =
@@ -2942,6 +3158,20 @@ async fn execute_cli(
                         })?;
 
                         return Ok(());
+                    }
+
+                    if include_attachments {
+                        return Err(CliError {
+                            code: 2,
+                            kind: "pages",
+                            message: "--include-attachments is not implemented for pages exports"
+                                .to_string(),
+                            hint: Some(
+                                "Remove --include-attachments. The current pages pipeline cannot extract attachment blobs from the source database yet."
+                                    .to_string(),
+                            ),
+                            retryable: false,
+                        });
                     }
 
                     // Handle --validate-config without --config
@@ -3029,15 +3259,7 @@ async fn execute_cli(
                             });
                         }
                     } else if scan_secrets {
-                        let db_path = cli.db.clone().unwrap_or_else(|| {
-                            directories::ProjectDirs::from(
-                                "com",
-                                "dicklesworthstone",
-                                "coding-agent-search",
-                            )
-                            .map(|dirs| dirs.data_dir().join("agent_search.db"))
-                            .unwrap_or_else(default_db_path)
-                        });
+                        let db_path = cli.db.clone().unwrap_or_else(default_db_path);
 
                         let workspaces_path = workspaces
                             .clone()
@@ -3221,6 +3443,9 @@ async fn execute_cli(
 
                         // Wizard mode: pass flags
                         let mut wizard = crate::pages::wizard::PagesWizard::new();
+                        if let Some(db_path) = cli.db.clone() {
+                            wizard.set_db_path(db_path);
+                        }
                         if no_encryption {
                             wizard.set_no_encryption(true);
                         }
@@ -3326,13 +3551,36 @@ async fn execute_cli(
                 } => {
                     run_context(&path, &data_dir, cli.db.clone(), json, limit)?;
                 }
+                Commands::Sessions {
+                    workspace,
+                    current,
+                    limit,
+                    data_dir,
+                    json,
+                } => {
+                    run_sessions(
+                        workspace.as_ref(),
+                        current,
+                        limit,
+                        &data_dir,
+                        cli.db.clone(),
+                        json,
+                    )?;
+                }
                 Commands::Export {
                     path,
                     format,
                     output,
                     include_tools,
+                    include_skills,
                 } => {
-                    run_export(&path, format, output.as_deref(), include_tools)?;
+                    run_export(
+                        &path,
+                        format,
+                        output.as_deref(),
+                        include_tools,
+                        include_skills,
+                    )?;
                 }
                 Commands::ExportHtml {
                     session,
@@ -3344,6 +3592,7 @@ async fn execute_cli(
                     include_tools,
                     show_timestamps,
                     no_cdns,
+                    include_skills,
                     theme,
                     dry_run,
                     explain,
@@ -3360,6 +3609,7 @@ async fn execute_cli(
                         include_tools,
                         show_timestamps,
                         !no_cdns,
+                        include_skills,
                         &theme,
                         dry_run,
                         explain,
@@ -3555,6 +3805,84 @@ fn analytics_build_filters(common: &AnalyticsCommon) -> Vec<String> {
     f
 }
 
+/// Open a read-only frankensqlite connection for analytics queries.
+fn open_franken_analytics_db(
+    data_dir: &Option<PathBuf>,
+    db_path_override: Option<&PathBuf>,
+) -> CliResult<frankensqlite::Connection> {
+    open_franken_cli_read_db(
+        analytics_db_path(data_dir, db_path_override),
+        "analytics",
+        Duration::from_secs(1),
+    )
+}
+
+fn analytics_db_path(data_dir: &Option<PathBuf>, db_path_override: Option<&PathBuf>) -> PathBuf {
+    let data_dir = data_dir.clone().unwrap_or_else(default_data_dir);
+    db_path_override
+        .cloned()
+        .unwrap_or_else(|| data_dir.join("agent_search.db"))
+}
+
+fn open_franken_cli_read_db(
+    path: PathBuf,
+    reason: &str,
+    busy_timeout: Duration,
+) -> CliResult<frankensqlite::Connection> {
+    use frankensqlite::compat::{OpenFlags, open_with_flags};
+
+    if !path.exists() {
+        return Err(CliError {
+            code: 3,
+            kind: "missing-db",
+            message: format!(
+                "Database not found at {}. Run 'cass index --full' first.",
+                path.display()
+            ),
+            hint: Some("Run 'cass index --full' to create the database.".into()),
+            retryable: true,
+        });
+    }
+
+    let conn = open_with_flags(
+        path.to_string_lossy().as_ref(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| CliError {
+        code: 9,
+        kind: "db-open",
+        message: format!(
+            "Failed to open {reason} database at {}: {e}",
+            path.display()
+        ),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let timeout_ms = busy_timeout.as_millis().clamp(1, u128::from(u32::MAX));
+    let _ = conn.execute(&format!("PRAGMA busy_timeout = {timeout_ms};"));
+    let _ = conn.execute("PRAGMA query_only = 1;");
+
+    Ok(conn)
+}
+
+fn close_franken_cli_read_db(
+    conn: frankensqlite::Connection,
+    path: &Path,
+    reason: &str,
+) -> CliResult<()> {
+    conn.close().map_err(|e| CliError {
+        code: 9,
+        kind: "db-close",
+        message: format!(
+            "Failed to close {reason} database at {}: {e}",
+            path.display()
+        ),
+        hint: None,
+        retryable: true,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // analytics status — delegates to crate::analytics::query
 // ---------------------------------------------------------------------------
@@ -3564,9 +3892,7 @@ fn run_analytics_status(
     common: &AnalyticsCommon,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    let lazy =
-        crate::storage::sqlite::LazyDb::from_overrides(&common.data_dir, db_path_override.cloned());
-    let conn = lazy.get("analytics-status").map_err(lazy_db_to_cli_error)?;
+    let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics::AnalyticsFilter::from(common);
 
     analytics::query::query_status(&conn, &filter)
@@ -3590,9 +3916,7 @@ fn run_analytics_tokens(
     group_by: AnalyticsBucketing,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    let lazy =
-        crate::storage::sqlite::LazyDb::from_overrides(&common.data_dir, db_path_override.cloned());
-    let conn = lazy.get("analytics-tokens").map_err(lazy_db_to_cli_error)?;
+    let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics::AnalyticsFilter::from(common);
 
     analytics::query::query_tokens_timeseries(&conn, &filter, group_by.into())
@@ -3619,7 +3943,7 @@ fn run_analytics_rebuild(
     _force: bool,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    use crate::storage::sqlite::SqliteStorage;
+    use crate::storage::sqlite::FrankenStorage;
 
     let data_dir = common.data_dir.clone().unwrap_or_else(default_data_dir);
     let db_path = db_path_override
@@ -3642,7 +3966,7 @@ fn run_analytics_rebuild(
     // Progress diagnostics go to stderr.
     eprintln!("Rebuilding analytics (Track A)...");
 
-    let mut storage = SqliteStorage::open(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
         code: 9,
         kind: "db-error",
         message: format!("Failed to open database: {e}"),
@@ -3693,9 +4017,7 @@ fn run_analytics_tools(
     limit: usize,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    let lazy =
-        crate::storage::sqlite::LazyDb::from_overrides(&common.data_dir, db_path_override.cloned());
-    let conn = lazy.get("analytics-tools").map_err(lazy_db_to_cli_error)?;
+    let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics::AnalyticsFilter::from(common);
 
     analytics::query::query_tools(&conn, &filter, group_by.into(), limit)
@@ -3719,11 +4041,7 @@ fn run_analytics_validate(
     _fix: bool,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    let lazy =
-        crate::storage::sqlite::LazyDb::from_overrides(&common.data_dir, db_path_override.cloned());
-    let conn = lazy
-        .get("analytics-validate")
-        .map_err(lazy_db_to_cli_error)?;
+    let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
 
     let config = analytics::ValidateConfig::default();
     let report = analytics::validate::run_validation(&conn, &config);
@@ -3766,12 +4084,16 @@ fn run_analytics_validate(
         } else {
             eprintln!("  {} all checks passed", "OK".green().bold());
         }
-        let ts_status = if perf_ts.within_budget {
+        let ts_status = if perf_ts.error.is_some() {
+            "ERR".red().to_string()
+        } else if perf_ts.within_budget {
             "OK".green().to_string()
         } else {
             "SLOW".red().to_string()
         };
-        let bd_status = if perf_bd.within_budget {
+        let bd_status = if perf_bd.error.is_some() {
+            "ERR".red().to_string()
+        } else if perf_bd.within_budget {
             "OK".green().to_string()
         } else {
             "SLOW".red().to_string()
@@ -3797,11 +4119,15 @@ fn run_analytics_validate(
                 "elapsed_ms": perf_ts.elapsed_ms,
                 "budget_ms": perf_ts.budget_ms,
                 "within_budget": perf_ts.within_budget,
+                "error": perf_ts.error,
+                "details": perf_ts.details,
             },
             "breakdown": {
                 "elapsed_ms": perf_bd.elapsed_ms,
                 "budget_ms": perf_bd.budget_ms,
                 "within_budget": perf_bd.within_budget,
+                "error": perf_bd.error,
+                "details": perf_bd.details,
             }
         }
     }))
@@ -3817,9 +4143,7 @@ fn run_analytics_models(
     group_by: AnalyticsBucketing,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
-    let lazy =
-        crate::storage::sqlite::LazyDb::from_overrides(&common.data_dir, db_path_override.cloned());
-    let conn = lazy.get("analytics-models").map_err(lazy_db_to_cli_error)?;
+    let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics::AnalyticsFilter::from(common);
     let db_err = |e: crate::analytics::AnalyticsError| CliError {
         code: 9,
@@ -4014,6 +4338,125 @@ async fn import_chatgpt_export(
 }
 
 /// Compute lightweight state snapshot (index/db freshness) for robot meta and state command reuse
+const STATE_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
+const STATUS_COUNT_SCAN_MAX_DB_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct StateDbSnapshot {
+    conversation_count: i64,
+    message_count: i64,
+    last_indexed_at: Option<i64>,
+    opened: bool,
+    open_error: Option<String>,
+    counts_skipped: bool,
+}
+
+fn probe_state_db(
+    db_path: &Path,
+    reason: &str,
+    timeout: Duration,
+    include_counts: bool,
+) -> StateDbSnapshot {
+    if !db_path.exists() {
+        return StateDbSnapshot::default();
+    }
+
+    let mut snapshot = StateDbSnapshot {
+        counts_skipped: !include_counts,
+        ..StateDbSnapshot::default()
+    };
+
+    let conn = match open_franken_cli_read_db(db_path.to_path_buf(), reason, timeout) {
+        Ok(conn) => conn,
+        Err(err) => {
+            snapshot.open_error = Some(err.message);
+            return snapshot;
+        }
+    };
+
+    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use frankensqlite::params;
+
+    snapshot.opened = true;
+    snapshot.last_indexed_at = conn
+        .query_row_map(
+            "SELECT value FROM meta WHERE key = 'last_indexed_at'",
+            params![],
+            |r| r.get_typed::<String>(0),
+        )
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok());
+    if include_counts {
+        snapshot.conversation_count = conn
+            .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
+                r.get_typed(0)
+            })
+            .unwrap_or(0);
+        snapshot.message_count = conn
+            .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
+                r.get_typed(0)
+            })
+            .unwrap_or(0);
+    }
+
+    if let Err(err) = close_franken_cli_read_db(conn, db_path, reason) {
+        snapshot.open_error = Some(err.message);
+    }
+
+    snapshot
+}
+
+#[derive(Debug, Default)]
+struct IndexRunSnapshot {
+    active: bool,
+    pid: Option<u32>,
+    started_at_ms: Option<i64>,
+}
+
+fn probe_index_run_lock(data_dir: &Path, db_path: &Path) -> IndexRunSnapshot {
+    let lock_path = data_dir.join("index-run.lock");
+    let mut file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+        Ok(file) => file,
+        Err(_) => return IndexRunSnapshot::default(),
+    };
+
+    let mut raw = String::new();
+    let _ = file.read_to_string(&mut raw);
+
+    let mut pid = None;
+    let mut started_at_ms = None;
+    let mut lock_db_path = None::<String>;
+    for line in raw.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "pid" => pid = value.trim().parse::<u32>().ok(),
+            "started_at_ms" => started_at_ms = value.trim().parse::<i64>().ok(),
+            "db_path" => lock_db_path = Some(value.trim().to_string()),
+            _ => {}
+        }
+    }
+
+    if lock_db_path.as_deref() != Some(db_path.to_string_lossy().as_ref()) {
+        return IndexRunSnapshot::default();
+    }
+
+    let active = match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(_) => true,
+    };
+
+    IndexRunSnapshot {
+        active,
+        pid,
+        started_at_ms,
+    }
+}
+
 fn state_meta_json(
     data_dir: &Path,
     db_path: &Path,
@@ -4029,39 +4472,35 @@ fn state_meta_json(
     let index_exists = index_path.exists();
     let db_exists = db_path.exists();
     let watch_state_path = data_dir.join("watch_state.json");
+    let rebuild_snapshot = crate::indexer::load_lexical_rebuild_snapshot(&index_path, db_path)
+        .ok()
+        .flatten();
+    let index_run = probe_index_run_lock(data_dir, db_path);
+    // The index-run lock covers the full `cass index` lifecycle, not just the
+    // later lexical checkpointing phase. Treat a live lock as authoritative so
+    // `cass status` reports early rebuild work honestly.
+    let rebuild_active = index_run.active;
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let mut conversation_count: i64 = 0;
-    let mut message_count: i64 = 0;
-    let mut last_indexed_at: Option<i64> = None;
-    let mut db_opened = false;
-
-    // Use LazyDb to get timing/logging for state snapshot DB access
-    let lazy = crate::storage::sqlite::LazyDb::new(db_path.to_path_buf());
-    if allow_db_open
-        && db_exists
-        && let Ok(conn) = lazy.get("state-meta")
-    {
-        db_opened = true;
-        conversation_count = conn
-            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-            .unwrap_or(0);
-        message_count = conn
-            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
-            .unwrap_or(0);
-        last_indexed_at = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'last_indexed_at'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok());
-    }
+    let db_size_bytes = fs::metadata(db_path).map(|m| m.len()).ok();
+    let include_counts = db_size_bytes
+        .map(|size| size <= STATUS_COUNT_SCAN_MAX_DB_BYTES)
+        .unwrap_or(false);
+    let db_snapshot = if allow_db_open && db_exists {
+        probe_state_db(db_path, "state-meta", STATE_DB_OPEN_TIMEOUT, include_counts)
+    } else {
+        StateDbSnapshot::default()
+    };
+    let conversation_count = db_snapshot.conversation_count;
+    let message_count = db_snapshot.message_count;
+    let mut last_indexed_at = db_snapshot.last_indexed_at;
+    let db_opened = db_snapshot.opened;
+    let db_open_error = db_snapshot.open_error;
+    let counts_skipped = db_snapshot.counts_skipped;
 
     if last_indexed_at.is_none() && index_exists {
         let meta_path = index_path.join("meta.json");
@@ -4087,15 +4526,22 @@ fn state_meta_json(
         0
     };
 
-    let index_age_secs = last_indexed_at.map(|ts| {
-        let ts_secs = ts / 1000;
-        now_secs.saturating_sub(ts_secs.max(0) as u64)
+    let index_age_secs = last_indexed_at.and_then(|ts| {
+        if ts <= 0 {
+            return None;
+        }
+        let ts_secs = (ts / 1000) as u64;
+        Some(now_secs.saturating_sub(ts_secs))
     });
     let is_stale = match index_age_secs {
         None => true,
         Some(age) => age > stale_threshold,
     };
     let fresh = index_exists && !is_stale;
+    let rebuild_updated_at = rebuild_snapshot
+        .as_ref()
+        .and_then(|snapshot| (snapshot.updated_at_ms > 0).then_some(snapshot.updated_at_ms))
+        .or(index_run.started_at_ms);
 
     let ts_str = chrono::DateTime::from_timestamp(now_secs as i64, 0)
         .unwrap_or_else(chrono::Utc::now)
@@ -4112,17 +4558,46 @@ fn state_meta_json(
             }),
             "age_seconds": index_age_secs,
             "stale": is_stale,
-            "stale_threshold_seconds": stale_threshold
+            "stale_threshold_seconds": stale_threshold,
+            "rebuilding": rebuild_active,
+            "activity_at": rebuild_updated_at.map(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            })
         },
         "database": {
             "exists": db_exists,
             "opened": db_opened,
-            "conversations": conversation_count,
-            "messages": message_count
+            "conversations": state_db_count_json(conversation_count, counts_skipped),
+            "messages": state_db_count_json(message_count, counts_skipped),
+            "open_error": db_open_error,
+            "counts_skipped": counts_skipped
         },
         "pending": {
             "sessions": pending_sessions,
             "watch_active": watch_state_path.exists()
+        },
+        "rebuild": {
+            "active": rebuild_active,
+            "pid": index_run.pid,
+            "started_at": index_run.started_at_ms.map(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            }),
+            "updated_at": rebuild_updated_at.map(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            }),
+            "processed_conversations": rebuild_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.processed_conversations),
+            "total_conversations": rebuild_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.total_conversations),
+            "indexed_docs": rebuild_snapshot.as_ref().map(|snapshot| snapshot.indexed_docs)
         },
         "_meta": {
             "timestamp": ts_str,
@@ -4142,8 +4617,17 @@ fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value>
         "age_seconds": index.get("age_seconds"),
         "stale": index.get("stale"),
         "stale_threshold_seconds": index.get("stale_threshold_seconds"),
+        "rebuilding": index.get("rebuilding"),
         "pending_sessions": pending.and_then(|p| p.get("sessions"))
     }))
+}
+
+fn state_db_count_json(count: i64, counts_skipped: bool) -> serde_json::Value {
+    if counts_skipped {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::from(count)
+    }
 }
 
 fn warn_tui_terminal_profile(stderr_is_tty: bool) {
@@ -4296,7 +4780,7 @@ fn lazy_db_to_cli_error(e: crate::storage::sqlite::LazyDbError) -> CliError {
             hint: Some("Run 'cass index --full' to create the database.".into()),
             retryable: true,
         },
-        LazyDbError::OpenFailed { path, source } => CliError {
+        LazyDbError::FrankenOpenFailed { path, source } => CliError {
             code: 9,
             kind: "db-open",
             message: format!("Failed to open database at {}: {source}", path.display()),
@@ -4325,6 +4809,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Health { .. }) => "health".to_string(),
         Some(Commands::Doctor { .. }) => "doctor".to_string(),
         Some(Commands::Context { .. }) => "context".to_string(),
+        Some(Commands::Sessions { .. }) => "sessions".to_string(),
         Some(Commands::Export { .. }) => "export".to_string(),
         Some(Commands::ExportHtml { .. }) => "export-html".to_string(),
         Some(Commands::Expand { .. }) => "expand".to_string(),
@@ -4363,6 +4848,7 @@ fn is_robot_mode(command: &Commands) -> bool {
         Commands::Capabilities { json, .. } => *json || env_robot_mode,
         Commands::Introspect { json, .. } => *json || env_robot_mode,
         Commands::Context { json, .. } => *json || env_robot_mode,
+        Commands::Sessions { json, .. } => *json || env_robot_mode,
         Commands::Expand { json, .. } => *json || env_robot_mode,
         Commands::ExportHtml { json, .. } => *json || env_robot_mode,
         Commands::Timeline { json, .. } => *json || env_robot_mode,
@@ -4548,7 +5034,9 @@ fn extract_search_terms(query: &str) -> Vec<String> {
                     chars.next();
                     break;
                 }
-                phrase.push(chars.next().unwrap());
+                if let Some(n) = chars.next() {
+                    phrase.push(n);
+                }
             }
             if !phrase.is_empty() {
                 terms.push(phrase);
@@ -4558,7 +5046,9 @@ fn extract_search_terms(query: &str) -> Vec<String> {
             let mut word = String::from(c);
             while let Some(&next) = chars.peek() {
                 if next.is_alphanumeric() || next == '_' || next == '-' {
-                    word.push(chars.next().unwrap());
+                    if let Some(n) = chars.next() {
+                        word.push(n);
+                    }
                 } else if next == ':' {
                     // This is a field filter - skip the whole thing
                     chars.next(); // consume ':'
@@ -4604,6 +5094,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  cass search \"bug fix\" --today        # Search today's sessions only",
         "  cass search \"api\" --week --agent codex  # Last 7 days, codex only",
         "  cass stats --json                    # Get index statistics",
+        "  cass sessions --current --json       # Find current workspace session",
         "  cass view /path/file.jsonl -n 42    # View file at line 42",
         "  cass robot-docs commands            # Machine-readable command list",
         "  cass --robot-docs=commands          # Also accepted (auto-normalized)",
@@ -4622,7 +5113,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  stdout=data only; stderr=warnings/errors only (INFO auto-suppressed)",
         "  Use -v/--verbose with --json to enable INFO logs if needed",
         "",
-        "Subcommands: search | stats | view | index | tui | robot-docs <topic>",
+        "Subcommands: search | sessions | stats | view | index | tui | robot-docs <topic>",
         "Topics: commands | env | paths | schemas | guide | exit-codes | examples | contracts | wrap | sources",
         "Exit codes: 0 ok; 2 usage; 3 missing index/db; 9 unknown",
         "More: cass robot-docs examples | cass robot-docs commands",
@@ -4646,7 +5137,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --json | --robot  JSON output for automation".to_string(),
             "    --fields F1,F2    Select specific fields in hits (reduces token usage)".to_string(),
             "                      Presets: minimal (path,line,agent), summary (+title,score), provenance (source_id,origin_kind,origin_host)".to_string(),
-            "                      Fields: score,agent,workspace,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host".to_string(),
+            "                      Fields: score,agent,workspace,workspace_original,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host".to_string(),
             "    --max-content-length N  Truncate content/snippet/title to N chars (UTF-8 safe, adds '...')".to_string(),
             "                            Adds *_truncated: true indicator for each truncated field".to_string(),
             "    --today           Filter to today only".to_string(),
@@ -4660,6 +5151,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass stats [--json] [--data-dir DIR]".to_string(),
             "  cass status [--json] [--stale-threshold N] [--data-dir DIR]".to_string(),
             "  cass diag [--json] [--verbose] [--data-dir DIR]".to_string(),
+            "  cass sessions [--workspace DIR] [--current] [--limit N] [--json]".to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
             "  cass index [--full] [--watch] [--json] [--data-dir DIR]".to_string(),
             "  cass tui [--once] [--data-dir DIR] [--reset-state] [--asciicast FILE]"
@@ -4725,6 +5217,10 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "# Filter by agent or workspace".to_string(),
             "  cass search \"error\" --agent codex         # codex sessions only".to_string(),
             "  cass search \"test\" --workspace /myproject # specific project".to_string(),
+            String::new(),
+            "# Discover session files for follow-up actions".to_string(),
+            "  cass sessions --current --json             # best match for current cwd".to_string(),
+            "  cass sessions --workspace /myproject --json --limit 5".to_string(),
             String::new(),
             "# Follow up on search results".to_string(),
             "  cass view /path/to/session.jsonl -n 42   # view line 42 with context".to_string(),
@@ -4940,8 +5436,8 @@ fn render_analytics_docs() -> Vec<String> {
         "      track_b.{tokens,agents}_match, cross_track.drift, non_negative.counters".into(),
         "  data.drift: [{ day_id, agent_slug, source_id, track_a_total,".into(),
         "                 track_b_total, delta, delta_pct, likely_cause }]".into(),
-        "  data.perf: { timeseries: { elapsed_ms, budget_ms, within_budget },".into(),
-        "              breakdown: { elapsed_ms, budget_ms, within_budget } }".into(),
+        "  data.perf: { timeseries: { elapsed_ms, budget_ms, within_budget, error?, details },".into(),
+        "              breakdown: { elapsed_ms, budget_ms, within_budget, error?, details } }".into(),
         "  --fix: attempt automatic repair (not yet implemented)".into(),
         String::new(),
         "## Coverage & Uncertainty Semantics".into(),
@@ -5096,6 +5592,8 @@ pub struct SemanticSearchOptions {
     pub use_daemon: bool,
     /// Use approximate nearest neighbor search when available
     pub approximate: bool,
+    /// Optional two-tier execution strategy for semantic mode.
+    pub tier_mode: crate::search::query::SemanticTierMode,
 }
 
 impl TimeFilter {
@@ -5338,6 +5836,12 @@ fn run_cli_search(
         semantic_opts.approximate
     };
 
+    if semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
+        && !matches!(effective_mode, SearchMode::Semantic)
+    {
+        eprintln!("Warning: tier flags currently only affect --mode semantic.");
+    }
+
     if matches!(effective_mode, SearchMode::Semantic | SearchMode::Hybrid) {
         use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
 
@@ -5571,6 +6075,7 @@ fn run_cli_search(
         || semantic_opts.reranker.is_some()
         || semantic_opts.use_daemon
         || semantic_opts.approximate
+        || semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
     {
         tracing::debug!(
             model = ?semantic_opts.model,
@@ -5578,6 +6083,7 @@ fn run_cli_search(
             reranker = ?semantic_opts.reranker,
             use_daemon = semantic_opts.use_daemon,
             approximate = semantic_opts.approximate,
+            tier_mode = ?semantic_opts.tier_mode,
             "Semantic search options configured"
         );
     }
@@ -5603,13 +6109,14 @@ fn run_cli_search(
             })?,
         SearchMode::Semantic => {
             let (hits, ann_stats) = client
-                .search_semantic(
+                .search_semantic_with_tier(
                     query,
                     filters.clone(),
                     search_limit,
                     search_offset,
                     field_mask,
                     approximate,
+                    semantic_opts.tier_mode,
                 )
                 .map_err(|e| {
                     let err_str = e.to_string();
@@ -6160,12 +6667,16 @@ fn resolve_field_mask(
 }
 
 /// Filter a search hit to only include the requested fields
+fn safe_robot_score_value(score: f32) -> serde_json::Value {
+    serde_json::Value::from(if score.is_finite() { score as f64 } else { 0.0 })
+}
+
 fn projected_hit_field_value(
     hit: &crate::search::query::SearchHit,
     field: &str,
 ) -> Option<serde_json::Value> {
     match field {
-        "score" => serde_json::to_value(hit.score).ok(),
+        "score" => Some(safe_robot_score_value(hit.score)),
         "agent" => Some(serde_json::Value::String(hit.agent.clone())),
         "workspace" => Some(serde_json::Value::String(hit.workspace.clone())),
         "source_path" => Some(serde_json::Value::String(hit.source_path.clone())),
@@ -6196,9 +6707,17 @@ fn filter_hit_fields(
     hit: &crate::search::query::SearchHit,
     fields: &Option<Vec<String>>,
 ) -> serde_json::Value {
+    // Sanitize NaN/Infinity score before serialization — serde_json rejects non-finite floats.
+    let sanitize = |h: &crate::search::query::SearchHit| -> serde_json::Value {
+        let mut h = h.clone();
+        if !h.score.is_finite() {
+            h.score = 0.0;
+        }
+        serde_json::to_value(&h).unwrap_or_default()
+    };
     match fields {
-        None => serde_json::to_value(hit).unwrap_or_default(), // No filtering
-        Some(field_list) if field_list.is_empty() => serde_json::to_value(hit).unwrap_or_default(), // "all" or "*" preset
+        None => sanitize(hit),
+        Some(field_list) if field_list.is_empty() => sanitize(hit),
         Some(field_list) => {
             let mut filtered = serde_json::Map::new();
             let known_fields = [
@@ -6216,6 +6735,7 @@ fn filter_hit_fields(
                 "source_id",
                 "origin_kind",
                 "origin_host",
+                "workspace_original",
             ];
 
             for field in field_list {
@@ -6500,8 +7020,8 @@ fn output_robot_results(
                 map.serialize_entry("line_number", &hit.line_number)?;
                 map.serialize_entry("agent", &hit.agent)?;
                 map.serialize_entry("title", &hit.title)?;
-                // Preserve existing score rendering behavior from serde_json::Value path.
-                map.serialize_entry("score", &(hit.score as f64))?;
+                let safe_score = safe_robot_score_value(hit.score);
+                map.serialize_entry("score", &safe_score)?;
                 map.end()
             }
         }
@@ -6609,7 +7129,8 @@ fn output_robot_results(
                 map.serialize_entry("title", &hit.title)?;
                 map.serialize_entry("snippet", &hit.snippet)?;
                 map.serialize_entry("content", &hit.content)?;
-                map.serialize_entry("score", &(hit.score as f64))?;
+                let safe_score = safe_robot_score_value(hit.score);
+                map.serialize_entry("score", &safe_score)?;
                 map.serialize_entry("source_path", &hit.source_path)?;
                 map.serialize_entry("agent", &hit.agent)?;
                 map.serialize_entry("workspace", &hit.workspace)?;
@@ -6729,15 +7250,25 @@ fn output_robot_results(
                     "title".to_string(),
                     serde_json::Value::String(hit.title.clone()),
                 );
-                map.insert(
-                    "score".to_string(),
-                    serde_json::to_value(hit.score).unwrap_or_default(),
-                );
+                map.insert("score".to_string(), safe_robot_score_value(hit.score));
                 serde_json::Value::Object(map)
             })
             .collect()
     } else if passthrough_all_fields && !needs_truncation {
-        match serde_json::to_value(&result.hits).unwrap_or_default() {
+        // Sanitize NaN/Infinity scores before bulk serialization — serde_json
+        // cannot represent non-finite floats, which would silently drop all hits.
+        let sanitized: Vec<_> = result
+            .hits
+            .iter()
+            .map(|hit| {
+                let mut h = hit.clone();
+                if !h.score.is_finite() {
+                    h.score = 0.0;
+                }
+                h
+            })
+            .collect();
+        match serde_json::to_value(&sanitized).unwrap_or_default() {
             serde_json::Value::Array(values) => values,
             _ => Vec::new(),
         }
@@ -7285,8 +7816,14 @@ fn run_stats(
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
 
-    let lazy = crate::storage::sqlite::LazyDb::from_overrides(data_dir_override, db_override);
-    let conn = lazy.get("stats").map_err(lazy_db_to_cli_error)?;
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+
+    let lazy =
+        crate::storage::sqlite::LazyFrankenDb::from_overrides(data_dir_override, db_override);
+    // Fix #128: Use timeout to prevent hanging on degraded databases.
+    let conn = lazy
+        .get_with_timeout("stats", Duration::from_secs(30))
+        .map_err(lazy_db_to_cli_error)?;
 
     // Parse source filter (P3.7)
     let source_filter = source.map(SourceFilter::parse);
@@ -7301,88 +7838,53 @@ fn run_stats(
         }
     };
 
-    // Get counts and statistics with source filter
-    let conversation_count: i64 = if let Some(ref param) = source_param {
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM conversations c{source_where}"),
-            [param],
-            |r| r.get(0),
-        )
-    } else {
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM conversations c{source_where}"),
-            [],
-            |r| r.get(0),
-        )
-    }
-    .unwrap_or(0);
+    // Helper: build params slice from optional source param
+    let make_params = |param: &Option<String>| -> Vec<ParamValue> {
+        match param {
+            Some(p) => vec![ParamValue::from(p.as_str())],
+            None => vec![],
+        }
+    };
 
-    let message_count: i64 = if let Some(ref param) = source_param {
-        conn.query_row(
+    // Get counts and statistics with source filter
+    let params = make_params(&source_param);
+    let conversation_count: i64 = conn
+        .query_row_map(
+            &format!("SELECT COUNT(*) FROM conversations c{source_where}"),
+            &params,
+            |r| r.get_typed(0),
+        )
+        .unwrap_or(0);
+
+    let message_count: i64 = conn
+        .query_row_map(
             &format!(
                 "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id{source_where}"
             ),
-            [param],
-            |r| r.get(0),
+            &params,
+            |r| r.get_typed(0),
         )
-    } else {
-        conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id{source_where}"
-            ),
-            [],
-            |r| r.get(0),
-        )
-    }
-    .unwrap_or(0);
+        .unwrap_or(0);
 
     // Get per-agent breakdown with source filter
     let agent_sql = format!(
         "SELECT a.slug, COUNT(*) FROM conversations c JOIN agents a ON c.agent_id = a.id{source_where} GROUP BY a.slug ORDER BY COUNT(*) DESC"
     );
-    let agent_rows: Vec<(String, i64)> = if let Some(ref param) = source_param {
-        let mut stmt = conn
-            .prepare(&agent_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([param], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    let agent_rows: Vec<(String, i64)> = conn
+        .query_map_collect(&agent_sql, &params, |r| {
+            Ok((r.get_typed::<String>(0)?, r.get_typed::<i64>(1)?))
         })
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .collect()
-    } else {
-        let mut stmt = conn
-            .prepare(&agent_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-            .map_err(|e| CliError::unknown(format!("query: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .collect()
-    };
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?;
 
     // Get workspace breakdown with source filter (top 10)
     let ws_sql = format!(
         "SELECT w.path, COUNT(*) FROM conversations c JOIN workspaces w ON c.workspace_id = w.id{source_where} GROUP BY w.path ORDER BY COUNT(*) DESC LIMIT 10"
     );
-    let ws_rows: Vec<(String, i64)> = if let Some(ref param) = source_param {
-        let mut stmt = conn
-            .prepare(&ws_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([param], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    let ws_rows: Vec<(String, i64)> = conn
+        .query_map_collect(&ws_sql, &params, |r| {
+            Ok((r.get_typed::<String>(0)?, r.get_typed::<i64>(1)?))
         })
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .collect()
-    } else {
-        let mut stmt = conn
-            .prepare(&ws_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-            .map_err(|e| CliError::unknown(format!("query: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .collect()
-    };
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?;
 
     // Get date range with source filter.
     // Note: source_where already includes a leading " WHERE ...", so when it is present we must
@@ -7395,13 +7897,11 @@ fn run_stats(
             "SELECT MIN(started_at), MAX(started_at) FROM conversations c{source_where} AND started_at IS NOT NULL"
         )
     };
-    let (oldest, newest): (Option<i64>, Option<i64>) = if let Some(ref param) = source_param {
-        conn.query_row(&date_sql, [param], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap_or((None, None))
-    } else {
-        conn.query_row(&date_sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap_or((None, None))
-    };
+    let (oldest, newest): (Option<i64>, Option<i64>) = conn
+        .query_row_map(&date_sql, &params, |r| {
+            Ok((r.get_typed(0)?, r.get_typed(1)?))
+        })
+        .unwrap_or((None, None));
 
     // Get per-source breakdown if requested (P3.7)
     let source_rows: Vec<(String, i64, i64)> = if by_source {
@@ -7413,32 +7913,14 @@ fn run_stats(
              GROUP BY c.source_id
              ORDER BY convs DESC"
         );
-        let mut stmt = conn
-            .prepare(&source_sql)
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        if let Some(ref param) = source_param {
-            stmt.query_map([param], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|e| CliError::unknown(format!("query: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .collect()
-        } else {
-            stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|e| CliError::unknown(format!("query: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .collect()
-        }
+        conn.query_map_collect(&source_sql, &params, |r| {
+            Ok((
+                r.get_typed::<String>(0)?,
+                r.get_typed::<i64>(1)?,
+                r.get_typed::<i64>(2)?,
+            ))
+        })
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?
     } else {
         Vec::new()
     };
@@ -7553,7 +8035,9 @@ fn run_diag(
     json: bool,
     verbose: bool,
 ) -> CliResult<()> {
-    use rusqlite::Connection;
+    use frankensqlite::Connection;
+    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use frankensqlite::params;
     use std::fs;
 
     let version = env!("CARGO_PKG_VERSION");
@@ -7566,16 +8050,24 @@ fn run_diag(
     // Check database existence and get stats
     let (db_exists, db_size, conversation_count, message_count) = if db_path.exists() {
         let size = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-        let (convs, msgs) = if let Ok(conn) = Connection::open(&db_path) {
-            let convs: i64 = conn
-                .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-                .unwrap_or(0);
-            let msgs: i64 = conn
-                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
-                .unwrap_or(0);
-            (convs, msgs)
-        } else {
-            (0, 0)
+        let (convs, msgs) = match Connection::open(db_path.to_string_lossy().into_owned()) {
+            Ok(conn) => {
+                let convs: i64 = conn
+                    .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
+                        r.get_typed(0)
+                    })
+                    .unwrap_or(0);
+                let msgs: i64 = conn
+                    .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
+                        r.get_typed(0)
+                    })
+                    .unwrap_or(0);
+                (convs, msgs)
+            }
+            Err(e) => {
+                tracing::warn!("failed to open database for diagnostics: {e}");
+                (-1, -1)
+            }
         };
         (true, size, convs, msgs)
     } else {
@@ -7833,78 +8325,87 @@ fn run_status(
     stale_threshold: u64,
     _robot_meta: bool,
 ) -> CliResult<()> {
-    use rusqlite::Connection;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    // Use the actual versioned index path (index/v4, not tantivy_index)
-    let index_path = crate::search::tantivy::index_dir(&data_dir)
-        .unwrap_or_else(|_| data_dir.join("index").join("v4"));
-    let watch_state_path = data_dir.join("watch_state.json");
+    let state = state_meta_json(&data_dir, &db_path, stale_threshold, true);
 
-    // Check if database exists
-    let db_exists = db_path.exists();
-    let index_exists = index_path.exists();
-
-    // Get current timestamp
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+    let index_exists = state
+        .get("index")
+        .and_then(|i| i.get("exists"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let index_fresh = state
+        .get("index")
+        .and_then(|i| i.get("fresh"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let index_age_secs = state
+        .get("index")
+        .and_then(|i| i.get("age_seconds"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let is_stale = state
+        .get("index")
+        .and_then(|i| i.get("stale"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let rebuild_active = state
+        .get("rebuild")
+        .and_then(|r| r.get("active"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let rebuild_processed = state
+        .get("rebuild")
+        .and_then(|r| r.get("processed_conversations"))
+        .and_then(|v| v.as_u64());
+    let rebuild_total = state
+        .get("rebuild")
+        .and_then(|r| r.get("total_conversations"))
+        .and_then(|v| v.as_u64());
+    let db_exists = state
+        .get("database")
+        .and_then(|d| d.get("exists"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let db_opened = state
+        .get("database")
+        .and_then(|d| d.get("opened"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let db_open_error = state
+        .get("database")
+        .and_then(|d| d.get("open_error"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let counts_skipped = state
+        .get("database")
+        .and_then(|d| d.get("counts_skipped"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let pending_sessions = state
+        .get("pending")
+        .and_then(|p| p.get("sessions"))
+        .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    // Default values if db doesn't exist
-    let mut conversation_count: i64 = 0;
-    let mut message_count: i64 = 0;
-    let mut last_indexed_at: Option<i64> = None;
-
-    if db_exists && let Ok(conn) = Connection::open(&db_path) {
-        // Get counts
-        conversation_count = conn
-            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-            .unwrap_or(0);
-        message_count = conn
-            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
-            .unwrap_or(0);
-
-        // Get last indexed timestamp from meta table
-        last_indexed_at = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'last_indexed_at'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok());
-    }
-
-    // Calculate index age and staleness
-    let index_age_secs = last_indexed_at.map(|ts| {
-        let ts_secs = ts / 1000; // Convert millis to secs
-        now_secs.saturating_sub(ts_secs.max(0) as u64)
-    });
-    let is_stale = match index_age_secs {
-        None => true,
-        Some(age) => age > stale_threshold,
-    };
-
-    // Check for pending sessions from watch_state.json
-    let pending_sessions = if watch_state_path.exists() {
-        std::fs::read_to_string(&watch_state_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|v| v.get("pending_count").and_then(serde_json::Value::as_u64))
-            .unwrap_or(0)
+    let healthy = db_exists && db_opened && index_exists && index_fresh && !rebuild_active;
+    let status = if rebuild_active {
+        "rebuilding"
+    } else if healthy {
+        "healthy"
+    } else if db_exists && !db_opened {
+        "degraded"
     } else {
-        0
+        "unhealthy"
     };
-
-    // Determine overall health
-    let healthy = db_exists && index_exists && !is_stale;
 
     // Build recommended action
-    let recommended_action = if !db_exists {
+    let recommended_action = if rebuild_active {
+        Some("Index rebuild is already in progress".to_string())
+    } else if !db_exists {
         Some("Run 'cass index --full' to create the database".to_string())
+    } else if !db_opened {
+        Some("Run 'cass doctor --fix' or 'cass index --full' to recover the database".to_string())
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
     } else if is_stale || pending_sessions > 0 {
@@ -7934,45 +8435,37 @@ fn run_status(
     });
 
     if let Some(fmt) = structured_format {
-        let ts_str = chrono::DateTime::from_timestamp(now_secs as i64, 0)
-            .unwrap_or_else(chrono::Utc::now)
-            .to_rfc3339();
         let payload = serde_json::json!({
+            "status": status,
             "healthy": healthy,
-            "index": {
-                "exists": index_exists,
-                "fresh": !is_stale,
-                "last_indexed_at": last_indexed_at.map(|ts| {
-                    chrono::DateTime::from_timestamp_millis(ts)
-                        .map(|d| d.to_rfc3339())
-                }),
-                "age_seconds": index_age_secs,
-                "stale": is_stale,
-                "stale_threshold_seconds": stale_threshold,
-            },
-            "database": {
+            "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
+            "database": serde_json::json!({
                 "exists": db_exists,
-                "conversations": conversation_count,
-                "messages": message_count,
+                "opened": db_opened,
+                "conversations": state.get("database").and_then(|d| d.get("conversations")).cloned().unwrap_or(serde_json::Value::Null),
+                "messages": state.get("database").and_then(|d| d.get("messages")).cloned().unwrap_or(serde_json::Value::Null),
                 "path": db_path.display().to_string(),
-            },
-            "pending": {
-                "sessions": pending_sessions,
-                "watch_active": watch_state_path.exists(),
-            },
+                "open_error": db_open_error,
+                "counts_skipped": counts_skipped,
+            }),
+            "pending": state.get("pending").cloned().unwrap_or(serde_json::Value::Null),
+            "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
             "recommended_action": recommended_action,
-            "_meta": {
-                "timestamp": ts_str,
-                "data_dir": data_dir.display().to_string(),
-                "db_path": db_path.display().to_string(),
-            },
+            "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
         });
         return output_structured_value(payload, fmt);
     }
 
-    // Human-readable output
-    let status_icon = if healthy { "✓" } else { "!" };
-    let status_word = if healthy {
+    let status_icon = if healthy {
+        "✓"
+    } else if rebuild_active {
+        "~"
+    } else {
+        "!"
+    };
+    let status_word = if rebuild_active {
+        "Rebuilding"
+    } else if healthy {
         "Healthy"
     } else {
         "Attention needed"
@@ -7984,7 +8477,7 @@ fn run_status(
     // Index info
     println!("Index:");
     if index_exists {
-        if let Some(age) = index_age_secs {
+        if let Some(age) = index_age_secs.as_u64() {
             let age_str = if age < 60 {
                 format!("{age} seconds ago")
             } else if age < 3600 {
@@ -7999,6 +8492,14 @@ fn run_status(
         } else {
             println!("  Last indexed: unknown");
         }
+        if rebuild_active {
+            match (rebuild_processed, rebuild_total) {
+                (Some(processed), Some(total)) => {
+                    println!("  Rebuild progress: {processed}/{total} conversations committed");
+                }
+                _ => println!("  Rebuild progress: in progress"),
+            }
+        }
     } else {
         println!("  Not found - run 'cass index --full'");
     }
@@ -8007,8 +8508,31 @@ fn run_status(
     println!();
     println!("Database:");
     if db_exists {
-        println!("  Conversations: {conversation_count}");
-        println!("  Messages: {message_count}");
+        if db_opened {
+            if counts_skipped {
+                println!("  Counts skipped for fast status on large database");
+            } else {
+                if let Some(conversations) = state
+                    .get("database")
+                    .and_then(|d| d.get("conversations"))
+                    .and_then(|v| v.as_i64())
+                {
+                    println!("  Conversations: {conversations}");
+                }
+                if let Some(messages) = state
+                    .get("database")
+                    .and_then(|d| d.get("messages"))
+                    .and_then(|v| v.as_i64())
+                {
+                    println!("  Messages: {messages}");
+                }
+            }
+        } else {
+            println!("  Exists, but could not be opened");
+            if let Some(err) = &db_open_error {
+                println!("  Error: {err}");
+            }
+        }
     } else {
         println!("  Not found");
     }
@@ -8030,6 +8554,9 @@ fn run_status(
 
 /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
 /// Designed for agent pre-flight checks before complex operations.
+///
+/// Invariant: when --json is requested, this function ALWAYS emits valid JSON
+/// to stdout before returning, even if the database is corrupt or WAL-damaged.
 fn run_health(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
@@ -8042,7 +8569,7 @@ fn run_health(
     let start = Instant::now();
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let state = state_meta_json(&data_dir, &db_path, stale_threshold, false);
+    let state = state_meta_json(&data_dir, &db_path, stale_threshold, true);
 
     let index_exists = state
         .get("index")
@@ -8054,20 +8581,65 @@ fn run_health(
         .and_then(|i| i.get("fresh"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let rebuild_active = state
+        .get("rebuild")
+        .and_then(|r| r.get("active"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let db_exists = state
         .get("database")
         .and_then(|d| d.get("exists"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let db_opened = state
+        .get("database")
+        .and_then(|d| d.get("opened"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // Extract any DB open error (e.g. WAL corruption) captured by state_meta_json.
+    let db_open_error: Option<String> = state
+        .get("database")
+        .and_then(|d| d.get("open_error"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let pending_sessions = state
         .get("pending")
         .and_then(|p| p.get("sessions"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    // Core operational health: can the tool be used at all?
-    // Freshness and pending sessions are informational (reported in state) but don't prevent searching
-    let healthy = db_exists && index_exists;
+    let db_degraded = db_exists && !db_opened;
+    let healthy = db_exists && db_opened && index_exists && index_fresh && !rebuild_active;
+
+    // Collect structured errors for the JSON response.
+    let mut errors: Vec<String> = Vec::new();
+    if let Some(ref err) = db_open_error {
+        errors.push(err.clone());
+    }
+    if !db_exists {
+        errors.push("database not found".to_string());
+    }
+    if !index_exists {
+        errors.push("index not found".to_string());
+    }
+    if !index_fresh {
+        errors.push("index stale".to_string());
+    }
+    if rebuild_active {
+        errors.push("index rebuild in progress".to_string());
+    }
+
+    // Determine status string for structured output.
+    let status = if rebuild_active {
+        "rebuilding"
+    } else if healthy {
+        "healthy"
+    } else if db_degraded {
+        "degraded"
+    } else {
+        "unhealthy"
+    };
+
     let latency_ms = start.elapsed().as_millis() as u64;
 
     let structured_format = if json {
@@ -8084,21 +8656,42 @@ fn run_health(
     });
 
     if let Some(fmt) = structured_format {
+        // Always emit valid JSON — even on WAL corruption or other DB errors.
+        // This is the core invariant for --json mode.
         let payload = serde_json::json!({
+            "status": status,
             "healthy": healthy,
+            "errors": errors,
             "latency_ms": latency_ms,
+            "db": {
+                "exists": db_exists,
+                "opened": db_opened,
+                "conversations": state.get("database").and_then(|d| d.get("conversations")).cloned().unwrap_or(serde_json::Value::Null),
+                "messages": state.get("database").and_then(|d| d.get("messages")).cloned().unwrap_or(serde_json::Value::Null),
+                "open_error": db_open_error,
+                "counts_skipped": state
+                    .get("database")
+                    .and_then(|d| d.get("counts_skipped"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Bool(false))
+            },
             "state": state
         });
         output_structured_value(payload, fmt)?;
     } else if healthy {
         println!("✓ Healthy ({latency_ms}ms)");
-        // Show informational warnings even when healthy
-        if !index_fresh {
-            println!("  Note: index stale (older than {}s)", stale_threshold);
-        }
         if pending_sessions > 0 {
             println!("  Note: {pending_sessions} sessions pending reindex");
         }
+    } else if rebuild_active {
+        println!("~ Rebuilding ({latency_ms}ms)");
+        println!("  - index rebuild is in progress");
+    } else if db_degraded {
+        println!("⚠ Degraded ({latency_ms}ms) - database exists but could not be opened");
+        for err in &errors {
+            println!("  - {err}");
+        }
+        println!("Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.");
     } else {
         println!("✗ Unhealthy ({latency_ms}ms)");
         if !db_exists {
@@ -8112,6 +8705,29 @@ fn run_health(
 
     if healthy {
         Ok(())
+    } else if rebuild_active {
+        Err(CliError {
+            code: 1,
+            kind: "health",
+            message: "Index rebuild is still in progress".to_string(),
+            hint: Some("Wait for the active 'cass index' run to finish.".to_string()),
+            retryable: true,
+        })
+    } else if db_degraded {
+        Err(CliError {
+            code: 1,
+            kind: "health",
+            message: format!(
+                "Database degraded: {}",
+                db_open_error
+                    .as_deref()
+                    .unwrap_or("could not open database")
+            ),
+            hint: Some(
+                "Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.".to_string(),
+            ),
+            retryable: false,
+        })
     } else {
         Err(CliError {
             code: 1,
@@ -8168,154 +8784,15 @@ fn rebuild_tantivy_from_db(
     total_conversations: usize,
     progress: Option<std::sync::Arc<indexer::IndexingProgress>>,
 ) -> CliResult<usize> {
-    use crate::connectors::{NormalizedConversation, NormalizedMessage};
-    use crate::model::types::MessageRole;
-    use crate::search::tantivy::TantivyIndex;
-    use crate::sources::provenance::{LOCAL_SOURCE_ID, SourceKind};
-    use crate::storage::sqlite::SqliteStorage;
-    use std::collections::HashMap;
-    use std::sync::atomic::Ordering;
-
-    let storage = SqliteStorage::open_readonly(db_path).map_err(|e| CliError {
-        code: 5,
-        kind: "doctor",
-        message: format!("failed to open database for rebuild: {e}"),
-        hint: None,
-        retryable: true,
-    })?;
-
-    let sources = storage.list_sources().unwrap_or_default();
-    let mut source_map: HashMap<String, (SourceKind, Option<String>)> = HashMap::new();
-    for source in sources {
-        source_map.insert(source.id, (source.kind, source.host_label));
-    }
-
-    let index_path = crate::search::tantivy::index_dir(data_dir).map_err(|e| CliError {
-        code: 5,
-        kind: "doctor",
-        message: format!("failed to resolve index path: {e}"),
-        hint: None,
-        retryable: true,
-    })?;
-
-    let _ = std::fs::remove_dir_all(&index_path);
-    std::fs::create_dir_all(&index_path).map_err(|e| CliError {
-        code: 5,
-        kind: "doctor",
-        message: format!("failed to create index directory: {e}"),
-        hint: None,
-        retryable: true,
-    })?;
-
-    let mut t_index = TantivyIndex::open_or_create(&index_path).map_err(|e| CliError {
-        code: 5,
-        kind: "doctor",
-        message: format!("failed to create tantivy index: {e}"),
-        hint: None,
-        retryable: true,
-    })?;
-
-    if let Some(p) = &progress {
-        p.phase.store(2, Ordering::Relaxed);
-        p.is_rebuilding.store(true, Ordering::Relaxed);
-        p.total.store(total_conversations, Ordering::Relaxed);
-        p.current.store(0, Ordering::Relaxed);
-        p.discovered_agents.store(0, Ordering::Relaxed);
-    }
-
-    let page_size: i64 = 200;
-    let mut offset: i64 = 0;
-    let mut indexed_docs: usize = 0;
-
-    loop {
-        let batch = storage
-            .list_conversations(page_size, offset)
-            .map_err(|e| CliError::unknown(format!("failed to list conversations: {e}")))?;
-        if batch.is_empty() {
-            break;
-        }
-
-        for conv in batch {
-            let Some(conv_id) = conv.id else {
-                continue;
-            };
-
-            let messages = storage
-                .fetch_messages(conv_id)
-                .map_err(|e| CliError::unknown(format!("failed to fetch messages: {e}")))?;
-
-            let mut metadata = conv.metadata_json.clone();
-            let (kind, host_label) =
-                source_map.get(&conv.source_id).cloned().unwrap_or_else(|| {
-                    let fallback_kind = if conv.source_id == LOCAL_SOURCE_ID {
-                        SourceKind::Local
-                    } else {
-                        SourceKind::Ssh
-                    };
-                    (fallback_kind, None)
-                });
-
-            let host = conv.origin_host.as_deref().or(host_label.as_deref());
-            ensure_cass_origin(&mut metadata, &conv.source_id, kind, host);
-
-            let normalized_messages: Vec<NormalizedMessage> = messages
-                .into_iter()
-                .map(|msg| {
-                    let role = match msg.role {
-                        MessageRole::User => "user".to_string(),
-                        MessageRole::Agent => "assistant".to_string(),
-                        MessageRole::Tool => "tool".to_string(),
-                        MessageRole::System => "system".to_string(),
-                        MessageRole::Other(other) => other,
-                    };
-
-                    NormalizedMessage {
-                        idx: msg.idx,
-                        role,
-                        author: msg.author,
-                        created_at: msg.created_at,
-                        content: msg.content,
-                        extra: msg.extra_json,
-                        snippets: Vec::new(),
-                    }
-                })
-                .collect();
-
-            let normalized = NormalizedConversation {
-                agent_slug: conv.agent_slug,
-                external_id: conv.external_id,
-                title: conv.title,
-                workspace: conv.workspace,
-                source_path: conv.source_path,
-                started_at: conv.started_at,
-                ended_at: conv.ended_at,
-                metadata,
-                messages: normalized_messages,
-            };
-
-            indexed_docs += normalized.messages.len();
-            t_index
-                .add_messages(&normalized, &normalized.messages)
-                .map_err(|e| CliError::unknown(format!("failed to index messages: {e}")))?;
-
-            if let Some(p) = &progress {
-                p.current.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        offset += page_size;
-    }
-
-    t_index
-        .commit()
-        .map_err(|e| CliError::unknown(format!("failed to commit index: {e}")))?;
-
-    if let Some(p) = &progress {
-        p.phase.store(0, Ordering::Relaxed);
-        p.is_rebuilding.store(false, Ordering::Relaxed);
-    }
-
-    Ok(indexed_docs)
+    indexer::rebuild_tantivy_from_db(db_path, data_dir, total_conversations, progress).map_err(
+        |e| CliError {
+            code: 5,
+            kind: "doctor",
+            message: format!("failed to rebuild Tantivy index from database: {e}"),
+            hint: None,
+            retryable: true,
+        },
+    )
 }
 
 fn wait_with_progress<T>(
@@ -8327,6 +8804,8 @@ fn wait_with_progress<T>(
 ) -> CliResult<T> {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
+
+    let mut progress_completion: Option<(indicatif::ProgressBar, usize, usize)> = None;
 
     if show_progress {
         use indicatif::{ProgressBar, ProgressStyle};
@@ -8430,11 +8909,7 @@ fn wait_with_progress<T>(
         let total = progress.total.load(Ordering::Relaxed);
         let current = progress.current.load(Ordering::Relaxed);
         let agents = progress.discovered_agents.load(Ordering::Relaxed);
-        pb.finish_with_message(format!(
-            "Done: {} conversations from {} agent(s)",
-            current.max(total),
-            agents
-        ));
+        progress_completion = Some((pb, current.max(total), agents));
     } else if show_plain {
         eprintln!("Starting index...");
         let mut last_phase = usize::MAX;
@@ -8492,13 +8967,373 @@ fn wait_with_progress<T>(
         }
     }
 
-    handle.join().map_err(|_| CliError {
-        code: 9,
-        kind: "doctor",
-        message: "doctor worker thread panicked".to_string(),
-        hint: None,
-        retryable: true,
-    })?
+    let result = match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(CliError {
+            code: 9,
+            kind: "doctor",
+            message: "doctor worker thread panicked".to_string(),
+            hint: None,
+            retryable: true,
+        }),
+    };
+
+    if let Some((pb, conversations, agents)) = progress_completion {
+        match &result {
+            Ok(_) => pb.finish_with_message(format!(
+                "Done: {} conversations from {} agent(s)",
+                conversations, agents
+            )),
+            Err(err) => pb.abandon_with_message(format!("Failed: {}", err)),
+        }
+    }
+
+    result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoctorFtsTableState {
+    QueryableViaFrankensqlite,
+    QueryableViaRusqlite,
+    Missing {
+        frankensqlite_error: String,
+        rusqlite_error: String,
+    },
+}
+
+fn probe_doctor_fts_table(
+    conn: &crate::storage::sqlite::SendFrankenConnection,
+    db_path: &std::path::Path,
+) -> DoctorFtsTableState {
+    match conn.query("SELECT rowid FROM fts_messages LIMIT 1;") {
+        Ok(_) => DoctorFtsTableState::QueryableViaFrankensqlite,
+        Err(frankensqlite_error) => {
+            match rusqlite::Connection::open_with_flags(
+                db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .and_then(|conn| {
+                conn.busy_timeout(std::time::Duration::from_secs(5))?;
+                conn.prepare("SELECT rowid FROM fts_messages LIMIT 1")
+                    .and_then(|mut stmt| stmt.exists([]))
+                    .map(|_| ())
+            }) {
+                Ok(()) => DoctorFtsTableState::QueryableViaRusqlite,
+                Err(rusqlite_error) => DoctorFtsTableState::Missing {
+                    frankensqlite_error: frankensqlite_error.to_string(),
+                    rusqlite_error: rusqlite_error.to_string(),
+                },
+            }
+        }
+    }
+}
+
+fn recreate_fts_table_via_rusqlite(
+    db_path: &std::path::Path,
+) -> std::result::Result<usize, String> {
+    crate::storage::sqlite::rebuild_fts_via_rusqlite(db_path).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod doctor_fts_tests {
+    use super::*;
+
+    fn create_search_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );",
+        )
+    }
+
+    #[test]
+    fn doctor_fts_probe_accepts_legacy_sqlite_fts_table() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::TempDir::new()?;
+        let db_path = temp_dir.path().join("legacy-fts.db");
+
+        let conn = rusqlite::Connection::open(&db_path)?;
+        create_search_schema(&conn)?;
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                message_id UNINDEXED,
+                tokenize='porter'
+             );",
+        )?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", [])?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')", [])?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+             VALUES(1, 1, 1, 'local', NULL, 'retro', '/tmp/retro.jsonl')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(7, 1, 0, 'retro investigation', 42)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                7_i64,
+                "retro investigation",
+                "retro",
+                "codex",
+                "/ws",
+                "/tmp/retro.jsonl",
+                42_i64,
+                "7"
+            ],
+        )?;
+        drop(conn);
+
+        let franken = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        let state = probe_doctor_fts_table(
+            &crate::storage::sqlite::SendFrankenConnection::new(franken),
+            &db_path,
+        );
+        assert!(
+            matches!(
+                state,
+                DoctorFtsTableState::QueryableViaFrankensqlite
+                    | DoctorFtsTableState::QueryableViaRusqlite
+            ),
+            "legacy sqlite FTS table should be accepted by doctor: {state:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn recreate_fts_table_via_rusqlite_rebuilds_missing_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let db_path = temp_dir.path().join("missing-fts.db");
+
+        let conn = rusqlite::Connection::open(&db_path)?;
+        create_search_schema(&conn)?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", [])?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')", [])?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+             VALUES(1, 1, 1, 'local', NULL, 'retro', '/tmp/retro.jsonl')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(7, 1, 0, 'retro investigation', 42)",
+            [],
+        )?;
+        drop(conn);
+
+        let inserted = recreate_fts_table_via_rusqlite(&db_path).map_err(std::io::Error::other)?;
+        assert_eq!(inserted, 1, "repair should repopulate one FTS row");
+
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let match_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'retro'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(match_count, 1, "recreated FTS table should be searchable");
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='fts_messages'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            sql.contains("content=''"),
+            "repair should recreate the contentless FTS schema"
+        );
+        drop(conn);
+
+        let franken = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        let state = probe_doctor_fts_table(
+            &crate::storage::sqlite::SendFrankenConnection::new(franken),
+            &db_path,
+        );
+        assert!(
+            matches!(
+                state,
+                DoctorFtsTableState::QueryableViaFrankensqlite
+                    | DoctorFtsTableState::QueryableViaRusqlite
+            ),
+            "repair should leave the FTS table queryable: {state:?}"
+        );
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cli_read_db_tests {
+    use super::*;
+    use crate::storage::sqlite::FrankenStorage;
+    use fs2::FileExt;
+    use tempfile::TempDir;
+
+    fn seed_cli_db() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open cass db");
+        storage
+            .set_last_indexed_at(1_733_000_000_000)
+            .expect("set last_indexed_at");
+        drop(storage);
+        (temp, db_path)
+    }
+
+    #[test]
+    fn analytics_db_open_is_readonly() {
+        let (temp, _db_path) = seed_cli_db();
+        let data_dir = Some(temp.path().to_path_buf());
+        let conn = open_franken_analytics_db(&data_dir, None).expect("open readonly analytics db");
+
+        let err = conn
+            .execute("CREATE TABLE cli_readonly_probe(id INTEGER PRIMARY KEY);")
+            .expect_err("analytics reader must not accept writes");
+        let message = err.to_string().to_lowercase();
+        assert!(
+            message.contains("readonly") || message.contains("query_only"),
+            "unexpected readonly failure surface: {message}"
+        );
+    }
+
+    #[test]
+    fn probe_state_db_reads_meta_without_count_scan() {
+        let (_temp, db_path) = seed_cli_db();
+        let snapshot = probe_state_db(&db_path, "status", Duration::from_millis(250), false);
+
+        assert!(snapshot.opened, "state probe should open the database");
+        assert_eq!(snapshot.last_indexed_at, Some(1_733_000_000_000));
+        assert!(snapshot.counts_skipped, "count scan should remain disabled");
+        assert_eq!(snapshot.conversation_count, 0);
+        assert_eq!(snapshot.message_count, 0);
+        assert!(
+            snapshot.open_error.is_none(),
+            "state probe should not report an error: {:?}",
+            snapshot.open_error
+        );
+    }
+
+    #[test]
+    fn state_meta_json_reports_active_rebuild() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(".lexical-rebuild-state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "db": {
+                    "db_path": db_path.display().to_string(),
+                    "total_conversations": 10,
+                    "storage_fingerprint": "10:42:0:0"
+                },
+                "page_size": 200,
+                "committed_offset": 4,
+                "processed_conversations": 4,
+                "indexed_docs": 20,
+                "committed_meta_fingerprint": null,
+                "pending": null,
+                "completed": false,
+                "updated_at_ms": 1_733_000_123_000_i64
+            }))
+            .expect("serialize rebuild state"),
+        )
+        .expect("write rebuild state");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}",
+            std::process::id(),
+            1_733_000_111_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
+        assert_eq!(
+            state["rebuild"]["processed_conversations"].as_u64(),
+            Some(4)
+        );
+        assert_eq!(state["rebuild"]["total_conversations"].as_u64(), Some(10));
+    }
+
+    #[test]
+    fn state_meta_json_reports_active_rebuild_before_lexical_snapshot_exists() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}",
+            std::process::id(),
+            1_733_000_555_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
+        assert_eq!(
+            state["rebuild"]["pid"].as_u64(),
+            Some(std::process::id() as u64)
+        );
+        assert_eq!(
+            state["rebuild"]["processed_conversations"],
+            serde_json::Value::Null
+        );
+        assert!(state["rebuild"]["updated_at"].as_str().is_some());
+    }
 }
 
 /// Comprehensive diagnostic and repair tool for cass installation.
@@ -8580,7 +9415,7 @@ fn run_doctor(
                 false
             );
         }
-    } else {
+    } else if fix {
         if std::fs::create_dir_all(&data_dir).is_ok() {
             checks.push(Check {
                 name: "data_directory".to_string(),
@@ -8595,10 +9430,20 @@ fn run_doctor(
             add_check!(
                 "data_directory",
                 "fail",
-                format!("Data directory missing: {}", data_dir.display()),
+                format!("Cannot create data directory: {}", data_dir.display()),
                 true
             );
         }
+    } else {
+        add_check!(
+            "data_directory",
+            "fail",
+            format!(
+                "Data directory missing: {} (run with --fix to create)",
+                data_dir.display()
+            ),
+            true
+        );
     }
 
     // 2. Check for stale lock files
@@ -8610,21 +9455,30 @@ fn run_doctor(
             .unwrap_or(true);
 
         if is_stale {
-            if std::fs::remove_file(&lock_path).is_ok() {
-                checks.push(Check {
-                    name: "lock_file".to_string(),
-                    status: "pass".to_string(),
-                    message: "Stale lock file removed".to_string(),
-                    fix_available: true,
-                    fix_applied: true,
-                });
-                auto_fix_actions.push("Removed stale lock file".to_string());
-                auto_fix_applied = true;
+            if fix {
+                if std::fs::remove_file(&lock_path).is_ok() {
+                    checks.push(Check {
+                        name: "lock_file".to_string(),
+                        status: "pass".to_string(),
+                        message: "Stale lock file removed".to_string(),
+                        fix_available: true,
+                        fix_applied: true,
+                    });
+                    auto_fix_actions.push("Removed stale lock file".to_string());
+                    auto_fix_applied = true;
+                } else {
+                    add_check!(
+                        "lock_file",
+                        "warn",
+                        "Stale lock file found (older than 1 hour) and removal failed",
+                        true
+                    );
+                }
             } else {
                 add_check!(
                     "lock_file",
                     "warn",
-                    "Stale lock file found (older than 1 hour)",
+                    "Stale lock file found (older than 1 hour) - run with --fix to remove",
                     true
                 );
             }
@@ -8641,10 +9495,27 @@ fn run_doctor(
     }
 
     // 3. Check database exists and is readable
+    // Fix #128: Wrap the DB open in a timeout to prevent hanging on degraded databases.
     if db_path.exists() {
-        match frankensqlite::Connection::open(db_path.to_string_lossy().as_ref()) {
+        let db_open_result = {
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    frankensqlite::Connection::open(&db_path_str)
+                        .map(crate::storage::sqlite::SendFrankenConnection::new),
+                );
+            });
+            rx.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| {
+                Err(frankensqlite::FrankenError::internal(
+                    "database open timed out after 30s (possible corruption or lock contention)",
+                ))
+            })
+        };
+        match db_open_result {
             Ok(conn) => {
                 use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
+
                 let conv_count: Option<i64> = conn
                     .query_row_map(
                         "SELECT COUNT(*) FROM conversations",
@@ -8661,90 +9532,127 @@ fn run_doctor(
                     .ok();
 
                 if let (Some(conv_count), Some(msg_count)) = (conv_count, msg_count) {
-                    db_ok = true;
                     db_conversations = Some(conv_count.max(0) as usize);
                     db_messages = Some(msg_count.max(0) as usize);
-                    add_check!(
-                        "database",
-                        "pass",
-                        format!(
-                            "Database OK ({} conversations, {} messages)",
-                            conv_count, msg_count
-                        ),
-                        false
-                    );
-
-                    // Check for FTS table (fts_messages) - this can be missing if table was
-                    // dropped after migrations completed
-                    let fts_exists = conn
-                        .query_row_map(
-                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fts_messages'",
-                            &[],
-                            |r: &frankensqlite::Row| r.get_typed::<i64>(0),
-                        )
-                        .unwrap_or(0)
-                        > 0;
-
-                    if fts_exists {
-                        add_check!(
-                            "fts_table",
-                            "pass",
-                            "FTS search table (fts_messages) exists",
-                            false
-                        );
-                    } else {
-                        // FTS table missing - attempt to recreate it if --fix is set
-                        if fix {
-                            use frankensqlite::compat::BatchExt as _;
-                            let create_result = conn.execute_batch(
-                                r#"
-                                CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
-                                    content,
-                                    title,
-                                    agent,
-                                    workspace,
-                                    source_path,
-                                    created_at UNINDEXED,
-                                    message_id UNINDEXED,
-                                    tokenize='porter'
-                                );
-                                INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-                                SELECT m.content, m.title, a.name, w.name, m.source_path, m.created_at, m.id
-                                FROM messages m
-                                LEFT JOIN agents a ON m.agent_id = a.id
-                                LEFT JOIN workspaces w ON m.workspace_id = w.id
-                                WHERE m.content IS NOT NULL;
-                                "#,
+                    match crate::storage::sqlite::probe_database_health_via_rusqlite(&db_path) {
+                        Ok(health) if health.quick_check_ok => {
+                            db_ok = true;
+                            add_check!(
+                                "database",
+                                "pass",
+                                format!(
+                                    "Database OK ({} conversations, {} messages)",
+                                    conv_count, msg_count
+                                ),
+                                false
                             );
-                            match create_result {
-                                Ok(_) => {
-                                    checks.push(Check {
-                                        name: "fts_table".to_string(),
-                                        status: "pass".to_string(),
-                                        message: "FTS search table (fts_messages) recreated"
-                                            .to_string(),
-                                        fix_available: true,
-                                        fix_applied: true,
-                                    });
-                                    auto_fix_actions
-                                        .push("Recreated missing FTS search table".to_string());
-                                    auto_fix_applied = true;
-                                }
-                                Err(e) => {
+
+                            // Check whether the FTS table is visible through
+                            // frankensqlite on this connection. Do not auto-register
+                            // it here: on migrated databases with legacy rootpage=0
+                            // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
+                            // can persist duplicate sqlite_master rows.
+                            match probe_doctor_fts_table(&conn, &db_path) {
+                                DoctorFtsTableState::QueryableViaFrankensqlite => {
                                     add_check!(
                                         "fts_table",
-                                        "fail",
-                                        format!("FTS table missing and recreation failed: {}", e),
-                                        true
+                                        "pass",
+                                        "FTS search table (fts_messages) is queryable via frankensqlite",
+                                        false
                                     );
-                                    needs_rebuild = true;
+                                }
+                                DoctorFtsTableState::QueryableViaRusqlite => {
+                                    add_check!(
+                                        "fts_table",
+                                        "pass",
+                                        "FTS search table (fts_messages) is queryable via the rusqlite fallback backend",
+                                        false
+                                    );
+                                }
+                                DoctorFtsTableState::Missing {
+                                    frankensqlite_error,
+                                    rusqlite_error,
+                                } => {
+                                    if fix {
+                                        match recreate_fts_table_via_rusqlite(&db_path) {
+                                            Ok(message_count) => {
+                                                match probe_doctor_fts_table(&conn, &db_path) {
+                                                    DoctorFtsTableState::QueryableViaFrankensqlite
+                                                    | DoctorFtsTableState::QueryableViaRusqlite => {
+                                                        checks.push(Check {
+                                                            name: "fts_table".to_string(),
+                                                            status: "pass".to_string(),
+                                                            message: format!(
+                                                                "Recreated FTS search table (fts_messages) and indexed {message_count} message(s) via rusqlite"
+                                                            ),
+                                                            fix_available: true,
+                                                            fix_applied: true,
+                                                        });
+                                                        auto_fix_actions.push(
+                                                            "Recreated missing FTS search table via rusqlite"
+                                                                .to_string(),
+                                                        );
+                                                        auto_fix_applied = true;
+                                                    }
+                                                    DoctorFtsTableState::Missing {
+                                                        frankensqlite_error,
+                                                        rusqlite_error,
+                                                    } => {
+                                                        checks.push(Check {
+                                                            name: "fts_table".to_string(),
+                                                            status: "fail".to_string(),
+                                                            message: format!(
+                                                                "Recreated FTS search table (fts_messages) via rusqlite, but it is still not queryable (frankensqlite: {frankensqlite_error}; rusqlite: {rusqlite_error})"
+                                                            ),
+                                                            fix_available: true,
+                                                            fix_applied: false,
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            Err(repair_error) => {
+                                                checks.push(Check {
+                                                    name: "fts_table".to_string(),
+                                                    status: "fail".to_string(),
+                                                    message: format!(
+                                                        "FTS search table (fts_messages) is missing on both doctor backends and recreation failed: {repair_error}"
+                                                    ),
+                                                    fix_available: true,
+                                                    fix_applied: false,
+                                                });
+                                            }
+                                        }
+                                    } else {
+                                        checks.push(Check {
+                                            name: "fts_table".to_string(),
+                                            status: "fail".to_string(),
+                                            message: format!(
+                                                "FTS search table (fts_messages) is missing on both doctor backends (frankensqlite: {frankensqlite_error}; rusqlite: {rusqlite_error}) - run with --fix to recreate the derived FTS table"
+                                            ),
+                                            fix_available: true,
+                                            fix_applied: false,
+                                        });
+                                    }
                                 }
                             }
-                        } else {
+                        }
+                        Ok(_health) => {
                             add_check!(
-                                "fts_table",
+                                "database",
                                 "fail",
-                                "FTS search table (fts_messages) missing - run with --fix to recreate",
+                                format!(
+                                    "Database failed SQLite quick_check ({} conversations, {} messages)",
+                                    conv_count, msg_count
+                                ),
+                                true
+                            );
+                            needs_rebuild = true;
+                        }
+                        Err(err) => {
+                            add_check!(
+                                "database",
+                                "fail",
+                                format!("Database health probe failed: {}", err),
                                 true
                             );
                             needs_rebuild = true;
@@ -8923,25 +9831,18 @@ fn run_doctor(
         );
     }
 
-    // Apply fix: rebuild index if needed
-    if needs_rebuild {
+    // Apply fix: rebuild index if needed (only when --fix is passed)
+    if needs_rebuild && fix {
         let stderr_is_tty = std::io::stderr().is_terminal();
         let show_progress = !json && stderr_is_tty;
         let show_plain = !json && !stderr_is_tty;
 
         if !json {
             println!();
-            if fix {
-                println!(
-                    "{} Rebuilding index (this may take a moment)...",
-                    "→".cyan()
-                );
-            } else {
-                println!(
-                    "{} Auto-repair: rebuilding index (this may take a moment)...",
-                    "→".cyan()
-                );
-            }
+            println!(
+                "{} Rebuilding index (this may take a moment)...",
+                "→".cyan()
+            );
         }
 
         let progress = std::sync::Arc::new(indexer::IndexingProgress::default());
@@ -9001,33 +9902,51 @@ fn run_doctor(
             // Preserve existing DB when possible; rebuild only derived data.
             let mut can_rebuild = true;
             let mut db_backup_done = false;
-            if db_path.exists() && !db_ok {
+            if !db_ok {
                 let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
                 let backup_path = db_path.with_extension(format!("corrupt.{ts}"));
-                match std::fs::rename(&db_path, &backup_path) {
-                    Ok(_) => {
+                match crate::storage::sqlite::move_database_bundle(&db_path, &backup_path) {
+                    Ok(moved) if moved.moved_any() => {
+                        let mut components = Vec::new();
+                        if moved.database {
+                            components.push("db");
+                        }
+                        if moved.wal {
+                            components.push("wal");
+                        }
+                        if moved.shm {
+                            components.push("shm");
+                        }
+                        let component_note = if components.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", components.join(", "))
+                        };
                         db_backup_done = true;
                         checks.push(Check {
                             name: "database_backup".to_string(),
                             status: "pass".to_string(),
                             message: format!(
-                                "Backed up corrupted database to {}",
-                                backup_path.display()
+                                "Backed up corrupted database bundle to {}{}",
+                                backup_path.display(),
+                                component_note
                             ),
                             fix_available: true,
                             fix_applied: true,
                         });
                         auto_fix_actions.push(format!(
-                            "Backed up corrupted database to {}",
-                            backup_path.display()
+                            "Backed up corrupted database bundle to {}{}",
+                            backup_path.display(),
+                            component_note
                         ));
                         auto_fix_applied = true;
                     }
+                    Ok(_) => {}
                     Err(e) => {
                         checks.push(Check {
                             name: "database_backup".to_string(),
                             status: "fail".to_string(),
-                            message: format!("Failed to backup corrupted database: {}", e),
+                            message: format!("Failed to backup corrupted database bundle: {}", e),
                             fix_available: true,
                             fix_applied: false,
                         });
@@ -9047,7 +9966,10 @@ fn run_doctor(
                 needs_rebuild = true;
             } else {
                 let index_opts = indexer::IndexOptions {
-                    full: false,
+                    // When the database is missing or corrupted, doctor must
+                    // rebuild from source sessions using the full path rather
+                    // than the incremental UPSERT-based path.
+                    full: force_rebuild || !db_ok,
                     force_rebuild,
                     watch: false,
                     watch_once_paths: None,
@@ -9057,6 +9979,7 @@ fn run_doctor(
                     build_hnsw: false,
                     embedder: "fastembed".to_string(),
                     progress: Some(progress.clone()),
+                    watch_interval_secs: 30,
                 };
 
                 let rebuild_handle = std::thread::spawn(move || {
@@ -9243,6 +10166,252 @@ fn run_doctor(
     }
 }
 
+#[derive(Debug)]
+struct SessionSummaryRecord {
+    agent: String,
+    workspace: Option<PathBuf>,
+    workspace_match_distance: Option<usize>,
+    title: Option<String>,
+    source_path: PathBuf,
+    started_at: Option<i64>,
+    modified_at: Option<i64>,
+    size_bytes: Option<u64>,
+    message_count: i64,
+    human_turns: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionSummaryEntry {
+    path: String,
+    workspace: Option<String>,
+    agent: String,
+    title: Option<String>,
+    modified: Option<String>,
+    size_bytes: Option<u64>,
+    message_count: i64,
+    human_turns: i64,
+}
+
+fn normalize_session_filter_path(path: &Path) -> CliResult<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| CliError::unknown(format!("current directory: {e}")))?
+            .join(path)
+    };
+    Ok(std::fs::canonicalize(&absolute).unwrap_or(absolute))
+}
+
+fn workspace_match_distance(candidate: Option<&Path>, target: &Path) -> Option<usize> {
+    let candidate = candidate?;
+    let candidate = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+
+    if candidate == target {
+        return Some(0);
+    }
+
+    let candidate_depth = candidate.components().count();
+    let target_depth = target.components().count();
+
+    if candidate.starts_with(target) {
+        Some(candidate_depth.saturating_sub(target_depth))
+    } else if target.starts_with(&candidate) {
+        Some(target_depth.saturating_sub(candidate_depth))
+    } else {
+        None
+    }
+}
+
+fn run_sessions(
+    workspace: Option<&PathBuf>,
+    current: bool,
+    limit: Option<usize>,
+    data_dir_override: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    json: bool,
+) -> CliResult<()> {
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+
+    let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
+    let target_workspace = match (workspace, current) {
+        (Some(path), _) => Some(normalize_session_filter_path(path)?),
+        (None, true) => Some(normalize_session_filter_path(
+            &std::env::current_dir()
+                .map_err(|e| CliError::unknown(format!("current directory: {e}")))?,
+        )?),
+        (None, false) => None,
+    };
+    // Default to 1 only when --current is the actual workspace source
+    // (i.e., no explicit --workspace was provided).
+    let current_determined_workspace = workspace.is_none() && current;
+    let effective_limit = match limit {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None if current_determined_workspace => Some(1),
+        None => Some(10),
+    };
+
+    let params: &[ParamValue] = &[];
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<i64>,
+        i64,
+        i64,
+    )> = conn
+        .query_map_collect(
+            "SELECT a.slug,
+                    w.path,
+                    c.title,
+                    c.source_path,
+                    c.started_at,
+                    COUNT(m.id) AS message_count,
+                    COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS human_turns
+             FROM conversations c
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             LEFT JOIN messages m ON m.conversation_id = c.id
+             GROUP BY c.id, a.slug, w.path, c.title, c.source_path, c.started_at
+             ORDER BY c.started_at IS NULL, c.started_at DESC, c.id DESC",
+            params,
+            |row: &frankensqlite::Row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                    row.get_typed(4)?,
+                    row.get_typed(5)?,
+                    row.get_typed(6)?,
+                ))
+            },
+        )
+        .map_err(|e| CliError {
+            code: 9,
+            kind: "db-query",
+            message: format!("Failed to list sessions: {e}"),
+            hint: None,
+            retryable: false,
+        })?;
+
+    let mut sessions: Vec<SessionSummaryRecord> = rows
+        .into_iter()
+        .map(
+            |(agent, workspace, title, source_path, started_at, message_count, human_turns)| {
+                let source_path_buf = PathBuf::from(&source_path);
+                let metadata = std::fs::metadata(&source_path_buf).ok();
+                let modified_at = metadata
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .map(|ts| chrono::DateTime::<Utc>::from(ts).timestamp_millis());
+
+                SessionSummaryRecord {
+                    agent,
+                    workspace: workspace.map(PathBuf::from),
+                    workspace_match_distance: None,
+                    title,
+                    source_path: source_path_buf,
+                    started_at,
+                    modified_at,
+                    size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
+                    message_count,
+                    human_turns,
+                }
+            },
+        )
+        .collect();
+
+    if let Some(target) = target_workspace.as_deref() {
+        for session in &mut sessions {
+            session.workspace_match_distance =
+                workspace_match_distance(session.workspace.as_deref(), target);
+        }
+        sessions.retain(|session| session.workspace_match_distance.is_some());
+    }
+
+    sessions.sort_by(|left, right| {
+        left.workspace_match_distance
+            .unwrap_or(usize::MAX)
+            .cmp(&right.workspace_match_distance.unwrap_or(usize::MAX))
+            .then_with(|| right.modified_at.cmp(&left.modified_at))
+            .then_with(|| right.started_at.cmp(&left.started_at))
+            .then_with(|| left.source_path.cmp(&right.source_path))
+    });
+
+    if let Some(limit) = effective_limit {
+        sessions.truncate(limit);
+    }
+
+    let entries: Vec<SessionSummaryEntry> = sessions
+        .into_iter()
+        .map(|session| SessionSummaryEntry {
+            path: session.source_path.to_string_lossy().into_owned(),
+            workspace: session
+                .workspace
+                .map(|path| path.to_string_lossy().into_owned()),
+            agent: session.agent,
+            title: session.title,
+            modified: session.modified_at.and_then(|ts| {
+                chrono::DateTime::<Utc>::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
+            }),
+            size_bytes: session.size_bytes,
+            message_count: session.message_count,
+            human_turns: session.human_turns,
+        })
+        .collect();
+
+    let structured_format = if json {
+        Some(RobotFormat::Json)
+    } else {
+        robot_format_from_env()
+    }
+    .map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(fmt) = structured_format {
+        let payload = serde_json::json!({ "sessions": entries });
+        return output_structured_value(payload, fmt);
+    }
+
+    if let Some(target) = target_workspace {
+        println!("Sessions for {}", target.display());
+    } else {
+        println!("Recent Sessions");
+    }
+    println!("{}", "─".repeat(72));
+
+    if entries.is_empty() {
+        println!("  No sessions found.");
+        return Ok(());
+    }
+
+    for (idx, session) in entries.iter().enumerate() {
+        let modified = session.modified.as_deref().unwrap_or("-");
+        let workspace = session.workspace.as_deref().unwrap_or("-");
+        println!(
+            "{:>2}. [{}] {}  {} msgs / {} human",
+            idx + 1,
+            modified,
+            session.agent,
+            session.message_count,
+            session.human_turns
+        );
+        println!("    workspace: {}", workspace);
+        println!("    path: {}", session.path);
+    }
+
+    Ok(())
+}
+
 /// Find related sessions for a given source path.
 /// Returns sessions that share the same workspace, same day, or same agent.
 fn run_context(
@@ -9252,27 +10421,28 @@ fn run_context(
     json: bool,
     limit: usize,
 ) -> CliResult<()> {
-    let lazy = crate::storage::sqlite::LazyDb::from_overrides(data_dir_override, db_override);
-    let conn = lazy.get("context").map_err(lazy_db_to_cli_error)?;
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+
+    let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
 
     // Find the source conversation by path (normalized to string)
     let path_str = path.to_string_lossy().to_string();
     #[allow(clippy::type_complexity)]
     let source_conv: Option<(i64, i64, Option<i64>, Option<i64>, String, String)> = conn
-        .query_row(
+        .query_row_map(
             "SELECT c.id, c.agent_id, c.workspace_id, c.started_at, c.title, a.slug
              FROM conversations c
              JOIN agents a ON c.agent_id = a.id
-             WHERE c.source_path = ?1",
-            [&path_str],
-            |r: &rusqlite::Row| {
+             WHERE c.source_path = ?",
+            &[ParamValue::from(path_str.as_str())],
+            |r: &frankensqlite::Row| {
                 Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    r.get(5)?,
+                    r.get_typed(0)?,
+                    r.get_typed(1)?,
+                    r.get_typed(2)?,
+                    r.get_typed(3)?,
+                    r.get_typed::<Option<String>>(4)?.unwrap_or_default(),
+                    r.get_typed(5)?,
                 ))
             },
         )
@@ -9293,10 +10463,10 @@ fn run_context(
 
     // Get workspace path for display
     let workspace_path: Option<String> = workspace_id.and_then(|ws_id: i64| {
-        conn.query_row(
-            "SELECT path FROM workspaces WHERE id = ?1",
-            [ws_id],
-            |r: &rusqlite::Row| r.get::<_, String>(0),
+        conn.query_row_map(
+            "SELECT path FROM workspaces WHERE id = ?",
+            &[ParamValue::from(ws_id)],
+            |r: &frankensqlite::Row| r.get_typed(0),
         )
         .ok()
     });
@@ -9304,27 +10474,28 @@ fn run_context(
     // Find related sessions: same workspace (excluding self)
     let same_workspace: Vec<(String, String, String, Option<i64>)> =
         if let Some(ws_id) = workspace_id {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT c.source_path, c.title, a.slug, c.started_at
+            conn.query_map_collect(
+                "SELECT c.source_path, c.title, a.slug, c.started_at
                  FROM conversations c
                  JOIN agents a ON c.agent_id = a.id
-                 WHERE c.workspace_id = ?1 AND c.id != ?2
+                 WHERE c.workspace_id = ? AND c.id != ?
                  ORDER BY c.started_at DESC
-                 LIMIT ?3",
-                )
-                .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-            stmt.query_map([ws_id, conv_id, limit as i64], |r: &rusqlite::Row| {
-                Ok((
-                    r.get(0)?,
-                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    r.get(2)?,
-                    r.get(3)?,
-                ))
-            })
+                 LIMIT ?",
+                &[
+                    ParamValue::from(ws_id),
+                    ParamValue::from(conv_id),
+                    ParamValue::from(limit as i64),
+                ],
+                |r: &frankensqlite::Row| {
+                    Ok((
+                        r.get_typed(0)?,
+                        r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                        r.get_typed(2)?,
+                        r.get_typed(3)?,
+                    ))
+                },
+            )
             .map_err(|e| CliError::unknown(format!("query: {e}")))?
-            .filter_map(std::result::Result::ok)
-            .collect()
         } else {
             Vec::new()
         };
@@ -9333,55 +10504,55 @@ fn run_context(
     let same_day: Vec<(String, String, String, Option<i64>)> = if let Some(ts) = started_at {
         let day_start = ts - (ts % 86_400_000); // Start of day in milliseconds
         let day_end = day_start + 86_400_000;
-        let mut stmt = conn
-            .prepare(
-                "SELECT c.source_path, c.title, a.slug, c.started_at
+        conn.query_map_collect(
+            "SELECT c.source_path, c.title, a.slug, c.started_at
                  FROM conversations c
                  JOIN agents a ON c.agent_id = a.id
-                 WHERE c.started_at >= ?1 AND c.started_at < ?2 AND c.id != ?3
+                 WHERE c.started_at >= ? AND c.started_at < ? AND c.id != ?
                  ORDER BY c.started_at DESC
-                 LIMIT ?4",
-            )
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map(
-            [day_start, day_end, conv_id, limit as i64],
-            |r: &rusqlite::Row| {
+                 LIMIT ?",
+            &[
+                ParamValue::from(day_start),
+                ParamValue::from(day_end),
+                ParamValue::from(conv_id),
+                ParamValue::from(limit as i64),
+            ],
+            |r: &frankensqlite::Row| {
                 Ok((
-                    r.get(0)?,
-                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    r.get(2)?,
-                    r.get(3)?,
+                    r.get_typed(0)?,
+                    r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                    r.get_typed(2)?,
+                    r.get_typed(3)?,
                 ))
             },
         )
         .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .collect()
     } else {
         Vec::new()
     };
 
     // Find related sessions: same agent (excluding self)
     let same_agent: Vec<(String, String, Option<i64>)> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT c.source_path, c.title, c.started_at
+        conn.query_map_collect(
+            "SELECT c.source_path, c.title, c.started_at
                  FROM conversations c
-                 WHERE c.agent_id = ?1 AND c.id != ?2
+                 WHERE c.agent_id = ? AND c.id != ?
                  ORDER BY c.started_at DESC
-                 LIMIT ?3",
-            )
-            .map_err(|e| CliError::unknown(format!("query prep: {e}")))?;
-        stmt.query_map([agent_id, conv_id, limit as i64], |r: &rusqlite::Row| {
-            Ok((
-                r.get(0)?,
-                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                r.get(2)?,
-            ))
-        })
+                 LIMIT ?",
+            &[
+                ParamValue::from(agent_id),
+                ParamValue::from(conv_id),
+                ParamValue::from(limit as i64),
+            ],
+            |r: &frankensqlite::Row| {
+                Ok((
+                    r.get_typed(0)?,
+                    r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                    r.get_typed(2)?,
+                ))
+            },
+        )
         .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .collect()
     };
 
     let structured_format = if json {
@@ -9992,7 +11163,7 @@ fn run_config_based_export(
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Encryption enabled but no password provided"))?;
         let chunk_size = config.encryption.chunk_size.unwrap_or(8 * 1024 * 1024) as usize;
-        let mut enc_engine = crate::pages::encrypt::EncryptionEngine::new(chunk_size);
+        let mut enc_engine = crate::pages::encrypt::EncryptionEngine::new(chunk_size)?;
         enc_engine.add_password_slot(password)?;
 
         // Add recovery slot if requested
@@ -10005,11 +11176,7 @@ fn run_config_based_export(
         }
 
         // Encrypt the database into the temp encrypted dir
-        let enc_config = enc_engine.encrypt_file(&export_db_path, &encrypted_dir, |_, _| {})?;
-
-        // Write config.json
-        let config_path = encrypted_dir.join("config.json");
-        std::fs::write(&config_path, serde_json::to_string_pretty(&enc_config)?)?;
+        enc_engine.encrypt_file(&export_db_path, &encrypted_dir, |_, _| {})?;
     } else {
         if !wizard_state.unencrypted_confirmed {
             anyhow::bail!(
@@ -10137,7 +11304,13 @@ fn run_config_based_export(
         } else {
             println!("  Encryption: DISABLED (content is public)");
         }
-        println!("  Fingerprint: {}", &bundle_result.fingerprint[..8]);
+        println!(
+            "  Fingerprint: {}",
+            bundle_result
+                .fingerprint
+                .get(..8)
+                .unwrap_or(&bundle_result.fingerprint)
+        );
 
         if let Some(deploy) = deploy_result {
             println!("  Deployment: {}", deploy);
@@ -10348,6 +11521,7 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
                             "line_number": { "type": ["integer", "null"] },
                             "agent": { "type": "string" },
                             "workspace": { "type": ["string", "null"] },
+                            "workspace_original": { "type": ["string", "null"], "description": "Original workspace path before remote path mapping" },
                             "title": { "type": ["string", "null"] },
                             "content": { "type": ["string", "null"] },
                             "snippet": { "type": ["string", "null"] },
@@ -10475,6 +11649,32 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
                     }
                 }
             }
+        }),
+    );
+    schemas.insert(
+        "sessions".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "sessions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "workspace": { "type": ["string", "null"] },
+                            "agent": { "type": "string" },
+                            "title": { "type": ["string", "null"] },
+                            "modified": { "type": ["string", "null"] },
+                            "size_bytes": { "type": ["integer", "null"] },
+                            "message_count": { "type": "integer" },
+                            "human_turns": { "type": "integer" }
+                        },
+                        "required": ["path", "agent", "message_count", "human_turns"]
+                    }
+                }
+            },
+            "required": ["sessions"]
         }),
     );
     schemas.insert(
@@ -10842,7 +12042,7 @@ fn try_load_indexed_conversation_from_db(
     if !db_path.exists() {
         return None;
     }
-    let storage = crate::storage::sqlite::SqliteStorage::open(db_path).ok()?;
+    let storage = crate::storage::sqlite::FrankenStorage::open(db_path).ok()?;
     crate::ui::data::load_conversation(&storage, &source_path.to_string_lossy()).ok()?
 }
 
@@ -10993,6 +12193,7 @@ fn run_index_with_data(
     force_rebuild: bool,
     watch: bool,
     watch_once: Option<Vec<PathBuf>>,
+    watch_interval: u64,
     data_dir_override: Option<PathBuf>,
     semantic: bool,
     build_hnsw: bool,
@@ -11001,7 +12202,6 @@ fn run_index_with_data(
     json: bool,
     idempotency_key: Option<String>,
 ) -> CliResult<()> {
-    use frankensqlite::Connection;
     use frankensqlite::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
 
@@ -11037,42 +12237,45 @@ fn run_index_with_data(
     };
 
     // Check for cached idempotency result
-    if let Some(key) = &idempotency_key
-        && let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref())
-    {
-        // Ensure idempotency_keys table exists
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS idempotency_keys (
-                key TEXT PRIMARY KEY,
-                params_hash TEXT NOT NULL,
-                result_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
-            )",
+    if let Some(key) = &idempotency_key {
+        let cached = with_frankensqlite_connection(
+            &db_path,
+            "checking index idempotency cache",
+            |conn| {
+                if let Err(e) = conn.execute(
+                    "CREATE TABLE IF NOT EXISTS idempotency_keys (
+                        key TEXT PRIMARY KEY,
+                        params_hash TEXT NOT NULL,
+                        result_json TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        expires_at INTEGER NOT NULL
+                    )",
+                ) {
+                    tracing::warn!("Failed to create idempotency_keys table: {e}");
+                }
+
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                if let Err(e) = conn.execute_compat(
+                    "DELETE FROM idempotency_keys WHERE expires_at < ?1",
+                    frankensqlite::params![now_ms],
+                ) {
+                    tracing::warn!("Failed to clean expired idempotency keys: {e}");
+                }
+
+                let cached: Option<(String, String)> = conn
+                    .query_row_map(
+                        "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
+                        frankensqlite::params![key.as_str(), now_ms],
+                        |r: &frankensqlite::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
+                    )
+                    .ok();
+                Ok(cached)
+            },
         );
 
-        // Clean expired keys
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let _ = conn.execute_params(
-            "DELETE FROM idempotency_keys WHERE expires_at < ?1",
-            frankensqlite::params![now_ms],
-        );
-
-        // Look up existing key
-        let cached: Option<(String, String)> = conn
-            .query_row_map(
-                "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
-                frankensqlite::params![key.as_str(), now_ms],
-                |r: &frankensqlite::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
-            )
-            .ok();
-
-        if let Some((stored_hash, result_json)) = cached {
-            // Verify params match
+        if let Ok(Some((stored_hash, result_json))) = cached {
             if stored_hash == params_hash.to_string() {
-                // Return cached result
                 if let Some(fmt) = structured_format {
-                    // Parse and augment with cached flag
                     if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&result_json) {
                         val["cached"] = serde_json::json!(true);
                         val["idempotency_key"] = serde_json::json!(key);
@@ -11087,7 +12290,6 @@ fn run_index_with_data(
                     return Ok(());
                 }
             } else {
-                // Parameter mismatch - return error
                 return Err(CliError {
                     code: 5,
                     kind: "idempotency_mismatch",
@@ -11096,7 +12298,8 @@ fn run_index_with_data(
                         key
                     ),
                     hint: Some(
-                        "Use a different idempotency key or wait for the existing one to expire (24h)".to_string(),
+                        "Use a different idempotency key or wait for the existing one to expire (24h)"
+                            .to_string(),
                     ),
                     retryable: false,
                 });
@@ -11122,6 +12325,7 @@ fn run_index_with_data(
         build_hnsw,
         embedder: embedder.clone(),
         progress: Some(index_progress.clone()),
+        watch_interval_secs: watch_interval,
     };
 
     // Set up progress display
@@ -11141,6 +12345,7 @@ fn run_index_with_data(
     }
 
     let start = Instant::now();
+    let mut progress_completion: Option<(indicatif::ProgressBar, usize, usize)> = None;
 
     // Run indexer in background thread so we can poll progress
     let opts_clone = opts.clone();
@@ -11261,11 +12466,7 @@ fn run_index_with_data(
         let total = index_progress.total.load(Ordering::Relaxed);
         let current = index_progress.current.load(Ordering::Relaxed);
         let agents = index_progress.discovered_agents.load(Ordering::Relaxed);
-        pb.finish_with_message(format!(
-            "Done: {} conversations from {} agent(s)",
-            current.max(total),
-            agents
-        ));
+        progress_completion = Some((pb, current.max(total), agents));
     } else if show_plain {
         // Plain mode: print periodic status updates
         use std::sync::atomic::Ordering;
@@ -11332,16 +12533,8 @@ fn run_index_with_data(
     }
 
     // Get the result from the indexer thread
-    let res = index_handle
-        .join()
-        .map_err(|_| CliError {
-            code: 9,
-            kind: "index",
-            message: "index thread panicked".to_string(),
-            hint: None,
-            retryable: true,
-        })?
-        .map_err(|e| {
+    let res = match index_handle.join() {
+        Ok(result) => result.map_err(|e| {
             let chain = e
                 .chain()
                 .map(std::string::ToString::to_string)
@@ -11354,7 +12547,26 @@ fn run_index_with_data(
                 hint: None,
                 retryable: true,
             }
-        });
+        }),
+        Err(_) => Err(CliError {
+            code: 9,
+            kind: "index",
+            message: "index thread panicked".to_string(),
+            hint: None,
+            retryable: true,
+        }),
+    };
+
+    if let Some((pb, conversations, agents)) = progress_completion {
+        match &res {
+            Ok(_) => pb.finish_with_message(format!(
+                "Done: {} conversations from {} agent(s)",
+                conversations, agents
+            )),
+            Err(err) => pb.abandon_with_message(format!("Failed: {}", err)),
+        }
+    }
+
     let elapsed_ms = start.elapsed().as_millis();
 
     if let Err(err) = &res {
@@ -11371,25 +12583,20 @@ fn run_index_with_data(
     } else if let Some(fmt) = structured_format {
         // Get stats after successful indexing
         let (conversations, messages) =
-            if let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref()) {
-                let convs: i64 = conn
-                    .query_row_map(
-                        "SELECT COUNT(*) FROM conversations",
-                        &[],
-                        |r: &frankensqlite::Row| r.get_typed(0),
-                    )
-                    .unwrap_or(0);
-                let msgs: i64 = conn
-                    .query_row_map(
-                        "SELECT COUNT(*) FROM messages",
-                        &[],
-                        |r: &frankensqlite::Row| r.get_typed(0),
-                    )
-                    .unwrap_or(0);
-                (convs, msgs)
-            } else {
-                (0, 0)
-            };
+            with_frankensqlite_connection(&db_path, "collecting index result counts", |conn| {
+                let convs: i64 = conn.query_row_map(
+                    "SELECT COUNT(*) FROM conversations",
+                    &[],
+                    |r: &frankensqlite::Row| r.get_typed(0),
+                )?;
+                let msgs: i64 = conn.query_row_map(
+                    "SELECT COUNT(*) FROM messages",
+                    &[],
+                    |r: &frankensqlite::Row| r.get_typed(0),
+                )?;
+                Ok((convs, msgs))
+            })
+            .unwrap_or((0, 0));
         let mut payload = serde_json::json!({
             "success": true,
             "elapsed_ms": elapsed_ms,
@@ -11416,15 +12623,22 @@ fn run_index_with_data(
             payload["idempotency_key"] = serde_json::json!(key);
             payload["cached"] = serde_json::json!(false);
 
-            if let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref()) {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
-                let result_json = serde_json::to_string(&payload).unwrap_or_default();
-                let hash_str = params_hash.to_string();
-                let _ = conn.execute_params(
-                    "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    frankensqlite::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
-                );
+            if let Err(e) = with_frankensqlite_connection(
+                &db_path,
+                "storing index idempotency result",
+                |conn| {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
+                    let result_json = serde_json::to_string(&payload).unwrap_or_default();
+                    let hash_str = params_hash.to_string();
+                    conn.execute_compat(
+                        "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        frankensqlite::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
+                    )?;
+                    Ok(())
+                },
+            ) {
+                tracing::warn!("Failed to store idempotency key: {e}");
             }
         }
 
@@ -11477,14 +12691,6 @@ fn read_session_paths(source: &str) -> Result<std::collections::HashSet<String>,
     Ok(paths)
 }
 
-const OWNER: &str = "Dicklesworthstone";
-const REPO: &str = "coding_agent_session_search";
-
-#[derive(Debug, Deserialize)]
-struct ReleaseInfo {
-    tag_name: String,
-}
-
 async fn maybe_prompt_for_update(once: bool) -> Result<()> {
     if once
         || dotenvy::var("CI").is_ok()
@@ -11495,22 +12701,19 @@ async fn maybe_prompt_for_update(once: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Use spawn_blocking so the network I/O doesn't block the async worker.
-    // reqwest's async client requires a tokio reactor we no longer have.
-    let update_result = asupersync::runtime::spawn_blocking(latest_release_version_blocking).await;
-
-    let Some((latest_tag, latest_ver)) = update_result else {
+    let Some(update_info) = crate::update_check::check_for_updates(env!("CARGO_PKG_VERSION")).await
+    else {
         return Ok(());
     };
 
-    let current_ver =
-        Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| Version::new(0, 1, 0));
-    if latest_ver <= current_ver {
+    if !update_info.should_show() {
         return Ok(());
     }
 
     println!(
-        "A newer version is available: current v{current_ver}, latest {latest_tag}. Update now? (y/N): "
+        "A newer version is available: current v{}, latest {}. Update now? (y/N): ",
+        env!("CARGO_PKG_VERSION"),
+        update_info.tag_name
     );
     print!("> ");
     io::stdout().flush().ok();
@@ -11523,76 +12726,8 @@ async fn maybe_prompt_for_update(once: bool) -> Result<()> {
         return Ok(());
     }
 
-    info!(target: "update", "starting self-update to {}", latest_tag);
-    match run_self_update(&latest_tag) {
-        Ok(true) => {
-            println!("Update complete. Please restart cass.");
-            std::process::exit(0);
-        }
-        Ok(false) => {
-            warn!(target: "update", "self-update failed (installer returned error)");
-        }
-        Err(err) => {
-            warn!(target: "update", "self-update failed: {err}");
-        }
-    }
-
-    Ok(())
-}
-
-fn latest_release_version_blocking() -> Option<(String, Version)> {
-    let url = format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/latest");
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("coding-agent-search (update-check)")
-        .timeout(Duration::from_secs(3))
-        .build()
-        .ok()?;
-    let resp = client.get(url).send().ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let info: ReleaseInfo = resp.json().ok()?;
-    let tag = info.tag_name;
-    let version_str = tag.trim_start_matches('v');
-    let version = Version::parse(version_str).ok()?;
-    Some((tag, version))
-}
-
-#[cfg(windows)]
-fn run_self_update(tag: &str) -> Result<bool> {
-    // Download the install script to a temp file and invoke it with parameters.
-    // Piping irm to iex doesn't support Param() arguments, so we save first.
-    let ps_cmd = format!(
-        "$s = Join-Path $env:TEMP 'cass-install.ps1';          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/{OWNER}/{REPO}/{tag}/install.ps1' -OutFile $s;          & $s -EasyMode -Verify -Version '{tag}';          Remove-Item -Force $s"
-    );
-    let status = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ps_cmd])
-        .status()?;
-    if status.success() {
-        info!(target: "update", "updated to {tag}");
-        Ok(true)
-    } else {
-        warn!(target: "update", "installer returned non-zero status: {status:?}");
-        Ok(false)
-    }
-}
-
-#[cfg(not(windows))]
-fn run_self_update(tag: &str) -> Result<bool> {
-    let sh_cmd = format!(
-        "curl -fsSL https://raw.githubusercontent.com/{OWNER}/{REPO}/{tag}/install.sh | bash -s -- --easy-mode --verify --version {tag}"
-    );
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&sh_cmd)
-        .status()?;
-    if status.success() {
-        info!(target: "update", "updated to {tag}");
-        Ok(true)
-    } else {
-        warn!(target: "update", "installer returned non-zero status: {status:?}");
-        Ok(false)
-    }
+    info!(target: "update", "starting self-update to {}", update_info.tag_name);
+    crate::update_check::run_self_update(&update_info.tag_name);
 }
 
 // ============================================================================
@@ -11840,6 +12975,7 @@ fn run_export(
     format: ConvExportFormat,
     output: Option<&Path>,
     include_tools: bool,
+    include_skills: bool,
 ) -> CliResult<()> {
     use std::fs::File;
     use std::io::{BufRead, BufReader, Write};
@@ -11922,6 +13058,29 @@ fn run_export(
         }
     }
 
+    // Drop entire messages that are skill injections (unless opted in)
+    if !include_skills {
+        messages.retain(|msg| {
+            let content = extract_text_content(msg);
+            if content.contains("Base directory for this skill:") {
+                return false;
+            }
+            if content.contains("<system-reminder>") {
+                return false;
+            }
+            if content.contains("The following skills are available for use with the Skill tool:") {
+                return false;
+            }
+            if content.contains("skillInjection:") && content.contains("matchedSkills") {
+                return false;
+            }
+            if content.contains("<!-- skillInjection:") {
+                return false;
+            }
+            true
+        });
+    }
+
     if messages.is_empty() {
         return Err(CliError {
             code: 9,
@@ -11999,6 +13158,7 @@ fn run_export_html(
     include_tools: bool,
     show_timestamps: bool,
     enable_cdns: bool,
+    include_skills: bool,
     theme: &str,
     dry_run: bool,
     explain: bool,
@@ -12230,6 +13390,44 @@ fn run_export_html(
                 content
             };
 
+            // --- Drop entire messages that are skill injections (unless opted in) ---
+            // When Claude Code/Codex/Gemini load a skill, the FULL SKILL.md body is
+            // injected as a user message starting with "Base directory for this skill:".
+            // These are often highly proprietary. DROP THE ENTIRE MESSAGE — don't try
+            // to parse, redact, or pattern-match the content. Just skip it.
+            if !include_skills {
+                if content.contains("Base directory for this skill:") {
+                    return None;
+                }
+                // System reminders contain skill listings, hook metadata, and other
+                // internal context. Drop entire messages that are system-reminder blocks.
+                if content.contains("<system-reminder>") {
+                    return None;
+                }
+                // Skill listing dumps (injected by hooks)
+                if content
+                    .contains("The following skills are available for use with the Skill tool:")
+                {
+                    return None;
+                }
+                // Vercel plugin hook injections with skill metadata
+                if content.contains("skillInjection:") && content.contains("matchedSkills") {
+                    return None;
+                }
+                // Hook injection blocks (contain skill names, patterns, metadata)
+                if content.contains("<!-- skillInjection:") {
+                    return None;
+                }
+            }
+
+            // Skip non-message records (queue-operation, summary, etc.)
+            // These are internal bookkeeping entries, not actual conversation messages.
+            // Only user, assistant, system, tool, and unknown are valid message roles.
+            match role.as_str() {
+                "user" | "assistant" | "system" | "tool" | "unknown" => {}
+                _ => return None,
+            }
+
             // Skip empty messages: no content AND no tool call AND unknown role
             // This filters out malformed/empty entries that would look broken
             if content.is_empty() && tool_call.is_none() && role == "unknown" {
@@ -12253,7 +13451,67 @@ fn run_export_html(
         })
         .collect();
 
-    // Store original message count for explain/dry_run modes
+    // Count message types from RAW messages for accuracy.
+    // Must distinguish human-typed prompts from tool results, which both have role "user".
+    // Tool results have content as an array containing {"type": "tool_result", ...} blocks.
+    // Also exclude skill injections from counts when !include_skills, since those messages
+    // are dropped from the rendered output and shouldn't inflate the prompt count.
+    let mut human_turns = 0usize;
+    let mut assistant_msgs = 0usize;
+    let mut tool_use_count = 0usize;
+    for msg in &raw_messages {
+        let role = extract_role(msg);
+        let text = extract_text_content(msg);
+
+        // Skip messages that would be dropped by skill filtering
+        if !include_skills
+            && (text.contains("Base directory for this skill:")
+                || text.contains("<system-reminder>")
+                || text.contains("The following skills are available for use with the Skill tool:")
+                || (text.contains("skillInjection:") && text.contains("matchedSkills"))
+                || text.contains("<!-- skillInjection:"))
+        {
+            continue;
+        }
+
+        match role.as_str() {
+            "user" => {
+                // Check if this is a tool result return or a human-typed message.
+                // Tool results have content as an array with tool_result type blocks.
+                let is_tool_result = msg
+                    .get("message")
+                    .or(Some(msg))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|arr| {
+                        arr.iter().any(|item| {
+                            item.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                        })
+                    });
+                if !is_tool_result {
+                    human_turns += 1;
+                }
+            }
+            "assistant" => {
+                assistant_msgs += 1;
+                // Count tool_use blocks within assistant messages
+                if let Some(content) = msg
+                    .get("message")
+                    .or(Some(msg))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    tool_use_count += content
+                        .iter()
+                        .filter(|item| {
+                            item.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                        })
+                        .count();
+                }
+            }
+            _ => {}
+        }
+    }
     let message_count = messages.len();
 
     // --- Build metadata ---
@@ -12281,6 +13539,9 @@ fn run_export_html(
         }),
         agent: agent_name.clone(),
         message_count,
+        human_turns,
+        assistant_msgs,
+        tool_use_count,
         duration,
         project: workspace.clone(),
     };
@@ -12342,7 +13603,10 @@ fn run_export_html(
             },
             "warnings": []
         });
-        println!("{}", serde_json::to_string_pretty(&plan).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".to_string())
+        );
         return Ok(());
     }
 
@@ -12357,7 +13621,10 @@ fn run_export_html(
             "encrypted": encrypt,
             "estimated_size_bytes": estimated_size
         });
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+        );
         return Ok(());
     }
 
@@ -12450,13 +13717,23 @@ fn run_export_html(
                 "title": session_title
             }
         });
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+        );
     } else {
         println!("✓ Exported to {}", output_path.display());
         if encrypt {
             println!("  🔒 Encrypted with Web Crypto (AES-256-GCM)");
         }
-        println!("  {} messages, {} bytes", message_count, file_size);
+        if human_turns > 0 {
+            println!(
+                "  {} prompts, {} responses, {} tool uses, {} bytes",
+                human_turns, assistant_msgs, tool_use_count, file_size
+            );
+        } else {
+            println!("  {} messages, {} bytes", message_count, file_size);
+        }
     }
 
     Ok(())
@@ -13073,7 +14350,7 @@ mod indexed_conversation_fallback_tests {
     fn db_fallback_loads_virtual_source_path_and_converts_messages() {
         let tmp = TempDir::new().expect("temp dir");
         let db_path = tmp.path().join("agent_search.db");
-        let mut storage = SqliteStorage::open(&db_path).expect("open sqlite");
+        let storage = SqliteStorage::open(&db_path).expect("open sqlite");
 
         let agent = Agent {
             id: None,
@@ -13127,6 +14404,66 @@ mod indexed_conversation_fallback_tests {
         assert_eq!(
             extract_message_timestamp(&raw_messages[0]),
             Some(1_733_000_000_000)
+        );
+    }
+}
+
+#[cfg(test)]
+mod robot_output_score_tests {
+    use super::{filter_hit_fields, projected_hit_field_value, safe_robot_score_value};
+    use crate::search::query::{MatchType, SearchHit};
+
+    fn test_hit(score: f32) -> SearchHit {
+        SearchHit {
+            title: "Title".to_string(),
+            snippet: "Snippet".to_string(),
+            content: "Content".to_string(),
+            content_hash: 0,
+            score,
+            source_path: "/tmp/session.jsonl".to_string(),
+            agent: "codex".to_string(),
+            workspace: "/tmp".to_string(),
+            workspace_original: None,
+            created_at: Some(1_733_000_000_000),
+            line_number: Some(1),
+            match_type: MatchType::Exact,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        }
+    }
+
+    #[test]
+    fn safe_robot_score_value_coerces_non_finite_scores() {
+        assert_eq!(safe_robot_score_value(f32::NAN), serde_json::json!(0.0));
+        assert_eq!(
+            safe_robot_score_value(f32::INFINITY),
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            safe_robot_score_value(f32::NEG_INFINITY),
+            serde_json::json!(0.0)
+        );
+        assert_eq!(safe_robot_score_value(1.25), serde_json::json!(1.25));
+    }
+
+    #[test]
+    fn projected_hit_score_never_serializes_to_null() {
+        let projected = projected_hit_field_value(&test_hit(f32::NAN), "score");
+        assert_eq!(projected, Some(serde_json::json!(0.0)));
+    }
+
+    #[test]
+    fn filter_hit_fields_supports_workspace_original_projection() {
+        let mut hit = test_hit(1.0);
+        hit.workspace_original = Some("/remote/workspace".to_string());
+
+        let filtered = filter_hit_fields(&hit, &Some(vec!["workspace_original".to_string()]));
+        assert_eq!(
+            filtered,
+            serde_json::json!({
+                "workspace_original": "/remote/workspace"
+            })
         );
     }
 }
@@ -13562,6 +14899,13 @@ fn format_as_markdown(
 
     for msg in messages {
         let role = extract_role(msg);
+        // Skip non-message records (queue-operation, summary, etc.)
+        if !matches!(
+            role.as_str(),
+            "user" | "assistant" | "system" | "tool" | "unknown"
+        ) {
+            continue;
+        }
         match role.as_str() {
             "user" => md.push_str("## 👤 User\n\n"),
             "assistant" => md.push_str("## 🤖 Assistant\n\n"),
@@ -13623,6 +14967,13 @@ fn format_as_text(messages: &[serde_json::Value], include_tools: bool) -> String
     let mut text = String::new();
     for msg in messages {
         let role = extract_role(msg);
+        // Skip non-message records (queue-operation, summary, etc.)
+        if !matches!(
+            role.as_str(),
+            "user" | "assistant" | "system" | "tool" | "unknown"
+        ) {
+            continue;
+        }
         text.push_str(&format!("=== {} ===\n\n", role.to_uppercase()));
 
         let content = extract_text_content(msg);
@@ -13660,7 +15011,8 @@ fn format_as_html(
     include_tools: bool,
 ) -> String {
     use chrono::{TimeZone, Utc};
-    let title_str = title.as_deref().unwrap_or("Conversation Export");
+    let title_raw = title.as_deref().unwrap_or("Conversation Export");
+    let title_str = html_escape(title_raw);
     let date_str = start_ts
         .and_then(|ts| Utc.timestamp_millis_opt(ts).single())
         .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
@@ -13703,6 +15055,13 @@ fn format_as_html(
 
     for msg in messages {
         let role = extract_role(msg);
+        // Skip non-message records (queue-operation, summary, etc.)
+        if !matches!(
+            role.as_str(),
+            "user" | "assistant" | "system" | "tool" | "unknown"
+        ) {
+            continue;
+        }
         let role_class = if role == "user" { "user" } else { "assistant" };
         let role_display = match role.as_str() {
             "user" => "👤 User",
@@ -13809,6 +15168,7 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// Show messages around a specific line in a session file
@@ -14026,16 +15386,15 @@ fn extract_role(msg: &serde_json::Value) -> String {
         match type_val {
             "user" => return "user".to_string(),
             "assistant" => return "assistant".to_string(),
-            _ => {}
+            // Return the actual type for non-message records (e.g. "queue-operation",
+            // "system", etc.) so callers can filter them rather than rendering as blank
+            other => return other.to_string(),
         }
     }
     "unknown".to_string()
 }
 
 /// Strip redundant "[Tool: X]" markers from content when tool call is shown separately.
-///
-/// When a message has a tool_call object that's rendered as a collapsible section,
-/// including the "[Tool: X]" text in the content is redundant and looks bad.
 fn strip_tool_marker(content: &str) -> String {
     let trimmed = content.trim();
 
@@ -14073,8 +15432,11 @@ fn smart_truncate(s: &str, max_len: usize) -> String {
     }
 
     // Look for last word boundary (space)
-    let last_idx = char_indices.last().map(|(i, _)| *i).unwrap_or(0);
-    let truncated = &s[..=last_idx];
+    let end_byte = char_indices
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let truncated = &s[..end_byte];
 
     // Find last space to break at word boundary
     if let Some(last_space) = truncated.rfind(|c: char| c.is_whitespace())
@@ -14103,17 +15465,21 @@ fn run_timeline(
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
     use chrono::{Local, TimeZone, Utc};
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
     use std::collections::HashMap;
 
     // Parse source filter (P3.2)
     let source_filter = source.as_ref().map(|s| SourceFilter::parse(s));
 
-    let lazy = crate::storage::sqlite::LazyDb::from_overrides(data_dir, db_override);
-    let conn = lazy.get("timeline").map_err(lazy_db_to_cli_error)?;
+    let db_path = analytics_db_path(data_dir, db_override.as_ref());
+    let conn = open_franken_analytics_db(data_dir, db_override.as_ref())?;
 
     let now = Local::now();
     let (start_ts, end_ts) = if today {
-        let start_of_day = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
+        let start_of_day = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("valid start of day");
         let local_start = match Local.from_local_datetime(&start_of_day) {
             chrono::LocalResult::Single(dt) => dt,
             chrono::LocalResult::Ambiguous(dt, _) => dt,
@@ -14140,7 +15506,7 @@ fn run_timeline(
          WHERE c.started_at >= ?1 AND c.started_at <= ?2",
     );
 
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(start_ts), Box::new(end_ts)];
+    let mut params: Vec<ParamValue> = vec![start_ts.into(), end_ts.into()];
 
     if !agents.is_empty() {
         sql.push_str(" AND a.slug IN (");
@@ -14149,7 +15515,7 @@ fn run_timeline(
                 sql.push_str(", ");
             }
             sql.push_str(&format!("?{}", params.len() + 1));
-            params.push(Box::new(agent.clone()));
+            params.push(agent.clone().into());
         }
         sql.push(')');
     }
@@ -14168,36 +15534,26 @@ fn run_timeline(
             }
             SourceFilter::SourceId(id) => {
                 sql.push_str(&format!(" AND c.source_id = ?{}", params.len() + 1));
-                params.push(Box::new(id.clone()));
+                params.push(id.clone().into());
             }
         }
     }
 
     sql.push_str(" GROUP BY c.id ORDER BY c.started_at DESC");
 
-    let mut stmt = conn.prepare(&sql).map_err(|e| CliError {
-        code: 9,
-        kind: "db-query",
-        message: format!("Query failed: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-    let rows = stmt
-        .query_map(param_refs.as_slice(), |row| {
+    let rows = conn
+        .query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
             Ok((
-                row.get::<_, i64>(0)?,            // id
-                row.get::<_, String>(1)?,         // agent
-                row.get::<_, Option<String>>(2)?, // title
-                row.get::<_, i64>(3)?,            // started_at
-                row.get::<_, Option<i64>>(4)?,    // ended_at
-                row.get::<_, String>(5)?,         // source_path
-                row.get::<_, i64>(6)?,            // message_count
-                row.get::<_, String>(7)?,         // source_id (P3.2)
-                row.get::<_, Option<String>>(8)?, // origin_host (P3.5)
-                row.get::<_, Option<String>>(9)?, // origin_kind (P3.5)
+                row.get_typed::<i64>(0)?,            // id
+                row.get_typed::<String>(1)?,         // agent
+                row.get_typed::<Option<String>>(2)?, // title
+                row.get_typed::<i64>(3)?,            // started_at
+                row.get_typed::<Option<i64>>(4)?,    // ended_at
+                row.get_typed::<String>(5)?,         // source_path
+                row.get_typed::<i64>(6)?,            // message_count
+                row.get_typed::<String>(7)?,         // source_id (P3.2)
+                row.get_typed::<Option<String>>(8)?, // origin_host (P3.5)
+                row.get_typed::<Option<String>>(9)?, // origin_kind (P3.5)
             ))
         })
         .map_err(|e| CliError {
@@ -14207,9 +15563,8 @@ fn run_timeline(
             hint: None,
             retryable: false,
         })?;
-
     #[allow(clippy::type_complexity)]
-    let mut sessions: Vec<(
+    let sessions: Vec<(
         i64,
         String,
         Option<String>,
@@ -14220,10 +15575,8 @@ fn run_timeline(
         String,
         Option<String>,
         Option<String>,
-    )> = Vec::new();
-    for r in rows.flatten() {
-        sessions.push(r);
-    }
+    )> = rows;
+    close_franken_cli_read_db(conn, &db_path, "timeline")?;
 
     let structured_format = if json {
         Some(RobotFormat::Json)
@@ -14256,13 +15609,14 @@ fn run_timeline(
                             origin_host,
                             origin_kind,
                         )| {
-                            let duration = ended.map(|e| e - started);
+                            let duration_ms = ended.map(|e| e - started);
+                            let duration_secs = duration_ms.map(|ms| ms / 1000);
                             // Use "local" as default origin_kind if not in DB (backward compat)
                             let kind = origin_kind.as_deref().unwrap_or("local");
                             serde_json::json!({
                                 "id": id, "agent": agent, "title": title,
                                 "started_at": started, "ended_at": ended,
-                                "duration_seconds": duration, "source_path": path,
+                                "duration_seconds": duration_secs, "source_path": path,
                                 "message_count": msg_count,
                                 // Provenance fields (P3.5)
                                 "source_id": source_id,
@@ -14676,7 +16030,7 @@ fn run_sources_add(
     })?;
 
     // Check for duplicate
-    if config.sources.iter().any(|s| s.name == source_id) {
+    if config.find_source(&source_id).is_some() {
         return Err(CliError {
             code: 10,
             kind: "config",
@@ -14775,18 +16129,17 @@ fn parse_source_url(url: &str, name: Option<&str>) -> Result<(String, String), C
         });
     }
 
-    // Generate source_id from hostname if not provided
+    // Generate source_id from hostname if not provided.
+    // Auto-generated remote names must not collide with the built-in local source ID.
     let source_id = if let Some(n) = name {
         n.to_string()
     } else {
         // Extract hostname part (after @)
         let hostname_part = host.split('@').nth(1).unwrap_or(host);
         // Take first segment before any dots
-        hostname_part
-            .split('.')
-            .next()
-            .unwrap_or(hostname_part)
-            .to_string()
+        crate::sources::config::normalize_generated_remote_source_name(
+            hostname_part.split('.').next().unwrap_or(hostname_part),
+        )
     };
 
     Ok((host.to_string(), source_id))
@@ -14835,7 +16188,9 @@ fn test_ssh_connectivity(host: &str) -> CliResult<()> {
 
 /// Remove a configured source (P5.7)
 fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<()> {
+    use crate::sources::SyncStatus;
     use crate::sources::config::SourcesConfig;
+    use colored::Colorize;
 
     // Load existing config
     let mut config = SourcesConfig::load().map_err(|e| CliError {
@@ -14847,7 +16202,8 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
     })?;
 
     // Check source exists
-    if !config.sources.iter().any(|s| s.name == name) {
+    let stored_source_name = config.find_source(name).map(|source| source.name.clone());
+    let Some(stored_source_name) = stored_source_name else {
         return Err(CliError {
             code: 13,
             kind: "not_found",
@@ -14855,16 +16211,17 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
             hint: Some("Run 'cass sources list' to see configured sources".into()),
             retryable: false,
         });
-    }
+    };
 
     // Confirmation prompt
     if !skip_confirm {
+        let display_name = &stored_source_name;
         let msg = if purge {
             format!(
-                "Remove source '{name}' and delete indexed data? This cannot be undone. [y/N]: "
+                "Remove source '{display_name}' and delete indexed data? This cannot be undone. [y/N]: "
             )
         } else {
-            format!("Remove source '{name}' from configuration? [y/N]: ")
+            format!("Remove source '{display_name}' from configuration? [y/N]: ")
         };
         print!("{msg}");
         std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -14888,7 +16245,7 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
     }
 
     // Remove from config
-    config.remove_source(name);
+    config.remove_source(&stored_source_name);
     config.save().map_err(|e| CliError {
         code: 11,
         kind: "config",
@@ -14897,13 +16254,34 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
         retryable: false,
     })?;
 
-    println!("Removed '{name}' from configuration.");
+    println!("Removed '{}' from configuration.", stored_source_name);
+
+    let data_dir = default_data_dir();
+    match SyncStatus::load(&data_dir) {
+        Ok(mut sync_status) => {
+            if sync_status.retain_sources(config.sources.iter().map(|source| source.name.as_str()))
+                && let Err(error) = sync_status.save(&data_dir)
+            {
+                eprintln!(
+                    "{} Failed to save pruned sync status: {}",
+                    "Warning:".yellow().bold(),
+                    error
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "{} Failed to load sync status for pruning: {}",
+                "Warning:".yellow().bold(),
+                error
+            );
+        }
+    }
 
     // Handle purge
     if purge {
         // Find and remove synced data directory
-        let data_dir = default_data_dir();
-        let source_dir = data_dir.join("remotes").join(name);
+        let source_dir = data_dir.join("remotes").join(&stored_source_name);
         if source_dir.exists() {
             std::fs::remove_dir_all(&source_dir).map_err(|e| CliError {
                 code: 15,
@@ -14941,7 +16319,7 @@ struct SourceDiagnostics {
 
 /// Diagnose source connectivity and configuration issues (P5.6)
 fn run_sources_doctor(source_filter: Option<&str>, json_output: bool) -> CliResult<()> {
-    use crate::sources::config::SourcesConfig;
+    use crate::sources::config::{SourcesConfig, source_names_equal};
     use colored::Colorize;
 
     let config = SourcesConfig::load().map_err(|e| CliError {
@@ -14972,7 +16350,7 @@ fn run_sources_doctor(source_filter: Option<&str>, json_output: bool) -> CliResu
     let sources_to_check: Vec<_> = config
         .sources
         .iter()
-        .filter(|s| source_filter.is_none() || source_filter == Some(s.name.as_str()))
+        .filter(|s| source_filter.is_none_or(|filter| source_names_equal(filter, &s.name)))
         .collect();
 
     if sources_to_check.is_empty() {
@@ -15281,7 +16659,7 @@ fn run_sources_sync(
     dry_run: bool,
     json_output: bool,
 ) -> CliResult<()> {
-    use crate::sources::config::SourcesConfig;
+    use crate::sources::config::{SourcesConfig, source_names_equal};
     use crate::sources::sync::{SyncEngine, SyncReport, SyncStatus};
     use colored::Colorize;
 
@@ -15318,7 +16696,7 @@ fn run_sources_sync(
     let sources_to_sync: Vec<_> = if let Some(ref names) = source_filter {
         remote_sources
             .into_iter()
-            .filter(|s| names.contains(&s.name))
+            .filter(|s| names.iter().any(|name| source_names_equal(name, &s.name)))
             .collect()
     } else {
         remote_sources
@@ -15477,8 +16855,20 @@ fn run_sources_sync(
     }
 
     // Save sync status
-    if !dry_run && let Err(e) = status.save(&data_dir) {
-        tracing::warn!("Failed to save sync status: {}", e);
+    if !dry_run {
+        let current_config = SourcesConfig::load().unwrap_or_else(|error| {
+            tracing::warn!("Failed to reload sources config before saving sync status: {error}");
+            config.clone()
+        });
+        status.retain_sources(
+            current_config
+                .sources
+                .iter()
+                .map(|source| source.name.as_str()),
+        );
+        if let Err(e) = status.save(&data_dir) {
+            tracing::warn!("Failed to save sync status: {}", e);
+        }
     }
 
     // Output summary
@@ -15522,6 +16912,7 @@ fn run_sources_sync(
             false,          // force_rebuild
             false,          // watch
             None,           // watch_once
+            30,             // watch_interval (default)
             Some(data_dir), // data_dir
             false,          // semantic
             false,          // build_hnsw
@@ -16031,11 +17422,12 @@ fn run_models_install(
     let pb_clone = pb.clone();
     let manifest_clone = manifest.clone();
 
-    // Run download on a fresh OS thread to avoid nested Tokio runtime drops from reqwest::blocking.
+    // Run download on a fresh OS thread so the model downloader owns its
+    // dedicated asupersync runtime and blocking file writes.
     let result = std::thread::spawn(move || {
         downloader.download(
             &manifest_clone,
-            Some(Box::new(move |progress| {
+            Some(std::sync::Arc::new(move |progress| {
                 pb_clone.set_position(progress.total_bytes);
             })),
         )

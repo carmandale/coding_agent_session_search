@@ -31,13 +31,15 @@ Installs the latest release by default. Pass `--version <tag>` / `-Version <tag>
 **Or via package managers:**
 
 ```bash
-# macOS/Linux (Homebrew)
+# Homebrew (Apple Silicon macOS + Linux)
 brew install dicklesworthstone/tap/cass
 
 # Windows (Scoop)
 scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bucket
 scoop install dicklesworthstone/cass
 ```
+
+Homebrew bottles are currently published for Linux and Apple Silicon macOS. On Intel macOS, use the install script with `--from-source`.
 
 </div>
 
@@ -54,11 +56,15 @@ cass health --json || cass index --full
 # 2) Search across all agent history
 cass search "authentication error" --robot --limit 5 --fields minimal
 
-# 3) View + expand a hit (use source_path/line_number from search output)
+# 3) Find the current or recent session for this workspace
+cass sessions --current --json
+cass sessions --workspace "$(pwd)" --json --limit 5
+
+# 4) View + expand a hit (use source_path/line_number from search output)
 cass view /path/to/session.jsonl -n 42 --json
 cass expand /path/to/session.jsonl -n 42 -C 3 --json
 
-# 4) Discover the full machine API
+# 5) Discover the full machine API
 cass robot-docs guide
 cass robot-docs schemas
 ```
@@ -743,6 +749,12 @@ The `retryable` field tells agents whether a retry might succeed (e.g., transien
 Beyond search, `cass` provides commands for deep-diving into specific sessions:
 
 ```bash
+# Discover the current session for this workspace
+cass sessions --current --json
+
+# List recent sessions for a specific project
+cass sessions --workspace /path/to/project --json --limit 5
+
 # Export full conversation to shareable format
 cass export /path/to/session.jsonl --format markdown -o conversation.md
 cass export /path/to/session.jsonl --format json --include-tools
@@ -751,6 +763,9 @@ cass export /path/to/session.jsonl --format json --include-tools
 cass export-html /path/to/session.jsonl                     # To Downloads folder
 cass export-html session.jsonl --encrypt --password "pwd"   # With password protection
 cass export-html session.jsonl --open --json                # Open in browser, JSON output
+
+# Common agent flow: find current session, then export it
+cass export-html "$(cass sessions --current --json | jq -r '.sessions[0].path')" --json
 
 # Expand context around a specific line (from search result)
 cass expand /path/to/session.jsonl -n 42 -C 5 --json
@@ -1773,12 +1788,12 @@ classDiagram
 
 ## 🧠 Architecture & Engineering
 
-`cass` employs a dual-storage strategy to balance data integrity with search performance.
+`cass` employs a dual-storage strategy to balance data integrity with search performance, powered by a suite of integrated "franken" libraries.
 
 ### The Pipeline
-1. **Ingestion**: Connectors scan proprietary agent files and normalize them into standard structs.
-2. **Storage (SQLite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`). This ensures ACID compliance, reliable storage, and supports complex relational queries (stats, grouping).
-3. **Search Index (Tantivy)**: The **Speed Layer**. New messages are incrementally pushed to a Tantivy full-text index. This index is optimized for speed:
+1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 15+ coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, and more).
+2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation with `BEGIN CONCURRENT` support for MVCC multi-writer transactions.
+3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
  * **Prefix Fields**: `title_prefix` and `content_prefix` use **Index-Time Edge N-Grams** (not stored on disk to save space) for instant prefix matching.
  * **Deduping**: Search results are deduplicated by content hash to remove noise from repeated tool outputs.
@@ -1812,12 +1827,12 @@ flowchart LR
  end
 
  subgraph "Ingestion Layer"
- C1["Connectors\nDetect & Scan\nNormalize & Dedupe"]:::pastel2
+ C1["franken_agent_detection\nAuto-Discover & Scan\nNormalize & Dedupe"]:::pastel2
  end
 
  subgraph "Dual Storage"
- S1["SQLite (WAL)\nSource of Truth\nRelational Data\nMigrations"]:::pastel3
- T1["Tantivy Index\nSearch Optimized\nEdge N-Grams\nPrefix Cache"]:::pastel4
+ S1["frankensqlite (WAL)\nSource of Truth\nBEGIN CONCURRENT\nMigrations"]:::pastel3
+ T1["frankensearch\nBM25 + Semantic\nRRF Fusion\nReranking"]:::pastel4
  end
 
  subgraph "Presentation"
@@ -1877,7 +1892,7 @@ graph TD
 ```
 
 ### Append-Only Storage Strategy
-Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sqlite.rs`) as an **append-only log** for conversations:
+Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sqlite.rs`, powered by frankensqlite) as an **append-only log** for conversations:
 
 - **Immutable History**: When an agent adds a message to a conversation, we don't update the existing row. We insert the new message linked to the conversation ID.
 - **Deduplication**: The connector layer uses content hashing to prevent duplicate messages if an agent re-writes a file.
@@ -2085,6 +2100,7 @@ cass completions powershell >> $PROFILE
 
 - **CPU**: x86_64 processor with **AVX** instruction support (any Intel/AMD CPU from ~2011 onwards). The ONNX Runtime dependency used for semantic search requires AVX instructions. On CPUs without AVX support, the binary will crash with a `SIGILL` (illegal instruction) signal. The `cass` binary includes a runtime check and will print a clear error message if AVX is not detected, but note that ONNX Runtime may be loaded before this check in some code paths.
 - **OS**: Linux, macOS, or Windows
+- **Linux glibc**: Pre-built binaries require **glibc 2.38+** (Ubuntu 24.04+, Fedora 39+, Debian 13+). Ubuntu 20.04 (glibc 2.31) and 22.04 (glibc 2.35) are **not supported** with pre-built binaries. Users on older distributions should build from source with `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`. This requirement exists because CI builds target ubuntu-24.04 to access newer kernel features used by the frankensqlite storage engine.
 - **Disk**: Sufficient space for the search index (varies with session history size)
 
 ---
@@ -2093,10 +2109,15 @@ cass completions powershell >> $PROFILE
 
 ### 1. Install
 
-**Recommended: Homebrew (macOS/Linux)**
+**Recommended: Homebrew (Apple Silicon macOS + Linux)**
 ```bash
 brew install dicklesworthstone/tap/cass
+
+# Update later
+brew upgrade cass
 ```
+
+Homebrew bottles are currently published for Linux and Apple Silicon macOS. On Intel macOS, use the install script with `--from-source`.
 
 **Windows: Scoop**
 ```powershell
@@ -2115,9 +2136,9 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_ses
 2. Verify `SHA256SUMS.txt` against the downloaded archive.
 3. Extract and move `cass` into your PATH.
 
-Example (Linux x86_64, replace `VERSION` with desired release tag):
+Example (Linux x86_64, replace `VERSION` with an explicit release tag):
 ```bash
-VERSION=latest  # or e.g. v0.1.65
+VERSION=v0.2.0  # e.g. v0.2.0
 curl -L -o cass-linux-amd64.tar.gz \
   "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/${VERSION}/cass-linux-amd64.tar.gz"
 curl -L -o SHA256SUMS.txt \
@@ -2229,6 +2250,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `health` | Minimal health check (<50ms), exit 0=healthy, 1=unhealthy |
 | `capabilities` | Discover features, versions, limits (for agent introspection) |
 | `introspect` | Full API schema: commands, arguments, response shapes |
+| `sessions [--workspace DIR] [--current]` | Discover recent session files for follow-up actions |
 | `context <path>` | Find related sessions by workspace, day, or agent |
 | `view <path> -n N` | View source file at specific line (follow-up on search) |
 | `export <path>` | Export conversation to markdown/JSON |

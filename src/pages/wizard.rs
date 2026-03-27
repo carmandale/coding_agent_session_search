@@ -26,7 +26,7 @@ use crate::pages::size::{BundleVerifier, SizeEstimate, SizeLimitResult};
 use crate::pages::summary::{
     ExclusionSet, PrePublishSummary, SummaryFilters, SummaryGenerator, format_size,
 };
-use crate::storage::sqlite::SqliteStorage;
+use crate::storage::sqlite::FrankenStorage;
 use frankensqlite::Connection;
 
 /// Deployment target for the export
@@ -48,7 +48,7 @@ impl std::fmt::Display for DeployTarget {
 }
 
 /// Wizard state tracking all configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WizardState {
     // Content selection
     pub agents: Vec<String>,
@@ -100,6 +100,46 @@ pub struct WizardState {
 
     // Final output location (set after export)
     pub final_site_dir: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for WizardState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WizardState")
+            .field("agents", &self.agents)
+            .field("time_range", &self.time_range)
+            .field("workspaces", &self.workspaces)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "recovery_secret",
+                &self.recovery_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("generate_recovery", &self.generate_recovery)
+            .field("generate_qr", &self.generate_qr)
+            .field("title", &self.title)
+            .field("description", &self.description)
+            .field("hide_metadata", &self.hide_metadata)
+            .field("target", &self.target)
+            .field("output_dir", &self.output_dir)
+            .field("repo_name", &self.repo_name)
+            .field("db_path", &self.db_path)
+            .field("exclusions", &self.exclusions)
+            .field("last_summary", &self.last_summary)
+            .field("secret_scan_has_findings", &self.secret_scan_has_findings)
+            .field("secret_scan_has_critical", &self.secret_scan_has_critical)
+            .field("secret_scan_count", &self.secret_scan_count)
+            .field("password_entropy_bits", &self.password_entropy_bits)
+            .field("no_encryption", &self.no_encryption)
+            .field("unencrypted_confirmed", &self.unencrypted_confirmed)
+            .field("include_attachments", &self.include_attachments)
+            .field("cloudflare_branch", &self.cloudflare_branch)
+            .field("cloudflare_account_id", &self.cloudflare_account_id)
+            .field(
+                "cloudflare_api_token",
+                &self.cloudflare_api_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("final_site_dir", &self.final_site_dir)
+            .finish()
+    }
 }
 
 impl Default for WizardState {
@@ -155,6 +195,11 @@ impl PagesWizard {
             state: WizardState::default(),
             no_encryption_mode: false,
         }
+    }
+
+    /// Override the database path used for agent/workspace discovery and export.
+    pub fn set_db_path(&mut self, db_path: PathBuf) {
+        self.state.db_path = db_path;
     }
 
     /// Set whether to skip encryption (DANGEROUS - requires explicit confirmation).
@@ -343,7 +388,7 @@ impl PagesWizard {
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
 
         // Load agents dynamically from database
-        let storage = SqliteStorage::open_readonly(&self.state.db_path)
+        let storage = FrankenStorage::open_readonly(&self.state.db_path)
             .context("Failed to open database. Run 'cass index' first.")?;
         let db_agents = storage.list_agents()?;
         let db_workspaces = storage.list_workspaces()?;
@@ -387,6 +432,7 @@ impl PagesWizard {
         )?;
 
         // Workspace selection (optional)
+        self.state.workspaces = None;
         if !db_workspaces.is_empty() {
             let include_all = Confirm::with_theme(theme)
                 .with_prompt("Include all workspaces?")
@@ -408,18 +454,23 @@ impl PagesWizard {
                     .items(&workspace_items)
                     .interact()?;
 
-                if !selected_ws.is_empty() {
-                    self.state.workspaces = Some(
-                        selected_ws
-                            .iter()
-                            .map(|&i| db_workspaces[i].path.clone())
-                            .collect(),
-                    );
+                self.state.workspaces = Some(
+                    selected_ws
+                        .iter()
+                        .map(|&i| db_workspaces[i].path.clone())
+                        .collect(),
+                );
+                writeln!(
+                    term,
+                    "  {} {} workspaces selected",
+                    style("✓").green(),
+                    selected_ws.len()
+                )?;
+                if selected_ws.is_empty() {
                     writeln!(
                         term,
-                        "  {} {} workspaces selected",
-                        style("✓").green(),
-                        selected_ws.len()
+                        "  {} No workspaces selected. The export will contain no conversations.",
+                        style("ℹ").yellow()
                     )?;
                 }
             }
@@ -528,7 +579,7 @@ impl PagesWizard {
             .with_prompt("Archive password (min 8 characters)")
             .with_confirmation("Confirm password", "Passwords don't match")
             .validate_with(|input: &String| -> Result<(), &str> {
-                if input.len() >= 8 {
+                if input.chars().count() >= 8 {
                     Ok(())
                 } else {
                     Err("Password must be at least 8 characters")
@@ -757,7 +808,7 @@ impl PagesWizard {
                 }
 
                 if !months.is_empty() {
-                    let month_max = months.values().max().copied().unwrap_or(1);
+                    let month_max = months.values().max().copied().unwrap_or(1).max(1);
                     let sparkline: String = months
                         .values()
                         .map(|&count| {
@@ -1543,12 +1594,12 @@ impl PagesWizard {
 
         writeln!(term)?;
 
-        // Create output directory
-        if !self.state.output_dir.exists() {
-            std::fs::create_dir_all(&self.state.output_dir)?;
-        }
-
-        let export_db_path = self.state.output_dir.join("export.db");
+        // Stage export/encryption artifacts in a temp directory so the final
+        // bundle root only contains deployable output (site/ + private/).
+        let staging_dir = tempfile::tempdir()?;
+        let export_db_path = staging_dir.path().join("export.db");
+        let encrypted_dir = staging_dir.path().join("encrypted");
+        std::fs::create_dir_all(&encrypted_dir)?;
 
         // Phase 1: Database Export with progress
         let pb = ProgressBar::new_spinner();
@@ -1610,7 +1661,7 @@ impl PagesWizard {
             )?;
 
             // For unencrypted mode, just copy the export.db to payload directory
-            let payload_dir = self.state.output_dir.join("payload");
+            let payload_dir = encrypted_dir.join("payload");
             std::fs::create_dir_all(&payload_dir)?;
             let dest_db = payload_dir.join("data.db");
             std::fs::copy(&export_db_path, &dest_db)?;
@@ -1627,7 +1678,7 @@ impl PagesWizard {
                 },
                 "warning": "UNENCRYPTED - All content is publicly readable"
             });
-            let config_path = self.state.output_dir.join("config.json");
+            let config_path = encrypted_dir.join("config.json");
             std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
         } else {
             let pb2 = ProgressBar::new_spinner();
@@ -1656,13 +1707,15 @@ impl PagesWizard {
                 self.state.recovery_secret = Some(recovery_bytes.to_vec());
             }
 
-            // Encrypt the database
-            let config =
-                enc_engine.encrypt_file(&export_db_path, &self.state.output_dir, |_, _| {})?;
+            // Guard: refuse to produce an archive with zero key slots
+            if enc_engine.key_slot_count() == 0 {
+                bail!(
+                    "No encryption key slots configured — archive would be permanently undecryptable"
+                );
+            }
 
-            // Write config.json
-            let config_path = self.state.output_dir.join("config.json");
-            std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+            // Encrypt the database
+            enc_engine.encrypt_file(&export_db_path, &encrypted_dir, |_, _| {})?;
 
             pb2.finish_with_message("✓ Encryption complete");
         }
@@ -1713,33 +1766,20 @@ impl PagesWizard {
             generated_docs,
         };
 
-        // Build the bundle - creates site/ and private/ directories
-        let bundle_output_dir = self
-            .state
-            .output_dir
-            .parent()
-            .map(|p| {
-                p.join(format!(
-                    "{}-bundle",
-                    self.state
-                        .output_dir
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                ))
-            })
-            .unwrap_or_else(|| self.state.output_dir.join("bundle"));
-
         let builder = BundleBuilder::with_config(bundle_config);
         let bundle_result =
-            builder.build(&self.state.output_dir, &bundle_output_dir, |phase, msg| {
+            builder.build(&encrypted_dir, &self.state.output_dir, |phase, msg| {
                 pb3.set_message(format!("{}: {}", phase, msg));
             })?;
+        self.state.final_site_dir = Some(bundle_result.site_dir.clone());
 
         pb3.finish_with_message(format!(
             "✓ Bundle complete: {} files, fingerprint {}",
             bundle_result.total_files,
-            &bundle_result.fingerprint[..8]
+            bundle_result
+                .fingerprint
+                .get(..8)
+                .unwrap_or(&bundle_result.fingerprint)
         ));
 
         // Phase 4: Post-export verification
@@ -1751,9 +1791,6 @@ impl PagesWizard {
                 writeln!(term, "    {}", warning)?;
             }
         }
-
-        // Clean up temporary export.db (encrypted version is in payload/)
-        std::fs::remove_file(&export_db_path).ok();
 
         writeln!(term)?;
         writeln!(
@@ -1814,13 +1851,25 @@ impl PagesWizard {
 
         match self.state.target {
             DeployTarget::Local => {
+                let site_dir = self
+                    .state
+                    .final_site_dir
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| self.state.output_dir.join("site"));
                 writeln!(term)?;
                 writeln!(term, "{}", style("✓ Export complete!").green().bold())?;
                 writeln!(term)?;
                 writeln!(
                     term,
-                    "Your archive has been exported to: {}",
+                    "Your archive bundle has been exported to: {}",
                     style(self.state.output_dir.display()).cyan()
+                )?;
+                writeln!(term)?;
+                writeln!(
+                    term,
+                    "Deployable site directory: {}",
+                    style(site_dir.display()).cyan()
                 )?;
                 writeln!(term)?;
                 writeln!(term, "To preview locally, run:")?;
@@ -1828,8 +1877,8 @@ impl PagesWizard {
                     term,
                     "  {}",
                     style(format!(
-                        "cd {} && python -m http.server 8080",
-                        self.state.output_dir.display()
+                        "cass pages --preview {} --no-open",
+                        site_dir.display()
                     ))
                     .dim()
                 )?;
@@ -1842,6 +1891,12 @@ impl PagesWizard {
             }
             DeployTarget::GitHubPages => {
                 writeln!(term, "  {} GitHub Pages deployment...", style("→").cyan())?;
+                let site_dir = self
+                    .state
+                    .final_site_dir
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| self.state.output_dir.join("site"));
 
                 // Determine repository name
                 let repo_name = self
@@ -1857,7 +1912,7 @@ impl PagesWizard {
                 match deployer.check_prerequisites() {
                     Ok(prereqs) if prereqs.is_ready() => {
                         // Deploy with progress output
-                        match deployer.deploy(&self.state.output_dir, |_phase, msg| {
+                        match deployer.deploy(&site_dir, |_phase, msg| {
                             let _ = writeln!(term, "    {} {}", style("•").dim(), msg);
                         }) {
                             Ok(result) => {
@@ -1882,7 +1937,7 @@ impl PagesWizard {
                                 writeln!(
                                     term,
                                     "To deploy manually, push the {} directory to a gh-pages branch.",
-                                    self.state.output_dir.display()
+                                    site_dir.display()
                                 )?;
                             }
                         }
@@ -1902,7 +1957,7 @@ impl PagesWizard {
                         writeln!(
                             term,
                             "To deploy manually after fixing prerequisites, push the {} directory to a gh-pages branch.",
-                            self.state.output_dir.display()
+                            site_dir.display()
                         )?;
                     }
                     Err(e) => {
@@ -1917,7 +1972,7 @@ impl PagesWizard {
                         writeln!(
                             term,
                             "To deploy manually, push the {} directory to a gh-pages branch.",
-                            self.state.output_dir.display()
+                            site_dir.display()
                         )?;
                     }
                 }
@@ -1928,6 +1983,12 @@ impl PagesWizard {
                     "  {} Cloudflare Pages deployment...",
                     style("→").cyan()
                 )?;
+                let site_dir = self
+                    .state
+                    .final_site_dir
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| self.state.output_dir.join("site"));
 
                 // Determine project name from repo_name or use default
                 let project_name = self
@@ -1950,7 +2011,7 @@ impl PagesWizard {
                 match deployer.check_prerequisites() {
                     Ok(prereqs) if prereqs.is_ready() => {
                         // Deploy with progress output
-                        match deployer.deploy(&self.state.output_dir, |_phase, msg| {
+                        match deployer.deploy(&site_dir, |_phase, msg| {
                             let _ = writeln!(term, "    {} {}", style("•").dim(), msg);
                         }) {
                             Ok(result) => {
@@ -1977,14 +2038,14 @@ impl PagesWizard {
                                 writeln!(
                                     term,
                                     "To deploy manually, use wrangler to deploy the {} directory:",
-                                    self.state.output_dir.display()
+                                    site_dir.display()
                                 )?;
                                 writeln!(
                                     term,
                                     "  {}",
                                     style(format!(
                                         "wrangler pages deploy {} --project-name {}",
-                                        self.state.output_dir.display(),
+                                        site_dir.display(),
                                         project_name
                                     ))
                                     .dim()
@@ -2006,7 +2067,7 @@ impl PagesWizard {
                             "  {}",
                             style(format!(
                                 "wrangler pages deploy {} --project-name {}",
-                                self.state.output_dir.display(),
+                                site_dir.display(),
                                 project_name
                             ))
                             .dim()
@@ -2024,14 +2085,14 @@ impl PagesWizard {
                         writeln!(
                             term,
                             "To deploy manually, use wrangler to deploy the {} directory:",
-                            self.state.output_dir.display()
+                            site_dir.display()
                         )?;
                         writeln!(
                             term,
                             "  {}",
                             style(format!(
                                 "wrangler pages deploy {} --project-name {}",
-                                self.state.output_dir.display(),
+                                site_dir.display(),
                                 project_name
                             ))
                             .dim()

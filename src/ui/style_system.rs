@@ -100,10 +100,12 @@ pub enum UiThemePreset {
     Nightfox,
     CyberpunkAurora,
     Synthwave84,
+    #[serde(alias = "cb", alias = "cvd")]
+    Colorblind,
 }
 
 impl UiThemePreset {
-    pub const fn all() -> [Self; 18] {
+    pub const fn all() -> [Self; 19] {
         [
             Self::TokyoNight,
             Self::Daylight,
@@ -123,6 +125,7 @@ impl UiThemePreset {
             Self::CyberpunkAurora,
             Self::Synthwave84,
             Self::HighContrast,
+            Self::Colorblind,
         ]
     }
 
@@ -146,6 +149,7 @@ impl UiThemePreset {
             Self::Nightfox => "Nightfox",
             Self::CyberpunkAurora => "Cyberpunk Aurora",
             Self::Synthwave84 => "Synthwave '84",
+            Self::Colorblind => "Colorblind",
         }
     }
 
@@ -183,6 +187,7 @@ impl UiThemePreset {
             "synthwave-84" | "synthwave_84" | "synthwave84" | "synthwave" => {
                 Some(Self::Synthwave84)
             }
+            "colorblind" | "colour-blind" | "color-blind" | "cb" | "cvd" => Some(Self::Colorblind),
             _ => None,
         }
     }
@@ -207,6 +212,7 @@ impl UiThemePreset {
             Self::Nightfox => nightfox_theme(),
             Self::CyberpunkAurora => cyberpunk_aurora_theme(),
             Self::Synthwave84 => synthwave_84_theme(),
+            Self::Colorblind => colorblind_theme(),
         }
     }
 }
@@ -670,6 +676,7 @@ fn breakpoint_name(breakpoint: super::app::LayoutBreakpoint) -> &'static str {
         LB::MediumNarrow => "medium-narrow",
         LB::Medium => "medium",
         LB::Wide => "wide",
+        LB::UltraWide => "ultra-wide",
     }
 }
 
@@ -1061,6 +1068,9 @@ fn env_truthy(value: Option<&str>) -> bool {
     match value {
         Some(raw) => {
             let normalized = raw.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                return false;
+            }
             !(normalized == "0"
                 || normalized == "false"
                 || normalized == "off"
@@ -1412,6 +1422,24 @@ fn synthwave_84_theme() -> Theme {
         .selection_fg(Color::rgb(34, 20, 54)) // #221436
         .scrollbar_track(Color::rgb(44, 28, 68)) // #2c1c44
         .scrollbar_thumb(Color::rgb(130, 115, 165)) // #8273a5
+        .build()
+}
+
+/// Colorblind-accessible theme based on Tokyo Night.
+///
+/// Swaps green/orange/red role colors with blue/yellow/magenta so that
+/// all role indicators remain distinguishable for deuteranopia and
+/// protanopia users.  Background, text, and structural colors are
+/// identical to Tokyo Night.
+fn colorblind_theme() -> Theme {
+    ThemeBuilder::from_theme(tokyo_night_theme())
+        .primary(Color::rgb(0, 114, 178))
+        .secondary(Color::rgb(204, 121, 167))
+        .accent(Color::rgb(230, 159, 0))
+        .success(Color::rgb(0, 158, 115))
+        .warning(Color::rgb(240, 228, 66))
+        .error(Color::rgb(213, 94, 0))
+        .info(Color::rgb(86, 180, 233))
         .build()
 }
 
@@ -1910,7 +1938,7 @@ mod tests {
         );
         assert_eq!(
             UiThemePreset::TokyoNight.previous(),
-            UiThemePreset::HighContrast
+            UiThemePreset::Colorblind
         );
     }
 
@@ -2248,8 +2276,8 @@ mod tests {
         // Verify env_truthy handles edge values correctly.
         assert!(!env_truthy(None), "None → false");
         assert!(
-            env_truthy(Some("")),
-            "empty string → true (not in falsy list)"
+            !env_truthy(Some("")),
+            "empty string → false (treated as unset)"
         );
         assert!(env_truthy(Some("1")), "\"1\" → true");
         assert!(env_truthy(Some("yes")), "\"yes\" → true");

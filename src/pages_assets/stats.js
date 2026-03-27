@@ -16,9 +16,14 @@ let analyticsData = null;
 let container = null;
 let isLoading = false;
 let currentTimelineView = 'monthly'; // 'daily' | 'weekly' | 'monthly'
+let analyticsEpoch = 0;
 
 // Cache for computed analytics (when using database fallback)
 let computedAnalytics = null;
+
+function isCurrentAnalyticsEpoch(epoch) {
+    return epoch === analyticsEpoch;
+}
 
 /**
  * Initialize the stats module with a container element
@@ -33,6 +38,8 @@ export function initStats(containerElement) {
  * @returns {Promise<Object>} Analytics data
  */
 export async function loadAnalytics() {
+    const epoch = analyticsEpoch;
+
     if (analyticsData) {
         return analyticsData;
     }
@@ -42,16 +49,28 @@ export async function loadAnalytics() {
 
     try {
         // Try to load precomputed JSON files
-        analyticsData = await loadPrecomputedAnalytics();
+        const loadedAnalytics = await loadPrecomputedAnalytics();
+        if (!isCurrentAnalyticsEpoch(epoch)) {
+            return null;
+        }
+        analyticsData = loadedAnalytics;
     } catch (error) {
         console.warn('[Stats] Precomputed analytics not available, using database fallback:', error.message);
 
         // Fall back to database queries
         if (isDatabaseReady()) {
-            analyticsData = computeAnalyticsFromDatabase();
+            const computed = computeAnalyticsFromDatabase();
+            if (!isCurrentAnalyticsEpoch(epoch)) {
+                return null;
+            }
+            analyticsData = computed;
         } else {
             throw new Error('Database not ready and precomputed analytics not available');
         }
+    }
+
+    if (!isCurrentAnalyticsEpoch(epoch)) {
+        return null;
     }
 
     isLoading = false;
@@ -245,8 +264,14 @@ function computeAnalyticsFromDatabase() {
         const stopWords = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'is', 'it', 'as', 'was', 'be', 'are', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'this', 'that', 'these', 'those', 'i', 'you', 'we', 'they', 'what', 'which', 'who', 'when', 'where', 'why', 'how']);
 
         titleRows.forEach(row => {
-            if (row.title) {
-                const words = row.title.toLowerCase().split(/\s+/);
+            const title = typeof row.title === 'string'
+                ? row.title
+                : row.title === undefined || row.title === null
+                    ? ''
+                    : String(row.title);
+
+            if (title) {
+                const words = title.toLowerCase().split(/\s+/);
                 words.forEach(word => {
                     const cleaned = word.replace(/[^a-z0-9_-]/g, '');
                     if (cleaned.length >= 3 && !stopWords.has(cleaned)) {
@@ -283,10 +308,18 @@ export async function renderStatsDashboard() {
         return;
     }
 
+    const epoch = analyticsEpoch;
+
     try {
         const data = await loadAnalytics();
+        if (!data || !isCurrentAnalyticsEpoch(epoch)) {
+            return;
+        }
         renderDashboard(data);
     } catch (error) {
+        if (!isCurrentAnalyticsEpoch(epoch)) {
+            return;
+        }
         console.error('[Stats] Failed to load analytics:', error);
         renderErrorState(error.message);
     }
@@ -349,6 +382,9 @@ function renderDashboard(data) {
     if (!container) return;
 
     const { statistics, timeline, agentSummary, workspaceSummary, topTerms } = data;
+    const availableTimelineViews = getAvailableTimelineViews(timeline);
+    const selectedTimelineView = getSelectedTimelineView(timeline);
+    currentTimelineView = selectedTimelineView;
 
     container.innerHTML = `
         <div class="panel stats-panel">
@@ -388,19 +424,19 @@ function renderDashboard(data) {
                 ` : ''}
 
                 <!-- Timeline Sparkline -->
-                ${timeline?.monthly?.length > 0 ? `
+                ${availableTimelineViews.length > 0 ? `
                     <section class="stats-section stats-timeline" aria-labelledby="timeline-heading">
                         <h3 id="timeline-heading">Activity Timeline</h3>
-                        <div class="timeline-controls" role="tablist" aria-label="Timeline view">
-                            <button type="button" role="tab" class="timeline-tab ${currentTimelineView === 'daily' ? 'active' : ''}"
-                                    data-view="daily" aria-selected="${currentTimelineView === 'daily'}">Daily</button>
-                            <button type="button" role="tab" class="timeline-tab ${currentTimelineView === 'weekly' ? 'active' : ''}"
-                                    data-view="weekly" aria-selected="${currentTimelineView === 'weekly'}">Weekly</button>
-                            <button type="button" role="tab" class="timeline-tab ${currentTimelineView === 'monthly' ? 'active' : ''}"
-                                    data-view="monthly" aria-selected="${currentTimelineView === 'monthly'}">Monthly</button>
-                        </div>
+                        ${availableTimelineViews.length > 1 ? `
+                            <div class="timeline-controls" role="tablist" aria-label="Timeline view">
+                                ${availableTimelineViews.map((view) => `
+                                    <button type="button" role="tab" class="timeline-tab ${selectedTimelineView === view ? 'active' : ''}"
+                                            data-view="${view}" aria-selected="${selectedTimelineView === view}">${formatTimelineViewLabel(view)}</button>
+                                `).join('')}
+                            </div>
+                        ` : ''}
                         <div id="timeline-chart" class="timeline-chart" role="img" aria-label="Activity timeline chart">
-                            ${renderTimelineChart(timeline)}
+                            ${renderTimelineChart(timeline, selectedTimelineView)}
                         </div>
                     </section>
                 ` : ''}
@@ -423,7 +459,7 @@ function renderDashboard(data) {
                                     ${agentSummary.agents.map(agent => `
                                         <tr>
                                             <td>
-                                                <span class="agent-badge agent-${agent.name.toLowerCase().replace(/[^a-z0-9]/g, '-')}">
+                                                <span class="agent-badge agent-${toCssSlug(agent.name)}">
                                                     ${escapeHtml(formatAgentName(agent.name))}
                                                 </span>
                                             </td>
@@ -495,6 +531,8 @@ function renderDashboard(data) {
         </div>
     `;
 
+    applyDynamicStatsStyles();
+
     // Set up timeline tab handlers
     setupTimelineControls(timeline);
 }
@@ -535,12 +573,45 @@ function renderTimeSpan(timeRange) {
 }
 
 /**
+ * Get timeline entries for a specific view
+ * @param {Object} timeline - Timeline data
+ * @param {string} view - Timeline view key
+ * @returns {Array} Timeline entries
+ */
+function getTimelineEntries(timeline, view) {
+    if (!timeline || !Array.isArray(timeline[view])) {
+        return [];
+    }
+    return timeline[view];
+}
+
+function getAvailableTimelineViews(timeline) {
+    return ['daily', 'weekly', 'monthly'].filter((view) => getTimelineEntries(timeline, view).length > 0);
+}
+
+function getSelectedTimelineView(timeline) {
+    const availableViews = getAvailableTimelineViews(timeline);
+    if (availableViews.includes(currentTimelineView)) {
+        return currentTimelineView;
+    }
+    return availableViews[0] || 'monthly';
+}
+
+function formatTimelineViewLabel(view) {
+    if (typeof view !== 'string' || view.length === 0) {
+        return 'Timeline';
+    }
+    return view.charAt(0).toUpperCase() + view.slice(1);
+}
+
+/**
  * Render timeline chart (SVG sparkline)
  * @param {Object} timeline - Timeline data
+ * @param {string} view - Timeline view
  * @returns {string} SVG HTML string
  */
-function renderTimelineChart(timeline) {
-    const data = timeline[currentTimelineView] || timeline.monthly || [];
+function renderTimelineChart(timeline, view = currentTimelineView) {
+    const data = getTimelineEntries(timeline, view);
     if (data.length === 0) {
         return '<p class="no-data">No timeline data available</p>';
     }
@@ -627,7 +698,8 @@ function renderTermsCloud(terms) {
 
         return `
             <span class="term-tag" role="listitem"
-                  style="font-size: ${size}em; opacity: ${opacity};"
+                  data-term-size="${size.toFixed(3)}"
+                  data-term-opacity="${opacity.toFixed(3)}"
                   title="${count} occurrences">
                 ${escapeHtml(term)}
             </span>
@@ -652,7 +724,7 @@ function renderRoleBars(roles) {
                 <div class="role-bar-item">
                     <span class="role-name">${escapeHtml(role)}</span>
                     <div class="role-bar-container">
-                        <div class="role-bar role-${role.toLowerCase()}" style="width: ${percent}%"
+                        <div class="role-bar role-${toCssSlug(role)}" data-role-width="${percent}"
                              aria-valuenow="${percent}" aria-valuemin="0" aria-valuemax="100"></div>
                     </div>
                     <span class="role-count">${formatNumber(count)} (${percent}%)</span>
@@ -661,16 +733,42 @@ function renderRoleBars(roles) {
         }).join('');
 }
 
+function applyDynamicStatsStyles() {
+    if (!container) {
+        return;
+    }
+
+    container.querySelectorAll('[data-term-size]').forEach(term => {
+        const fontSize = Number.parseFloat(term.dataset.termSize || '');
+        const opacity = Number.parseFloat(term.dataset.termOpacity || '');
+
+        if (Number.isFinite(fontSize)) {
+            term.style.fontSize = `${Math.min(Math.max(fontSize, 0.8), 1.4)}em`;
+        }
+        if (Number.isFinite(opacity)) {
+            term.style.opacity = String(Math.min(Math.max(opacity, 0.6), 1));
+        }
+    });
+
+    container.querySelectorAll('[data-role-width]').forEach(roleBar => {
+        const width = Number.parseFloat(roleBar.dataset.roleWidth || '');
+        if (Number.isFinite(width)) {
+            roleBar.style.width = `${Math.min(Math.max(width, 0), 100)}%`;
+        }
+    });
+}
+
 /**
  * Set up timeline control event handlers
  * @param {Object} timeline - Timeline data
  */
 function setupTimelineControls(timeline) {
     const tabs = container.querySelectorAll('.timeline-tab');
+    const availableViews = new Set(getAvailableTimelineViews(timeline));
     tabs.forEach(tab => {
         tab.addEventListener('click', () => {
             const view = tab.dataset.view;
-            if (view && timeline[view]) {
+            if (view && availableViews.has(view)) {
                 currentTimelineView = view;
 
                 // Update tab states
@@ -680,9 +778,9 @@ function setupTimelineControls(timeline) {
                 });
 
                 // Re-render chart
-                const chartContainer = document.getElementById('timeline-chart');
+                const chartContainer = container?.querySelector('#timeline-chart');
                 if (chartContainer) {
-                    chartContainer.innerHTML = renderTimelineChart(timeline);
+                    chartContainer.innerHTML = renderTimelineChart(timeline, view);
                 }
             }
         });
@@ -695,8 +793,18 @@ function setupTimelineControls(timeline) {
  * @returns {string} Formatted name
  */
 function formatAgentName(agent) {
-    if (!agent) return 'Unknown';
-    return agent.charAt(0).toUpperCase() + agent.slice(1).replace(/[-_]/g, ' ');
+    if (agent === undefined || agent === null || agent === '') return 'Unknown';
+    const value = String(agent);
+    return value.charAt(0).toUpperCase() + value.slice(1).replace(/[-_]/g, ' ');
+}
+
+function toCssSlug(value, fallback = 'unknown') {
+    if (value === undefined || value === null || value === '') {
+        return fallback;
+    }
+
+    const slug = String(value).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    return slug || fallback;
 }
 
 /**
@@ -766,8 +874,14 @@ function escapeHtml(text) {
  * Clear cached analytics data
  */
 export function clearStatsCache() {
+    analyticsEpoch += 1;
     analyticsData = null;
     computedAnalytics = null;
+    isLoading = false;
+    currentTimelineView = 'monthly';
+    if (container) {
+        container.innerHTML = '';
+    }
 }
 
 /**

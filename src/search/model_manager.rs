@@ -20,7 +20,7 @@ use crate::search::model_download::{ModelManifest, ModelState, check_version_mis
 use crate::search::vector_index::{
     ROLE_ASSISTANT, ROLE_USER, SemanticFilterMaps, VectorIndex, vector_index_path,
 };
-use crate::storage::sqlite::SqliteStorage;
+use crate::storage::sqlite::FrankenStorage;
 
 /// Unified TUI state machine for semantic search availability.
 ///
@@ -294,7 +294,7 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
         };
     }
 
-    let storage = match SqliteStorage::open_readonly(db_path) {
+    let storage = match FrankenStorage::open_readonly(db_path) {
         Ok(storage) => storage,
         Err(err) => {
             return SemanticSetup {
@@ -402,7 +402,7 @@ fn load_semantic_context_inner(
         };
     }
 
-    let storage = match SqliteStorage::open_readonly(db_path) {
+    let storage = match FrankenStorage::open_readonly(db_path) {
         Ok(storage) => storage,
         Err(err) => {
             return SemanticSetup {

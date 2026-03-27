@@ -7,10 +7,10 @@
 //! - Hourly check cadence (configurable)
 
 use anyhow::{Context, Result};
-use reqwest::Client;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
@@ -94,7 +94,7 @@ impl UpdateState {
                 .await
                 .with_context(|| format!("creating update state directory {}", parent.display()))?;
         }
-        let json = serde_json::to_string_pretty(self)?;
+        let json = serde_json::to_string_pretty(self).context("serializing update state")?;
         asupersync::fs::write(&path, json)
             .await
             .with_context(|| format!("writing {}", path.display()))?;
@@ -104,6 +104,9 @@ impl UpdateState {
     /// Check if enough time has passed since last check
     pub fn should_check(&self) -> bool {
         let now = now_unix();
+        if self.last_check_ts <= 0 || self.last_check_ts > now {
+            return true;
+        }
         now.saturating_sub(self.last_check_ts) >= CHECK_INTERVAL_SECS as i64
     }
 
@@ -162,11 +165,14 @@ struct GitHubRelease {
 /// Check for updates asynchronously
 ///
 /// Returns None if:
-/// - Not enough time since last check
+/// - Not enough time since last successful check
 /// - Network error (offline-friendly)
 /// - Parse error
-/// - Already on latest
 pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
+    check_for_updates_async_impl(current_version, false).await
+}
+
+async fn check_for_updates_async_impl(current_version: &str, force: bool) -> Option<UpdateInfo> {
     // Escape hatch for CI/CD or restricted environments
     if updates_disabled() {
         return None;
@@ -175,18 +181,11 @@ pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
     let mut state = UpdateState::load_async().await;
 
     // Respect check interval
-    if !state.should_check() {
+    if !force && !state.should_check() {
         debug!("update check: skipping, checked recently");
         return None;
     }
 
-    // Mark that we're checking (even if it fails)
-    state.mark_checked();
-    if let Err(e) = state.save_async().await {
-        warn!("update check: failed to save state: {e}");
-    }
-
-    // Fetch latest release
     let release = match fetch_latest_release().await {
         Ok(r) => r,
         Err(e) => {
@@ -195,45 +194,21 @@ pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
         }
     };
 
-    // Parse versions
-    let latest_str = release.tag_name.trim_start_matches('v');
-    let latest = match Version::parse(latest_str) {
-        Ok(v) => v,
-        Err(e) => {
-            debug!("update check: invalid version '{}': {e}", release.tag_name);
-            return None;
-        }
-    };
+    let info = build_update_info(current_version, release, &state)?;
 
-    let current = match Version::parse(current_version) {
-        Ok(v) => v,
-        Err(e) => {
-            debug!("update check: invalid current version '{current_version}': {e}");
-            return None;
-        }
-    };
+    // Persist cadence only after a successful fetch + parse so transient
+    // network or server errors do not suppress future checks for an hour.
+    state.mark_checked();
+    if let Err(e) = state.save_async().await {
+        warn!("update check: failed to save state: {e}");
+    }
 
-    let is_newer = latest > current;
-    let is_skipped = state.is_skipped(latest_str);
-
-    Some(UpdateInfo {
-        latest_version: latest_str.to_string(),
-        tag_name: release.tag_name,
-        current_version: current_version.to_string(),
-        release_url: release.html_url,
-        is_newer,
-        is_skipped,
-    })
+    Some(info)
 }
 
 /// Force a check regardless of interval (for manual refresh)
 pub async fn force_check(current_version: &str) -> Option<UpdateInfo> {
-    let mut state = UpdateState::load_async().await;
-    state.last_check_ts = 0; // Reset to force check
-    if let Err(e) = state.save_async().await {
-        warn!("update check: failed to reset state: {e}");
-    }
-    check_for_updates(current_version).await
+    check_for_updates_async_impl(current_version, true).await
 }
 
 /// Skip the specified version
@@ -337,39 +312,9 @@ fn release_api_base_url() -> String {
         .unwrap_or_else(|_| format!("https://api.github.com/repos/{GITHUB_REPO}"))
 }
 
-/// Fetch latest release from GitHub API
-async fn fetch_latest_release() -> Result<GitHubRelease> {
-    let url = format!("{}/releases/latest", release_api_base_url());
-
-    let client = Client::builder()
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building http client")?;
-
-    let response = client
-        .get(&url)
-        .header("Accept", "application/vnd.github.v3+json")
-        .send()
-        .await
-        .context("fetching release")?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("GitHub API returned {}", response.status());
-    }
-
-    response
-        .json::<GitHubRelease>()
-        .await
-        .context("parsing release JSON")
-}
-
 /// Get path to update state file
 fn state_path() -> PathBuf {
-    directories::ProjectDirs::from("com", "dicklesworthstone", "coding-agent-search").map_or_else(
-        || PathBuf::from("update_state.json"),
-        |dirs| dirs.data_dir().join("update_state.json"),
-    )
+    crate::default_data_dir().join("update_state.json")
 }
 
 fn legacy_state_path() -> PathBuf {
@@ -395,7 +340,7 @@ fn now_unix() -> i64 {
 // ============================================================================
 
 /// Synchronous version of `check_for_updates` for use in sync TUI code.
-/// Uses reqwest blocking client with short timeout.
+/// Uses a short-lived asupersync runtime and native HTTP client.
 pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
     if updates_disabled() {
         return None;
@@ -409,12 +354,6 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
         return None;
     }
 
-    // Mark that we're checking (even if it fails)
-    state.mark_checked();
-    if let Err(e) = state.save() {
-        warn!("update check: failed to save state: {e}");
-    }
-
     // Fetch latest release (blocking)
     let release = match fetch_latest_release_blocking() {
         Ok(r) => r,
@@ -424,12 +363,29 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
         }
     };
 
-    // Parse versions
-    let latest_str = release.tag_name.trim_start_matches('v');
-    let latest = match Version::parse(latest_str) {
+    let info = build_update_info(current_version, release, &state)?;
+
+    // Persist cadence only after a successful fetch + parse so transient
+    // network or server errors do not suppress future checks for an hour.
+    state.mark_checked();
+    if let Err(e) = state.save() {
+        warn!("update check: failed to save state: {e}");
+    }
+
+    Some(info)
+}
+
+fn build_update_info(
+    current_version: &str,
+    release: GitHubRelease,
+    state: &UpdateState,
+) -> Option<UpdateInfo> {
+    let GitHubRelease { tag_name, html_url } = release;
+    let latest_version = tag_name.trim_start_matches('v').to_string();
+    let latest = match Version::parse(&latest_version) {
         Ok(v) => v,
         Err(e) => {
-            debug!("update check: invalid version '{}': {e}", release.tag_name);
+            debug!("update check: invalid version '{}': {e}", tag_name);
             return None;
         }
     };
@@ -441,43 +397,83 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
             return None;
         }
     };
-
-    let is_newer = latest > current;
-    let is_skipped = state.is_skipped(latest_str);
+    let is_skipped = state.is_skipped(&latest_version);
 
     Some(UpdateInfo {
-        latest_version: latest_str.to_string(),
-        tag_name: release.tag_name,
+        latest_version,
+        tag_name,
         current_version: current_version.to_string(),
-        release_url: release.html_url,
-        is_newer,
+        release_url: html_url,
+        is_newer: latest > current,
         is_skipped,
     })
 }
 
-/// Fetch latest release using blocking HTTP client
-fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
+/// Fetch latest release using the native asupersync HTTP client.
+async fn fetch_latest_release() -> Result<GitHubRelease> {
+    if let Some(cx) = asupersync::Cx::current() {
+        return fetch_latest_release_with_cx(&cx).await;
+    }
+
+    let handle = asupersync::runtime::Runtime::current_handle()
+        .context("update check requires an active asupersync runtime")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle
+        .try_spawn_with_cx(move |cx| async move {
+            let _ = tx.send(fetch_latest_release_with_cx(&cx).await);
+        })
+        .context("spawning update check task")?;
+
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return result,
+            Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
+            Err(TryRecvError::Disconnected) => {
+                anyhow::bail!("update check task exited before returning a result");
+            }
+        }
+    }
+}
+
+async fn fetch_latest_release_with_cx(cx: &asupersync::Cx) -> Result<GitHubRelease> {
     let url = format!("{}/releases/latest", release_api_base_url());
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+    let client = asupersync::http::h1::HttpClient::builder()
         .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building http client")?;
+        .build();
+    let response = asupersync::time::timeout(
+        cx.now(),
+        Duration::from_secs(HTTP_TIMEOUT_SECS),
+        client.request(
+            cx,
+            asupersync::http::h1::Method::Get,
+            &url,
+            vec![(
+                "Accept".to_string(),
+                "application/vnd.github.v3+json".to_string(),
+            )],
+            Vec::new(),
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("timed out fetching release: {e}"))?
+    .context("fetching release")?;
 
-    let response = client
-        .get(&url)
-        .header("Accept", "application/vnd.github.v3+json")
-        .send()
-        .context("fetching release")?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("GitHub API returned {}", response.status());
+    if !response.is_success() {
+        anyhow::bail!("GitHub API returned {}", response.status);
     }
 
     response
         .json::<GitHubRelease>()
         .context("parsing release JSON")
+}
+
+/// Fetch latest release using a dedicated synchronous runtime.
+fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .context("building update-check runtime")?
+        .block_on(fetch_latest_release())
 }
 
 /// Start a background thread to check for updates.
@@ -503,6 +499,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_state_should_check() {
         let mut state = UpdateState::default();
         assert!(state.should_check()); // Fresh state should check
@@ -513,9 +510,15 @@ mod tests {
         // Simulate time passing
         state.last_check_ts = now_unix() - CHECK_INTERVAL_SECS as i64 - 1;
         assert!(state.should_check()); // Enough time passed
+
+        // Future timestamps should not suppress checks indefinitely after
+        // clock skew or state-file corruption.
+        state.last_check_ts = now_unix() + CHECK_INTERVAL_SECS as i64;
+        assert!(state.should_check());
     }
 
     #[test]
+    #[serial]
     fn test_skip_version() {
         let mut state = UpdateState::default();
         assert!(!state.is_skipped("1.0.0"));
@@ -529,6 +532,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_update_info_should_show() {
         let info = UpdateInfo {
             latest_version: "1.0.0".into(),
@@ -558,6 +562,7 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[serial]
     fn test_version_comparison_upgrade_scenarios() {
         // Test various upgrade scenarios with semver comparison
         let test_cases = vec![
@@ -588,6 +593,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_update_state_persistence_round_trip() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let state_file = temp_dir.path().join("update_state.json");
@@ -624,6 +630,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_update_info_upgrade_workflow() {
         // Simulate the full upgrade decision workflow
 
@@ -671,6 +678,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_check_interval_respects_cadence() {
         let mut state = UpdateState::default();
 
@@ -691,6 +699,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_github_repo_constant_is_valid() {
         // Verify the repo constant is properly formatted
         assert!(GITHUB_REPO.contains('/'));
@@ -990,10 +999,134 @@ mod tests {
 
     #[test]
     #[serial]
+    fn integration_failed_sync_check_does_not_throttle_future_checks() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_file = temp_dir.path().join("update_state.json");
+        unsafe {
+            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", "http://127.0.0.1:1");
+            std::env::remove_var("CASS_SKIP_UPDATE");
+            std::env::remove_var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT");
+            std::env::remove_var("TUI_HEADLESS");
+            std::env::remove_var("CI");
+        }
+
+        let result = check_for_updates_sync("0.1.0");
+        assert!(result.is_none(), "offline sync check should fail quietly");
+
+        assert!(
+            !state_file.exists(),
+            "failed sync checks must not persist cadence state"
+        );
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+            std::env::remove_var("CASS_DATA_DIR");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn integration_failed_async_check_does_not_throttle_future_checks() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_file = temp_dir.path().join("update_state.json");
+        unsafe {
+            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", "http://127.0.0.1:1");
+            std::env::remove_var("CASS_SKIP_UPDATE");
+            std::env::remove_var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT");
+            std::env::remove_var("TUI_HEADLESS");
+            std::env::remove_var("CI");
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let result = runtime.block_on(check_for_updates("0.1.0"));
+        assert!(result.is_none(), "offline async check should fail quietly");
+
+        assert!(
+            !state_file.exists(),
+            "failed async checks must not persist cadence state"
+        );
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+            std::env::remove_var("CASS_DATA_DIR");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn integration_force_check_bypasses_cadence_even_when_state_save_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_file = temp_dir.path().join("update_state.json");
+        let state = UpdateState {
+            last_check_ts: now_unix(),
+            skipped_version: None,
+        };
+        std::fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+        let release_json = r#"{
+            "tag_name": "v9.9.9",
+            "html_url": "https://github.com/test/repo/releases/tag/v9.9.9"
+        }"#;
+        let (addr, handle) = start_test_server(release_json, 200);
+
+        let dir_metadata = std::fs::metadata(temp_dir.path()).unwrap();
+        let file_metadata = std::fs::metadata(&state_file).unwrap();
+        let dir_mode = dir_metadata.permissions().mode();
+        let file_mode = file_metadata.permissions().mode();
+
+        let mut readonly_dir = dir_metadata.permissions();
+        readonly_dir.set_mode(0o555);
+        std::fs::set_permissions(temp_dir.path(), readonly_dir).unwrap();
+
+        let mut readonly_file = file_metadata.permissions();
+        readonly_file.set_mode(0o444);
+        std::fs::set_permissions(&state_file, readonly_file).unwrap();
+
+        unsafe {
+            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", format!("http://{}", addr));
+            std::env::remove_var("CASS_SKIP_UPDATE");
+            std::env::remove_var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT");
+            std::env::remove_var("TUI_HEADLESS");
+            std::env::remove_var("CI");
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let result = runtime.block_on(force_check("0.1.0"));
+
+        let mut restore_file = std::fs::metadata(&state_file).unwrap().permissions();
+        restore_file.set_mode(file_mode);
+        std::fs::set_permissions(&state_file, restore_file).unwrap();
+
+        let mut restore_dir = std::fs::metadata(temp_dir.path()).unwrap().permissions();
+        restore_dir.set_mode(dir_mode);
+        std::fs::set_permissions(temp_dir.path(), restore_dir).unwrap();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+            std::env::remove_var("CASS_DATA_DIR");
+        }
+
+        handle.join().expect("server thread");
+
+        let info = result.expect("force check should bypass cadence and succeed");
+        assert_eq!(info.latest_version, "9.9.9");
+        assert!(info.is_newer);
+    }
+
+    #[test]
+    #[serial]
     fn integration_blocking_fetch_release_success_v1() {
-        // Validates the blocking HTTP client path with a v1.0.0 tag.
-        // (The async reqwest client requires a tokio reactor, so we test
-        // the blocking path which is what the production TUI uses.)
+        // Validates the synchronous wrapper over the native HTTP client.
         let release_json = r#"{
             "tag_name": "v1.0.0",
             "html_url": "https://github.com/test/repo/releases/tag/v1.0.0"
@@ -1074,6 +1207,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn integration_http_timeout_is_reasonable() {
         const _: () = {
             // Verify the timeout constant is short enough for startup
@@ -1089,6 +1223,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn integration_check_interval_is_reasonable() {
         const _: () = {
             // Verify check interval is reasonable (not too frequent, not too rare)

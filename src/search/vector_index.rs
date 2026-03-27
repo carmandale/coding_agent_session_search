@@ -9,14 +9,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
+use frankensqlite::Connection as FrankenConnection;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use half::f16;
-use rusqlite::Connection;
 
 pub use frankensearch::index::{Quantization, SearchParams, VectorIndex, VectorIndexWriter};
 
 use crate::search::query::SearchFilters;
 use crate::sources::provenance::{LOCAL_SOURCE_ID, SourceFilter, SourceKind};
-use crate::storage::sqlite::SqliteStorage;
+use crate::storage::sqlite::FrankenStorage;
 
 /// Directory under the cass data dir where vector artifacts are stored.
 pub const VECTOR_INDEX_DIR: &str = "vector_index";
@@ -217,47 +218,53 @@ pub struct SemanticFilterMaps {
 }
 
 impl SemanticFilterMaps {
-    pub fn from_storage(storage: &SqliteStorage) -> Result<Self> {
+    pub fn from_storage(storage: &FrankenStorage) -> Result<Self> {
         Self::from_connection(storage.raw())
     }
 
-    pub fn from_connection(conn: &Connection) -> Result<Self> {
+    pub fn from_connection(conn: &FrankenConnection) -> Result<Self> {
         let mut agent_slug_to_id = HashMap::new();
-        let mut stmt = conn.prepare("SELECT id, slug FROM agents")?;
-        let rows = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let slug: String = row.get(1)?;
-            Ok((id, slug))
-        })?;
-        for row in rows {
-            let (id, slug) = row?;
+        let agent_rows = conn.query_map_collect(
+            "SELECT id, slug FROM agents",
+            &[],
+            |row: &frankensqlite::Row| {
+                let id: i64 = row.get_typed(0)?;
+                let slug: String = row.get_typed(1)?;
+                Ok((id, slug))
+            },
+        )?;
+        for (id, slug) in agent_rows {
             let id_u32 = u32::try_from(id).map_err(|_| anyhow!("agent id out of range"))?;
             agent_slug_to_id.insert(slug, id_u32);
         }
 
         let mut workspace_path_to_id = HashMap::new();
-        let mut stmt = conn.prepare("SELECT id, path FROM workspaces")?;
-        let rows = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let path: String = row.get(1)?;
-            Ok((id, path))
-        })?;
-        for row in rows {
-            let (id, path) = row?;
+        let workspace_rows = conn.query_map_collect(
+            "SELECT id, path FROM workspaces",
+            &[],
+            |row: &frankensqlite::Row| {
+                let id: i64 = row.get_typed(0)?;
+                let path: String = row.get_typed(1)?;
+                Ok((id, path))
+            },
+        )?;
+        for (id, path) in workspace_rows {
             let id_u32 = u32::try_from(id).map_err(|_| anyhow!("workspace id out of range"))?;
             workspace_path_to_id.insert(path, id_u32);
         }
 
         let mut source_id_to_id = HashMap::new();
         let mut remote_source_ids = HashSet::new();
-        let mut stmt = conn.prepare("SELECT id, kind FROM sources")?;
-        let rows = stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let kind: String = row.get(1)?;
-            Ok((id, kind))
-        })?;
-        for row in rows {
-            let (id, kind) = row?;
+        let source_rows = conn.query_map_collect(
+            "SELECT id, kind FROM sources",
+            &[],
+            |row: &frankensqlite::Row| {
+                let id: String = row.get_typed(0)?;
+                let kind: String = row.get_typed(1)?;
+                Ok((id, kind))
+            },
+        )?;
+        for (id, kind) in source_rows {
             let id_u32 = source_id_hash(&id);
             if SourceKind::parse(&kind).is_none_or(|k| k.is_remote()) {
                 remote_source_ids.insert(id_u32);
@@ -271,6 +278,21 @@ impl SemanticFilterMaps {
             source_id_to_id,
             remote_source_ids,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        agent_slug_to_id: HashMap<String, u32>,
+        workspace_path_to_id: HashMap<String, u32>,
+        source_id_to_id: HashMap<String, u32>,
+        remote_source_ids: HashSet<u32>,
+    ) -> Self {
+        Self {
+            agent_slug_to_id,
+            workspace_path_to_id,
+            source_id_to_id,
+            remote_source_ids,
+        }
     }
 
     fn sources_from_filter(&self, filter: &SourceFilter) -> Result<Option<HashSet<u32>>> {

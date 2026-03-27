@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
+use frankensqlite::compat::{ParamValue, RowExt, params_from_iter};
 use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use frankensqlite::compat::{OpenFlags, ParamValue, RowExt, open_with_flags, params_from_iter};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -188,6 +188,9 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         SecretPattern {
             id: "openai_key",
             severity: SecretSeverity::High,
+            // Note: this also matches Anthropic keys (sk-ant-...) — the anthropic_key
+            // pattern below is more specific and checked separately. Dedup by position
+            // in the caller prevents double-reporting.
             regex: Regex::new(r"\bsk-[A-Za-z0-9]{20,}\b").expect("openai key regex"),
         },
         SecretPattern {
@@ -204,8 +207,10 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         SecretPattern {
             id: "private_key",
             severity: SecretSeverity::Critical,
-            regex: Regex::new(r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----")
-                .expect("private key regex"),
+            regex: Regex::new(
+                r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----",
+            )
+            .expect("private key regex"),
         },
         SecretPattern {
             id: "database_url",
@@ -257,11 +262,8 @@ pub fn scan_database<P: AsRef<Path>>(
     running: Option<Arc<AtomicBool>>,
     progress: Option<&ProgressBar>,
 ) -> Result<SecretScanReport> {
-    let conn = open_with_flags(
-        &db_path.as_ref().to_string_lossy(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .context("Failed to open database for secret scan")?;
+    let conn = super::open_existing_sqlite_db(db_path.as_ref())
+        .context("Failed to open database for secret scan")?;
 
     let mut findings: Vec<SecretFinding> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -844,25 +846,31 @@ fn is_allowlisted(matched: &str, config: &SecretScanConfig) -> bool {
     false
 }
 
-fn build_where_clause(
-    filters: &SecretScanFilters,
-) -> Result<(String, Vec<ParamValue>)> {
+fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamValue>)> {
     let mut conditions: Vec<String> = Vec::new();
     let mut params: Vec<ParamValue> = Vec::new();
 
-    if let Some(agents) = filters.agents.as_ref().filter(|a| !a.is_empty()) {
-        let placeholders: Vec<&str> = agents.iter().map(|_| "?").collect();
-        conditions.push(format!("a.slug IN ({})", placeholders.join(", ")));
-        for agent in agents {
-            params.push(ParamValue::from(agent.as_str()));
+    if let Some(agents) = filters.agents.as_ref() {
+        if agents.is_empty() {
+            conditions.push("1=0".to_string());
+        } else {
+            let placeholders: Vec<&str> = agents.iter().map(|_| "?").collect();
+            conditions.push(format!("a.slug IN ({})", placeholders.join(", ")));
+            for agent in agents {
+                params.push(ParamValue::from(agent.as_str()));
+            }
         }
     }
 
-    if let Some(workspaces) = filters.workspaces.as_ref().filter(|w| !w.is_empty()) {
-        let placeholders: Vec<&str> = workspaces.iter().map(|_| "?").collect();
-        conditions.push(format!("w.path IN ({})", placeholders.join(", ")));
-        for ws in workspaces {
-            params.push(ParamValue::from(ws.to_string_lossy().to_string()));
+    if let Some(workspaces) = filters.workspaces.as_ref() {
+        if workspaces.is_empty() {
+            conditions.push("1=0".to_string());
+        } else {
+            let placeholders: Vec<&str> = workspaces.iter().map(|_| "?").collect();
+            conditions.push(format!("w.path IN ({})", placeholders.join(", ")));
+            for ws in workspaces {
+                params.push(ParamValue::from(ws.to_string_lossy().to_string()));
+            }
         }
     }
 
@@ -1283,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    fn build_where_clause_empty_agent_list_ignored() {
+    fn build_where_clause_empty_agent_list_matches_nothing() {
         let filters = SecretScanFilters {
             agents: Some(vec![]),
             workspaces: None,
@@ -1291,7 +1299,27 @@ mod tests {
             until_ts: None,
         };
         let (clause, _) = build_where_clause(&filters).unwrap();
-        assert!(clause.is_empty(), "empty agent list should be ignored");
+        assert!(
+            clause.contains("1=0"),
+            "empty agent list should match nothing: {}",
+            clause
+        );
+    }
+
+    #[test]
+    fn build_where_clause_empty_workspace_list_matches_nothing() {
+        let filters = SecretScanFilters {
+            agents: None,
+            workspaces: Some(vec![]),
+            since_ts: None,
+            until_ts: None,
+        };
+        let (clause, _) = build_where_clause(&filters).unwrap();
+        assert!(
+            clause.contains("1=0"),
+            "empty workspace list should match nothing: {}",
+            clause
+        );
     }
 
     // =========================================================================

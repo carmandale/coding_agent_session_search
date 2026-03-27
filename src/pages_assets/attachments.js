@@ -23,13 +23,35 @@ const CACHE_CONFIG = {
 let manifest = null;
 let isManifestLoaded = false;
 let manifestLoadPromise = null;
+let manifestLoadEpoch = 0;
+let attachmentEpoch = 0;
 
 // Blob cache: hash -> { data: Uint8Array, objectUrl: string|null, size: number }
 const blobCache = new Map();
+const blobLoadPromises = new Map();
+const blobUrlPromises = new Map();
 let cacheSize = 0;
 
 // LRU tracking
 const lruOrder = [];
+
+function isCurrentEpoch(epoch) {
+    return epoch === attachmentEpoch;
+}
+
+function createAttachmentError(message, code) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+}
+
+function createInvalidationError() {
+    return createAttachmentError('Attachment request invalidated', 'ATTACHMENT_REQUEST_INVALIDATED');
+}
+
+function shouldCacheManifestAbsence(error) {
+    return error?.code === 'ATTACHMENT_MANIFEST_ABSENT';
+}
 
 /**
  * Initialize the attachment system
@@ -40,28 +62,46 @@ const lruOrder = [];
  * @returns {Promise<object|null>} Manifest or null if no attachments
  */
 export async function initAttachments(dek, exportId) {
+    const epoch = attachmentEpoch;
+
     if (isManifestLoaded) {
         return manifest;
     }
 
-    if (manifestLoadPromise) {
+    if (manifestLoadPromise && manifestLoadEpoch === epoch) {
         return manifestLoadPromise;
     }
 
-    manifestLoadPromise = loadManifest(dek, exportId);
+    manifestLoadEpoch = epoch;
+    manifestLoadPromise = (async () => {
+        try {
+            const loadedManifest = await loadManifest(dek, exportId);
+            if (!isCurrentEpoch(epoch)) {
+                throw createInvalidationError();
+            }
+            manifest = loadedManifest;
+            isManifestLoaded = true;
+            return manifest;
+        } catch (error) {
+            if (error?.code !== 'ATTACHMENT_REQUEST_INVALIDATED') {
+                console.warn('[Attachments] No attachments found or manifest failed:', error.message);
+            }
+            if (isCurrentEpoch(epoch)) {
+                manifest = null;
+                isManifestLoaded = shouldCacheManifestAbsence(error);
+            }
+            if (shouldCacheManifestAbsence(error)) {
+                return null;
+            }
+            throw error;
+        } finally {
+            if (manifestLoadEpoch === epoch) {
+                manifestLoadPromise = null;
+            }
+        }
+    })();
 
-    try {
-        manifest = await manifestLoadPromise;
-        isManifestLoaded = true;
-        return manifest;
-    } catch (error) {
-        console.warn('[Attachments] No attachments found or manifest failed:', error.message);
-        manifest = null;
-        isManifestLoaded = true;
-        return null;
-    } finally {
-        manifestLoadPromise = null;
-    }
+    return manifestLoadPromise;
 }
 
 /**
@@ -70,7 +110,13 @@ export async function initAttachments(dek, exportId) {
 async function loadManifest(dek, exportId) {
     const response = await fetch('./blobs/manifest.enc');
     if (!response.ok) {
-        throw new Error('Manifest not found');
+        if (response.status === 404) {
+            throw createAttachmentError('Manifest not found', 'ATTACHMENT_MANIFEST_ABSENT');
+        }
+        throw createAttachmentError(
+            `Failed to load attachment manifest: ${response.status}`,
+            'ATTACHMENT_MANIFEST_FETCH_FAILED'
+        );
     }
 
     const ciphertext = new Uint8Array(await response.arrayBuffer());
@@ -101,7 +147,16 @@ async function loadManifest(dek, exportId) {
     // Parse JSON manifest
     const decoder = new TextDecoder();
     const manifestJson = decoder.decode(plaintext);
-    return JSON.parse(manifestJson);
+    let parsedManifest;
+    try {
+        parsedManifest = JSON.parse(manifestJson);
+    } catch (error) {
+        throw createAttachmentError(
+            `Invalid attachment manifest JSON: ${error.message}`,
+            'ATTACHMENT_MANIFEST_INVALID'
+        );
+    }
+    return validateManifest(parsedManifest);
 }
 
 /**
@@ -141,55 +196,79 @@ export function getMessageAttachments(messageId) {
  * @returns {Promise<Uint8Array>} Decrypted blob data
  */
 export async function loadBlob(hash, dek, exportId) {
+    const epoch = attachmentEpoch;
+    const normalizedHash = normalizeBlobHash(hash);
+
     // Check cache
-    if (blobCache.has(hash)) {
-        updateLru(hash);
-        return blobCache.get(hash).data;
+    const cached = blobCache.get(normalizedHash);
+    if (cached) {
+        updateLru(normalizedHash);
+        return cached.data;
     }
 
-    // Fetch encrypted blob
-    const response = await fetch(`./blobs/${hash}.bin`);
-    if (!response.ok) {
-        throw new Error(`Blob not found: ${hash}`);
+    const inFlight = blobLoadPromises.get(normalizedHash);
+    if (inFlight?.epoch === epoch) {
+        return inFlight.promise;
     }
 
-    const ciphertext = new Uint8Array(await response.arrayBuffer());
+    let loadPromise;
+    loadPromise = (async () => {
+        // Fetch encrypted blob
+        const response = await fetch(`./blobs/${normalizedHash}.bin`);
+        if (!response.ok) {
+            throw new Error(`Blob not found: ${normalizedHash}`);
+        }
 
-    // Derive nonce using HKDF
-    const nonce = await deriveBlobNonce(hash);
+        const ciphertext = new Uint8Array(await response.arrayBuffer());
 
-    // Import DEK for decryption
-    const dekKey = await crypto.subtle.importKey(
-        'raw',
-        dek,
-        { name: 'AES-GCM' },
-        false,
-        ['decrypt']
-    );
+        // Derive nonce using HKDF
+        const nonce = await deriveBlobNonce(normalizedHash);
 
-    // Build AAD: export_id || hash_bytes
-    const hashBytes = hexToBytes(hash);
-    const aad = new Uint8Array(exportId.length + hashBytes.length);
-    aad.set(exportId);
-    aad.set(hashBytes, exportId.length);
+        // Import DEK for decryption
+        const dekKey = await crypto.subtle.importKey(
+            'raw',
+            dek,
+            { name: 'AES-GCM' },
+            false,
+            ['decrypt']
+        );
 
-    // Decrypt
-    const plaintext = await crypto.subtle.decrypt(
-        {
-            name: 'AES-GCM',
-            iv: nonce,
-            additionalData: aad,
-        },
-        dekKey,
-        ciphertext
-    );
+        // Build AAD: export_id || hash_bytes
+        const hashBytes = hexToBytes(normalizedHash);
+        const aad = new Uint8Array(exportId.length + hashBytes.length);
+        aad.set(exportId);
+        aad.set(hashBytes, exportId.length);
 
-    const data = new Uint8Array(plaintext);
+        // Decrypt
+        const plaintext = await crypto.subtle.decrypt(
+            {
+                name: 'AES-GCM',
+                iv: nonce,
+                additionalData: aad,
+            },
+            dekKey,
+            ciphertext
+        );
 
-    // Cache the result
-    cacheBlob(hash, data);
+        const data = new Uint8Array(plaintext);
 
-    return data;
+        if (!isCurrentEpoch(epoch)) {
+            throw createInvalidationError();
+        }
+
+        // Cache the result
+        cacheBlob(normalizedHash, data);
+
+        return data;
+    })().finally(() => {
+        const current = blobLoadPromises.get(normalizedHash);
+        if (current?.epoch === epoch && current.promise === loadPromise) {
+            blobLoadPromises.delete(normalizedHash);
+        }
+    });
+
+    blobLoadPromises.set(normalizedHash, { epoch, promise: loadPromise });
+    return loadPromise;
 }
 
 /**
@@ -202,26 +281,62 @@ export async function loadBlob(hash, dek, exportId) {
  * @returns {Promise<string>} Object URL
  */
 export async function loadBlobAsUrl(hash, mimeType, dek, exportId) {
+    const epoch = attachmentEpoch;
+    const normalizedHash = normalizeBlobHash(hash);
+
     // Check if we already have an object URL
-    const cached = blobCache.get(hash);
+    const cached = blobCache.get(normalizedHash);
     if (cached?.objectUrl) {
-        updateLru(hash);
+        updateLru(normalizedHash);
         return cached.objectUrl;
     }
 
-    // Load the blob data
-    const data = await loadBlob(hash, dek, exportId);
-
-    // Create object URL
-    const blob = new Blob([data], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-
-    // Update cache with URL
-    if (blobCache.has(hash)) {
-        blobCache.get(hash).objectUrl = url;
+    const inFlight = blobUrlPromises.get(normalizedHash);
+    if (inFlight?.epoch === epoch) {
+        return inFlight.promise;
     }
 
-    return url;
+    let urlPromise;
+    urlPromise = (async () => {
+        // Load the blob data
+        const data = await loadBlob(normalizedHash, dek, exportId);
+
+        const cachedEntry = blobCache.get(normalizedHash);
+        if (cachedEntry?.objectUrl) {
+            updateLru(normalizedHash);
+            return cachedEntry.objectUrl;
+        }
+
+        // Create object URL
+        const blob = new Blob([data], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+
+        if (!isCurrentEpoch(epoch)) {
+            URL.revokeObjectURL(url);
+            throw createInvalidationError();
+        }
+
+        const cacheEntry = blobCache.get(normalizedHash);
+        if (!cacheEntry) {
+            URL.revokeObjectURL(url);
+            throw createAttachmentError(
+                'Attachment cache entry missing after blob load',
+                'ATTACHMENT_CACHE_INCONSISTENT'
+            );
+        }
+
+        cacheEntry.objectUrl = url;
+        updateLru(normalizedHash);
+        return url;
+    })().finally(() => {
+        const current = blobUrlPromises.get(normalizedHash);
+        if (current?.epoch === epoch && current.promise === urlPromise) {
+            blobUrlPromises.delete(normalizedHash);
+        }
+    });
+
+    blobUrlPromises.set(normalizedHash, { epoch, promise: urlPromise });
+    return urlPromise;
 }
 
 /**
@@ -274,10 +389,77 @@ function hexToBytes(hex) {
     return bytes;
 }
 
+function normalizeBlobHash(hash) {
+    if (typeof hash !== 'string') {
+        throw new Error('Attachment hash must be a string');
+    }
+
+    const normalized = hash.trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(normalized)) {
+        throw new Error('Attachment hash must be 64 hex characters');
+    }
+
+    return normalized;
+}
+
+function validateManifest(rawManifest) {
+    if (!rawManifest || typeof rawManifest !== 'object' || Array.isArray(rawManifest)) {
+        throw new Error('Attachment manifest must be an object');
+    }
+    if (!Array.isArray(rawManifest.entries)) {
+        throw new Error('Attachment manifest entries must be an array');
+    }
+    if (
+        rawManifest.total_size_bytes !== null
+        && rawManifest.total_size_bytes !== undefined
+        && (!Number.isSafeInteger(rawManifest.total_size_bytes) || rawManifest.total_size_bytes < 0)
+    ) {
+        throw new Error('Attachment manifest total_size_bytes must be a non-negative integer');
+    }
+
+    return {
+        ...rawManifest,
+        entries: rawManifest.entries.map((entry, index) => validateManifestEntry(entry, index)),
+    };
+}
+
+function validateManifestEntry(entry, index) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new Error(`Attachment entry ${index} must be an object`);
+    }
+    if (typeof entry.filename !== 'string' || entry.filename.length === 0 || entry.filename.includes('\0')) {
+        throw new Error(`Attachment entry ${index} has an invalid filename`);
+    }
+    if (
+        typeof entry.mime_type !== 'string'
+        || entry.mime_type.trim().length === 0
+        || /[\0\r\n]/.test(entry.mime_type)
+    ) {
+        throw new Error(`Attachment entry ${index} has an invalid MIME type`);
+    }
+    if (!Number.isSafeInteger(entry.size_bytes) || entry.size_bytes < 0) {
+        throw new Error(`Attachment entry ${index} has an invalid size`);
+    }
+    if (!Number.isSafeInteger(entry.message_id) || entry.message_id < 0) {
+        throw new Error(`Attachment entry ${index} has an invalid message ID`);
+    }
+
+    return {
+        ...entry,
+        hash: normalizeBlobHash(entry.hash),
+        mime_type: entry.mime_type.trim(),
+    };
+}
+
 /**
  * Cache a blob with LRU eviction
  */
 function cacheBlob(hash, data) {
+    if (blobCache.has(hash)) {
+        updateLru(hash);
+        return;
+    }
+
     // Check if we need to evict
     while (
         blobCache.size >= CACHE_CONFIG.MAX_ENTRIES ||
@@ -344,10 +526,14 @@ export function clearCache() {
  * Reset the attachment system (for re-auth)
  */
 export function reset() {
+    attachmentEpoch += 1;
     clearCache();
     manifest = null;
     isManifestLoaded = false;
     manifestLoadPromise = null;
+    blobLoadPromises.clear();
+    blobUrlPromises.clear();
+    manifestLoadEpoch = attachmentEpoch;
 }
 
 /**
@@ -454,17 +640,15 @@ async function loadImageAttachment(container, img, hash, mimeType, dek, exportId
         loading.classList.remove('hidden');
 
         const url = await loadBlobAsUrl(hash, mimeType, dek, exportId);
-        img.src = url;
-
-        await new Promise((resolve, reject) => {
-            img.onload = resolve;
-            img.onerror = reject;
-        });
+        await waitForImageLoad(img, url);
 
         loading.classList.add('hidden');
         img.classList.remove('hidden');
         container.classList.add('loaded');
     } catch (error) {
+        if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {
+            return;
+        }
         console.error('[Attachments] Failed to load image:', error);
         loading.classList.add('hidden');
         placeholder.classList.remove('hidden');
@@ -473,6 +657,31 @@ async function loadImageAttachment(container, img, hash, mimeType, dek, exportId
             <span class="attachment-error">Failed to load</span>
         `;
     }
+}
+
+function waitForImageLoad(img, url) {
+    return new Promise((resolve, reject) => {
+        const cleanup = () => {
+            img.onload = null;
+            img.onerror = null;
+        };
+        const handleLoad = () => {
+            cleanup();
+            resolve();
+        };
+        const handleError = () => {
+            cleanup();
+            reject(new Error('Image failed to load'));
+        };
+
+        img.onload = handleLoad;
+        img.onerror = handleError;
+        img.src = url;
+
+        if (img.complete && (!('naturalWidth' in img) || img.naturalWidth > 0)) {
+            handleLoad();
+        }
+    });
 }
 
 /**
@@ -534,6 +743,9 @@ async function downloadAttachment(entry, dek, exportId) {
         a.click();
         document.body.removeChild(a);
     } catch (error) {
+        if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {
+            return;
+        }
         console.error('[Attachments] Failed to download:', error);
         alert('Failed to download attachment');
     }

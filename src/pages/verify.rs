@@ -4,9 +4,10 @@
 //! The verifier confirms correct structure, config schema, payload integrity, and
 //! the absence of secrets in site/.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -46,6 +47,44 @@ const SECRET_FILES: &[&str] = &[
 
 /// Directories that should not exist in site/
 const SECRET_DIRS: &[&str] = &["private"];
+
+/// JSON keys in config.json that indicate plaintext secret leakage.
+const FORBIDDEN_CONFIG_KEYS: &[(&str, &str)] = &[
+    ("password", "password field"),
+    ("secret", "secret field"),
+    ("private_key", "private_key field"),
+    ("master_key", "master_key field"),
+    ("recovery_secret", "recovery_secret"),
+];
+
+const ENCRYPTED_CONFIG_KEYS: &[&str] = &[
+    "version",
+    "export_id",
+    "base_nonce",
+    "compression",
+    "kdf_defaults",
+    "payload",
+    "key_slots",
+];
+const UNENCRYPTED_CONFIG_KEYS: &[&str] = &["encrypted", "version", "payload", "warning"];
+const ENCRYPTED_PAYLOAD_KEYS: &[&str] = &[
+    "chunk_size",
+    "chunk_count",
+    "total_compressed_size",
+    "total_plaintext_size",
+    "files",
+];
+const UNENCRYPTED_PAYLOAD_KEYS: &[&str] = &["path", "format", "size_bytes"];
+const ARGON2_PARAM_KEYS: &[&str] = &["memory_kb", "iterations", "parallelism"];
+const KEY_SLOT_KEYS: &[&str] = &[
+    "id",
+    "slot_type",
+    "kdf",
+    "salt",
+    "wrapped_dek",
+    "nonce",
+    "argon2_params",
+];
 
 /// Verification result for a single check
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,32 +238,31 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
 
 /// Resolve the site directory from a path
 fn resolve_site_dir(path: &Path) -> Result<PathBuf> {
-    if !path.exists() {
-        bail!("Path does not exist: {}", path.display());
-    }
-
-    // If path ends with "site" or contains site/, use it
-    if path.ends_with("site") || path.file_name().map(|n| n == "site").unwrap_or(false) {
-        return Ok(path.to_path_buf());
-    }
-
-    // If path contains site/ subdirectory, use that
-    let site_subdir = path.join("site");
-    if site_subdir.exists() && site_subdir.is_dir() {
-        return Ok(site_subdir);
-    }
-
-    // Otherwise treat path as site directory
-    Ok(path.to_path_buf())
+    super::resolve_site_dir(path)
 }
 
 /// Check that all required files exist
 fn check_required_files(site_dir: &Path) -> CheckResult {
     let mut missing = Vec::new();
+    let mut invalid = Vec::new();
 
     for file in REQUIRED_FILES {
-        if !site_dir.join(file).exists() {
-            missing.push(*file);
+        let path = site_dir.join(file);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_file() {
+                    continue;
+                }
+                if file_type.is_symlink()
+                    && let Ok(target_meta) = fs::metadata(&path)
+                    && target_meta.file_type().is_file()
+                {
+                    continue;
+                }
+                invalid.push(format!("{file} (must be a regular file)"));
+            }
+            Err(_) => missing.push(*file),
         }
     }
 
@@ -233,10 +271,17 @@ fn check_required_files(site_dir: &Path) -> CheckResult {
         missing.push("payload/");
     }
 
-    if missing.is_empty() {
+    if missing.is_empty() && invalid.is_empty() {
         CheckResult::pass()
     } else {
-        CheckResult::fail(format!("Missing files: {}", missing.join(", ")))
+        let mut parts = Vec::new();
+        if !missing.is_empty() {
+            parts.push(format!("Missing files: {}", missing.join(", ")));
+        }
+        if !invalid.is_empty() {
+            parts.push(format!("Invalid required files: {}", invalid.join(", ")));
+        }
+        CheckResult::fail(parts.join("; "))
     }
 }
 
@@ -244,11 +289,23 @@ fn check_required_files(site_dir: &Path) -> CheckResult {
 fn check_config_schema(site_dir: &Path) -> CheckResult {
     let config_path = site_dir.join("config.json");
 
-    // Parse config
-    let config: ArchiveConfig = match File::open(&config_path)
-        .context("Failed to open config.json")
-        .and_then(|f| serde_json::from_reader(BufReader::new(f)).context("Failed to parse JSON"))
-    {
+    let content = match fs::read_to_string(&config_path).context("Failed to read config.json") {
+        Ok(content) => content,
+        Err(e) => return CheckResult::fail(format!("Failed to read config.json: {}", e)),
+    };
+
+    let config_json: Value =
+        match serde_json::from_str(&content).context("Failed to parse JSON syntax") {
+            Ok(json) => json,
+            Err(e) => return CheckResult::fail(format!("Failed to parse config.json: {}", e)),
+        };
+
+    let unknown_field_errors = find_unknown_config_fields(&config_json);
+    if !unknown_field_errors.is_empty() {
+        return CheckResult::fail(unknown_field_errors.join("; "));
+    }
+
+    let config: ArchiveConfig = match serde_json::from_value(config_json) {
         Ok(c) => c,
         Err(e) => return CheckResult::fail(format!("Failed to parse config.json: {}", e)),
     };
@@ -262,6 +319,64 @@ fn check_config_schema(site_dir: &Path) -> CheckResult {
         CheckResult::pass()
     } else {
         CheckResult::fail(errors.join("; "))
+    }
+}
+
+fn find_unknown_config_fields(value: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    let Some(root) = value.as_object() else {
+        return errors;
+    };
+
+    if root.contains_key("encrypted") {
+        collect_unknown_fields(root, UNENCRYPTED_CONFIG_KEYS, "", &mut errors);
+        if let Some(payload) = root.get("payload").and_then(Value::as_object) {
+            collect_unknown_fields(payload, UNENCRYPTED_PAYLOAD_KEYS, "payload", &mut errors);
+        }
+    } else {
+        collect_unknown_fields(root, ENCRYPTED_CONFIG_KEYS, "", &mut errors);
+        if let Some(payload) = root.get("payload").and_then(Value::as_object) {
+            collect_unknown_fields(payload, ENCRYPTED_PAYLOAD_KEYS, "payload", &mut errors);
+        }
+        if let Some(params) = root.get("kdf_defaults").and_then(Value::as_object) {
+            collect_unknown_fields(params, ARGON2_PARAM_KEYS, "kdf_defaults", &mut errors);
+        }
+        if let Some(slots) = root.get("key_slots").and_then(Value::as_array) {
+            for (idx, slot) in slots.iter().enumerate() {
+                if let Some(slot_obj) = slot.as_object() {
+                    let slot_path = format!("key_slots[{idx}]");
+                    collect_unknown_fields(slot_obj, KEY_SLOT_KEYS, &slot_path, &mut errors);
+                    if let Some(params) = slot_obj.get("argon2_params").and_then(Value::as_object) {
+                        collect_unknown_fields(
+                            params,
+                            ARGON2_PARAM_KEYS,
+                            &format!("{slot_path}.argon2_params"),
+                            &mut errors,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    errors
+}
+
+fn collect_unknown_fields(
+    object: &Map<String, Value>,
+    allowed_keys: &[&str],
+    current_path: &str,
+    errors: &mut Vec<String>,
+) {
+    for key in object.keys() {
+        if !allowed_keys.contains(&key.as_str()) {
+            let path = if current_path.is_empty() {
+                key.clone()
+            } else {
+                format!("{current_path}.{key}")
+            };
+            errors.push(format!("config.json contains unknown field: {path}"));
+        }
     }
 }
 
@@ -993,7 +1108,7 @@ fn check_no_secrets(site_dir: &Path) -> CheckResult {
     // Check for forbidden files
     for file in SECRET_FILES {
         let path = site_dir.join(file);
-        if path.exists() {
+        if fs::symlink_metadata(&path).is_ok() {
             errors.push(format!("Secret file found in site/: {}", file));
         }
     }
@@ -1001,41 +1116,134 @@ fn check_no_secrets(site_dir: &Path) -> CheckResult {
     // Check for forbidden directories
     for dir in SECRET_DIRS {
         let path = site_dir.join(dir);
-        if path.exists() && path.is_dir() {
-            errors.push(format!("Secret directory found in site/: {}/", dir));
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            let file_type = metadata.file_type();
+            if file_type.is_dir() || file_type.is_symlink() {
+                errors.push(format!("Secret directory found in site/: {}/", dir));
+            }
         }
     }
 
-    // Check config.json doesn't contain plaintext secrets
-    // Note: We're looking for actual secret values, not field names like "total_plaintext_size"
+    // Recursive scan: detect secret files/dirs hidden in subdirectories
+    find_secrets_recursive(site_dir, site_dir, &mut errors);
+
+    // Check config.json doesn't contain plaintext secrets.
+    // Walk the parsed JSON tree instead of doing brittle raw substring checks so
+    // formatting changes like `"secret" : "..."` or nested objects can't hide leakage.
     let config_path = site_dir.join("config.json");
     if config_path.exists()
         && let Ok(content) = fs::read_to_string(&config_path)
+        && let Ok(config_json) = serde_json::from_str::<Value>(&content)
     {
-        let content_lower = content.to_lowercase();
-        // Check for patterns that indicate actual secrets being stored
-        // These patterns look for JSON keys that shouldn't exist in public config
-        let forbidden_patterns = [
-            ("\"password\":", "password field"), // Password stored in config
-            ("\"secret\":", "secret field"),     // Secret stored directly
-            ("\"private_key\":", "private_key field"), // Private key in config
-            ("\"master_key\":", "master_key field"), // Master key exposed
-            ("\"recovery_secret\":", "recovery_secret"), // Recovery secret in config
-        ];
-        for (pattern, description) in forbidden_patterns {
-            if content_lower.contains(pattern) {
-                errors.push(format!(
-                    "config.json contains forbidden pattern: {}",
-                    description
-                ));
-            }
-        }
+        find_forbidden_config_keys(&config_json, "", &mut errors);
     }
 
     if errors.is_empty() {
         CheckResult::pass()
     } else {
         CheckResult::fail(errors.join("; "))
+    }
+}
+
+fn find_forbidden_config_keys(value: &Value, current_path: &str, findings: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let child_path = if current_path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{current_path}.{key}")
+                };
+                if let Some((_, description)) = FORBIDDEN_CONFIG_KEYS
+                    .iter()
+                    .find(|(forbidden, _)| key.eq_ignore_ascii_case(forbidden))
+                {
+                    findings.push(format!(
+                        "config.json contains forbidden field: {} at {}",
+                        description, child_path
+                    ));
+                }
+                find_forbidden_config_keys(child, &child_path, findings);
+            }
+        }
+        Value::Array(items) => {
+            for (idx, child) in items.iter().enumerate() {
+                let child_path = if current_path.is_empty() {
+                    format!("[{idx}]")
+                } else {
+                    format!("{current_path}[{idx}]")
+                };
+                find_forbidden_config_keys(child, &child_path, findings);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recursively scan a directory tree for secret files and directories.
+/// Finds entries whose name (not full path) matches SECRET_FILES or SECRET_DIRS
+/// at any depth, catching secrets hidden in subdirectories.
+fn find_secrets_recursive(base: &Path, current: &Path, findings: &mut Vec<String>) {
+    let entries = match fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        let name = match entry.file_name().to_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let is_secret_file = SECRET_FILES.contains(&name.as_str());
+        let is_secret_dir = SECRET_DIRS.contains(&name.as_str());
+
+        let rel_path = path
+            .strip_prefix(base)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        if file_type.is_dir() {
+            if is_secret_dir {
+                // Skip if this is a top-level match (already caught above)
+                if current != base {
+                    findings.push(format!(
+                        "Secret directory found in site subdirectory: {}/",
+                        rel_path
+                    ));
+                }
+            }
+            // Only recurse into real directories. Symlinked directories are handled below
+            // so a malicious or accidental loop cannot drag verification outside site/.
+            find_secrets_recursive(base, &path, findings);
+        } else if file_type.is_symlink() {
+            if is_secret_dir {
+                if current != base {
+                    findings.push(format!(
+                        "Secret directory found in site subdirectory: {}/",
+                        rel_path
+                    ));
+                }
+            } else if is_secret_file && current != base {
+                findings.push(format!(
+                    "Secret file found in site subdirectory: {}",
+                    rel_path
+                ));
+            }
+        } else if file_type.is_file() && is_secret_file {
+            // Skip if this is a top-level match (already caught above)
+            if current != base {
+                findings.push(format!(
+                    "Secret file found in site subdirectory: {}",
+                    rel_path
+                ));
+            }
+        }
     }
 }
 
@@ -1415,6 +1623,43 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_rejects_required_file_replaced_by_directory() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        let viewer_backup = temp.path().join("viewer.js.backup");
+
+        copy_fixture("valid", &site_dir).unwrap();
+        fs::rename(site_dir.join("viewer.js"), &viewer_backup).unwrap();
+        fs::create_dir(site_dir.join("viewer.js")).unwrap();
+
+        let mut manifest: IntegrityManifest = serde_json::from_reader(BufReader::new(
+            File::open(site_dir.join("integrity.json")).unwrap(),
+        ))
+        .unwrap();
+        manifest.files.remove("viewer.js");
+        fs::write(
+            site_dir.join("integrity.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let result = verify_bundle(&site_dir, false).unwrap();
+        assert_eq!(result.status, "invalid");
+        assert!(!result.checks.required_files.passed);
+        assert!(
+            result
+                .checks
+                .required_files
+                .details
+                .as_ref()
+                .map(|details| details.contains("viewer.js (must be a regular file)"))
+                .unwrap_or(false),
+            "required file directories should be rejected: {:?}",
+            result.checks.required_files.details
+        );
+    }
+
+    #[test]
     fn test_verify_invalid_config() {
         let temp = TempDir::new().unwrap();
         let site_dir = temp.path().join("site");
@@ -1434,6 +1679,41 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_rejects_unknown_config_fields() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+
+        copy_fixture("valid", &site_dir).unwrap();
+        fs::write(
+            site_dir.join("config.json"),
+            r#"{
+                "encrypted": false,
+                "version": "1.0",
+                "payload": {
+                    "path": "payload/data.sqlite",
+                    "format": "sqlite"
+                },
+                "totally_unknown_field": 123
+            }"#,
+        )
+        .unwrap();
+
+        let result = verify_bundle(&site_dir, false).unwrap();
+        assert!(!result.checks.config_schema.passed);
+        assert!(
+            result
+                .checks
+                .config_schema
+                .details
+                .as_ref()
+                .map(|details| details.contains("unknown field"))
+                .unwrap_or(false),
+            "unknown config fields should fail schema validation: {:?}",
+            result.checks.config_schema.details
+        );
+    }
+
+    #[test]
     fn test_verify_secret_leakage() {
         let temp = TempDir::new().unwrap();
         let site_dir = temp.path().join("site");
@@ -1443,6 +1723,174 @@ mod tests {
 
         let result = verify_bundle(&site_dir, false).unwrap();
         assert!(!result.checks.no_secrets_in_site.passed);
+    }
+
+    #[test]
+    fn test_check_no_secrets_flags_nested_config_secret_key_with_whitespace() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        fs::create_dir_all(&site_dir).unwrap();
+        fs::write(
+            site_dir.join("config.json"),
+            r#"{
+                "encrypted": false,
+                "version": "1.0",
+                "payload": { "path": "payload/data.sqlite", "format": "sqlite" },
+                "metadata": { "secret" : "leaked" }
+            }"#,
+        )
+        .unwrap();
+
+        let result = check_no_secrets(&site_dir);
+        assert!(!result.passed);
+        assert!(
+            result
+                .details
+                .as_ref()
+                .map(|details| {
+                    details.contains(
+                        "config.json contains forbidden field: secret field at metadata.secret",
+                    )
+                })
+                .unwrap_or(false),
+            "nested secret key with whitespace should be detected: {:?}",
+            result.details
+        );
+    }
+
+    #[test]
+    fn test_check_no_secrets_flags_forbidden_config_key_inside_array() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        fs::create_dir_all(&site_dir).unwrap();
+        fs::write(
+            site_dir.join("config.json"),
+            r#"{
+                "encrypted": false,
+                "version": "1.0",
+                "payload": { "path": "payload/data.sqlite", "format": "sqlite" },
+                "metadata": [{ "private_key" : "leaked" }]
+            }"#,
+        )
+        .unwrap();
+
+        let result = check_no_secrets(&site_dir);
+        assert!(!result.passed);
+        assert!(
+            result
+                .details
+                .as_ref()
+                .map(|details| {
+                    details.contains(
+                        "config.json contains forbidden field: private_key field at metadata[0].private_key",
+                    )
+                })
+                .unwrap_or(false),
+            "forbidden key inside arrays should be detected: {:?}",
+            result.details
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_check_no_secrets_does_not_follow_symlinked_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&site_dir).unwrap();
+        fs::create_dir_all(outside_dir.join("private")).unwrap();
+        fs::write(outside_dir.join("private/recovery-secret.txt"), "secret").unwrap();
+        symlink(&outside_dir, site_dir.join("linked-assets")).unwrap();
+
+        let result = check_no_secrets(&site_dir);
+        assert!(
+            result.passed,
+            "symlink targets outside site/ should not be scanned as in-tree secrets: {:?}",
+            result.details
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_check_no_secrets_flags_secret_named_symlink_without_recursing() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        let benign_dir = temp.path().join("benign");
+        fs::create_dir_all(site_dir.join("nested")).unwrap();
+        fs::create_dir_all(&benign_dir).unwrap();
+        symlink(&benign_dir, site_dir.join("nested/private")).unwrap();
+
+        let result = check_no_secrets(&site_dir);
+        assert!(!result.passed);
+        assert!(
+            result
+                .details
+                .as_ref()
+                .map(|details| {
+                    details.contains("Secret directory found in site subdirectory: nested/private/")
+                })
+                .unwrap_or(false),
+            "secret-named symlink should still be reported: {:?}",
+            result.details
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_check_no_secrets_flags_top_level_secret_file_broken_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        fs::create_dir_all(&site_dir).unwrap();
+        symlink(
+            temp.path().join("missing-recovery-secret"),
+            site_dir.join("recovery-secret.txt"),
+        )
+        .unwrap();
+
+        let result = check_no_secrets(&site_dir);
+        assert!(!result.passed);
+        assert!(
+            result
+                .details
+                .as_ref()
+                .map(|details| details.contains("Secret file found in site/: recovery-secret.txt"))
+                .unwrap_or(false),
+            "top-level dangling secret symlink should still be reported: {:?}",
+            result.details
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_check_no_secrets_flags_top_level_secret_dir_broken_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        fs::create_dir_all(&site_dir).unwrap();
+        symlink(
+            temp.path().join("missing-private"),
+            site_dir.join("private"),
+        )
+        .unwrap();
+
+        let result = check_no_secrets(&site_dir);
+        assert!(!result.passed);
+        assert!(
+            result
+                .details
+                .as_ref()
+                .map(|details| details.contains("Secret directory found in site/: private/"))
+                .unwrap_or(false),
+            "top-level dangling private symlink should still be reported: {:?}",
+            result.details
+        );
     }
 
     #[test]
@@ -1541,6 +1989,29 @@ mod tests {
         // Test with direct path
         let resolved_direct = resolve_site_dir(&site_dir).unwrap();
         assert_eq!(resolved_direct, site_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_resolve_site_dir_rejects_symlinked_site_directory() {
+        use std::os::unix::fs::symlink;
+
+        let bundle_root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_site = outside.path().join("site");
+        fs::create_dir_all(&outside_site).unwrap();
+        fs::write(outside_site.join("index.html"), "<html></html>").unwrap();
+        symlink(&outside_site, bundle_root.path().join("site")).unwrap();
+
+        let err = resolve_site_dir(bundle_root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be a symlink"));
+
+        let direct_err = resolve_site_dir(&bundle_root.path().join("site"))
+            .unwrap_err()
+            .to_string();
+        assert!(direct_err.contains("must not be a symlink"));
     }
 
     #[test]

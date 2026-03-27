@@ -18,13 +18,67 @@ CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/coding-agent-search-install.lock"
-SYSTEM=0
 
 log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
 info() { log "\033[0;34m→\033[0m $*"; }
 ok() { log "\033[0;32m✓\033[0m $*"; }
 warn() { log "\033[1;33m⚠\033[0m $*"; }
 err() { log "\033[0;31m✗\033[0m $*"; }
+
+strip_url_suffix() {
+  local value="$1"
+  value="${value%%\#*}"
+  value="${value%%\?*}"
+  printf '%s' "$value"
+}
+
+artifact_name_from_url() {
+  basename "$(strip_url_suffix "$1")"
+}
+
+sibling_url() {
+  local url="$1"
+  local sibling="$2"
+  local base
+  base="$(strip_url_suffix "$url")"
+  printf '%s/%s' "${base%/*}" "$sibling"
+}
+
+is_valid_sha256() {
+  printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{64}$'
+}
+
+checksum_matches() {
+  local file="$1"
+  local expected actual status
+  expected=$(printf '%s' "$CHECKSUM" | tr '[:upper:]' '[:lower:]')
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "$expected  $file" | sha256sum -c - >/dev/null 2>&1
+    status=$?
+    if [ "$status" -eq 0 ]; then
+      return 0
+    fi
+    if [ "$status" -ne 127 ]; then
+      return "$status"
+    fi
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$file" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
+    [ "$actual" = "$expected" ]
+    return $?
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    actual=$(openssl dgst -sha256 "$file" | awk '{print $NF}' | tr '[:upper:]' '[:lower:]')
+    [ "$actual" = "$expected" ]
+    return $?
+  fi
+
+  err "No SHA-256 verification tool found (need sha256sum, shasum, or openssl)"
+  exit 1
+}
 
 resolve_version() {
   if [ -n "$VERSION" ]; then return 0; fi
@@ -67,12 +121,12 @@ maybe_add_path() {
           fi
         done
         if [ "$UPDATED" -eq 1 ]; then
-          warn "PATH updated in ~/.zshrc/.bashrc; restart shell to use coding-agent-search"
+          warn "PATH updated in ~/.zshrc/.bashrc; restart shell to use cass"
         else
-          warn "Add $DEST to PATH to use coding-agent-search"
+          warn "Add $DEST to PATH to use cass"
         fi
       else
-        warn "Add $DEST to PATH to use coding-agent-search"
+        warn "Add $DEST to PATH to use cass"
       fi
     ;;
   esac
@@ -109,7 +163,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="$2"; shift 2;;
     --dest) DEST="$2"; shift 2;;
-    --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
+    --system) DEST="/usr/local/bin"; shift;;
     --easy-mode) EASY=1; shift;;
     --verify) VERIFY=1; shift;;
     --quickstart) QUICKSTART=1; shift;;
@@ -126,7 +180,7 @@ done
 resolve_version
 
 mkdir -p "$DEST"
-OS=$(uname -s | tr 'A-Z' 'a-z')
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64|amd64) ARCH="amd64" ;;
@@ -150,7 +204,7 @@ TAR=""
 URL=""
 if [ "$FROM_SOURCE" -eq 0 ]; then
   if [ -n "$ARTIFACT_URL" ]; then
-    TAR=$(basename "$ARTIFACT_URL")
+    TAR=$(artifact_name_from_url "$ARTIFACT_URL")
     URL="$ARTIFACT_URL"
   elif [ -n "$TARGET" ]; then
     TAR="cass-${TARGET}.${EXT}"
@@ -205,7 +259,7 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
 fi
 
 if [ "$FROM_SOURCE" -eq 1 ]; then
-  info "Building from source (requires git, rust nightly)"
+  info "Building from source (requires git and a working Rust stable toolchain)"
   ensure_rust
   git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
   (cd "$TMP/src" && cargo build --release)
@@ -221,18 +275,35 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
 fi
 
 if [ -z "$CHECKSUM" ]; then
-  [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="${URL}.sha256"
-  info "Fetching checksum from ${CHECKSUM_URL}"
+  [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="$(sibling_url "$URL" "${TAR}.sha256")"
   CHECKSUM_FILE="$TMP/checksum.sha256"
-  if ! curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
-    err "Checksum required and could not be fetched"; exit 1;
-  fi
-  # Extract just the hash (first field) from the file
-  CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
-  if [ -z "$CHECKSUM" ]; then err "Empty checksum file"; exit 1; fi
+  SUMS_URL="$(sibling_url "$URL" "SHA256SUMS.txt")"
+  for TRY_URL in "$CHECKSUM_URL" "$SUMS_URL"; do
+    [ -n "$TRY_URL" ] || continue
+    info "Fetching checksum from ${TRY_URL}"
+    if ! curl -fsSL "$TRY_URL" -o "$CHECKSUM_FILE"; then
+      warn "Could not fetch checksum from ${TRY_URL}; trying next source..."
+      continue
+    fi
+
+    if [ "$TRY_URL" = "$SUMS_URL" ]; then
+      CHECKSUM=$(awk -v tb="$TAR" '$2 == tb {print $1; exit}' "$CHECKSUM_FILE")
+    else
+      # Per-file checksum assets are expected to contain only the requested hash line.
+      CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
+    fi
+
+    if is_valid_sha256 "$CHECKSUM"; then
+      break
+    fi
+
+    CHECKSUM=""
+    warn "Checksum data from ${TRY_URL} did not contain a valid entry for ${TAR}; trying next source..."
+  done
+  if [ -z "$CHECKSUM" ]; then err "Checksum required and could not be resolved"; exit 1; fi
 fi
 
-echo "$CHECKSUM  $TMP/$TAR" | sha256sum -c - || { err "Checksum mismatch"; exit 1; }
+checksum_matches "$TMP/$TAR" || { err "Checksum mismatch"; exit 1; }
 ok "Checksum verified"
 
 info "Extracting"
@@ -280,4 +351,4 @@ if [ "$QUICKSTART" -eq 1 ]; then
 fi
 
 ok "Done. Run: cass"
-info "Tip: For automatic updates, install via Homebrew: brew install dicklesworthstone/tap/cass"
+info "Tip: If installed via Homebrew, update with: brew upgrade cass"

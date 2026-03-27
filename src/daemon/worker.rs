@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use crate::indexer::semantic::{EmbeddingInput, SemanticIndexer};
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::vector_index::{VectorIndex, role_code_from_str, vector_index_path};
-use crate::storage::sqlite::SqliteStorage;
+use crate::storage::sqlite::FrankenStorage;
 
 /// Configuration for a single embedding job.
 #[derive(Debug, Clone)]
@@ -44,6 +44,9 @@ pub enum WorkerMessage {
 #[derive(Clone)]
 pub struct EmbeddingWorkerHandle {
     sender: Sender<WorkerMessage>,
+    /// Shared cancel flag — set directly from the handle so cancellation
+    /// takes effect even while `process_job` is running on the worker thread.
+    cancel_flag: Arc<AtomicBool>,
 }
 
 impl EmbeddingWorkerHandle {
@@ -55,7 +58,11 @@ impl EmbeddingWorkerHandle {
     }
 
     /// Cancel embedding jobs for a db_path.
+    ///
+    /// Sets the cancel flag directly (so the running job sees it immediately)
+    /// AND sends a Cancel message for database-level cleanup.
     pub fn cancel(&self, db_path: String, model_id: Option<String>) -> Result<(), String> {
+        self.cancel_flag.store(true, Ordering::SeqCst);
         self.sender
             .send(WorkerMessage::Cancel { db_path, model_id })
             .map_err(|e| format!("worker channel closed: {e}"))
@@ -121,11 +128,14 @@ impl EmbeddingWorker {
     pub fn new() -> (Self, EmbeddingWorkerHandle) {
         let (sender, receiver) = std::sync::mpsc::channel();
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let handle = EmbeddingWorkerHandle {
+            sender,
+            cancel_flag: Arc::clone(&cancel_flag),
+        };
         let worker = Self {
             receiver,
             cancel_flag,
         };
-        let handle = EmbeddingWorkerHandle { sender };
         (worker, handle)
     }
 
@@ -142,9 +152,10 @@ impl EmbeddingWorker {
                     }
                 }
                 WorkerMessage::Cancel { db_path, model_id } => {
-                    info!(%db_path, ?model_id, "Cancelling embedding jobs");
-                    self.cancel_flag.store(true, Ordering::SeqCst);
-                    // Also cancel in the database
+                    // The cancel_flag is already set by the handle (so the running
+                    // job sees it immediately). This handler performs DB cleanup.
+                    info!(%db_path, ?model_id, "Processing cancel — flag already set by handle");
+                    // Cancel in the database
                     if let Err(e) = Self::cancel_in_db(&db_path, model_id.as_deref()) {
                         warn!(%db_path, error = %e, "Failed to cancel jobs in database");
                     }
@@ -160,7 +171,7 @@ impl EmbeddingWorker {
 
     /// Cancel jobs in the database.
     fn cancel_in_db(db_path: &str, model_id: Option<&str>) -> anyhow::Result<()> {
-        let storage = SqliteStorage::open(Path::new(db_path))?;
+        let storage = FrankenStorage::open(Path::new(db_path))?;
         storage.cancel_embedding_jobs(db_path, model_id)?;
         Ok(())
     }
@@ -171,7 +182,7 @@ impl EmbeddingWorker {
         let index_path = Path::new(&config.index_path);
 
         // Open storage and fetch messages
-        let storage = SqliteStorage::open(db_path)?;
+        let storage = FrankenStorage::open(db_path)?;
         let messages = storage.fetch_messages_for_embedding()?;
         let total_docs = i64::try_from(messages.len()).unwrap_or(i64::MAX);
 
@@ -257,7 +268,7 @@ impl EmbeddingWorker {
     /// Generate embeddings for messages and save the vector index.
     fn generate_embeddings_and_save(
         &self,
-        storage: &SqliteStorage,
+        storage: &FrankenStorage,
         messages: &[crate::storage::sqlite::MessageForEmbedding],
         model_name: &str,
         use_semantic: bool,
@@ -360,9 +371,16 @@ impl EmbeddingWorker {
         let final_completed = i64::try_from(messages.len()).unwrap_or(i64::MAX);
         let _ = storage.update_job_progress(job_id, final_completed);
 
-        // Build and save vector index (FSVI)
-        let _index = indexer.build_and_save_index(embedded, index_path)?;
+        // Append to existing vector index, or create a new one if none exists.
+        // Using append_to_index preserves previously-indexed unchanged documents
+        // that were skipped by the dedup check above.
         let save_path = vector_index_path(index_path, indexer.embedder_id());
+        if save_path.exists() {
+            let appended = indexer.append_to_index(embedded, index_path)?;
+            info!(appended, "Appended to existing vector index");
+        } else {
+            let _index = indexer.build_and_save_index(embedded, index_path)?;
+        }
 
         info!(
             model = model_name,

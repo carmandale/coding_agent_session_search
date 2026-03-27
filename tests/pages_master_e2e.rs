@@ -146,7 +146,7 @@ fn build_pipeline(config: &E2EConfig) -> PipelineArtifacts {
     // Step 3: Encrypt
     debug!("Step 3: Encrypting archive");
     let encrypt_dir = temp_dir.path().join("encrypt_staging");
-    let mut enc_engine = EncryptionEngine::new(1024 * 1024); // 1MB chunks
+    let mut enc_engine = EncryptionEngine::new(1024 * 1024).expect("valid chunk size"); // 1MB chunks
 
     enc_engine
         .add_password_slot(TEST_PASSWORD)
@@ -210,7 +210,7 @@ fn build_pipeline(config: &E2EConfig) -> PipelineArtifacts {
 /// Setup test database with conversation fixtures.
 fn setup_test_db(data_dir: &Path, config: &E2EConfig) -> std::path::PathBuf {
     let db_path = data_dir.join("agent_search.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
+    let storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
 
     // Create agent
     let agent = Agent {
@@ -689,7 +689,7 @@ fn test_export_with_filters() {
 
     // Create DB with multiple agents
     let db_path = data_dir.join("agent_search.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
+    let storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
 
     // Create two agents
     let claude_agent = Agent {

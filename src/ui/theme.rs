@@ -10,7 +10,7 @@
 //!   and mono terminals get safe automatic fallbacks via `ColorProfile`.
 //! - Env-var overrides: respects `NO_COLOR`, `CASS_NO_COLOR`, `CASS_NO_ICONS`,
 //!   `CASS_NO_GRADIENT`, `CASS_DISABLE_ANIMATIONS`, and `CASS_A11Y`.
-//! - Preset cycling: all eighteen `ThemePreset` variants produce a valid ftui Theme.
+//! - Preset cycling: all nineteen `ThemePreset` variants produce a valid ftui Theme.
 
 use ftui::render::cell::PackedRgba;
 use ftui::{Color, ColorCache, ColorProfile, Style, StyleSheet, Theme};
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn preset_cycling_wraps() {
         let mut theme = CassTheme::with_options(
-            ThemePreset::HighContrast,
+            ThemePreset::Colorblind,
             ColorProfile::TrueColor,
             ThemeFlags::all_enabled(),
         );

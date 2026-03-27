@@ -60,6 +60,26 @@ fn is_openrsync() -> bool {
     })
 }
 
+fn quote_remote_shell_path(path: &str) -> String {
+    format!("'{}'", path.replace('\'', r#"'\''"#))
+}
+
+fn remote_spec_for_shell_bound_copy(host: &str, remote_path: &str) -> String {
+    format!("{host}:{}", quote_remote_shell_path(remote_path))
+}
+
+fn remote_spec_for_scp(host: &str, remote_path: &str) -> String {
+    format!("{host}:{remote_path}")
+}
+
+fn remote_spec_for_rsync(host: &str, remote_path: &str, protect_args_supported: bool) -> String {
+    if protect_args_supported {
+        remote_spec_for_scp(host, remote_path)
+    } else {
+        remote_spec_for_shell_bound_copy(host, remote_path)
+    }
+}
+
 /// Errors that can occur during sync operations.
 #[derive(Error, Debug)]
 pub enum SyncError {
@@ -90,7 +110,21 @@ pub enum SyncError {
 pub enum SyncMethod {
     /// rsync over SSH - preferred for delta transfers
     Rsync,
-    /// SFTP fallback when rsync is unavailable
+    /// rsync invoked via WSL (`wsl rsync`) - used on Windows when native rsync is unavailable
+    /// but WSL is installed with rsync available inside it.
+    WslRsync,
+    /// SCP-based transfer using the system `scp` command.
+    ///
+    /// Used on Windows (and other platforms) when rsync is unavailable. Delegates all
+    /// authentication to the system `ssh`/`scp` binary so it inherits OpenSSH agent,
+    /// `~/.ssh/` keys, and `~/.ssh/config` correctly – avoiding the `ssh2` library
+    /// which does not integrate with the Windows OpenSSH agent.
+    Scp,
+    /// SFTP fallback using the `ssh2` crate – last resort only.
+    ///
+    /// Deprecated in favour of [`SyncMethod::Scp`] which uses the native system SSH
+    /// binary. Kept for backward compatibility with callers that pattern-match on this
+    /// variant.
     Sftp,
 }
 
@@ -98,6 +132,8 @@ impl std::fmt::Display for SyncMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Rsync => write!(f, "rsync"),
+            Self::WslRsync => write!(f, "wsl-rsync"),
+            Self::Scp => write!(f, "scp"),
             Self::Sftp => write!(f, "sftp"),
         }
     }
@@ -190,6 +226,24 @@ impl SyncReport {
     /// Get count of failed path syncs.
     pub fn failed_paths(&self) -> usize {
         self.path_results.iter().filter(|r| !r.success).count()
+    }
+
+    /// Summarize the overall sync outcome.
+    pub fn sync_result(&self) -> SyncResult {
+        if self.all_succeeded {
+            SyncResult::Success
+        } else {
+            let errors: Vec<String> = self
+                .path_results
+                .iter()
+                .filter_map(|r| r.error.clone())
+                .collect();
+            if self.successful_paths() > 0 {
+                SyncResult::PartialFailure(errors.join("; "))
+            } else {
+                SyncResult::Failed(errors.join("; "))
+            }
+        }
     }
 }
 
@@ -301,17 +355,59 @@ impl SyncEngine {
     }
 
     /// Detect the available sync method.
+    ///
+    /// Detection order:
+    /// 1. Native `rsync` → [`SyncMethod::Rsync`]
+    /// 2. `wsl rsync` (Windows only) → [`SyncMethod::WslRsync`]
+    /// 3. System `scp` available → [`SyncMethod::Scp`]
+    /// 4. Last resort → [`SyncMethod::Sftp`] (ssh2-based, no native-agent integration)
+    ///
+    /// On Windows the `ssh2` SFTP path is intentionally avoided whenever possible
+    /// because it bypasses the Windows OpenSSH agent and `~/.ssh/config`, leading to
+    /// "No valid authentication method found" errors even when SSH keys are properly
+    /// configured. Using the system `scp` binary instead lets OpenSSH handle auth the
+    /// same way `ssh` and `cass sources doctor` do.
     pub fn detect_sync_method() -> SyncMethod {
+        // 1. Native rsync
         if Command::new("rsync")
             .arg("--version")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
         {
-            SyncMethod::Rsync
-        } else {
-            SyncMethod::Sftp
+            return SyncMethod::Rsync;
         }
+
+        // 2. WSL rsync (Windows-only: rsync inside WSL invoked via `wsl rsync`)
+        #[cfg(target_os = "windows")]
+        if Command::new("wsl")
+            .args(["rsync", "--version"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return SyncMethod::WslRsync;
+        }
+
+        // 3. System scp – preferred over ssh2/SFTP because it inherits the native
+        //    OpenSSH agent and ~/.ssh/config on all platforms (especially Windows).
+        if Command::new("scp")
+            .arg("-S")
+            .arg("ssh")
+            .arg("--")
+            // pass a harmless flag; scp prints usage and exits non-zero, but if the
+            // binary exists the spawn itself succeeds which is all we need to check.
+            .output()
+            .is_ok()
+        {
+            // Confirm scp is a real binary by checking for the executable
+            if which_scp_exists() {
+                return SyncMethod::Scp;
+            }
+        }
+
+        // 4. Last resort: ssh2-based SFTP
+        SyncMethod::Sftp
     }
 
     /// Sync a single source.
@@ -354,6 +450,12 @@ impl SyncEngine {
             let result = match method {
                 SyncMethod::Rsync => {
                     self.sync_path_rsync(host, remote_path, &mirror_dir, remote_home.as_deref())
+                }
+                SyncMethod::WslRsync => {
+                    self.sync_path_wsl_rsync(host, remote_path, &mirror_dir, remote_home.as_deref())
+                }
+                SyncMethod::Scp => {
+                    self.sync_path_scp(host, remote_path, &mirror_dir, remote_home.as_deref())
                 }
                 SyncMethod::Sftp => {
                     self.sync_path_sftp(host, remote_path, &mirror_dir, remote_home.as_deref())
@@ -441,7 +543,8 @@ impl SyncEngine {
 
         // Build rsync command
         // NOTE: NO --delete flag! Safe additive sync only.
-        let remote_spec = format!("{}:{}", host, expanded_path);
+        let protect_args_supported = !is_openrsync();
+        let remote_spec = remote_spec_for_rsync(host, &expanded_path, protect_args_supported);
         let ssh_opts = strict_ssh_command_for_rsync(self.connection_timeout);
 
         let local_path_str = match local_path.to_str() {
@@ -462,7 +565,7 @@ impl SyncEngine {
         let mut cmd = Command::new("rsync");
         cmd.args(["-avz", "--stats", "--partial"]);
         // openrsync (macOS 15+) does not support --protect-args.
-        if !is_openrsync() {
+        if protect_args_supported {
             cmd.arg("--protect-args");
         }
         cmd.args([
@@ -550,6 +653,334 @@ impl SyncEngine {
             local_path,
             files_transferred: stats.files_transferred,
             bytes_transferred: stats.bytes_transferred,
+            success: true,
+            error: None,
+            duration_ms,
+        }
+    }
+
+    /// Sync a single path using rsync invoked through WSL (`wsl rsync …`).
+    ///
+    /// Used on Windows when native rsync is absent but WSL with rsync is available.
+    /// WSL paths use the `\\wsl$\…` UNC convention for the local destination.
+    fn sync_path_wsl_rsync(
+        &self,
+        host: &str,
+        remote_path: &str,
+        dest_dir: &Path,
+        remote_home: Option<&str>,
+    ) -> PathSyncResult {
+        let start = Instant::now();
+
+        if remote_path.starts_with('~') && remote_home.is_none() {
+            let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
+            return PathSyncResult {
+                remote_path: remote_path.to_string(),
+                local_path,
+                success: false,
+                error: Some(
+                    "Cannot expand '~' in remote path; failed to determine remote home directory"
+                        .to_string(),
+                ),
+                duration_ms: start.elapsed().as_millis() as u64,
+                ..Default::default()
+            };
+        }
+
+        let expanded_path = Self::expand_tilde_with_home(remote_path, remote_home);
+        let safe_name = path_to_safe_dirname(remote_path);
+        let local_path = dest_dir.join(&safe_name);
+
+        if let Err(e) = std::fs::create_dir_all(&local_path) {
+            return PathSyncResult {
+                remote_path: remote_path.to_string(),
+                local_path,
+                success: false,
+                error: Some(format!("Failed to create directory: {}", e)),
+                duration_ms: start.elapsed().as_millis() as u64,
+                ..Default::default()
+            };
+        }
+
+        let local_path_str = match local_path.to_str() {
+            Some(s) => s,
+            None => {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some("Local path contains invalid UTF-8".to_string()),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+        };
+
+        // Convert Windows path to a WSL-accessible path.
+        // WSL can access Windows paths via /mnt/<drive>/... conventions.
+        // E.g. C:\Users\george\AppData\... → /mnt/c/Users/george/AppData/...
+        let wsl_dest = windows_path_to_wsl(local_path_str);
+
+        let remote_spec = remote_spec_for_rsync(host, &expanded_path, true);
+        let ssh_opts = strict_ssh_command_for_rsync(self.connection_timeout);
+        let timeout_str = self.transfer_timeout.to_string();
+
+        let mut cmd = Command::new("wsl");
+        cmd.args(["rsync", "-avz", "--stats", "--partial"]);
+        // WSL rsync is the real rsync (not openrsync), so --protect-args is safe.
+        cmd.arg("--protect-args");
+        cmd.args([
+            "--timeout",
+            &timeout_str,
+            "-e",
+            &ssh_opts,
+            "--",
+            &remote_spec,
+            &wsl_dest,
+        ]);
+
+        tracing::debug!(
+            host = %host,
+            remote_path = %expanded_path,
+            local_path = %local_path.display(),
+            wsl_dest = %wsl_dest,
+            "starting wsl rsync"
+        );
+
+        let output = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some(format!("Failed to execute wsl rsync: {}", e)),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+        };
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success() {
+            let error_msg = if stderr.contains("Connection refused")
+                || stderr.contains("Connection timed out")
+            {
+                format!("SSH connection failed: {}", stderr.trim())
+            } else if is_host_key_verification_failure(&stderr) {
+                host_key_verification_error(host)
+            } else if stderr.contains("No such file or directory") {
+                format!("Remote path not found: {}", expanded_path)
+            } else if stderr.contains("Permission denied") {
+                format!("Permission denied: {}", stderr.trim())
+            } else {
+                format!("wsl rsync failed: {}", stderr.trim())
+            };
+
+            tracing::warn!(
+                host = %host,
+                remote_path = %expanded_path,
+                error = %error_msg,
+                "wsl rsync failed"
+            );
+
+            return PathSyncResult {
+                remote_path: remote_path.to_string(),
+                local_path,
+                success: false,
+                error: Some(error_msg),
+                duration_ms,
+                ..Default::default()
+            };
+        }
+
+        let stats = parse_rsync_stats(&stdout);
+
+        tracing::info!(
+            host = %host,
+            remote_path = %expanded_path,
+            files = stats.files_transferred,
+            bytes = stats.bytes_transferred,
+            duration_ms,
+            "wsl rsync completed"
+        );
+
+        PathSyncResult {
+            remote_path: remote_path.to_string(),
+            local_path,
+            files_transferred: stats.files_transferred,
+            bytes_transferred: stats.bytes_transferred,
+            success: true,
+            error: None,
+            duration_ms,
+        }
+    }
+
+    /// Sync a single path using SCP (system `scp -r`).
+    ///
+    /// This method delegates all authentication to the native system `scp`/`ssh`
+    /// binary, which correctly reads `~/.ssh/config`, the OpenSSH agent (including
+    /// the Windows OpenSSH agent on Windows), and all standard key locations.
+    ///
+    /// This avoids the "No valid authentication method found" failure that occurs
+    /// in the `ssh2`-based SFTP path on Windows, where the library does not
+    /// integrate with the Windows OpenSSH agent (`ssh-agent.exe`).
+    fn sync_path_scp(
+        &self,
+        host: &str,
+        remote_path: &str,
+        dest_dir: &Path,
+        remote_home: Option<&str>,
+    ) -> PathSyncResult {
+        let start = Instant::now();
+
+        if remote_path.starts_with('~') && remote_home.is_none() {
+            let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
+            return PathSyncResult {
+                remote_path: remote_path.to_string(),
+                local_path,
+                success: false,
+                error: Some(
+                    "Cannot expand '~' in remote path; failed to determine remote home directory"
+                        .to_string(),
+                ),
+                duration_ms: start.elapsed().as_millis() as u64,
+                ..Default::default()
+            };
+        }
+
+        let expanded_path = Self::expand_tilde_with_home(remote_path, remote_home);
+        let safe_name = path_to_safe_dirname(remote_path);
+        let local_path = dest_dir.join(&safe_name);
+
+        if let Err(e) = std::fs::create_dir_all(&local_path) {
+            return PathSyncResult {
+                remote_path: remote_path.to_string(),
+                local_path,
+                success: false,
+                error: Some(format!("Failed to create directory: {}", e)),
+                duration_ms: start.elapsed().as_millis() as u64,
+                ..Default::default()
+            };
+        }
+
+        let local_path_str = match local_path.to_str() {
+            Some(s) => s,
+            None => {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some("Local path contains invalid UTF-8".to_string()),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+        };
+
+        // Build the scp command.
+        // -r: recursive copy
+        // -B: batch mode (non-interactive, same as ssh -o BatchMode=yes)
+        // -o: pass through SSH options
+        // The remote source is "host:path"; the local destination is the mirror dir.
+        let connect_timeout = self.connection_timeout.to_string();
+        // Modern OpenSSH scp uses SFTP by default, so the remote path is not
+        // parsed by a remote shell unless the caller forces legacy `-O` mode.
+        let remote_spec = remote_spec_for_scp(host, &expanded_path);
+
+        let mut cmd = Command::new("scp");
+        cmd.args([
+            "-r",
+            "-B",
+            "-o",
+            &format!("ConnectTimeout={}", connect_timeout),
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "--",
+            &remote_spec,
+            local_path_str,
+        ]);
+
+        tracing::debug!(
+            host = %host,
+            remote_path = %expanded_path,
+            local_path = %local_path.display(),
+            "starting scp sync"
+        );
+
+        let output = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some(format!("Failed to execute scp: {}", e)),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+        };
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success() {
+            let error_msg = if stderr.contains("Connection refused")
+                || stderr.contains("Connection timed out")
+            {
+                format!("SSH connection failed: {}", stderr.trim())
+            } else if is_host_key_verification_failure(&stderr) {
+                host_key_verification_error(host)
+            } else if stderr.contains("No such file or directory") {
+                format!("Remote path not found: {}", expanded_path)
+            } else if stderr.contains("Permission denied") {
+                format!("Permission denied: {}", stderr.trim())
+            } else {
+                format!("scp failed: {}", stderr.trim())
+            };
+
+            tracing::warn!(
+                host = %host,
+                remote_path = %expanded_path,
+                error = %error_msg,
+                "scp failed"
+            );
+
+            return PathSyncResult {
+                remote_path: remote_path.to_string(),
+                local_path,
+                success: false,
+                error: Some(error_msg),
+                duration_ms,
+                ..Default::default()
+            };
+        }
+
+        // scp does not emit machine-readable stats; count transferred files from the
+        // local directory to give a best-effort count.
+        let files_transferred = count_files_in_dir(&local_path).unwrap_or(0);
+
+        tracing::info!(
+            host = %host,
+            remote_path = %expanded_path,
+            files = files_transferred,
+            duration_ms,
+            "scp sync completed"
+        );
+
+        PathSyncResult {
+            remote_path: remote_path.to_string(),
+            local_path,
+            files_transferred,
+            bytes_transferred: 0, // scp does not report bytes
             success: true,
             error: None,
             duration_ms,
@@ -657,8 +1088,34 @@ impl SyncEngine {
             "SFTP connection parameters"
         );
 
-        // Connect via TCP
-        let tcp = match TcpStream::connect((hostname, port)) {
+        // Connect via TCP with connection timeout
+        let conn_timeout = std::time::Duration::from_secs(self.connection_timeout);
+        let addr = format!("{}:{}", hostname, port);
+        let sock_addr: std::net::SocketAddr = match addr.parse().or_else(|_| {
+            // Resolve hostname to socket address
+            use std::net::ToSocketAddrs;
+            (hostname, port)
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut addrs| addrs.next())
+                .ok_or(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "cannot resolve hostname",
+                ))
+        }) {
+            Ok(a) => a,
+            Err(e) => {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some(format!("DNS resolution failed for {hostname}:{port}: {e}")),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+        };
+        let tcp = match TcpStream::connect_timeout(&sock_addr, conn_timeout) {
             Ok(t) => t,
             Err(e) => {
                 return PathSyncResult {
@@ -675,10 +1132,14 @@ impl SyncEngine {
             }
         };
 
-        // Set TCP timeout
-        let timeout = std::time::Duration::from_secs(self.connection_timeout);
-        let _ = tcp.set_read_timeout(Some(timeout));
-        let _ = tcp.set_write_timeout(Some(timeout));
+        // Set TCP read/write timeout (use transfer_timeout, not connection_timeout)
+        let timeout = std::time::Duration::from_secs(self.transfer_timeout);
+        if let Err(e) = tcp.set_read_timeout(Some(timeout)) {
+            tracing::warn!("Failed to set TCP read timeout: {}", e);
+        }
+        if let Err(e) = tcp.set_write_timeout(Some(timeout)) {
+            tracing::warn!("Failed to set TCP write timeout: {}", e);
+        }
         let tcp_shutdown = tcp.try_clone().ok();
 
         // Create SSH session
@@ -981,6 +1442,59 @@ impl SyncEngine {
     }
 }
 
+/// Check whether the `scp` executable exists on this system.
+///
+/// Uses a simple PATH search rather than running `scp` (which exits non-zero
+/// when invoked without arguments on many platforms).
+fn which_scp_exists() -> bool {
+    std::env::var_os("PATH")
+        .map(|path_var| {
+            std::env::split_paths(&path_var).any(|dir| {
+                let candidate = dir.join(if cfg!(target_os = "windows") {
+                    "scp.exe"
+                } else {
+                    "scp"
+                });
+                candidate.is_file()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Convert a Windows absolute path to a WSL-accessible `/mnt/<drive>/…` path.
+///
+/// E.g. `C:\Users\george\AppData\Roaming\cass` →
+///      `/mnt/c/Users/george/AppData/Roaming/cass`
+///
+/// If the path does not look like a Windows drive path it is returned unchanged.
+fn windows_path_to_wsl(path: &str) -> String {
+    // Match "C:\..." or "C:/..."
+    if path.len() >= 3 {
+        let bytes = path.as_bytes();
+        if bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+            let drive = (bytes[0] as char).to_lowercase().next().unwrap_or('c');
+            let rest = path[3..].replace('\\', "/");
+            return format!("/mnt/{}/{}", drive, rest);
+        }
+    }
+    path.to_string()
+}
+
+/// Count regular files recursively under `dir`.
+fn count_files_in_dir(dir: &Path) -> Result<u64, std::io::Error> {
+    let mut count = 0u64;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_file() {
+            count += 1;
+        } else if ft.is_dir() {
+            count += count_files_in_dir(&entry.path()).unwrap_or(0);
+        }
+    }
+    Ok(count)
+}
+
 /// Parse SSH host string into (optional_user, host).
 ///
 /// Examples:
@@ -1114,6 +1628,26 @@ pub enum SyncResult {
     Skipped,
 }
 
+impl SyncResult {
+    /// Short display label for the result.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::PartialFailure(_) => "partial",
+            Self::Failed(_) => "failed",
+            Self::Skipped => "never",
+        }
+    }
+
+    /// Error text for partial/full failures.
+    pub fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::PartialFailure(error) | Self::Failed(error) => Some(error.as_str()),
+            Self::Success | Self::Skipped => None,
+        }
+    }
+}
+
 /// Sync information for a single source.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SourceSyncInfo {
@@ -1129,6 +1663,19 @@ pub struct SourceSyncInfo {
     pub duration_ms: u64,
 }
 
+impl SourceSyncInfo {
+    /// Build sync info from a sync report using the current wall clock time.
+    pub fn from_report(report: &SyncReport) -> Self {
+        Self {
+            last_sync: Some(current_unix_ms()),
+            last_result: report.sync_result(),
+            files_synced: report.total_files(),
+            bytes_transferred: report.total_bytes(),
+            duration_ms: report.total_duration_ms,
+        }
+    }
+}
+
 /// Persistent sync status for all sources.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SyncStatus {
@@ -1140,61 +1687,48 @@ impl SyncStatus {
     /// Load sync status from disk.
     pub fn load(data_dir: &Path) -> Result<Self, std::io::Error> {
         let path = Self::status_path(data_dir);
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            serde_json::from_str(&content)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        } else {
-            Ok(Self::default())
+        match std::fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e),
         }
     }
 
     /// Save sync status to disk.
+    ///
+    /// Uses an atomic rename on Unix. On Windows, falls back to remove-then-rename
+    /// because replacing an existing destination with `std::fs::rename` fails.
     pub fn save(&self, data_dir: &Path) -> Result<(), std::io::Error> {
         let path = Self::status_path(data_dir);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, content)
+        let tmp_path = unique_atomic_temp_path(&path);
+        std::fs::write(&tmp_path, content)?;
+        replace_file_from_temp(&tmp_path, &path)
     }
 
     /// Update status for a source from a sync report.
     pub fn update(&mut self, source_name: &str, report: &SyncReport) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let now = i64::try_from(now).unwrap_or(i64::MAX);
+        self.set_info(source_name, SourceSyncInfo::from_report(report));
+    }
 
-        let result = if report.all_succeeded {
-            SyncResult::Success
-        } else if report.successful_paths() > 0 {
-            let errors: Vec<String> = report
-                .path_results
-                .iter()
-                .filter_map(|r| r.error.clone())
-                .collect();
-            SyncResult::PartialFailure(errors.join("; "))
-        } else {
-            let errors: Vec<String> = report
-                .path_results
-                .iter()
-                .filter_map(|r| r.error.clone())
-                .collect();
-            SyncResult::Failed(errors.join("; "))
-        };
+    /// Set status for a source from precomputed sync info.
+    pub fn set_info(&mut self, source_name: &str, info: SourceSyncInfo) {
+        self.sources.insert(source_name.to_string(), info);
+    }
 
-        self.sources.insert(
-            source_name.to_string(),
-            SourceSyncInfo {
-                last_sync: Some(now),
-                last_result: result,
-                files_synced: report.total_files(),
-                bytes_transferred: report.total_bytes(),
-                duration_ms: report.total_duration_ms,
-            },
-        );
+    /// Drop sync status entries for sources that no longer exist.
+    ///
+    /// Returns `true` when at least one stale entry was removed.
+    pub fn retain_sources<'a>(&mut self, source_names: impl IntoIterator<Item = &'a str>) -> bool {
+        let allowed: std::collections::HashSet<&str> = source_names.into_iter().collect();
+        let previous_len = self.sources.len();
+        self.sources
+            .retain(|source_name, _| allowed.contains(source_name.as_str()));
+        self.sources.len() != previous_len
     }
 
     /// Get sync info for a source.
@@ -1208,9 +1742,115 @@ impl SyncStatus {
     }
 }
 
+fn current_unix_ms() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(now).unwrap_or(i64::MAX)
+}
+
+fn unique_atomic_temp_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "tmp", "sync_status.json")
+}
+
+fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(windows)]
+    {
+        match std::fs::rename(temp_path, final_path) {
+            Ok(()) => Ok(()),
+            Err(first_err)
+                if final_path.exists()
+                    && matches!(
+                        first_err.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                let backup_path = unique_replace_backup_path(final_path);
+                std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    let _ = std::fs::remove_file(temp_path);
+                    std::io::Error::other(format!(
+                        "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
+                        backup_path.display(),
+                        final_path.display(),
+                        first_err,
+                        backup_err
+                    ))
+                })?;
+                match std::fs::rename(temp_path, final_path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&backup_path);
+                        Ok(())
+                    }
+                    Err(second_err) => {
+                        let restore_result = std::fs::rename(&backup_path, final_path);
+                        match restore_result {
+                            Ok(()) => {
+                                let _ = std::fs::remove_file(temp_path);
+                                Err(std::io::Error::new(
+                                    second_err.kind(),
+                                    format!(
+                                        "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
+                                        final_path.display(),
+                                        temp_path.display(),
+                                        first_err,
+                                        second_err
+                                    ),
+                                ))
+                            }
+                            Err(restore_err) => Err(std::io::Error::other(format!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err,
+                                restore_err,
+                                temp_path.display()
+                            ))),
+                        }
+                    }
+                }
+            }
+            Err(rename_err) => Err(rename_err),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temp_path, final_path)
+    }
+}
+
+#[cfg(windows)]
+fn unique_replace_backup_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "bak", "sync_status.json")
+}
+
+fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+
+    path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_path_to_safe_dirname() {
@@ -1257,6 +1897,50 @@ Total transferred file size: 1,234 bytes
     }
 
     #[test]
+    fn test_quote_remote_shell_path_handles_spaces_and_quotes() {
+        assert_eq!(
+            quote_remote_shell_path("/Users/me/Library/Application Support/Cursor"),
+            "'/Users/me/Library/Application Support/Cursor'"
+        );
+        assert_eq!(
+            quote_remote_shell_path("/tmp/that's all"),
+            "'/tmp/that'\\''s all'"
+        );
+    }
+
+    #[test]
+    fn test_remote_spec_for_rsync_quotes_only_when_needed() {
+        assert_eq!(
+            remote_spec_for_rsync("work-mac", "/tmp/has space", true),
+            "work-mac:/tmp/has space"
+        );
+        assert_eq!(
+            remote_spec_for_rsync("work-mac", "/tmp/has space", false),
+            "work-mac:'/tmp/has space'"
+        );
+    }
+
+    #[test]
+    fn test_remote_spec_for_shell_bound_copy_quotes_remote_path() {
+        assert_eq!(
+            remote_spec_for_shell_bound_copy("work-mac", "/tmp/has space"),
+            "work-mac:'/tmp/has space'"
+        );
+    }
+
+    #[test]
+    fn test_remote_spec_for_scp_preserves_raw_path() {
+        assert_eq!(
+            remote_spec_for_scp("work-mac", "/tmp/has space"),
+            "work-mac:/tmp/has space"
+        );
+        assert_eq!(
+            remote_spec_for_scp("work-mac", "/tmp/that's all"),
+            "work-mac:/tmp/that's all"
+        );
+    }
+
+    #[test]
     fn test_sync_report_totals() {
         let mut report = SyncReport::new("test", SyncMethod::Rsync);
         report.add_path_result(PathSyncResult {
@@ -1299,7 +1983,10 @@ Total transferred file size: 1,234 bytes
     fn test_detect_sync_method() {
         // This test is platform-dependent but should at least not panic
         let method = SyncEngine::detect_sync_method();
-        assert!(matches!(method, SyncMethod::Rsync | SyncMethod::Sftp));
+        assert!(matches!(
+            method,
+            SyncMethod::Rsync | SyncMethod::WslRsync | SyncMethod::Scp | SyncMethod::Sftp
+        ));
     }
 
     #[test]
@@ -1312,7 +1999,34 @@ Total transferred file size: 1,234 bytes
     #[test]
     fn test_sync_method_display() {
         assert_eq!(SyncMethod::Rsync.to_string(), "rsync");
+        assert_eq!(SyncMethod::WslRsync.to_string(), "wsl-rsync");
+        assert_eq!(SyncMethod::Scp.to_string(), "scp");
         assert_eq!(SyncMethod::Sftp.to_string(), "sftp");
+    }
+
+    #[test]
+    fn test_windows_path_to_wsl_drive() {
+        assert_eq!(
+            windows_path_to_wsl("C:\\Users\\george\\AppData\\Roaming\\cass"),
+            "/mnt/c/Users/george/AppData/Roaming/cass"
+        );
+    }
+
+    #[test]
+    fn test_windows_path_to_wsl_forward_slash() {
+        assert_eq!(
+            windows_path_to_wsl("C:/Users/george/data"),
+            "/mnt/c/Users/george/data"
+        );
+    }
+
+    #[test]
+    fn test_windows_path_to_wsl_non_windows_path_unchanged() {
+        // A Unix absolute path should pass through unchanged.
+        assert_eq!(
+            windows_path_to_wsl("/home/george/data"),
+            "/home/george/data"
+        );
     }
 
     #[test]
@@ -1362,6 +2076,7 @@ Total transferred file size: 1,234 bytes
     fn test_sync_result_default() {
         let result = SyncResult::default();
         assert!(matches!(result, SyncResult::Skipped));
+        assert_eq!(result.label(), "never");
     }
 
     #[test]
@@ -1433,6 +2148,86 @@ Total transferred file size: 1,234 bytes
 
         let info = status.get("dead-host").unwrap();
         assert!(matches!(info.last_result, SyncResult::Failed(_)));
+    }
+
+    #[test]
+    fn test_sync_status_save_round_trips() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut status = SyncStatus::default();
+        let mut report = SyncReport::new("laptop", SyncMethod::Rsync);
+        report.add_path_result(PathSyncResult {
+            files_transferred: 3,
+            bytes_transferred: 42,
+            success: true,
+            ..Default::default()
+        });
+        status.update("laptop", &report);
+
+        status.save(temp.path()).expect("save status");
+        let loaded = SyncStatus::load(temp.path()).expect("load status");
+
+        let info = loaded.get("laptop").expect("round-tripped source");
+        assert_eq!(info.files_synced, 3);
+        assert_eq!(info.bytes_transferred, 42);
+        assert!(matches!(info.last_result, SyncResult::Success));
+    }
+
+    #[test]
+    fn test_sync_status_retain_sources_prunes_removed_entries() {
+        let mut status = SyncStatus::default();
+        status.sources.insert(
+            "laptop".into(),
+            SourceSyncInfo {
+                files_synced: 3,
+                ..Default::default()
+            },
+        );
+        status.sources.insert(
+            "desktop".into(),
+            SourceSyncInfo {
+                files_synced: 5,
+                ..Default::default()
+            },
+        );
+
+        let removed_any = status.retain_sources(["laptop"]);
+
+        assert!(removed_any);
+        assert!(status.get("laptop").is_some());
+        assert!(status.get("desktop").is_none());
+    }
+
+    #[test]
+    fn test_unique_atomic_temp_path_changes_each_call() {
+        let final_path = Path::new("/tmp/sync_status.json");
+        let first = unique_atomic_temp_path(final_path);
+        let second = unique_atomic_temp_path(final_path);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), final_path.parent());
+        assert_eq!(second.parent(), final_path.parent());
+    }
+
+    #[test]
+    fn test_replace_file_from_temp_overwrites_existing_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let final_path = temp.path().join("sync_status.json");
+        let first_tmp = temp.path().join("first.tmp");
+        let second_tmp = temp.path().join("second.tmp");
+
+        std::fs::write(&first_tmp, "{\"first\":true}").expect("write first temp");
+        replace_file_from_temp(&first_tmp, &final_path).expect("initial replace");
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("read first final"),
+            "{\"first\":true}"
+        );
+
+        std::fs::write(&second_tmp, "{\"second\":true}").expect("write second temp");
+        replace_file_from_temp(&second_tmp, &final_path).expect("overwrite replace");
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("read second final"),
+            "{\"second\":true}"
+        );
     }
 
     #[test]

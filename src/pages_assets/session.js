@@ -5,6 +5,8 @@
  * Balances security with usability by supporting multiple storage options.
  */
 
+import { getArchiveScopeId } from './storage.js';
+
 // Session configuration
 export const SESSION_CONFIG = {
     // Default session duration: 4 hours
@@ -21,11 +23,50 @@ export const SESSION_CONFIG = {
     STORAGE_SESSION: 'session',     // Survives refresh, not tabs
     STORAGE_LOCAL: 'local',         // Persists across sessions (least secure)
 
-    // Storage keys
+    // Storage key bases
     KEY_SESSION_TOKEN: 'cass_session',
     KEY_EXPIRY: 'cass_expiry',
     KEY_STORAGE_PREF: 'cass_storage_pref',
 };
+
+function getScopedSessionKeys() {
+    const scopeId = getArchiveScopeId();
+    return {
+        TOKEN: `${SESSION_CONFIG.KEY_SESSION_TOKEN}_${scopeId}`,
+        EXPIRY: `${SESSION_CONFIG.KEY_EXPIRY}_${scopeId}`,
+        STORAGE_PREF: `${SESSION_CONFIG.KEY_STORAGE_PREF}_${scopeId}`,
+    };
+}
+
+function encodeBytes(bytes) {
+    return btoa(String.fromCharCode(...bytes));
+}
+
+function decodeBytes(base64) {
+    return Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+}
+
+function getPersistentStorages() {
+    const storages = [];
+
+    try {
+        if (typeof sessionStorage !== 'undefined') {
+            storages.push(sessionStorage);
+        }
+    } catch (error) {
+        // Ignore unavailable storage backends and fall back to memory-only behavior.
+    }
+
+    try {
+        if (typeof localStorage !== 'undefined') {
+            storages.push(localStorage);
+        }
+    } catch (error) {
+        // Ignore unavailable storage backends and fall back to memory-only behavior.
+    }
+
+    return storages;
+}
 
 /**
  * In-memory storage fallback
@@ -65,10 +106,12 @@ export class SessionManager {
         this.onWarning = options.onWarning || (() => {});
 
         this.dek = null;              // Current DEK (in memory)
-        this.sessionKey = null;       // Key for encrypting DEK in storage
+        this.expiryTs = 0;            // Current session expiry timestamp
+        this.persistent = false;      // Whether the session is persisted in storage
         this.expiryTimeout = null;    // Expiry timer
         this.warningTimeout = null;   // Warning timer
         this.memoryStorage = new MemoryStorage();
+        this.cleanupHandlersInstalled = false;
 
         // Bind methods for event handlers
         this.handleVisibilityChange = this.handleVisibilityChange.bind(this);
@@ -81,17 +124,18 @@ export class SessionManager {
      * @param {boolean} rememberMe - Whether to persist the session
      */
     async startSession(dek, rememberMe = false) {
+        this.clearStorage();
         this.dek = dek;
 
         const expiry = Date.now() + this.duration;
+        this.expiryTs = expiry;
+        this.persistent = rememberMe && this.storage !== SESSION_CONFIG.STORAGE_MEMORY;
 
-        if (rememberMe && this.storage !== SESSION_CONFIG.STORAGE_MEMORY) {
-            // Encrypt DEK with a session-specific key before storing
-            this.sessionKey = this.generateSessionKey();
-            const encryptedDek = await this.encryptDekForStorage(dek, this.sessionKey);
-
-            this.getStorage().setItem(SESSION_CONFIG.KEY_SESSION_TOKEN, encryptedDek);
-            this.getStorage().setItem(SESSION_CONFIG.KEY_EXPIRY, expiry.toString());
+        if (this.persistent) {
+            const storage = this.getStorage();
+            const sessionKeys = getScopedSessionKeys();
+            storage.setItem(sessionKeys.TOKEN, encodeBytes(dek));
+            storage.setItem(sessionKeys.EXPIRY, expiry.toString());
         }
 
         // Set timers
@@ -109,8 +153,12 @@ export class SessionManager {
      */
     async restoreSession() {
         const storage = this.getStorage();
-        const token = storage.getItem(SESSION_CONFIG.KEY_SESSION_TOKEN);
-        const expiry = parseInt(storage.getItem(SESSION_CONFIG.KEY_EXPIRY) || '0', 10);
+        const sessionKeys = getScopedSessionKeys();
+        const token = storage.getItem(sessionKeys.TOKEN);
+        const expiry = parseInt(
+            storage.getItem(sessionKeys.EXPIRY) || '0',
+            10
+        );
 
         if (!token || Date.now() > expiry) {
             console.log('[Session] No valid session to restore');
@@ -118,19 +166,15 @@ export class SessionManager {
             return null;
         }
 
-        if (!this.sessionKey) {
-            // Session key lost (e.g., tab was closed)
-            console.log('[Session] Session key not available');
-            this.clearStorage();
-            return null;
-        }
-
         try {
-            const dek = await this.decryptDekFromStorage(token, this.sessionKey);
+            const dek = decodeBytes(token);
             this.dek = dek;
+            this.expiryTs = expiry;
+            this.persistent = true;
 
             // Reset timers with remaining time
             this.setTimers(expiry);
+            this.setupCleanupHandlers();
 
             console.log(`[Session] Restored, expires at ${new Date(expiry).toISOString()}`);
             return dek;
@@ -153,14 +197,10 @@ export class SessionManager {
             this.dek = null;
         }
 
-        // Clear session key
-        if (this.sessionKey) {
-            this.sessionKey.fill(0);
-            this.sessionKey = null;
-        }
-
         // Clear timers
         this.clearTimers();
+        this.expiryTs = 0;
+        this.persistent = false;
 
         // Clear storage
         this.clearStorage();
@@ -184,11 +224,15 @@ export class SessionManager {
         const storage = this.getStorage();
 
         // Calculate new expiry
-        const currentExpiry = parseInt(storage.getItem(SESSION_CONFIG.KEY_EXPIRY) || '0', 10);
+        const sessionKeys = getScopedSessionKeys();
+        const currentExpiry = this.expiryTs || parseInt(storage.getItem(sessionKeys.EXPIRY) || '0', 10);
         const newExpiry = Math.max(Date.now(), currentExpiry) + extension;
+        this.expiryTs = newExpiry;
 
         // Update storage
-        storage.setItem(SESSION_CONFIG.KEY_EXPIRY, newExpiry.toString());
+        if (this.persistent) {
+            storage.setItem(sessionKeys.EXPIRY, newExpiry.toString());
+        }
 
         // Reset timers
         this.setTimers(newExpiry);
@@ -218,11 +262,7 @@ export class SessionManager {
      * @returns {number}
      */
     getRemainingTime() {
-        const expiry = parseInt(
-            this.getStorage().getItem(SESSION_CONFIG.KEY_EXPIRY) || '0',
-            10
-        );
-        return Math.max(0, expiry - Date.now());
+        return Math.max(0, this.expiryTs - Date.now());
     }
 
     /**
@@ -270,9 +310,23 @@ export class SessionManager {
     getStorage() {
         switch (this.storage) {
             case SESSION_CONFIG.STORAGE_LOCAL:
-                return typeof localStorage !== 'undefined' ? localStorage : this.memoryStorage;
+                try {
+                    if (typeof localStorage !== 'undefined') {
+                        return localStorage;
+                    }
+                } catch (error) {
+                    // Fall back to memory-only storage below.
+                }
+                return this.memoryStorage;
             case SESSION_CONFIG.STORAGE_SESSION:
-                return typeof sessionStorage !== 'undefined' ? sessionStorage : this.memoryStorage;
+                try {
+                    if (typeof sessionStorage !== 'undefined') {
+                        return sessionStorage;
+                    }
+                } catch (error) {
+                    // Fall back to memory-only storage below.
+                }
+                return this.memoryStorage;
             case SESSION_CONFIG.STORAGE_MEMORY:
             default:
                 return this.memoryStorage;
@@ -283,81 +337,37 @@ export class SessionManager {
      * Clear all session data from storage
      */
     clearStorage() {
-        const storage = this.getStorage();
-        storage.removeItem(SESSION_CONFIG.KEY_SESSION_TOKEN);
-        storage.removeItem(SESSION_CONFIG.KEY_EXPIRY);
-    }
-
-    /**
-     * Generate a random session key for encrypting DEK in storage
-     */
-    generateSessionKey() {
-        return crypto.getRandomValues(new Uint8Array(32));
-    }
-
-    /**
-     * Encrypt DEK for storage using a session key
-     */
-    async encryptDekForStorage(dek, sessionKey) {
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        const key = await crypto.subtle.importKey(
-            'raw',
-            sessionKey,
-            'AES-GCM',
-            false,
-            ['encrypt']
-        );
-        const ciphertext = await crypto.subtle.encrypt(
-            { name: 'AES-GCM', iv },
-            key,
-            dek
-        );
-
-        // Return IV + ciphertext as base64
-        const combined = new Uint8Array(iv.length + ciphertext.byteLength);
-        combined.set(iv, 0);
-        combined.set(new Uint8Array(ciphertext), iv.length);
-        return btoa(String.fromCharCode(...combined));
-    }
-
-    /**
-     * Decrypt DEK from storage using session key
-     */
-    async decryptDekFromStorage(token, sessionKey) {
-        const combined = Uint8Array.from(atob(token), c => c.charCodeAt(0));
-        const iv = combined.slice(0, 12);
-        const ciphertext = combined.slice(12);
-
-        const key = await crypto.subtle.importKey(
-            'raw',
-            sessionKey,
-            'AES-GCM',
-            false,
-            ['decrypt']
-        );
-        const plaintext = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv },
-            key,
-            ciphertext
-        );
-
-        return new Uint8Array(plaintext);
+        const sessionKeys = getScopedSessionKeys();
+        this.memoryStorage.removeItem(sessionKeys.TOKEN);
+        this.memoryStorage.removeItem(sessionKeys.EXPIRY);
+        for (const storage of getPersistentStorages()) {
+            storage.removeItem(sessionKeys.TOKEN);
+            storage.removeItem(sessionKeys.EXPIRY);
+        }
     }
 
     /**
      * Set up cleanup handlers for page visibility and unload
      */
     setupCleanupHandlers() {
+        if (this.cleanupHandlersInstalled) {
+            return;
+        }
         document.addEventListener('visibilitychange', this.handleVisibilityChange);
         window.addEventListener('beforeunload', this.handleBeforeUnload);
+        this.cleanupHandlersInstalled = true;
     }
 
     /**
      * Remove cleanup handlers
      */
     removeCleanupHandlers() {
+        if (!this.cleanupHandlersInstalled) {
+            return;
+        }
         document.removeEventListener('visibilitychange', this.handleVisibilityChange);
         window.removeEventListener('beforeunload', this.handleBeforeUnload);
+        this.cleanupHandlersInstalled = false;
     }
 
     /**

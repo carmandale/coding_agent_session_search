@@ -9,24 +9,62 @@
 let dek = null;
 let config = null;
 
+function hashScopeId(input) {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < input.length; i++) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, '0');
+}
+
+function getArchiveScopeId() {
+    try {
+        return hashScopeId(new URL('./', self.location.href).href);
+    } catch (error) {
+        const href = typeof self?.location?.href === 'string'
+            ? self.location.href
+            : 'unknown';
+        return hashScopeId(href.split('#')[0].split('?')[0]);
+    }
+}
+
+function getArchiveOpfsDbName() {
+    return `cass-archive-${getArchiveScopeId()}.db`;
+}
+
 /**
  * Handle messages from main thread
  */
 self.onmessage = async (event) => {
-    const { type, ...data } = event.data;
+    const payload = event?.data && typeof event.data === 'object' ? event.data : null;
+    const requestId = payload && 'requestId' in payload ? payload.requestId : null;
+    if (!payload || typeof payload.type !== 'string' || payload.type.length === 0) {
+        console.warn('Ignoring malformed worker request payload');
+        if (requestId !== null && requestId !== undefined) {
+            self.postMessage({
+                type: 'WORKER_ERROR',
+                error: 'Malformed worker request payload',
+                requestId,
+            });
+        }
+        return;
+    }
+
+    const { type, ...data } = payload;
 
     try {
         switch (type) {
             case 'UNLOCK_PASSWORD':
-                await handleUnlockPassword(data.password, data.config);
+                await handleUnlockPassword(data.password, data.config, requestId);
                 break;
 
             case 'UNLOCK_RECOVERY':
-                await handleUnlockRecovery(data.recoverySecret, data.config);
+                await handleUnlockRecovery(data.recoverySecret, data.config, requestId);
                 break;
 
             case 'DECRYPT_DATABASE':
-                await handleDecryptDatabase(data.dek, data.config, data.opfsEnabled);
+                await handleDecryptDatabase(data.dek, data.config, data.opfsEnabled, requestId);
                 break;
 
             case 'CLEAR_KEYS':
@@ -34,21 +72,34 @@ self.onmessage = async (event) => {
                 break;
 
             default:
-                console.warn('Unknown message type:', type);
+                throw new Error(`Unknown worker message type: ${type}`);
         }
     } catch (error) {
         console.error('Worker error:', error);
         self.postMessage({
-            type: type.replace('UNLOCK', 'UNLOCK_FAILED').replace('DECRYPT', 'DECRYPT_FAILED'),
-            error: error.message,
+            type: getWorkerFailureMessageType(type),
+            error: error?.message || String(error),
+            requestId,
         });
     }
 };
 
+function getWorkerFailureMessageType(type) {
+    switch (type) {
+        case 'UNLOCK_PASSWORD':
+        case 'UNLOCK_RECOVERY':
+            return 'UNLOCK_FAILED';
+        case 'DECRYPT_DATABASE':
+            return 'DECRYPT_FAILED';
+        default:
+            return 'WORKER_ERROR';
+    }
+}
+
 /**
  * Handle password-based unlock
  */
-async function handleUnlockPassword(password, cfg) {
+async function handleUnlockPassword(password, cfg, requestId) {
     config = cfg;
 
     // Find password slot
@@ -57,13 +108,13 @@ async function handleUnlockPassword(password, cfg) {
         throw new Error('No password slot found in archive');
     }
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Deriving key...', percent: 10 });
+    self.postMessage({ type: 'PROGRESS', phase: 'Deriving key...', percent: 10, requestId });
 
     // Try each password slot
     for (const slot of passwordSlots) {
         try {
             const kek = await deriveKekFromPassword(password, slot);
-            self.postMessage({ type: 'PROGRESS', phase: 'Unwrapping key...', percent: 80 });
+            self.postMessage({ type: 'PROGRESS', phase: 'Unwrapping key...', percent: 80, requestId });
 
             const unwrappedDek = await unwrapDek(kek, slot, config.export_id);
             dek = unwrappedDek;
@@ -71,6 +122,7 @@ async function handleUnlockPassword(password, cfg) {
             self.postMessage({
                 type: 'UNLOCK_SUCCESS',
                 dek: arrayToBase64(dek),
+                requestId,
             });
             return;
         } catch (error) {
@@ -85,7 +137,7 @@ async function handleUnlockPassword(password, cfg) {
 /**
  * Handle recovery secret-based unlock
  */
-async function handleUnlockRecovery(recoverySecret, cfg) {
+async function handleUnlockRecovery(recoverySecret, cfg, requestId) {
     config = cfg;
 
     // Find recovery slot
@@ -94,7 +146,7 @@ async function handleUnlockRecovery(recoverySecret, cfg) {
         throw new Error('No recovery slot found in archive');
     }
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Deriving key...', percent: 10 });
+    self.postMessage({ type: 'PROGRESS', phase: 'Deriving key...', percent: 10, requestId });
 
     // Convert recovery secret to bytes
     let secretBytes;
@@ -113,7 +165,7 @@ async function handleUnlockRecovery(recoverySecret, cfg) {
     for (const slot of recoverySlots) {
         try {
             const kek = await deriveKekFromRecovery(secretBytes, slot);
-            self.postMessage({ type: 'PROGRESS', phase: 'Unwrapping key...', percent: 80 });
+            self.postMessage({ type: 'PROGRESS', phase: 'Unwrapping key...', percent: 80, requestId });
 
             const unwrappedDek = await unwrapDek(kek, slot, config.export_id);
             dek = unwrappedDek;
@@ -121,6 +173,7 @@ async function handleUnlockRecovery(recoverySecret, cfg) {
             self.postMessage({
                 type: 'UNLOCK_SUCCESS',
                 dek: arrayToBase64(dek),
+                requestId,
             });
             return;
         } catch (error) {
@@ -227,7 +280,7 @@ async function unwrapDek(kek, slot, exportId) {
 /**
  * Handle database decryption
  */
-async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled) {
+async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled, requestId) {
     config = cfg;
     dek = base64ToArray(dekBase64);
     const { payload } = config;
@@ -235,7 +288,7 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled) {
     const baseNonce = base64ToArray(config.base_nonce);
     const exportId = base64ToArray(config.export_id);
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Decrypting...', percent: 0 });
+    self.postMessage({ type: 'PROGRESS', phase: 'Decrypting...', percent: 0, requestId });
 
     // Import DEK for decryption
     const dekKey = await crypto.subtle.importKey(
@@ -287,13 +340,14 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled) {
                 type: 'PROGRESS',
                 phase: `Decrypting chunk ${i + 1}/${totalChunks}...`,
                 percent: percent,
+                requestId,
             });
         } catch (error) {
             throw new Error(`Failed to decrypt chunk ${i}: ${error.message}`);
         }
     }
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Decompressing...', percent: 92 });
+    self.postMessage({ type: 'PROGRESS', phase: 'Decompressing...', percent: 92, requestId });
 
     // Concatenate chunks
     const compressed = concatenateChunks(decryptedChunks);
@@ -307,7 +361,7 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled) {
         decompressed = compressed;
     }
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Loading database...', percent: 95 });
+    self.postMessage({ type: 'PROGRESS', phase: 'Loading database...', percent: 95, requestId });
 
     // Store in OPFS or memory
     const dbBytes = decompressed;
@@ -322,6 +376,7 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled) {
             type: 'DECRYPT_SUCCESS',
             dbSize: dbBytes.byteLength,
             dbBytes: transfer,
+            requestId,
         },
         [transfer]
     );
@@ -417,7 +472,7 @@ async function decompressDeflate(compressed) {
 /**
  * Initialize sqlite-wasm with decrypted database
  */
-async function initDatabase(dbBytes, opfsEnabled) {
+async function initDatabase(dbBytes, opfsEnabled, requestId) {
     // Load sqlite-wasm if not loaded
     if (!self.sqlite3) {
         await loadSqlite();
@@ -431,14 +486,15 @@ async function initDatabase(dbBytes, opfsEnabled) {
         let db;
         if (opfsEnabled && sqlite3.oo1.OpfsDb) {
             try {
+                const opfsDbName = getArchiveOpfsDbName();
                 // Write to OPFS
                 const opfs = await navigator.storage.getDirectory();
-                const fileHandle = await opfs.getFileHandle('cass-archive.db', { create: true });
+                const fileHandle = await opfs.getFileHandle(opfsDbName, { create: true });
                 const writable = await fileHandle.createWritable();
                 await writable.write(dbBytes);
                 await writable.close();
 
-                db = new sqlite3.oo1.OpfsDb('cass-archive.db');
+                db = new sqlite3.oo1.OpfsDb(opfsDbName);
             } catch (opfsError) {
                 console.warn('OPFS not available, using in-memory:', opfsError);
                 db = new sqlite3.oo1.DB();
@@ -457,6 +513,7 @@ async function initDatabase(dbBytes, opfsEnabled) {
             type: 'DB_READY',
             conversationCount: getConversationCount(db),
             messageCount: getMessageCount(db),
+            requestId,
         });
     } catch (error) {
         throw new Error(`Failed to initialize database: ${error.message}`);
@@ -546,12 +603,22 @@ async function loadSqlite() {
  * Convert base64 to Uint8Array
  */
 function base64ToArray(base64) {
-    const binary = atob(base64);
+    const normalized = normalizeBase64(base64);
+    const binary = atob(normalized);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) {
         bytes[i] = binary.charCodeAt(i);
     }
     return bytes;
+}
+
+function normalizeBase64(base64) {
+    const trimmed = base64.trim().replace(/-/g, '+').replace(/_/g, '/');
+    const padding = trimmed.length % 4;
+    if (padding === 0) {
+        return trimmed;
+    }
+    return trimmed + '='.repeat(4 - padding);
 }
 
 /**

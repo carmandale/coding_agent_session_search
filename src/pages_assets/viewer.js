@@ -14,13 +14,19 @@
  */
 
 import { isDatabaseReady, getStatistics, closeDatabase } from './database.js';
-import { initSearch, clearSearch, getSearchState, setSearchQuery } from './search.js';
-import { initConversationViewer, loadConversation, clearViewer, getCurrentConversation } from './conversation.js';
-import { createRouter, getRouter, parseSearchParams, buildConversationPath } from './router.js';
+import { initSearch, clearSearch, getSearchState, setSearchRoute } from './search.js';
+import {
+    initConversationViewer,
+    loadConversation,
+    clearViewer,
+    cleanupConversationViewer,
+    getCurrentConversation,
+} from './conversation.js';
+import { createRouter, getRouter, parseSearchParams, buildConversationPath, buildSearchPath } from './router.js';
 import { getConversationLink, copyConversationLink, isWebShareAvailable, shareConversation } from './share.js';
-import { initStats, renderStatsDashboard } from './stats.js';
+import { initStats, renderStatsDashboard, clearStatsCache } from './stats.js';
 import { initStorage, StorageKeys } from './storage.js';
-import { initSettings, render as renderSettings } from './settings.js';
+import { initSettings, render as renderSettings, cleanupSettings } from './settings.js';
 
 // Application state
 const state = {
@@ -28,6 +34,12 @@ const state = {
     conversationId: null,
     messageId: null,
     searchQuery: '',
+    searchFilters: {
+        agent: null,
+        since: null,
+        until: null,
+        timePreset: null,
+    },
     initialized: false,
 };
 
@@ -35,6 +47,8 @@ const state = {
 let router = null;
 let storageReady = null;
 let settingsReady = false;
+let waitingForDatabaseReady = false;
+let viewerLifecycleEpoch = 0;
 
 // DOM element references
 let elements = {
@@ -62,16 +76,33 @@ export function init() {
         return;
     }
 
-    // Check if database is ready
-    if (!isDatabaseReady()) {
-        console.log('[Viewer] Waiting for database...');
-        // Listen for database ready event
-        window.addEventListener('cass:db-ready', handleDatabaseReady);
+    if (state.initialized) {
+        if (!isDatabaseReady()) {
+            console.log('[Viewer] Waiting for database re-open...');
+            ensureDatabaseReadyListener();
+            return;
+        }
+
+        refreshAfterDatabaseReady();
         return;
     }
 
-    // Database is ready, initialize views
+    if (!isDatabaseReady()) {
+        console.log('[Viewer] Waiting for database...');
+        ensureDatabaseReadyListener();
+        return;
+    }
+
     initializeViews();
+}
+
+function ensureDatabaseReadyListener() {
+    if (waitingForDatabaseReady) {
+        return;
+    }
+
+    waitingForDatabaseReady = true;
+    window.addEventListener('cass:db-ready', handleDatabaseReady);
 }
 
 /**
@@ -80,6 +111,13 @@ export function init() {
 function handleDatabaseReady(event) {
     console.log('[Viewer] Database ready:', event.detail);
     window.removeEventListener('cass:db-ready', handleDatabaseReady);
+    waitingForDatabaseReady = false;
+
+    if (state.initialized) {
+        refreshAfterDatabaseReady();
+        return;
+    }
+
     initializeViews();
 }
 
@@ -87,6 +125,8 @@ function handleDatabaseReady(event) {
  * Initialize views after database is ready
  */
 function initializeViews() {
+    const lifecycleEpoch = ++viewerLifecycleEpoch;
+
     // Clear loading state
     elements.appContent.innerHTML = '';
 
@@ -100,14 +140,12 @@ function initializeViews() {
     applyStoredTheme();
 
     // Initialize storage and settings
-    storageReady = initStorage().catch((error) => {
+    storageReady = initStorage().then(() => ({ ok: true })).catch((error) => {
         console.warn('[Viewer] Storage init failed:', error);
+        return { ok: false, error };
     });
-    storageReady.then(() => {
-        initSettings(elements.settingsView, {
-            onSessionReset: handleSessionReset,
-        });
-        settingsReady = true;
+    storageReady.then((result) => {
+        void initializeSettingsAfterStorageReady(result, lifecycleEpoch);
     });
 
     // Initialize search view
@@ -124,10 +162,51 @@ function initializeViews() {
         onNavigate: handleRouteChange,
     });
 
+    window.addEventListener('cass:lock', handleGlobalLock);
+
     // Mark as initialized
     state.initialized = true;
 
     console.log('[Viewer] Initialized with hash-based routing');
+}
+
+function refreshAfterDatabaseReady() {
+    if (!state.initialized) {
+        initializeViews();
+        return;
+    }
+
+    switch (state.view) {
+        case 'conversation':
+            if (state.conversationId) {
+                handleConversationRoute(state.conversationId, state.messageId);
+                return;
+            }
+            break;
+        case 'settings':
+            handleSettingsRoute();
+            return;
+        case 'stats':
+            handleStatsRoute();
+            return;
+        case 'not-found':
+            handleNotFoundRoute(window.location.hash || '/');
+            return;
+        default:
+            break;
+    }
+
+    handleSearchRoute({
+        query: {
+            q: state.searchQuery,
+            agent: state.searchFilters.agent,
+            since: state.searchFilters.since,
+            until: state.searchFilters.until,
+            time: state.searchFilters.timePreset && state.searchFilters.timePreset !== 'custom'
+                ? state.searchFilters.timePreset
+                : null,
+        },
+    });
 }
 
 /**
@@ -199,10 +278,23 @@ function handleRouteChange(route) {
     console.debug('[Viewer] Route change:', route);
 
     const { view, params, query } = route;
+    const leavingConversation = state.view === 'conversation' && view !== 'conversation';
+    const leavingSearch = state.view === 'search' && view !== 'search';
+    const leavingStats = state.view === 'stats' && view !== 'stats';
+
+    if (leavingConversation) {
+        clearViewer();
+    }
+    if (leavingSearch) {
+        clearSearch({ reloadRecent: false });
+    }
+    if (leavingStats) {
+        clearStatsCache();
+    }
 
     switch (view) {
         case 'search':
-            handleSearchRoute(query);
+            handleSearchRoute(route);
             break;
 
         case 'conversation':
@@ -227,11 +319,19 @@ function handleRouteChange(route) {
 /**
  * Handle search route
  */
-function handleSearchRoute(query = {}) {
+function handleSearchRoute(route = { query: {} }) {
+    const searchParams = parseSearchParams(route);
+
     state.view = 'search';
     state.conversationId = null;
     state.messageId = null;
-    state.searchQuery = query.q || '';
+    state.searchQuery = searchParams.query;
+    state.searchFilters = {
+        agent: searchParams.agent,
+        since: searchParams.since,
+        until: searchParams.until,
+        timePreset: searchParams.timePreset,
+    };
 
     // Show search view
     showViewContainer('search');
@@ -242,14 +342,15 @@ function handleSearchRoute(query = {}) {
     // Update nav
     updateActiveNavLink('search');
 
-    // If there's a search query, we could trigger the search
-    // This would require exposing a setQuery function from search.js
-    if (state.searchQuery) {
-        console.debug('[Viewer] Search query from URL:', state.searchQuery);
-        setSearchQuery(state.searchQuery).catch((error) => {
-            console.warn('[Viewer] Failed to run search from URL:', error);
+    if (state.searchQuery || state.searchFilters.agent || state.searchFilters.since || state.searchFilters.until || state.searchFilters.timePreset) {
+        console.debug('[Viewer] Search route from URL:', searchParams);
+        setSearchRoute(searchParams).catch((error) => {
+            console.warn('[Viewer] Failed to run search route from URL:', error);
         });
+        return;
     }
+
+    clearSearch({ reloadRecent: true });
 }
 
 /**
@@ -414,16 +515,65 @@ function displayStats() {
  */
 function renderSettingsPanel() {
     if (storageReady) {
-        storageReady.then(() => {
-            if (settingsReady) {
-                renderSettings();
-            }
+        storageReady.then((result) => {
+            void renderSettingsPanelAfterStorageReady(result);
         });
         return;
     }
 
     if (settingsReady) {
-        renderSettings();
+        void renderSettingsPanelNow();
+    }
+}
+
+async function initializeSettingsAfterStorageReady(result, lifecycleEpoch) {
+    if (lifecycleEpoch !== viewerLifecycleEpoch) {
+        return;
+    }
+
+    if (!result?.ok) {
+        settingsReady = false;
+        return;
+    }
+
+    try {
+        await initSettings(elements.settingsView, {
+            onSessionReset: handleSessionReset,
+        });
+        if (lifecycleEpoch !== viewerLifecycleEpoch) {
+            return;
+        }
+        settingsReady = true;
+    } catch (error) {
+        console.error('[Viewer] Failed to initialize settings:', error);
+        settingsReady = false;
+        if (state.initialized && state.view === 'settings') {
+            renderSettingsErrorPanel('Settings could not be initialized for this archive.');
+        }
+    }
+}
+
+async function renderSettingsPanelAfterStorageReady(result) {
+    if (!result?.ok) {
+        if (state.initialized && state.view === 'settings') {
+            renderSettingsErrorPanel('Settings are unavailable because browser storage failed to initialize.');
+        }
+        return;
+    }
+
+    if (!settingsReady || !state.initialized || state.view !== 'settings') {
+        return;
+    }
+
+    await renderSettingsPanelNow();
+}
+
+async function renderSettingsPanelNow() {
+    try {
+        await renderSettings();
+    } catch (error) {
+        console.error('[Viewer] Failed to render settings panel:', error);
+        renderSettingsErrorPanel('Settings could not be rendered for this archive.');
     }
 }
 
@@ -474,6 +624,23 @@ function renderNotFoundPanel(path) {
     `;
 }
 
+function renderSettingsErrorPanel(message) {
+    if (!elements.settingsView) {
+        return;
+    }
+
+    elements.settingsView.innerHTML = `
+        <div class="panel settings-panel">
+            <header class="panel-header">
+                <h2>Settings</h2>
+            </header>
+            <div class="panel-content">
+                <p>${escapeHtml(message)}</p>
+            </div>
+        </div>
+    `;
+}
+
 /**
  * Handle search result selection
  */
@@ -492,15 +659,49 @@ function handleBackToSearch() {
 
     // Navigate using router
     if (router) {
-        router.goHome();
+        const searchState = getSearchState();
+        router.navigate(buildSearchPath(searchState.query, searchState.filters));
+    }
+}
+
+function syncLockedViewerState() {
+    state.view = 'search';
+    state.conversationId = null;
+    state.messageId = null;
+    state.searchQuery = '';
+    state.searchFilters = {
+        agent: null,
+        since: null,
+        until: null,
+        timePreset: null,
+    };
+
+    if (window?.location?.href) {
+        const url = new URL(window.location.href);
+        url.hash = '/';
+        if (window.history?.replaceState) {
+            window.history.replaceState(null, '', url.toString());
+        } else {
+            window.location.replace(url.toString());
+        }
     }
 }
 
 function handleSessionReset(action) {
-    clearViewer();
-    clearSearch();
-    closeDatabase();
-    window.dispatchEvent(new CustomEvent('cass:lock', { detail: { action } }));
+    syncLockedViewerState();
+    cleanup();
+    window.dispatchEvent(new CustomEvent('cass:lock', {
+        detail: { action, source: 'viewer' },
+    }));
+}
+
+function handleGlobalLock(event) {
+    if (event?.detail?.source === 'viewer') {
+        return;
+    }
+
+    syncLockedViewerState();
+    cleanup();
 }
 
 /**
@@ -515,9 +716,9 @@ export function navigateToConversation(conversationId, messageId = null) {
 /**
  * Navigate to search (public API)
  */
-export function navigateToSearch(query = null) {
+export function navigateToSearch(query = null, filters = {}) {
     if (router) {
-        router.goHome(query);
+        router.navigate(buildSearchPath(query || '', filters));
     }
 }
 
@@ -593,9 +794,10 @@ function showNotification(message, type = 'info') {
  * Format agent name for display
  */
 function formatAgentName(agent) {
-    if (!agent) return 'Unknown';
+    if (agent === undefined || agent === null || agent === '') return 'Unknown';
+    const value = String(agent);
     // Capitalize first letter
-    return agent.charAt(0).toUpperCase() + agent.slice(1).replace(/_/g, ' ');
+    return value.charAt(0).toUpperCase() + value.slice(1).replace(/_/g, ' ');
 }
 
 /**
@@ -628,15 +830,26 @@ function escapeHtml(text) {
  * Clean up resources
  */
 export function cleanup() {
+    viewerLifecycleEpoch += 1;
+
     // Destroy router
     if (router) {
         router.destroy();
         router = null;
     }
 
+    window.removeEventListener('cass:db-ready', handleDatabaseReady);
+    window.removeEventListener('cass:lock', handleGlobalLock);
+    waitingForDatabaseReady = false;
+    storageReady = null;
+    settingsReady = false;
+    state.initialized = false;
+
+    cleanupSettings();
     closeDatabase();
-    clearSearch();
-    clearViewer();
+    clearSearch({ reloadRecent: false });
+    cleanupConversationViewer();
+    clearStatsCache();
     console.log('[Viewer] Cleaned up');
 }
 

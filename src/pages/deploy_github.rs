@@ -167,26 +167,27 @@ impl GitHubDeployer {
 
     /// Check size of bundle directory
     pub fn check_size(&self, bundle_dir: &Path) -> Result<SizeCheck> {
+        let bundle_dir = resolve_deploy_site_dir(bundle_dir)?;
         let mut total_bytes = 0u64;
         let mut file_count = 0usize;
         let mut large_files = Vec::new();
         let mut has_oversized = false;
 
-        visit_files(bundle_dir, &mut |path, size| {
+        visit_files(&bundle_dir, &mut |path, size| {
             total_bytes += size;
             file_count += 1;
 
             if size > MAX_FILE_SIZE_BYTES {
                 has_oversized = true;
                 let rel_path = path
-                    .strip_prefix(bundle_dir)
+                    .strip_prefix(bundle_dir.as_path())
                     .unwrap_or(path)
                     .to_string_lossy()
                     .to_string();
                 large_files.push((rel_path, size));
             } else if size > FILE_SIZE_WARNING_BYTES {
                 let rel_path = path
-                    .strip_prefix(bundle_dir)
+                    .strip_prefix(bundle_dir.as_path())
                     .unwrap_or(path)
                     .to_string_lossy()
                     .to_string();
@@ -213,7 +214,7 @@ impl GitHubDeployer {
         bundle_dir: P,
         mut progress: impl FnMut(&str, &str),
     ) -> Result<DeployResult> {
-        let bundle_dir = bundle_dir.as_ref();
+        let bundle_dir = resolve_deploy_site_dir(bundle_dir.as_ref())?;
 
         // Step 1: Check prerequisites
         progress("prereq", "Checking prerequisites...");
@@ -231,7 +232,7 @@ impl GitHubDeployer {
 
         // Step 2: Check size
         progress("size", "Checking bundle size...");
-        let size_check = self.check_size(bundle_dir)?;
+        let size_check = self.check_size(&bundle_dir)?;
 
         if size_check.exceeds_limit {
             bail!(
@@ -290,7 +291,8 @@ impl GitHubDeployer {
         // Step 5: Copy bundle contents
         progress("copy", "Copying bundle files...");
         let work_dir = temp_dir.join(&self.repo_name);
-        copy_bundle_to_repo(bundle_dir, &work_dir)?;
+        copy_bundle_to_repo(&bundle_dir, &work_dir)?;
+        configure_git_identity(&work_dir, username)?;
 
         // Step 6: Create orphan branch and push
         progress("push", "Pushing to gh-pages branch...");
@@ -366,6 +368,31 @@ fn create_temp_dir() -> Result<PathBuf> {
     let temp_dir = temp_base.join(dir_name);
     std::fs::create_dir_all(&temp_dir)?;
     Ok(temp_dir)
+}
+
+fn resolve_deploy_site_dir(path: &Path) -> Result<PathBuf> {
+    if path.file_name().map(|name| name == "site").unwrap_or(false) {
+        return super::resolve_site_dir(path);
+    }
+
+    let site_subdir = path.join("site");
+    match std::fs::symlink_metadata(&site_subdir) {
+        Ok(_) => return super::resolve_site_dir(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to inspect deployment site directory {}",
+                    site_subdir.display()
+                )
+            });
+        }
+    }
+
+    bail!(
+        "expected a bundle root containing site/ or a site/ directory, got {}",
+        path.display()
+    );
 }
 
 /// Get gh CLI version
@@ -519,6 +546,8 @@ fn clone_repo(repo_url: &str, dest: &Path) -> Result<()> {
 
 /// Copy bundle contents to repository directory
 fn copy_bundle_to_repo(bundle_dir: &Path, repo_dir: &Path) -> Result<()> {
+    let bundle_dir = resolve_deploy_site_dir(bundle_dir)?;
+
     // Clear existing files (except .git)
     if repo_dir.exists() {
         for entry in std::fs::read_dir(repo_dir)? {
@@ -537,7 +566,7 @@ fn copy_bundle_to_repo(bundle_dir: &Path, repo_dir: &Path) -> Result<()> {
     }
 
     // Copy bundle files
-    copy_dir_recursive(bundle_dir, repo_dir)?;
+    copy_dir_recursive(&bundle_dir, repo_dir)?;
 
     // Ensure .nojekyll exists
     let nojekyll = repo_dir.join(".nojekyll");
@@ -550,6 +579,16 @@ fn copy_bundle_to_repo(bundle_dir: &Path, repo_dir: &Path) -> Result<()> {
 
 /// Copy directory recursively
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    let canonical_base = src.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve deployment source root {} before copying",
+            src.display()
+        )
+    })?;
+    copy_dir_recursive_inner(src, dst, &canonical_base)
+}
+
+fn copy_dir_recursive_inner(src: &Path, dst: &Path, canonical_base: &Path) -> Result<()> {
     if !dst.exists() {
         std::fs::create_dir_all(dst)?;
     }
@@ -562,13 +601,66 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let file_type = metadata.file_type();
 
         if file_type.is_symlink() {
+            let canonical_target = src_path.canonicalize().with_context(|| {
+                format!(
+                    "Failed to resolve symlinked deploy entry {}",
+                    src_path.display()
+                )
+            })?;
+            if !canonical_target.starts_with(canonical_base) {
+                bail!(
+                    "Refusing to deploy symlinked site entry outside deployment root: {}",
+                    src_path.display()
+                );
+            }
+
+            let target_meta = std::fs::metadata(&src_path).with_context(|| {
+                format!(
+                    "Failed to inspect symlink target for deploy entry {}",
+                    src_path.display()
+                )
+            })?;
+            if !target_meta.is_file() {
+                bail!(
+                    "Refusing to deploy symlinked site entry that does not point to a regular file: {}",
+                    src_path.display()
+                );
+            }
+
+            std::fs::copy(&canonical_target, &dst_path).with_context(|| {
+                format!(
+                    "Failed copying symlink target {} to {} during deploy staging",
+                    canonical_target.display(),
+                    dst_path.display()
+                )
+            })?;
             continue;
         }
 
         if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+            copy_dir_recursive_inner(&src_path, &dst_path, canonical_base)?;
         } else if file_type.is_file() {
             std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Configure a local git identity for commits in the temporary deployment clone.
+fn configure_git_identity(repo_dir: &Path, username: &str) -> Result<()> {
+    let email = format!("{username}@users.noreply.github.com");
+
+    for (key, value) in [("user.name", username), ("user.email", email.as_str())] {
+        let output = Command::new("git")
+            .args(["config", key, value])
+            .current_dir(repo_dir)
+            .output()
+            .with_context(|| format!("Failed to set git {key}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to set git {key}: {stderr}");
         }
     }
 
@@ -682,6 +774,20 @@ fn enable_github_pages(username: &str, repo_name: &str) -> bool {
 
 /// Visit all files in a directory recursively
 fn visit_files(dir: &Path, f: &mut impl FnMut(&Path, u64)) -> Result<()> {
+    let canonical_base = dir.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve deployment source root {} before sizing",
+            dir.display()
+        )
+    })?;
+    visit_files_inner(dir, &canonical_base, f)
+}
+
+fn visit_files_inner(
+    dir: &Path,
+    canonical_base: &Path,
+    f: &mut impl FnMut(&Path, u64),
+) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -689,11 +795,38 @@ fn visit_files(dir: &Path, f: &mut impl FnMut(&Path, u64)) -> Result<()> {
         let file_type = metadata.file_type();
 
         if file_type.is_symlink() {
+            let canonical_target = path.canonicalize().with_context(|| {
+                format!(
+                    "Failed to resolve symlinked deploy entry {}",
+                    path.display()
+                )
+            })?;
+            if !canonical_target.starts_with(canonical_base) {
+                bail!(
+                    "Refusing to deploy symlinked site entry outside deployment root: {}",
+                    path.display()
+                );
+            }
+
+            let target_meta = std::fs::metadata(&path).with_context(|| {
+                format!(
+                    "Failed to inspect symlink target for deploy entry {}",
+                    path.display()
+                )
+            })?;
+            if !target_meta.is_file() {
+                bail!(
+                    "Refusing to deploy symlinked site entry that does not point to a regular file: {}",
+                    path.display()
+                );
+            }
+
+            f(&path, target_meta.len());
             continue;
         }
 
         if file_type.is_dir() {
-            visit_files(&path, f)?;
+            visit_files_inner(&path, canonical_base, f)?;
         } else if file_type.is_file() {
             f(&path, metadata.len());
         }
@@ -770,6 +903,81 @@ mod tests {
     }
 
     #[test]
+    fn test_size_check_resolves_bundle_root_without_counting_private_artifacts() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        let private_dir = temp.path().join("private");
+        std::fs::create_dir_all(&site_dir).unwrap();
+        std::fs::create_dir_all(&private_dir).unwrap();
+        std::fs::write(site_dir.join("index.html"), "abcd").unwrap();
+        std::fs::write(private_dir.join("master-key.json"), "secret").unwrap();
+
+        let deployer = GitHubDeployer::default();
+        let check = deployer.check_size(temp.path()).unwrap();
+
+        assert_eq!(check.file_count, 1);
+        assert_eq!(check.total_bytes, 4);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_size_check_counts_in_tree_symlinked_files() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        std::fs::create_dir_all(&site_dir).unwrap();
+        std::fs::write(site_dir.join("root.txt"), "root").unwrap();
+        symlink("root.txt", site_dir.join("linked-file.txt")).unwrap();
+
+        let deployer = GitHubDeployer::default();
+        let check = deployer.check_size(temp.path()).unwrap();
+
+        assert_eq!(check.file_count, 2);
+        assert_eq!(check.total_bytes, 8);
+    }
+
+    #[test]
+    fn test_resolve_deploy_site_dir_rejects_non_bundle_directory() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("index.html"), "<html></html>").unwrap();
+
+        let err = resolve_deploy_site_dir(temp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected a bundle root containing site/ or a site/ directory"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_resolve_deploy_site_dir_rejects_symlinked_site_directory() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let bundle_root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_site = outside.path().join("site");
+        std::fs::create_dir_all(&outside_site).unwrap();
+        std::fs::write(outside_site.join("index.html"), "<html></html>").unwrap();
+        symlink(&outside_site, bundle_root.path().join("site")).unwrap();
+
+        let err = resolve_deploy_site_dir(bundle_root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be a symlink"));
+
+        let direct_err = resolve_deploy_site_dir(&bundle_root.path().join("site"))
+            .unwrap_err()
+            .to_string();
+        assert!(direct_err.contains("must not be a symlink"));
+    }
+
+    #[test]
     fn test_copy_dir_recursive() {
         use tempfile::TempDir;
 
@@ -788,8 +996,55 @@ mod tests {
     }
 
     #[test]
+    fn test_copy_bundle_to_repo_resolves_bundle_root_without_copying_private_artifacts() {
+        use tempfile::TempDir;
+
+        let bundle_root = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let site_dir = bundle_root.path().join("site");
+        let private_dir = bundle_root.path().join("private");
+        std::fs::create_dir_all(&site_dir).unwrap();
+        std::fs::create_dir_all(&private_dir).unwrap();
+        std::fs::write(site_dir.join("index.html"), "<html></html>").unwrap();
+        std::fs::write(site_dir.join("config.json"), "{}").unwrap();
+        std::fs::write(private_dir.join("master-key.json"), "{\"secret\":true}").unwrap();
+
+        copy_bundle_to_repo(bundle_root.path(), repo_dir.path()).unwrap();
+
+        assert!(repo_dir.path().join("index.html").exists());
+        assert!(repo_dir.path().join("config.json").exists());
+        assert!(repo_dir.path().join(".nojekyll").exists());
+        assert!(!repo_dir.path().join("private").exists());
+        assert!(!repo_dir.path().join("site").exists());
+    }
+
+    #[test]
     #[cfg(unix)]
-    fn test_copy_dir_recursive_skips_symlinks() {
+    fn test_copy_dir_recursive_materializes_in_tree_symlinked_files() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+
+        std::fs::write(src.path().join("root.txt"), "root").unwrap();
+        symlink("root.txt", src.path().join("linked-file.txt")).unwrap();
+
+        copy_dir_recursive(src.path(), dst.path()).unwrap();
+
+        let linked_metadata =
+            std::fs::symlink_metadata(dst.path().join("linked-file.txt")).unwrap();
+        assert!(linked_metadata.file_type().is_file());
+        assert!(!linked_metadata.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("linked-file.txt")).unwrap(),
+            "root"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_dir_recursive_rejects_symlinks_outside_root() {
         use std::os::unix::fs::symlink;
         use tempfile::TempDir;
 
@@ -804,18 +1059,45 @@ mod tests {
             src.path().join("linked-file.txt"),
         )
         .unwrap();
-        symlink(outside.path(), src.path().join("linked-dir")).unwrap();
 
-        copy_dir_recursive(src.path(), dst.path()).unwrap();
-
-        assert!(dst.path().join("root.txt").exists());
-        assert!(!dst.path().join("linked-file.txt").exists());
-        assert!(!dst.path().join("linked-dir").exists());
+        let err = copy_dir_recursive(src.path(), dst.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Refusing to deploy symlinked site entry outside deployment root"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
     #[cfg(unix)]
-    fn test_visit_files_skips_symlink_paths() {
+    fn test_visit_files_counts_in_tree_symlinked_files() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let src = TempDir::new().unwrap();
+
+        std::fs::write(src.path().join("root.txt"), "root").unwrap();
+        symlink("root.txt", src.path().join("linked-file.txt")).unwrap();
+
+        let mut visited = Vec::new();
+        visit_files(src.path(), &mut |path, size| {
+            visited.push((
+                path.strip_prefix(src.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+                size,
+            ));
+        })
+        .unwrap();
+
+        assert!(visited.contains(&("root.txt".to_string(), 4)));
+        assert!(visited.contains(&("linked-file.txt".to_string(), 4)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_visit_files_rejects_symlink_paths_outside_root() {
         use std::os::unix::fs::symlink;
         use tempfile::TempDir;
 
@@ -834,19 +1116,71 @@ mod tests {
         .unwrap();
         symlink(outside.path().join("nested"), src.path().join("linked-dir")).unwrap();
 
-        let mut visited = Vec::new();
-        visit_files(src.path(), &mut |path, _size| {
-            visited.push(
-                path.strip_prefix(src.path())
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string(),
-            );
-        })
-        .unwrap();
+        let err = visit_files(src.path(), &mut |_path, _size| {}).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Refusing to deploy symlinked site entry outside deployment root"),
+            "unexpected error: {err:#}"
+        );
+    }
 
-        assert!(visited.contains(&"root.txt".to_string()));
-        assert!(!visited.contains(&"linked-file.txt".to_string()));
-        assert!(!visited.iter().any(|p| p.starts_with("linked-dir/")));
+    #[test]
+    fn test_configure_git_identity_sets_local_commit_metadata() {
+        use tempfile::TempDir;
+
+        let repo = TempDir::new().unwrap();
+        let init = Command::new("git")
+            .args(["init"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        configure_git_identity(repo.path(), "cass-test").unwrap();
+
+        let name = Command::new("git")
+            .args(["config", "user.name"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&name.stdout).trim(), "cass-test");
+
+        let email = Command::new("git")
+            .args(["config", "user.email"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&email.stdout).trim(),
+            "cass-test@users.noreply.github.com"
+        );
+
+        std::fs::write(repo.path().join("index.html"), "<html></html>").unwrap();
+
+        let add = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            add.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+
+        let commit = Command::new("git")
+            .args(["commit", "-m", "Test commit"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
     }
 }

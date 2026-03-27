@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.2.0"
+version = "0.2.4"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -15,6 +15,9 @@ thiserror = "*"
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter", "fmt", "ansi"] }
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "d72f93e", features = ["test-internals"] }
+franken-decision = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "d72f93e", package = "franken-decision" }
+franken-evidence = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "d72f93e", package = "franken-evidence" }
+franken-kernel = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "d72f93e", package = "franken-kernel" }
 clap = { version = "*", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "*"
 clap_mangen = "*"
@@ -32,25 +35,22 @@ which = "*"
 shell-words = "*"
 dotenvy = "*"
 notify = "*"
-rusqlite = { version = "*", features = ["bundled", "modern_sqlite"] }
-# FrankenSQLite foundation for staged storage migration (bead 300hj).
-# Keep rusqlite side-by-side during transition; migration code opts in explicitly.
 frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68533b1", package = "fsqlite", features = ["fts5"] }
 rayon = "*"
 crossbeam-channel = "*"
 parking_lot = "*"
-lru = "*"
+fs2 = "*"
+lru = "0.16"
 rustc-hash = "*"  # Fast non-cryptographic hashing for cache keys (P1 Opt 1.3), replaces unmaintained fxhash
 smallvec = "*"  # Stack-allocated small vectors for hot paths (Opt 4.4)
 regex = "*"
-reqwest = { version = "*", default-features = false, features = ["json", "rustls", "blocking", "multipart"] }
 portable-pty = "*"
 # FrankenTUI migration foundation (bead 2noh9.2.1).
 # Strategy: pin a Git revision for reproducible CI builds.
-ftui = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3" }
-ftui-runtime = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3", features = ["native-backend", "crossterm-compat"] }
-ftui-tty = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3" }
-ftui-extras = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
+ftui = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089" }
+ftui-runtime = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089", features = ["native-backend", "crossterm-compat"] }
+ftui-tty = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089" }
+ftui-extras = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
 dirs = "*"
 walkdir = "*"
 glob = "*"
@@ -71,9 +71,9 @@ urlencoding = "*"
 half = { version = "*", features = ["bytemuck"] }
 memmap2 = "*"
 bytemuck = "*"
-fastembed = { version = "*", default-features = false, features = ["ort-download-binaries"] }
-frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "8b319e9", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
-franken-agent-detection = { git = "https://github.com/Dicklesworthstone/franken_agent_detection", tag = "v0.1.2", features = ["connectors", "cursor", "chatgpt", "opencode"] }
+fastembed = { version = "*", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
+frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3eec663", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
+franken-agent-detection = { git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "bb3e6132", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
 wide = "*"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "*"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "*"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -94,6 +94,8 @@ dialoguer = "*"
 
 # SFTP fallback for sync when rsync is unavailable
 ssh2 = "*"
+# Statically link OpenSSL so release binaries don't require system libssl.so.3
+openssl = { version = "*", features = ["vendored"] }
 argon2 = "*"
 hkdf = "*"
 zeroize = { version = "*", features = ["derive"] }
@@ -104,6 +106,9 @@ rand = "0.10"
 qrcode = { version = "*", optional = true }
 image = { version = "*", optional = true, default-features = false, features = ["png"] }
 unicode-width = "0.2.2"
+# rusqlite used for FTS5 search fallback path: frankensqlite's in-memory FTS5
+# cannot read on-disk shadow tables, so we need stock SQLite for MATCH queries.
+rusqlite = { version = "*", features = ["bundled", "modern_sqlite"] }
 
 # macOS keychain access (optional, for ChatGPT decryption)
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -186,6 +191,10 @@ harness = false
 
 [[bench]]
 name = "regex_cache"
+harness = false
+
+[[bench]]
+name = "integration_regression"
 harness = false
 
 [[test]]

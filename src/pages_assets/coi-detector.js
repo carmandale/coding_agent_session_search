@@ -20,8 +20,30 @@ export const COI_STATE = {
     DEGRADED: 'DEGRADED',
 };
 
-// Local storage key for tracking setup completion
-const SETUP_COMPLETE_KEY = 'cass-coi-setup-complete';
+let activeReloadController = null;
+const serviceWorkerActivationCallbacks = new Set();
+let serviceWorkerActivationListenersInstalled = false;
+let serviceWorkerActivationDispatchScheduled = false;
+
+function hashScopeId(input) {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < input.length; i++) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, '0');
+}
+
+function getSetupCompleteKey() {
+    try {
+        return `cass-coi-setup-complete-${hashScopeId(new URL('./', window.location.href).href)}`;
+    } catch {
+        const href = typeof window?.location?.href === 'string'
+            ? window.location.href
+            : 'unknown';
+        return `cass-coi-setup-complete-${hashScopeId(href.split('#')[0].split('?')[0])}`;
+    }
+}
 
 /**
  * Check if COI setup has been completed before
@@ -29,7 +51,7 @@ const SETUP_COMPLETE_KEY = 'cass-coi-setup-complete';
  */
 export function isSetupComplete() {
     try {
-        return localStorage.getItem(SETUP_COMPLETE_KEY) === 'true';
+        return localStorage.getItem(getSetupCompleteKey()) === 'true';
     } catch {
         return false;
     }
@@ -40,7 +62,7 @@ export function isSetupComplete() {
  */
 export function markSetupComplete() {
     try {
-        localStorage.setItem(SETUP_COMPLETE_KEY, 'true');
+        localStorage.setItem(getSetupCompleteKey(), 'true');
     } catch {
         // localStorage not available
     }
@@ -51,9 +73,21 @@ export function markSetupComplete() {
  */
 export function clearSetupComplete() {
     try {
-        localStorage.removeItem(SETUP_COMPLETE_KEY);
+        localStorage.removeItem(getSetupCompleteKey());
     } catch {
         // localStorage not available
+    }
+}
+
+async function getCurrentServiceWorkerRegistration() {
+    if (!('serviceWorker' in navigator)) {
+        return null;
+    }
+
+    try {
+        return (await navigator.serviceWorker.getRegistration()) ?? null;
+    } catch {
+        return null;
     }
 }
 
@@ -70,14 +104,16 @@ export function isCrossOriginIsolated() {
  * @returns {Promise<boolean>}
  */
 export async function isServiceWorkerActive() {
-    if (!('serviceWorker' in navigator)) return false;
+    const registration = await getCurrentServiceWorkerRegistration();
+    return registration?.active !== null && registration?.active !== undefined;
+}
 
-    try {
-        const registration = await navigator.serviceWorker.getRegistration();
-        return registration?.active != null;
-    } catch {
-        return false;
-    }
+/**
+ * Check if a service worker registration exists for this archive scope
+ * @returns {Promise<boolean>}
+ */
+export async function hasServiceWorkerRegistration() {
+    return (await getCurrentServiceWorkerRegistration()) !== null;
 }
 
 /**
@@ -219,6 +255,11 @@ export function updateProgressStep(stepId, status) {
 export function showReloadRequiredUI(container, options = {}) {
     const { onReload = null, countdownSeconds = 3, autoReload = true } = options;
 
+    if (activeReloadController) {
+        activeReloadController.cancel();
+        activeReloadController = null;
+    }
+
     container.innerHTML = `
         <div class="coi-status needs-reload">
             <div class="coi-header">
@@ -287,6 +328,9 @@ export function showReloadRequiredUI(container, options = {}) {
             clearInterval(timerId);
             timerId = null;
         }
+        if (activeReloadController === control) {
+            activeReloadController = null;
+        }
         if (onReload) {
             onReload();
         }
@@ -303,6 +347,9 @@ export function showReloadRequiredUI(container, options = {}) {
         }
         if (cancelBtn) {
             cancelBtn.classList.add('hidden');
+        }
+        if (activeReloadController === control) {
+            activeReloadController = null;
         }
     };
 
@@ -327,10 +374,12 @@ export function showReloadRequiredUI(container, options = {}) {
     }
 
     // Return control object for external management
-    return {
+    const control = {
         cancel: cancelCountdown,
         reload: doReload,
     };
+    activeReloadController = control;
+    return control;
 }
 
 /**
@@ -364,6 +413,10 @@ export function showDegradedModeWarning() {
  * @param {HTMLElement} container - Container to hide
  */
 export function hideStatusUI(container) {
+    if (activeReloadController) {
+        activeReloadController.cancel();
+        activeReloadController = null;
+    }
     container.classList.add('hidden');
     container.innerHTML = '';
 }
@@ -460,6 +513,13 @@ export async function initCOIDetection({
         case COI_STATE.SW_INSTALLING:
             // Still installing after timeout - check if we should show reload or proceed
             console.log('[COI] SW still installing - checking fallback');
+            if (!await hasServiceWorkerRegistration()) {
+                console.warn('[COI] No service worker registration found after waiting - degrading');
+                hideStatusUI(statusContainer);
+                showDegradedModeWarning();
+                if (onReady) onReady();
+                return COI_STATE.DEGRADED;
+            }
             if (isSharedArrayBufferAvailable()) {
                 // Already have SAB somehow (maybe browser feature)
                 markSetupComplete();
@@ -487,19 +547,50 @@ export async function initCOIDetection({
  * @param {Function} callback - Called when SW activates
  */
 export function onServiceWorkerActivated(callback) {
-    if ('serviceWorker' in navigator) {
+    if (!('serviceWorker' in navigator) || typeof callback !== 'function') {
+        return () => {};
+    }
+
+    serviceWorkerActivationCallbacks.add(callback);
+
+    if (!serviceWorkerActivationListenersInstalled) {
+        const notifyActivation = (reason) => {
+            if (serviceWorkerActivationDispatchScheduled) {
+                return;
+            }
+
+            serviceWorkerActivationDispatchScheduled = true;
+            queueMicrotask(() => {
+                serviceWorkerActivationDispatchScheduled = false;
+                console.log('[COI] Service worker activation detected:', reason);
+                [...serviceWorkerActivationCallbacks].forEach((registeredCallback) => {
+                    try {
+                        Promise.resolve(registeredCallback()).catch((error) => {
+                            console.error('[COI] Activation callback failed:', error);
+                        });
+                    } catch (error) {
+                        console.error('[COI] Activation callback failed:', error);
+                    }
+                });
+            });
+        };
+
         navigator.serviceWorker.addEventListener('message', (event) => {
             if (event.data?.type === 'SW_ACTIVATED') {
-                console.log('[COI] Received SW_ACTIVATED message');
-                callback();
+                notifyActivation('message');
             }
         });
 
         navigator.serviceWorker.addEventListener('controllerchange', () => {
-            console.log('[COI] Controller changed');
-            callback();
+            notifyActivation('controllerchange');
         });
+
+        serviceWorkerActivationListenersInstalled = true;
     }
+
+    return () => {
+        serviceWorkerActivationCallbacks.delete(callback);
+    };
 }
 
 // Export default
@@ -507,6 +598,7 @@ export default {
     COI_STATE,
     isCrossOriginIsolated,
     isServiceWorkerActive,
+    hasServiceWorkerRegistration,
     isServiceWorkerSupported,
     isSharedArrayBufferAvailable,
     getCOIState,

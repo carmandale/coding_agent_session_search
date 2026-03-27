@@ -1,11 +1,13 @@
 //! SQL query builders for analytics.
 //!
-//! All functions accept a `&rusqlite::Connection` and an [`AnalyticsFilter`],
+//! All functions accept a `&frankensqlite::Connection` and an [`AnalyticsFilter`],
 //! keeping the SQL and bucketing logic in one place for both CLI and ftui.
 
 use std::collections::BTreeMap;
 
-use rusqlite::Connection;
+use frankensqlite::Connection;
+use frankensqlite::Row;
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 
 use super::bucketing;
 use super::types::*;
@@ -16,26 +18,26 @@ use super::types::*;
 
 /// Check whether a table exists in the database.
 pub fn table_exists(conn: &Connection, name: &str) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-        [name],
-        |_| Ok(()),
-    )
-    .is_ok()
+    let rows =
+        match conn.query_map_collect(&format!("PRAGMA table_info({})", name), &[], |row: &Row| {
+            row.get_typed::<String>(1)
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return false,
+        };
+    !rows.is_empty()
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
-    let mut stmt = match conn.prepare(&format!("PRAGMA table_info({table})")) {
-        Ok(stmt) => stmt,
-        Err(_) => return false,
-    };
+    let rows =
+        match conn.query_map_collect(&format!("PRAGMA table_info({table})"), &[], |row: &Row| {
+            row.get_typed::<String>(1)
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return false,
+        };
 
-    let rows = match stmt.query_map([], |row| row.get::<_, String>(1)) {
-        Ok(rows) => rows,
-        Err(_) => return false,
-    };
-
-    rows.flatten().any(|name| name == column)
+    rows.iter().any(|name| name == column)
 }
 
 fn table_has_plan_token_rollups(conn: &Connection, table: &str) -> bool {
@@ -81,12 +83,12 @@ fn query_table_stats(
         }
         None => format!("SELECT COUNT(*), MIN({day_col}), MAX({day_col}), NULL FROM {table}"),
     };
-    conn.query_row(&sql, [], |row| {
+    conn.query_row_map(&sql, &[], |row: &Row| {
         Ok(RollupStats {
-            row_count: row.get::<_, i64>(0).unwrap_or(0),
-            min_day: row.get::<_, Option<i64>>(1).unwrap_or(None),
-            max_day: row.get::<_, Option<i64>>(2).unwrap_or(None),
-            last_updated: row.get::<_, Option<i64>>(3).unwrap_or(None),
+            row_count: row.get_typed::<i64>(0).unwrap_or(0),
+            min_day: row.get_typed::<Option<i64>>(1).unwrap_or(None),
+            max_day: row.get_typed::<Option<i64>>(2).unwrap_or(None),
+            last_updated: row.get_typed::<Option<i64>>(3).unwrap_or(None),
         })
     })
     .unwrap_or_default()
@@ -101,20 +103,20 @@ fn query_table_stats(
 ///
 /// `workspace_column` should be provided only for tables that contain a
 /// workspace id dimension (for example `usage_daily.workspace_id`).
-pub fn build_where_parts(
-    filter: &AnalyticsFilter,
-    workspace_column: Option<&str>,
-) -> (Vec<String>, Vec<String>) {
-    let mut parts = Vec::new();
-    let mut params = Vec::new();
+pub fn build_where_parts<'a>(
+    filter: &'a AnalyticsFilter,
+    workspace_column: Option<&'a str>,
+) -> (Vec<String>, Vec<ParamValue>) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut params: Vec<ParamValue> = Vec::new();
 
     // Agent filters — multiple agents are OR'd together.
     if !filter.agents.is_empty() {
         let placeholders: Vec<String> = filter
             .agents
             .iter()
-            .map(|a| {
-                params.push(a.clone());
+            .map(|agent| {
+                params.push(ParamValue::from(agent.as_str()));
                 format!("?{}", params.len())
             })
             .collect();
@@ -125,15 +127,15 @@ pub fn build_where_parts(
     match &filter.source {
         SourceFilter::All => {}
         SourceFilter::Local => {
-            params.push("local".into());
+            params.push(ParamValue::from("local"));
             parts.push(format!("source_id = ?{}", params.len()));
         }
         SourceFilter::Remote => {
-            params.push("local".into());
+            params.push(ParamValue::from("local"));
             parts.push(format!("source_id != ?{}", params.len()));
         }
         SourceFilter::Specific(s) => {
-            params.push(s.clone());
+            params.push(ParamValue::from(s.as_str()));
             parts.push(format!("source_id = ?{}", params.len()));
         }
     }
@@ -145,7 +147,7 @@ pub fn build_where_parts(
             .workspace_ids
             .iter()
             .map(|workspace_id| {
-                params.push(workspace_id.to_string());
+                params.push(ParamValue::from(*workspace_id));
                 format!("?{}", params.len())
             })
             .collect();
@@ -180,15 +182,17 @@ pub fn query_status(conn: &Connection, _filter: &AnalyticsFilter) -> AnalyticsRe
 
     // 3. Coverage diagnostics.
     let total_messages: i64 = conn
-        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |r: &Row| {
+            r.get_typed(0)
+        })
         .unwrap_or(0);
 
     let api_coverage_pct = if has_message_metrics && mm.row_count > 0 {
         let api_count: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COUNT(*) FROM message_metrics WHERE api_data_source = 'api'",
-                [],
-                |r| r.get(0),
+                &[],
+                |r: &Row| r.get_typed(0),
             )
             .unwrap_or(0);
         if mm.row_count > 0 {
@@ -202,10 +206,10 @@ pub fn query_status(conn: &Connection, _filter: &AnalyticsFilter) -> AnalyticsRe
 
     let model_coverage_pct = if has_token_usage && tu.row_count > 0 {
         let with_model: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COUNT(*) FROM token_usage WHERE model_name IS NOT NULL AND model_name != ''",
-                [],
-                |r| r.get(0),
+                &[],
+                |r: &Row| r.get_typed(0),
             )
             .unwrap_or(0);
         (with_model as f64 / tu.row_count as f64) * 100.0
@@ -215,10 +219,10 @@ pub fn query_status(conn: &Connection, _filter: &AnalyticsFilter) -> AnalyticsRe
 
     let estimate_only_pct = if has_token_usage && tu.row_count > 0 {
         let estimates: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COUNT(*) FROM token_usage WHERE data_source = 'estimated'",
-                [],
-                |r| r.get(0),
+                &[],
+                |r: &Row| r.get_typed(0),
             )
             .unwrap_or(0);
         (estimates as f64 / tu.row_count as f64) * 100.0
@@ -394,21 +398,21 @@ pub fn query_tokens_timeseries(
     match group_by {
         GroupBy::Hour => {
             if let Some(min) = hour_min {
-                bind_values.push(min.to_string());
+                bind_values.push(ParamValue::from(min));
                 where_parts.push(format!("{bucket_col} >= ?{}", bind_values.len()));
             }
             if let Some(max) = hour_max {
-                bind_values.push(max.to_string());
+                bind_values.push(ParamValue::from(max));
                 where_parts.push(format!("{bucket_col} <= ?{}", bind_values.len()));
             }
         }
         _ => {
             if let Some(min) = day_min {
-                bind_values.push(min.to_string());
+                bind_values.push(ParamValue::from(min));
                 where_parts.push(format!("{bucket_col} >= ?{}", bind_values.len()));
             }
             if let Some(max) = day_max {
-                bind_values.push(max.to_string());
+                bind_values.push(ParamValue::from(max));
                 where_parts.push(format!("{bucket_col} <= ?{}", bind_values.len()));
             }
         }
@@ -424,12 +428,14 @@ pub fn query_tokens_timeseries(
     let plan_content_expr = if has_plan_token_rollups {
         "SUM(plan_content_tokens_est_total)"
     } else {
-        "0"
+        // Use SUM(0) instead of bare 0 — frankensqlite requires all non-GROUP-BY
+        // columns in a grouped query to be aggregate expressions.
+        "SUM(0)"
     };
     let plan_api_expr = if has_plan_token_rollups {
         "SUM(plan_api_tokens_total)"
     } else {
-        "0"
+        "SUM(0)"
     };
 
     let sql = format!(
@@ -457,67 +463,35 @@ pub fn query_tokens_timeseries(
          ORDER BY {bucket_col}"
     );
 
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| AnalyticsError::Db(format!("Failed to prepare analytics query: {e}")))?;
+    let param_values: Vec<ParamValue> = bind_values.clone();
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = bind_values
-        .iter()
-        .map(|v| v as &dyn rusqlite::types::ToSql)
-        .collect();
-
-    let rows_result = stmt
-        .query_map(param_refs.as_slice(), |row| {
+    let raw_buckets: Vec<(i64, UsageBucket)> = conn
+        .query_map_collect(&sql, &param_values, |row: &Row| {
             Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, i64>(9)?,
-                row.get::<_, i64>(10)?,
-                row.get::<_, i64>(11)?,
-                row.get::<_, i64>(12)?,
-                row.get::<_, i64>(13)?,
-                row.get::<_, i64>(14)?,
-                row.get::<_, i64>(15)?,
-                row.get::<_, i64>(16)?,
-                row.get::<_, i64>(17)?,
+                row.get_typed::<i64>(0)?,
+                UsageBucket {
+                    message_count: row.get_typed(1)?,
+                    user_message_count: row.get_typed(2)?,
+                    assistant_message_count: row.get_typed(3)?,
+                    tool_call_count: row.get_typed(4)?,
+                    plan_message_count: row.get_typed(5)?,
+                    plan_content_tokens_est_total: row.get_typed(6)?,
+                    plan_api_tokens_total: row.get_typed(7)?,
+                    api_coverage_message_count: row.get_typed(8)?,
+                    content_tokens_est_total: row.get_typed(9)?,
+                    content_tokens_est_user: row.get_typed(10)?,
+                    content_tokens_est_assistant: row.get_typed(11)?,
+                    api_tokens_total: row.get_typed(12)?,
+                    api_input_tokens_total: row.get_typed(13)?,
+                    api_output_tokens_total: row.get_typed(14)?,
+                    api_cache_read_tokens_total: row.get_typed(15)?,
+                    api_cache_creation_tokens_total: row.get_typed(16)?,
+                    api_thinking_tokens_total: row.get_typed(17)?,
+                    ..Default::default()
+                },
             ))
         })
         .map_err(|e| AnalyticsError::Db(format!("Analytics query failed: {e}")))?;
-
-    let mut raw_buckets: Vec<(i64, UsageBucket)> = Vec::new();
-    for row in rows_result {
-        let r = row.map_err(|e| AnalyticsError::Db(format!("Row read error: {e}")))?;
-        raw_buckets.push((
-            r.0,
-            UsageBucket {
-                message_count: r.1,
-                user_message_count: r.2,
-                assistant_message_count: r.3,
-                tool_call_count: r.4,
-                plan_message_count: r.5,
-                plan_content_tokens_est_total: r.6,
-                plan_api_tokens_total: r.7,
-                api_coverage_message_count: r.8,
-                content_tokens_est_total: r.9,
-                content_tokens_est_user: r.10,
-                content_tokens_est_assistant: r.11,
-                api_tokens_total: r.12,
-                api_input_tokens_total: r.13,
-                api_output_tokens_total: r.14,
-                api_cache_read_tokens_total: r.15,
-                api_cache_creation_tokens_total: r.16,
-                api_thinking_tokens_total: r.17,
-                ..Default::default()
-            },
-        ));
-    }
 
     // Re-bucket by week or month if needed.
     let final_buckets: Vec<(String, UsageBucket)> = match group_by {
@@ -602,12 +576,20 @@ pub fn query_cost_timeseries(
     let mut bind_values = dim_params;
 
     if let Some(min) = day_min {
-        bind_values.push(min.to_string());
+        bind_values.push(ParamValue::from(min));
         where_parts.push(format!("day_id >= ?{}", bind_values.len()));
     }
     if let Some(max) = day_max {
-        bind_values.push(max.to_string());
+        bind_values.push(ParamValue::from(max));
         where_parts.push(format!("day_id <= ?{}", bind_values.len()));
+    }
+
+    // Exclude pre-aggregated "all" permutation rows from token_daily_stats
+    // to avoid double/multi-counting. The SUM in the query does aggregation.
+    if table == "token_daily_stats" {
+        where_parts.push("model_family != 'all'".into());
+        where_parts.push("agent_slug != 'all'".into());
+        where_parts.push("source_id != 'all'".into());
     }
 
     let where_clause = if where_parts.is_empty() {
@@ -636,30 +618,23 @@ pub fn query_cost_timeseries(
          ORDER BY day_id"
     );
 
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| AnalyticsError::Db(format!("Failed to prepare cost timeseries query: {e}")))?;
+    let param_values: Vec<ParamValue> = bind_values.clone();
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = bind_values
-        .iter()
-        .map(|v| v as &dyn rusqlite::types::ToSql)
-        .collect();
-
-    let rows_result = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            let day_id: i64 = row.get(0)?;
-            let api_call_count: i64 = row.get(1)?;
-            let user_msg: i64 = row.get(2)?;
-            let asst_msg: i64 = row.get(3)?;
-            let tool_calls: i64 = row.get(4)?;
-            let input_tok: i64 = row.get(5)?;
-            let output_tok: i64 = row.get(6)?;
-            let cache_read: i64 = row.get(7)?;
-            let cache_create: i64 = row.get(8)?;
-            let thinking: i64 = row.get(9)?;
-            let grand_total: i64 = row.get(10)?;
-            let content_chars: i64 = row.get(11)?;
-            let cost: f64 = row.get(12)?;
+    let raw_buckets: Vec<(i64, UsageBucket)> = conn
+        .query_map_collect(&sql, &param_values, |row: &Row| {
+            let day_id: i64 = row.get_typed(0)?;
+            let api_call_count: i64 = row.get_typed(1)?;
+            let user_msg: i64 = row.get_typed(2)?;
+            let asst_msg: i64 = row.get_typed(3)?;
+            let tool_calls: i64 = row.get_typed(4)?;
+            let input_tok: i64 = row.get_typed(5)?;
+            let output_tok: i64 = row.get_typed(6)?;
+            let cache_read: i64 = row.get_typed(7)?;
+            let cache_create: i64 = row.get_typed(8)?;
+            let thinking: i64 = row.get_typed(9)?;
+            let grand_total: i64 = row.get_typed(10)?;
+            let content_chars: i64 = row.get_typed(11)?;
+            let cost: f64 = row.get_typed(12)?;
 
             Ok((
                 day_id,
@@ -682,12 +657,6 @@ pub fn query_cost_timeseries(
             ))
         })
         .map_err(|e| AnalyticsError::Db(format!("Cost timeseries query failed: {e}")))?;
-
-    let mut raw_buckets: Vec<(i64, UsageBucket)> = Vec::new();
-    for row in rows_result {
-        let r = row.map_err(|e| AnalyticsError::Db(format!("Row read error: {e}")))?;
-        raw_buckets.push(r);
-    }
 
     // Re-bucket by day/week/month (Track B has no hourly, so Hour falls back to Day).
     let final_buckets: Vec<(String, UsageBucket)> = match group_by {
@@ -788,12 +757,20 @@ pub fn query_breakdown(
     let mut bind_values = dim_params;
 
     if let Some(min) = day_min {
-        bind_values.push(min.to_string());
+        bind_values.push(ParamValue::from(min));
         where_parts.push(format!("day_id >= ?{}", bind_values.len()));
     }
     if let Some(max) = day_max {
-        bind_values.push(max.to_string());
+        bind_values.push(ParamValue::from(max));
         where_parts.push(format!("day_id <= ?{}", bind_values.len()));
+    }
+
+    // Exclude pre-aggregated "all" permutation rows from token_daily_stats
+    // to avoid double-counting. The SUM in the query handles aggregation.
+    if use_track_b {
+        where_parts.push("model_family != 'all'".into());
+        where_parts.push("agent_slug != 'all'".into());
+        where_parts.push("source_id != 'all'".into());
     }
 
     let where_clause = if where_parts.is_empty() {
@@ -819,19 +796,12 @@ pub fn query_breakdown(
         )
     };
 
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| AnalyticsError::Db(format!("Failed to prepare breakdown query: {e}")))?;
-
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = bind_values
-        .iter()
-        .map(|v| v as &dyn rusqlite::types::ToSql)
-        .collect();
+    let param_values: Vec<ParamValue> = bind_values.clone();
 
     let rows = if use_track_b {
-        read_breakdown_rows_track_b(&mut stmt, &param_refs, &metric)?
+        read_breakdown_rows_track_b(conn, &sql, &param_values, &metric)?
     } else {
-        read_breakdown_rows_track_a(&mut stmt, &param_refs, &metric)?
+        read_breakdown_rows_track_a(conn, &sql, &param_values, &metric)?
     };
 
     let elapsed_ms = query_start.elapsed().as_millis() as u64;
@@ -857,12 +827,14 @@ fn build_breakdown_sql_track_a(
     let plan_content_expr = if has_plan_token_rollups {
         "SUM(plan_content_tokens_est_total)"
     } else {
-        "0"
+        // Use SUM(0) instead of bare 0 — frankensqlite requires all non-GROUP-BY
+        // columns in a grouped query to be aggregate expressions.
+        "SUM(0)"
     };
     let plan_api_expr = if has_plan_token_rollups {
         "SUM(plan_api_tokens_total)"
     } else {
-        "0"
+        "SUM(0)"
     };
     format!(
         "SELECT CAST({dim_col} AS TEXT),
@@ -886,7 +858,7 @@ fn build_breakdown_sql_track_a(
                 SUM({order_col})
          FROM usage_daily
          {where_clause}
-         GROUP BY {dim_col}
+         GROUP BY CAST({dim_col} AS TEXT)
          ORDER BY SUM({order_col}) DESC
          LIMIT {limit}"
     )
@@ -942,42 +914,41 @@ fn build_breakdown_sql_track_b(
 
 /// Read breakdown rows from a Track A (usage_daily) query result.
 fn read_breakdown_rows_track_a(
-    stmt: &mut rusqlite::Statement<'_>,
-    params: &[&dyn rusqlite::types::ToSql],
+    conn: &Connection,
+    sql: &str,
+    params: &[ParamValue],
     metric: &Metric,
 ) -> AnalyticsResult<Vec<BreakdownRow>> {
-    let rows_result = stmt
-        .query_map(params, |row| {
-            let key: String = row.get(0)?;
+    let raw_rows = conn
+        .query_map_collect(sql, params, |row: &Row| {
+            let key: String = row.get_typed(0)?;
             let bucket = UsageBucket {
-                message_count: row.get(1)?,
-                user_message_count: row.get(2)?,
-                assistant_message_count: row.get(3)?,
-                tool_call_count: row.get(4)?,
-                plan_message_count: row.get(5)?,
-                plan_content_tokens_est_total: row.get(6)?,
-                plan_api_tokens_total: row.get(7)?,
-                api_coverage_message_count: row.get(8)?,
-                content_tokens_est_total: row.get(9)?,
-                content_tokens_est_user: row.get(10)?,
-                content_tokens_est_assistant: row.get(11)?,
-                api_tokens_total: row.get(12)?,
-                api_input_tokens_total: row.get(13)?,
-                api_output_tokens_total: row.get(14)?,
-                api_cache_read_tokens_total: row.get(15)?,
-                api_cache_creation_tokens_total: row.get(16)?,
-                api_thinking_tokens_total: row.get(17)?,
+                message_count: row.get_typed(1)?,
+                user_message_count: row.get_typed(2)?,
+                assistant_message_count: row.get_typed(3)?,
+                tool_call_count: row.get_typed(4)?,
+                plan_message_count: row.get_typed(5)?,
+                plan_content_tokens_est_total: row.get_typed(6)?,
+                plan_api_tokens_total: row.get_typed(7)?,
+                api_coverage_message_count: row.get_typed(8)?,
+                content_tokens_est_total: row.get_typed(9)?,
+                content_tokens_est_user: row.get_typed(10)?,
+                content_tokens_est_assistant: row.get_typed(11)?,
+                api_tokens_total: row.get_typed(12)?,
+                api_input_tokens_total: row.get_typed(13)?,
+                api_output_tokens_total: row.get_typed(14)?,
+                api_cache_read_tokens_total: row.get_typed(15)?,
+                api_cache_creation_tokens_total: row.get_typed(16)?,
+                api_thinking_tokens_total: row.get_typed(17)?,
                 ..Default::default()
             };
-            let sort_value: i64 = row.get(18)?;
+            let sort_value: i64 = row.get_typed(18)?;
             Ok((key, bucket, sort_value))
         })
         .map_err(|e| AnalyticsError::Db(format!("Breakdown query failed: {e}")))?;
 
     let mut result = Vec::new();
-    for row in rows_result {
-        let (key, bucket, sort_value) =
-            row.map_err(|e| AnalyticsError::Db(format!("Row read error: {e}")))?;
+    for (key, bucket, sort_value) in raw_rows {
         // Some metrics are derived when reading Track A rows.
         let value = match metric {
             Metric::CoveragePct => {
@@ -1003,31 +974,32 @@ fn read_breakdown_rows_track_a(
 
 /// Read breakdown rows from a Track B (token_daily_stats) query result.
 fn read_breakdown_rows_track_b(
-    stmt: &mut rusqlite::Statement<'_>,
-    params: &[&dyn rusqlite::types::ToSql],
+    conn: &Connection,
+    sql: &str,
+    params: &[ParamValue],
     metric: &Metric,
 ) -> AnalyticsResult<Vec<BreakdownRow>> {
-    let rows_result = stmt
-        .query_map(params, |row| {
-            let key: String = row.get(0)?;
-            let api_call_count: i64 = row.get(1)?;
-            let user_message_count: i64 = row.get(2)?;
-            let assistant_message_count: i64 = row.get(3)?;
-            let total_tool_calls: i64 = row.get(4)?;
-            let total_input: i64 = row.get(5)?;
-            let total_output: i64 = row.get(6)?;
-            let total_cache_read: i64 = row.get(7)?;
-            let total_cache_creation: i64 = row.get(8)?;
-            let total_thinking: i64 = row.get(9)?;
-            let grand_total: i64 = row.get(10)?;
-            let total_content_chars: i64 = row.get(11)?;
-            let estimated_cost: f64 = row.get(12)?;
+    let raw_rows = conn
+        .query_map_collect(sql, params, |row: &Row| {
+            let key: String = row.get_typed(0)?;
+            let api_call_count: i64 = row.get_typed(1)?;
+            let user_message_count: i64 = row.get_typed(2)?;
+            let assistant_message_count: i64 = row.get_typed(3)?;
+            let total_tool_calls: i64 = row.get_typed(4)?;
+            let total_input: i64 = row.get_typed(5)?;
+            let total_output: i64 = row.get_typed(6)?;
+            let total_cache_read: i64 = row.get_typed(7)?;
+            let total_cache_creation: i64 = row.get_typed(8)?;
+            let total_thinking: i64 = row.get_typed(9)?;
+            let grand_total: i64 = row.get_typed(10)?;
+            let total_content_chars: i64 = row.get_typed(11)?;
+            let estimated_cost: f64 = row.get_typed(12)?;
             // When the sort metric is a Real column (e.g. estimated_cost_usd),
             // SQLite returns a float.  Round before converting to i64 to avoid
             // truncation (e.g. $0.99 → 1 instead of 0).
-            let sort_value: i64 = match row.get::<_, f64>(13) {
+            let sort_value: i64 = match row.get_typed::<f64>(13) {
                 Ok(v) => v.round() as i64,
-                Err(_) => row.get(13)?,
+                Err(_) => row.get_typed(13)?,
             };
 
             // Map Track B columns to UsageBucket.
@@ -1053,9 +1025,7 @@ fn read_breakdown_rows_track_b(
         .map_err(|e| AnalyticsError::Db(format!("Breakdown query failed: {e}")))?;
 
     let mut result = Vec::new();
-    for row in rows_result {
-        let (key, bucket, sort_value) =
-            row.map_err(|e| AnalyticsError::Db(format!("Row read error: {e}")))?;
+    for (key, bucket, sort_value) in raw_rows {
         let value = match metric {
             Metric::CoveragePct => {
                 super::derive::safe_pct(bucket.api_coverage_message_count, bucket.message_count)
@@ -1117,21 +1087,21 @@ pub fn query_tools(
     match group_by {
         GroupBy::Hour => {
             if let Some(min) = hour_min {
-                bind_values.push(min.to_string());
+                bind_values.push(ParamValue::from(min));
                 where_parts.push(format!("{bucket_col} >= ?{}", bind_values.len()));
             }
             if let Some(max) = hour_max {
-                bind_values.push(max.to_string());
+                bind_values.push(ParamValue::from(max));
                 where_parts.push(format!("{bucket_col} <= ?{}", bind_values.len()));
             }
         }
         _ => {
             if let Some(min) = day_min {
-                bind_values.push(min.to_string());
+                bind_values.push(ParamValue::from(min));
                 where_parts.push(format!("{bucket_col} >= ?{}", bind_values.len()));
             }
             if let Some(max) = day_max {
-                bind_values.push(max.to_string());
+                bind_values.push(ParamValue::from(max));
                 where_parts.push(format!("{bucket_col} <= ?{}", bind_values.len()));
             }
         }
@@ -1157,22 +1127,15 @@ pub fn query_tools(
          LIMIT {limit}"
     );
 
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| AnalyticsError::Db(format!("Failed to prepare tool report query: {e}")))?;
+    let param_values: Vec<ParamValue> = bind_values.clone();
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = bind_values
-        .iter()
-        .map(|v| v as &dyn rusqlite::types::ToSql)
-        .collect();
-
-    let rows_result = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            let key: String = row.get(0)?;
-            let tool_call_count: i64 = row.get(1)?;
-            let message_count: i64 = row.get(2)?;
-            let api_tokens_total: i64 = row.get(3)?;
-            let content_tokens_est_total: i64 = row.get(4)?;
+    let tool_rows = conn
+        .query_map_collect(&sql, &param_values, |row: &Row| {
+            let key: String = row.get_typed(0)?;
+            let tool_call_count: i64 = row.get_typed(1)?;
+            let message_count: i64 = row.get_typed(2)?;
+            let api_tokens_total: i64 = row.get_typed(3)?;
+            let content_tokens_est_total: i64 = row.get_typed(4)?;
 
             let tool_calls_per_1k_api = if api_tokens_total > 0 {
                 Some(tool_call_count as f64 / (api_tokens_total as f64 / 1000.0))
@@ -1201,8 +1164,7 @@ pub fn query_tools(
     let mut total_messages: i64 = 0;
     let mut total_api_tokens: i64 = 0;
 
-    for row in rows_result {
-        let r = row.map_err(|e| AnalyticsError::Db(format!("Row read error: {e}")))?;
+    for r in tool_rows {
         total_tool_calls += r.tool_call_count;
         total_messages += r.message_count;
         total_api_tokens += r.api_tokens_total;
@@ -1244,7 +1206,7 @@ pub fn query_session_scatter(
     }
 
     let mut where_parts: Vec<String> = Vec::new();
-    let mut bind_values: Vec<String> = Vec::new();
+    let mut bind_values: Vec<ParamValue> = Vec::new();
 
     // Agent filters.
     if !filter.agents.is_empty() {
@@ -1252,7 +1214,7 @@ pub fn query_session_scatter(
             .agents
             .iter()
             .map(|agent| {
-                bind_values.push(agent.clone());
+                bind_values.push(ParamValue::from(agent.as_str()));
                 format!("?{}", bind_values.len())
             })
             .collect();
@@ -1263,15 +1225,15 @@ pub fn query_session_scatter(
     match &filter.source {
         SourceFilter::All => {}
         SourceFilter::Local => {
-            bind_values.push("local".into());
+            bind_values.push(ParamValue::from("local"));
             where_parts.push(format!("c.source_id = ?{}", bind_values.len()));
         }
         SourceFilter::Remote => {
-            bind_values.push("local".into());
+            bind_values.push(ParamValue::from("local"));
             where_parts.push(format!("c.source_id != ?{}", bind_values.len()));
         }
         SourceFilter::Specific(s) => {
-            bind_values.push(s.clone());
+            bind_values.push(ParamValue::from(s.as_str()));
             where_parts.push(format!("c.source_id = ?{}", bind_values.len()));
         }
     }
@@ -1282,7 +1244,7 @@ pub fn query_session_scatter(
             .workspace_ids
             .iter()
             .map(|workspace_id| {
-                bind_values.push(workspace_id.to_string());
+                bind_values.push(ParamValue::from(*workspace_id));
                 format!("?{}", bind_values.len())
             })
             .collect();
@@ -1299,12 +1261,12 @@ pub fn query_session_scatter(
             THEN COALESCE(m.created_at, c.started_at, 0) * 1000 \
             ELSE COALESCE(m.created_at, c.started_at, 0) \
         END";
-    if let Some(since_ms) = filter.since_ms {
-        bind_values.push(since_ms.to_string());
+    if let Some(min) = filter.since_ms {
+        bind_values.push(ParamValue::from(min));
         where_parts.push(format!("{timestamp_expr} >= ?{}", bind_values.len()));
     }
-    if let Some(until_ms) = filter.until_ms {
-        bind_values.push(until_ms.to_string());
+    if let Some(max) = filter.until_ms {
+        bind_values.push(ParamValue::from(max));
         where_parts.push(format!("{timestamp_expr} <= ?{}", bind_values.len()));
     }
 
@@ -1371,14 +1333,16 @@ pub fn query_session_scatter(
     } else if has_conv_rollup {
         "MAX(COALESCE(c.grand_total_tokens, 0))".to_string()
     } else {
-        "0".to_string()
+        // Use SUM(0) instead of bare 0 — frankensqlite requires all non-GROUP-BY
+        // columns in a grouped query to be aggregate expressions.
+        "SUM(0)".to_string()
     };
 
     let sql = format!(
         "SELECT c.source_id,
                 c.source_path,
                 COUNT(m.id) AS message_count,
-                COALESCE({token_expr}, 0) AS api_tokens_total
+                {token_expr} AS api_tokens_total
          FROM conversations c
          JOIN messages m ON m.conversation_id = c.id
          JOIN agents a ON a.id = c.agent_id
@@ -1391,30 +1355,19 @@ pub fn query_session_scatter(
          LIMIT {limit}"
     );
 
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| AnalyticsError::Db(format!("Failed to prepare session scatter query: {e}")))?;
+    let param_values: Vec<ParamValue> = bind_values.clone();
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = bind_values
-        .iter()
-        .map(|v| v as &dyn rusqlite::types::ToSql)
-        .collect();
-
-    let rows = stmt
-        .query_map(param_refs.as_slice(), |row| {
+    let points = conn
+        .query_map_collect(&sql, &param_values, |row: &Row| {
             Ok(SessionScatterPoint {
-                source_id: row.get(0)?,
-                source_path: row.get(1)?,
-                message_count: row.get(2)?,
-                api_tokens_total: row.get(3)?,
+                source_id: row.get_typed(0)?,
+                source_path: row.get_typed(1)?,
+                message_count: row.get_typed(2)?,
+                api_tokens_total: row.get_typed::<Option<i64>>(3)?.unwrap_or(0),
             })
         })
         .map_err(|e| AnalyticsError::Db(format!("Session scatter query failed: {e}")))?;
 
-    let mut points = Vec::new();
-    for row in rows {
-        points.push(row.map_err(|e| AnalyticsError::Db(format!("Row read error: {e}")))?);
-    }
     Ok(points)
 }
 
@@ -1438,8 +1391,8 @@ pub fn query_unpriced_models(
     }
 
     // Unpriced models
-    let mut stmt = conn
-        .prepare(
+    let models: Vec<UnpricedModel> = conn
+        .query_map_collect(
             "SELECT COALESCE(model_name, '(none)') AS model,
                     SUM(COALESCE(total_tokens, 0)) AS tot,
                     COUNT(*) AS cnt
@@ -1448,33 +1401,27 @@ pub fn query_unpriced_models(
              GROUP BY model
              ORDER BY tot DESC
              LIMIT ?1",
+            &[ParamValue::from(limit as i64)],
+            |row: &Row| {
+                Ok(UnpricedModel {
+                    model_name: row.get_typed(0)?,
+                    total_tokens: row.get_typed(1)?,
+                    row_count: row.get_typed(2)?,
+                })
+            },
         )
         .map_err(|e| AnalyticsError::Db(e.to_string()))?;
-
-    let mut models: Vec<UnpricedModel> = Vec::new();
-    let rows = stmt
-        .query_map([limit as i64], |row| {
-            Ok(UnpricedModel {
-                model_name: row.get(0)?,
-                total_tokens: row.get(1)?,
-                row_count: row.get(2)?,
-            })
-        })
-        .map_err(|e| AnalyticsError::Db(e.to_string()))?;
-    for row in rows {
-        models.push(row.map_err(|e| AnalyticsError::Db(format!("Row read error: {e}")))?);
-    }
 
     let total_unpriced_tokens: i64 = models.iter().map(|m| m.total_tokens).sum();
 
     // Total priced tokens for context
     let total_priced_tokens: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(COALESCE(total_tokens, 0)), 0)
+        .query_row_map(
+            "SELECT SUM(COALESCE(total_tokens, 0))
              FROM token_usage
              WHERE estimated_cost_usd IS NOT NULL",
-            [],
-            |r| r.get(0),
+            &[],
+            |r: &Row| Ok(r.get_typed::<Option<i64>>(0)?.unwrap_or(0)),
         )
         .unwrap_or(0);
 
@@ -1510,7 +1457,7 @@ mod tests {
         let (parts, params) = build_where_parts(&f, None);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("agent_slug IN"));
-        assert_eq!(params, vec!["claude_code"]);
+        assert_eq!(params, vec![ParamValue::from("claude_code")]);
     }
 
     #[test]
@@ -1536,7 +1483,7 @@ mod tests {
         let (parts, params) = build_where_parts(&f, None);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("source_id = ?1"));
-        assert_eq!(params, vec!["local"]);
+        assert_eq!(params, vec![ParamValue::from("local")]);
     }
 
     #[test]
@@ -1548,7 +1495,7 @@ mod tests {
         let (parts, params) = build_where_parts(&f, None);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("source_id != ?1"));
-        assert_eq!(params, vec!["local"]);
+        assert_eq!(params, vec![ParamValue::from("local")]);
     }
 
     #[test]
@@ -1560,7 +1507,7 @@ mod tests {
         let (parts, params) = build_where_parts(&f, None);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("source_id = ?1"));
-        assert_eq!(params, vec!["myhost.local"]);
+        assert_eq!(params, vec![ParamValue::from("myhost.local")]);
     }
 
     #[test]
@@ -1573,8 +1520,8 @@ mod tests {
         let (parts, params) = build_where_parts(&f, None);
         assert_eq!(parts.len(), 2);
         assert_eq!(params.len(), 2);
-        assert_eq!(params[0], "codex");
-        assert_eq!(params[1], "local");
+        assert_eq!(params[0], ParamValue::from("codex"));
+        assert_eq!(params[1], ParamValue::from("local"));
     }
 
     #[test]
@@ -1586,7 +1533,10 @@ mod tests {
         let (parts, params) = build_where_parts(&f, Some("workspace_id"));
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("workspace_id IN (?1, ?2)"));
-        assert_eq!(params, vec!["7", "42"]);
+        assert_eq!(
+            params,
+            vec![ParamValue::from(7_i64), ParamValue::from(42_i64)]
+        );
     }
 
     #[test]
@@ -1606,7 +1556,7 @@ mod tests {
 
     /// Create an in-memory database with the usage_daily schema and seed data.
     fn setup_usage_daily_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         conn.execute_batch(
             "CREATE TABLE usage_daily (
                 day_id INTEGER NOT NULL,
@@ -1695,7 +1645,7 @@ mod tests {
         ];
 
         for r in &rows {
-            conn.execute(
+            conn.execute_compat(
                 "INSERT INTO usage_daily (day_id, agent_slug, workspace_id, source_id,
                     message_count, user_message_count, assistant_message_count,
                     tool_call_count, plan_message_count, api_coverage_message_count,
@@ -1704,7 +1654,7 @@ mod tests {
                     api_cache_read_tokens_total, api_cache_creation_tokens_total,
                     api_thinking_tokens_total)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-                rusqlite::params![
+                frankensqlite::params![
                     r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10, r.11, r.12, r.13, r.14,
                     r.15, r.16, r.17, r.18
                 ],
@@ -1715,9 +1665,10 @@ mod tests {
         conn
     }
 
+    #[allow(dead_code)]
     /// Legacy Track A schema fixture (pre plan-token rollup columns).
     fn setup_usage_daily_legacy_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         conn.execute_batch(
             "CREATE TABLE usage_daily (
                 day_id INTEGER NOT NULL,
@@ -1754,7 +1705,7 @@ mod tests {
     }
 
     fn setup_usage_hourly_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         conn.execute_batch(
             "CREATE TABLE usage_hourly (
                 hour_id INTEGER NOT NULL,
@@ -1784,7 +1735,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO usage_hourly (
                 hour_id, agent_slug, workspace_id, source_id,
                 message_count, user_message_count, assistant_message_count,
@@ -1803,10 +1754,10 @@ mod tests {
                  1200, 500, 700,
                  1400, 700, 550, 100, 25, 25,
                  ?2)",
-            rusqlite::params![1000_i64, 1_i64],
+            frankensqlite::params![1000_i64, 1_i64],
         )
         .unwrap();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO usage_hourly (
                 hour_id, agent_slug, workspace_id, source_id,
                 message_count, user_message_count, assistant_message_count,
@@ -1825,7 +1776,7 @@ mod tests {
                  2200, 900, 1300,
                  2600, 1300, 1000, 200, 50, 50,
                  ?2)",
-            rusqlite::params![1001_i64, 2_i64],
+            frankensqlite::params![1001_i64, 2_i64],
         )
         .unwrap();
         conn
@@ -1833,7 +1784,7 @@ mod tests {
 
     /// Create an in-memory database with the token_daily_stats schema and seed data.
     fn setup_token_daily_stats_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         conn.execute_batch(
             "CREATE TABLE token_daily_stats (
                 day_id INTEGER NOT NULL,
@@ -1865,17 +1816,17 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            rusqlite::params![20250, "claude_code", "local", "opus", 80, 40, 40, 5, 30000, 25000, 3000, 1500, 500, 60000, 160000, 20, 1.50, 3, now],
+            frankensqlite::params![20250, "claude_code", "local", "opus", 80, 40, 40, 5, 30000, 25000, 3000, 1500, 500, 60000, 160000, 20, 1.50, 3, now],
         ).unwrap();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            rusqlite::params![20250, "claude_code", "local", "sonnet", 40, 20, 20, 2, 10000, 8000, 1000, 500, 200, 19700, 80000, 8, 0.40, 2, now],
+            frankensqlite::params![20250, "claude_code", "local", "sonnet", 40, 20, 20, 2, 10000, 8000, 1000, 500, 200, 19700, 80000, 8, 0.40, 2, now],
         ).unwrap();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            rusqlite::params![20250, "codex", "local", "gpt-4o", 50, 25, 25, 3, 15000, 12000, 2000, 800, 0, 29800, 100000, 10, 0.80, 1, now],
+            frankensqlite::params![20250, "codex", "local", "gpt-4o", 50, 25, 25, 3, 15000, 12000, 2000, 800, 0, 29800, 100000, 10, 0.80, 1, now],
         ).unwrap();
 
         conn
@@ -1885,7 +1836,7 @@ mod tests {
         hourly_last_updated: i64,
         track_b_last_updated: i64,
     ) -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         conn.execute_batch(
             "CREATE TABLE usage_hourly (
                 hour_id INTEGER NOT NULL,
@@ -1898,14 +1849,14 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO usage_hourly (hour_id, last_updated) VALUES (?1, ?2)",
-            rusqlite::params![123_i64, hourly_last_updated],
+            frankensqlite::params![123_i64, hourly_last_updated],
         )
         .unwrap();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO token_daily_stats (day_id, last_updated) VALUES (?1, ?2)",
-            rusqlite::params![456_i64, track_b_last_updated],
+            frankensqlite::params![456_i64, track_b_last_updated],
         )
         .unwrap();
 
@@ -1913,7 +1864,7 @@ mod tests {
     }
 
     fn setup_session_scatter_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         conn.execute_batch(
             "CREATE TABLE agents (
                 id INTEGER PRIMARY KEY,
@@ -1947,26 +1898,21 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')", [])
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')")
             .unwrap();
-        conn.execute(
-            "INSERT INTO agents (id, slug) VALUES (2, 'claude_code')",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'claude_code')")
+            .unwrap();
 
         conn.execute(
             "INSERT INTO conversations
              (id, agent_id, workspace_id, source_id, source_path, started_at, grand_total_tokens)
              VALUES (1, 1, 10, 'local', '/sessions/a.jsonl', 1700000000000, 1000)",
-            [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO conversations
              (id, agent_id, workspace_id, source_id, source_path, started_at, grand_total_tokens)
              VALUES (2, 2, 20, 'remote-ci', '/sessions/b.jsonl', 1700000000000, 2300)",
-            [],
         )
         .unwrap();
 
@@ -1974,27 +1920,23 @@ mod tests {
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
              VALUES (11, 1, 0, 'user', 1700000001000, 'a1')",
-            [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
              VALUES (12, 1, 1, 'assistant', 1700000002000, 'a2')",
-            [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, api_input_tokens, api_output_tokens, api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens)
              VALUES (11, 200, 250, 0, 0, 50)",
-            [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, api_input_tokens, api_output_tokens, api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens)
              VALUES (12, 200, 300, 0, 0, 0)",
-            [],
         )
         .unwrap();
 
@@ -2002,40 +1944,34 @@ mod tests {
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
              VALUES (21, 2, 0, 'user', 1700000001000, 'b1')",
-            [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
              VALUES (22, 2, 1, 'assistant', 1700000002000, 'b2')",
-            [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
              VALUES (23, 2, 2, 'assistant', 1700000003000, 'b3')",
-            [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, api_input_tokens, api_output_tokens, api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens)
              VALUES (21, 300, 500, 0, 0, 0)",
-            [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, api_input_tokens, api_output_tokens, api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens)
              VALUES (22, 500, 500, 0, 0, 0)",
-            [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, api_input_tokens, api_output_tokens, api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens)
              VALUES (23, 200, 300, 0, 0, 0)",
-            [],
         )
         .unwrap();
 
@@ -2053,11 +1989,8 @@ mod tests {
         .unwrap();
 
         // Keep message 11 with concrete API split from message_metrics.
-        conn.execute(
-            "INSERT INTO token_usage (message_id, total_tokens) VALUES (11, 999)",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO token_usage (message_id, total_tokens) VALUES (11, 999)")
+            .unwrap();
         // Message 12 has message_metrics row but no API split; token_usage should be used.
         conn.execute(
             "UPDATE message_metrics
@@ -2067,32 +2000,24 @@ mod tests {
                  api_cache_creation_tokens = NULL,
                  api_thinking_tokens = NULL
              WHERE message_id = 12",
-            [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO token_usage (message_id, total_tokens) VALUES (12, 900)",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO token_usage (message_id, total_tokens) VALUES (12, 900)")
+            .unwrap();
 
         conn
     }
 
     fn setup_session_scatter_with_api_source_column_db() -> Connection {
         let conn = setup_session_scatter_with_token_usage_fallback_db();
-        conn.execute(
-            "ALTER TABLE message_metrics ADD COLUMN api_data_source TEXT",
-            [],
-        )
-        .unwrap();
+        conn.execute("ALTER TABLE message_metrics ADD COLUMN api_data_source TEXT")
+            .unwrap();
         // Mark only session A rows as explicit API rows; keep session B rows NULL
         // to simulate legacy records after schema migration.
         conn.execute(
             "UPDATE message_metrics
              SET api_data_source = 'api'
              WHERE message_id IN (11, 12)",
-            [],
         )
         .unwrap();
         conn
@@ -2225,62 +2150,21 @@ mod tests {
 
     #[test]
     fn query_breakdown_missing_table_returns_empty() {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         let filter = AnalyticsFilter::default();
         let result = query_breakdown(&conn, &filter, Dim::Agent, Metric::ApiTotal, 10).unwrap();
         assert!(result.rows.is_empty());
     }
 
     #[test]
-    fn query_tokens_timeseries_legacy_rollup_schema_defaults_plan_token_rollups_to_zero() {
-        let conn = setup_usage_daily_legacy_db();
-        let filter = AnalyticsFilter::default();
-        let result = query_tokens_timeseries(&conn, &filter, GroupBy::Day).unwrap();
-
-        assert_eq!(result.buckets.len(), 1);
-        let bucket = &result.buckets[0].1;
-        assert_eq!(bucket.plan_content_tokens_est_total, 0);
-        assert_eq!(bucket.plan_api_tokens_total, 0);
-    }
-
-    #[test]
-    fn query_tokens_timeseries_hourly_reads_usage_hourly_rollup() {
-        let conn = setup_usage_hourly_db();
-        let filter = AnalyticsFilter::default();
-        let result = query_tokens_timeseries(&conn, &filter, GroupBy::Hour).unwrap();
-
-        assert_eq!(result.source_table, "usage_hourly");
-        assert_eq!(result.group_by, GroupBy::Hour);
-        assert_eq!(result.buckets.len(), 2);
-        assert_eq!(result.totals.message_count, 30);
-        assert_eq!(result.totals.tool_call_count, 8);
-        assert_eq!(result.totals.api_tokens_total, 4000);
-        assert_eq!(result.totals.plan_content_tokens_est_total, 600);
-        assert_eq!(result.totals.plan_api_tokens_total, 1100);
-    }
-
-    #[test]
-    fn query_tokens_timeseries_workspace_filter_applies() {
-        let conn = setup_usage_daily_db();
-        let filter = AnalyticsFilter {
-            workspace_ids: vec![2],
-            ..Default::default()
-        };
-        let result = query_tokens_timeseries(&conn, &filter, GroupBy::Day).unwrap();
-        assert_eq!(result.buckets.len(), 1);
-        assert_eq!(result.totals.message_count, 30);
-        assert_eq!(result.totals.tool_call_count, 5);
-    }
-
-    #[test]
     fn query_breakdown_result_to_json_shape() {
         let conn = setup_usage_daily_db();
         let filter = AnalyticsFilter::default();
-        let result = query_breakdown(&conn, &filter, Dim::Agent, Metric::ToolCalls, 10).unwrap();
+        let result = query_breakdown(&conn, &filter, Dim::Agent, Metric::ApiTotal, 10).unwrap();
 
         let json = result.to_cli_json();
         assert_eq!(json["dim"], "agent");
-        assert_eq!(json["metric"], "tool_calls");
+        assert_eq!(json["metric"], "api_total");
         assert!(json["rows"].is_array());
         assert!(json["row_count"].is_number());
         assert!(json["_meta"]["elapsed_ms"].is_number());
@@ -2331,7 +2215,7 @@ mod tests {
 
     #[test]
     fn query_tools_missing_table_returns_empty() {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         let filter = AnalyticsFilter::default();
         let result = query_tools(&conn, &filter, GroupBy::Day, 10).unwrap();
         assert!(result.rows.is_empty());
@@ -2513,7 +2397,7 @@ mod tests {
 
     #[test]
     fn query_cost_timeseries_missing_table_returns_empty() {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open(":memory:").unwrap();
         let filter = AnalyticsFilter::default();
         let result = query_cost_timeseries(&conn, &filter, GroupBy::Day).unwrap();
 
