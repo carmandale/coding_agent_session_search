@@ -16,7 +16,10 @@ pub mod sources;
 pub mod storage;
 pub mod tui_asciicast;
 pub mod ui;
+pub mod doctor;
 pub mod update_check;
+#[cfg(target_os = "macos")]
+pub mod watchdog;
 
 use anyhow::Result;
 use base64::prelude::*;
@@ -797,6 +800,12 @@ pub enum Commands {
     /// ```
     #[command(subcommand)]
     Analytics(AnalyticsCommand),
+    /// Watchdog: monitor and manage the watcher daemon
+    #[cfg(target_os = "macos")]
+    Watchdog {
+        #[command(subcommand)]
+        command: Option<watchdog::WatchdogCommand>,
+    },
 }
 
 /// Subcommands for importing external data
@@ -3483,6 +3492,16 @@ async fn execute_cli(
                 Commands::Analytics(subcmd) => {
                     run_analytics(subcmd, cli.db.clone())?;
                 }
+                #[cfg(target_os = "macos")]
+                Commands::Watchdog { command } => {
+                    crate::watchdog::run_watchdog_command(command).map_err(|e| CliError {
+                        code: 9,
+                        kind: "watchdog",
+                        message: e.to_string(),
+                        hint: None,
+                        retryable: false,
+                    })?;
+                }
                 _ => {}
             }
         }
@@ -4819,6 +4838,8 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Pages { .. }) => "pages".to_string(),
         Some(Commands::Import(..)) => "import".to_string(),
         Some(Commands::Analytics(..)) => "analytics".to_string(),
+        #[cfg(target_os = "macos")]
+        Some(Commands::Watchdog { .. }) => "watchdog".to_string(),
         None => "(default)".to_string(),
     }
 }
@@ -8453,6 +8474,26 @@ fn run_status(
             "recommended_action": recommended_action,
             "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
         });
+        // Append watchdog field (needs let bindings, can't go inside json! macro)
+        let mut payload = payload;
+        {
+            #[cfg(target_os = "macos")]
+            let watcher_plist = dirs::home_dir()
+                .map(|h| h.join("Library/LaunchAgents/com.cass.index-watch.plist").exists())
+                .unwrap_or(false);
+            #[cfg(not(target_os = "macos"))]
+            let watcher_plist = false;
+            #[cfg(target_os = "macos")]
+            let watchdog_plist = dirs::home_dir()
+                .map(|h| h.join("Library/LaunchAgents/com.cass.health-watchdog.plist").exists())
+                .unwrap_or(false);
+            #[cfg(not(target_os = "macos"))]
+            let watchdog_plist = false;
+            payload["watchdog"] = serde_json::json!({
+                "watcher_plist_installed": watcher_plist,
+                "plist_installed": watchdog_plist,
+            });
+        }
         return output_structured_value(payload, fmt);
     }
 

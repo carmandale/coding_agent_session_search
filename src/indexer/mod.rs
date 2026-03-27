@@ -8,6 +8,8 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+// signal_hook for graceful SIGTERM/SIGINT handling in watcher mode
+use signal_hook;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,12 +23,14 @@ use notify::{RecursiveMode, Watcher, recommended_watcher};
 use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
-    codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
-    cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
-    kimi::KimiConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
-    pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
+    codebuff::CodebuffConnector, codex::CodexConnector, copilot::CopilotConnector,
+    copilot_cli::CopilotCliConnector, cursor::CursorConnector, factory::FactoryConnector,
+    gemini::GeminiConnector, kimi::KimiConnector, openclaw::OpenClawConnector,
+    opencode::OpenCodeConnector, pi_agent::PiAgentConnector, qwen::QwenConnector,
+    vibe::VibeConnector,
 };
 use crate::connectors::{NormalizedConversation, NormalizedMessage};
+use crate::doctor::ConnectorExt as _; // compat shim: scan_with_callback, supports_streaming_scan
 use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
 
@@ -2430,6 +2434,7 @@ pub fn run_index(
             event_channel,
             stale_detector,
             opts.watch_interval_secs,
+            opts.data_dir.clone(),
             move |paths, roots, is_rebuild| {
                 let indexed = if is_rebuild {
                     if let Ok(mut g) = state.lock() {
@@ -3279,6 +3284,7 @@ impl ConnectorKind {
             "kimi" => Some(Self::Kimi),
             "copilot_cli" => Some(Self::CopilotCli),
             "qwen" => Some(Self::Qwen),
+            "codebuff" => Some(Self::Codebuff),
             _ => None,
         }
     }
@@ -3305,8 +3311,18 @@ impl ConnectorKind {
             Self::Kimi => Box::new(KimiConnector::new()),
             Self::CopilotCli => Box::new(CopilotCliConnector::new()),
             Self::Qwen => Box::new(QwenConnector::new()),
+            Self::Codebuff => Box::new(CodebuffConnector::new()),
         }
     }
+}
+
+/// Write a heartbeat timestamp to disk so the watchdog can verify liveness.
+fn write_heartbeat(path: &Path) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = fs::write(path, ts.to_string());
 }
 
 fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
@@ -3315,6 +3331,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     stale_detector: Arc<StaleDetector>,
     watch_interval_secs: u64,
+    data_dir: PathBuf,
     callback: F,
 ) -> Result<()> {
     if let Some(paths) = watch_once_paths {
@@ -3323,6 +3340,25 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
         }
         return Ok(());
     }
+
+    // Write PID file so watchdog can identify us reliably
+    let pid_path = data_dir.join("watcher.pid");
+    let _ = fs::write(&pid_path, std::process::id().to_string());
+    tracing::info!(pid = std::process::id(), path = %pid_path.display(), "wrote PID file");
+
+    // Register SIGTERM/SIGINT handler for graceful shutdown
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown));
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown));
+        tracing::info!("registered SIGTERM/SIGINT handlers for graceful shutdown");
+    }
+
+    // Heartbeat setup
+    let heartbeat_path = data_dir.join("watcher-heartbeat");
+    let heartbeat_interval = Duration::from_secs(60);
+    let mut last_heartbeat = Instant::now();
+    write_heartbeat(&heartbeat_path);
 
     let (tx, rx) = event_channel.unwrap_or_else(crossbeam_channel::unbounded);
     let tx_clone = tx.clone();
@@ -3410,7 +3446,17 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
             }
         };
 
-        match rx.recv_timeout(timeout) {
+        // Check shutdown flag before blocking recv
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!("received shutdown signal, stopping watcher");
+            break;
+        }
+
+        // Use heartbeat_interval as the upper bound on recv_timeout so we
+        // always write a heartbeat within 60s even if no events arrive
+        let effective_timeout = timeout.min(heartbeat_interval);
+
+        match rx.recv_timeout(effective_timeout) {
             Ok(IndexerEvent::Notify(paths)) => {
                 if pending.is_empty() {
                     first_event = Some(Instant::now());
@@ -3476,7 +3522,20 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
+
+        // Write heartbeat after each loop iteration
+        if last_heartbeat.elapsed() >= heartbeat_interval {
+            write_heartbeat(&heartbeat_path);
+            last_heartbeat = Instant::now();
+        }
     }
+
+    // Clean up PID file on shutdown
+    if pid_path.exists() {
+        let _ = fs::remove_file(&pid_path);
+        tracing::info!(path = %pid_path.display(), "removed PID file on shutdown");
+    }
+
     Ok(())
 }
 
@@ -3681,6 +3740,8 @@ enum ConnectorKind {
     CopilotCli,
     #[serde(rename = "qw", alias = "Qwen")]
     Qwen,
+    #[serde(rename = "bf", alias = "Codebuff")]
+    Codebuff,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
