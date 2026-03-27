@@ -5,6 +5,9 @@ bead: coding_agent_session_search-3iqk
 ---
 
 <!-- issue:complete:v1 | harness: unknown | date: 2026-03-27T10:36:12Z -->
+<!-- Codex Review: APPROVED after 5 rounds | model: gpt-5.3-codex | date: 2026-03-27 -->
+<!-- Status: UNCHANGED — spec predates shaping; plan reflects the shaped outcome -->
+<!-- Note: plan.md supersedes spec.md where they conflict (full upstream sync vs selective cherry-pick) -->
 
 # Spec 008 — Frankensqlite + Frankensearch Migration
 

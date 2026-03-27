@@ -4,6 +4,9 @@ date: 2026-03-27
 bead: coding_agent_session_search-3iqk
 ---
 
+<!-- Codex Review: APPROVED after 5 rounds | model: gpt-5.3-codex | date: 2026-03-27 -->
+<!-- Status: REVISED -->
+<!-- Revisions: Phase 3 now includes explicit wiring tasks for 5 watchdog + 4 codebuff integration sites and unconditional SIGTERM patch; Phase 5 migration now uses set -euo pipefail, set-e-safe add_col with if-form, cass analytics rebuild as migration trigger, hard-fail rollback, watcher restart as hard gate -->
 <!-- plan:complete:v1 | harness: pi/claude-sonnet-4-6 | date: 2026-03-27T16:44:26Z -->
 
 # Tasks — Spec 008: Full Upstream Sync
@@ -71,36 +74,43 @@ bead: coding_agent_session_search-3iqk
 
 ## Phase 3: Re-apply our unique additions
 
-- [ ] **T3.1** Add watchdog.rs (new file)
+- [ ] **T3.1** Copy watchdog.rs (new file — upstream has no equivalent)
   ```bash
-  cd /tmp/cass-merge-base
-  git apply /tmp/cass-our-diffs/watchdog.patch
-  # Or: copy directly: cp ~/dev/coding_agent_session_search/src/watchdog.rs src/
+  cp ~/dev/coding_agent_session_search/src/watchdog.rs /tmp/cass-merge-base/src/watchdog.rs
   ```
-- [ ] **T3.2** Add codebuff.rs connector (new file)
+- [ ] **T3.2** Copy codebuff.rs connector (new file)
   ```bash
-  git apply /tmp/cass-our-diffs/codebuff.patch
-  # Register in src/connectors/mod.rs: add `pub mod codebuff;`
-  # Register in indexer/mod.rs connector list if not already present
+  cp ~/dev/coding_agent_session_search/src/connectors/codebuff.rs /tmp/cass-merge-base/src/connectors/codebuff.rs
   ```
-- [ ] **T3.3** Create `src/doctor.rs` with DoctorConnector extension trait
+- [ ] **T3.3** Apply watchdog wiring to upstream's lib.rs — 5 explicit sites:
+  - Add `pub mod watchdog;` at top (after other pub mod declarations)
+  - Add `Watchdog { command: Option<watchdog::WatchdogCommand> }` variant to Commands enum
+  - Add `Commands::Watchdog { command } => crate::watchdog::run_watchdog_command(command)...` to dispatch
+  - Add `Some(Commands::Watchdog { .. }) => "watchdog".to_string()` to robot_mode match
+  - Add `"watchdog": { plist_installed: ..., watcher_plist_installed: ... }` to health JSON
+- [ ] **T3.4** Apply codebuff wiring to upstream's connectors/mod.rs + indexer/mod.rs — 4 sites:
+  - `src/connectors/mod.rs`: add `pub mod codebuff;`
+  - `src/indexer/mod.rs` imports: add `codebuff::CodebuffConnector`
+  - `src/indexer/mod.rs` factory tuple: add `("codebuff", || Box::new(CodebuffConnector::new()))`
+  - `src/indexer/mod.rs` AgentKind: add `Codebuff` variant and all match arms
+- [ ] **T3.5** Apply SIGTERM/heartbeat patch to upstream's indexer/mod.rs (unconditional —
+  confirmed absent in upstream):
+  - signal_hook SIGTERM/SIGINT flag registration
+  - `write_heartbeat()` function
+  - Heartbeat interval loop replacing `rx.recv()`
+  - PID file write at startup; PID file cleanup at shutdown
+- [ ] **T3.6** Create `src/doctor.rs` with DoctorConnector extension trait
   ```rust
-  // src/doctor.rs
-  /// Extension trait for connectors that support disk-vs-DB reconciliation.
-  /// Separate from Connector (which lives in FAD) to avoid upstream divergence.
   pub trait DoctorConnector {
       fn count_disk_files(&self) -> Option<usize>;
       fn reconciliation_notes(&self) -> Option<String> { None }
   }
-  // Implement for CodebuffConnector here or in codebuff.rs
   ```
-- [ ] **T3.4** Update the doctor subcommand in lib.rs to use `DoctorConnector` instead of
-  looking for `count_disk_files` on the base `Connector` trait. Connectors that don't
-  implement `DoctorConnector` show "N/A" in the doctor output.
-- [ ] **T3.5** Add `pub mod doctor;` to `src/lib.rs` or `src/main.rs`
-- [ ] **T3.6** Commit additions
+- [ ] **T3.7** Update doctor subcommand in lib.rs to use `&dyn DoctorConnector`
+  (FAD-backed connectors → "N/A"); add `pub mod doctor;`
+- [ ] **T3.8** Commit additions
   ```bash
-  git add -A && git commit -m "feat: re-apply watchdog, codebuff, doctor extension trait"
+  git add -A && git commit -m "feat: re-apply watchdog, codebuff, SIGTERM/heartbeat, doctor extension trait"
   ```
 
 ## Phase 4: Build verification
@@ -130,67 +140,105 @@ bead: coding_agent_session_search-3iqk
 
 ## Phase 5: Database migration (8.8GB live DB)
 
-- [ ] **T5.1** Take mandatory pre-migration backup
+Run all steps with `set -euo pipefail`. Every failure exits immediately.
+
+- [ ] **T5.0** Build gate — must pass before touching the DB
+  ```bash
+  set -euo pipefail
+  cd /tmp/cass-merge-base
+  cargo build --release
+  cargo test
+  echo "Build gate: PASSED"
+  ```
+- [ ] **T5.1** Quiesce the system
   ```bash
   DB="$HOME/Library/Application Support/com.coding-agent-search.coding-agent-search/agent_search.db"
-  sqlite3 "$DB" "VACUUM INTO '${DB%.db}-backup-pre-v14.db'"
-  echo "Backup size: $(du -h "${DB%.db}-backup-pre-v14.db")"
+  launchctl unload ~/Library/LaunchAgents/com.cass.index-watch.plist || true
+  launchctl unload ~/Library/LaunchAgents/com.cass.health-watchdog.plist || true
+  sleep 3
+  if pgrep -f "cass index --watch" > /dev/null; then
+    echo "FATAL: watcher still running after unload"; exit 1
+  fi
+  echo "watcher stopped OK"
   ```
-- [ ] **T5.2** Inspect what columns our live conversations table currently has
+- [ ] **T5.2** Pre-migration integrity check and conversation count snapshot
   ```bash
-  sqlite3 "$DB" "PRAGMA table_info(conversations);" | awk '{print $2, $3}'
+  sqlite3 "$DB" "PRAGMA integrity_check;" | grep -q "^ok$" \
+    || { echo "FATAL: DB integrity check failed before migration"; exit 1; }
+  CONV_COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM conversations;")
+  echo "Pre-migration integrity OK, conversations: $CONV_COUNT"
   ```
-- [ ] **T5.3** Run surgical gap-fill to add columns that MIGRATION_FRESH_SCHEMA assumes
-  (SQLite ALTER TABLE ADD COLUMN is idempotent — wrap in shell to skip duplicates):
+- [ ] **T5.3** VACUUM INTO backup (path in variable — reused throughout)
   ```bash
-  for col_sql in \
-    "ALTER TABLE conversations ADD COLUMN metadata_bin BLOB" \
-    "ALTER TABLE conversations ADD COLUMN total_input_tokens INTEGER" \
-    "ALTER TABLE conversations ADD COLUMN total_output_tokens INTEGER" \
-    "ALTER TABLE conversations ADD COLUMN total_cache_read_tokens INTEGER" \
-    "ALTER TABLE conversations ADD COLUMN total_cache_creation_tokens INTEGER" \
-    "ALTER TABLE conversations ADD COLUMN grand_total_tokens INTEGER" \
-    "ALTER TABLE conversations ADD COLUMN estimated_cost_usd REAL" \
-    "ALTER TABLE conversations ADD COLUMN primary_model TEXT" \
-    "ALTER TABLE messages ADD COLUMN extra_bin BLOB"; do
-    sqlite3 "$DB" "$col_sql" 2>/dev/null && echo "OK: $col_sql" || echo "SKIP (exists): $col_sql"
-  done
+  BACKUP_PATH="${HOME}/cass-backup-pre-v14-$(date +%Y%m%d-%H%M%S).db"
+  sqlite3 "$DB" "VACUUM INTO '${BACKUP_PATH}'"
+  sqlite3 "$BACKUP_PATH" "PRAGMA integrity_check;" | grep -q "^ok$" \
+    || { echo "FATAL: backup integrity check failed"; exit 1; }
+  echo "Backup created and verified: $BACKUP_PATH"
   ```
-- [ ] **T5.4** Run the migration by starting the new binary once
+- [ ] **T5.4** Surgical gap-fill — 13 columns using set-e-safe add_col
   ```bash
-  ./target/release/cass health --json 2>/dev/null | python3 -c "
-  import sys, json; d = json.load(sys.stdin)
-  print('healthy:', d['healthy'])
-  print('conversations:', d['state']['database']['conversations'])
-  "
+  add_col() {
+    local sql="$1" err
+    if err=$(sqlite3 "$DB" "$sql" 2>&1); then
+      echo "OK: $sql"
+    elif echo "$err" | grep -q "duplicate column name"; then
+      echo "SKIP (exists): $sql"
+    else
+      echo "FATAL: $sql — $err"; exit 1
+    fi
+  }
+  add_col "ALTER TABLE conversations ADD COLUMN metadata_bin BLOB"
+  add_col "ALTER TABLE messages ADD COLUMN extra_bin BLOB"
+  add_col "ALTER TABLE conversations ADD COLUMN total_input_tokens INTEGER"
+  add_col "ALTER TABLE conversations ADD COLUMN total_output_tokens INTEGER"
+  add_col "ALTER TABLE conversations ADD COLUMN total_cache_read_tokens INTEGER"
+  add_col "ALTER TABLE conversations ADD COLUMN total_cache_creation_tokens INTEGER"
+  add_col "ALTER TABLE conversations ADD COLUMN grand_total_tokens INTEGER"
+  add_col "ALTER TABLE conversations ADD COLUMN estimated_cost_usd REAL"
+  add_col "ALTER TABLE conversations ADD COLUMN primary_model TEXT"
+  add_col "ALTER TABLE conversations ADD COLUMN api_call_count INTEGER"
+  add_col "ALTER TABLE conversations ADD COLUMN tool_call_count INTEGER"
+  add_col "ALTER TABLE conversations ADD COLUMN user_message_count INTEGER"
+  add_col "ALTER TABLE conversations ADD COLUMN assistant_message_count INTEGER"
+  echo "Gap-fill complete"
   ```
-  The startup triggers `transition_from_meta_version()` + MigrationRunner (V13, V14).
-- [ ] **T5.5** Verify conversation count is preserved (should still be ≥24,340)
+- [ ] **T5.5** Trigger MigrationRunner (V13 + V14) via analytics rebuild
+  
+  `cass analytics rebuild` → `run_analytics_rebuild()` → `FrankenStorage::open()` →
+  `run_migrations()` → `transition_from_meta_version()` + MigrationRunner(V13, V14).
+  `cass health` and `cass doctor` do NOT trigger migrations.
   ```bash
-  sqlite3 "$DB" "SELECT COUNT(*) FROM conversations;"
+  ./target/release/cass analytics rebuild --json \
+    || { echo "FATAL: migration trigger failed — restoring backup"; cp "$BACKUP_PATH" "$DB"; exit 1; }
+  echo "Migration: complete"
   ```
-- [ ] **T5.6** Verify new schema tables exist
+- [ ] **T5.6** Post-migration verification (hard-fail = rollback + exit)
   ```bash
-  sqlite3 "$DB" ".tables" | tr ' ' '\n' | sort
-  # Should include: token_usage, message_metrics, embedding_jobs, etc.
-  ```
-- [ ] **T5.7** **Fallback (if migration fails):** Restore from backup and run full rebuild
-  ```bash
-  cp "${DB%.db}-backup-pre-v14.db" "$DB"
-  ./target/release/cass index --full --force-rebuild
+  rollback() { echo "FATAL: $1 — restoring backup"; cp "$BACKUP_PATH" "$DB"; exit 1; }
+  sqlite3 "$DB" "PRAGMA integrity_check;" | grep -q "^ok$" || rollback "integrity check failed"
+  POST_COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM conversations;")
+  [ "$POST_COUNT" -eq "$CONV_COUNT" ] || rollback "count changed $CONV_COUNT → $POST_COUNT"
+  sqlite3 "$DB" "SELECT COUNT(*) FROM token_usage;" > /dev/null || rollback "token_usage missing"
+  sqlite3 "$DB" "SELECT COUNT(*) FROM message_metrics;" > /dev/null || rollback "message_metrics missing"
+  echo "Post-migration verification: PASSED ($POST_COUNT conversations)"
   ```
 
 ## Phase 6: Integration verification
 
-- [ ] **T6.1** Watcher starts correctly
+- [ ] **T6.1** Watcher restart — hard gate (R4)
   ```bash
-  launchctl unload ~/Library/LaunchAgents/com.cass.index-watch.plist
   launchctl load ~/Library/LaunchAgents/com.cass.index-watch.plist
-  sleep 5 && pgrep -af "cass index --watch" && echo "watcher running"
+  launchctl load ~/Library/LaunchAgents/com.cass.health-watchdog.plist
+  sleep 5
+  pgrep -f "cass index --watch" > /dev/null \
+    || { echo "FATAL: watcher did not start"; exit 1; }
+  echo "Watcher running: $(pgrep -f 'cass index --watch')"
   ```
-- [ ] **T6.2** Watchdog subcommand works
+- [ ] **T6.2** Watchdog smoke check — hard gate (R4)
   ```bash
-  ./target/release/cass watchdog run
+  ./target/release/cass watchdog run \
+    || { echo "FATAL: watchdog run subcommand failed"; exit 1; }
   ./target/release/cass watchdog install --dry-run
   ```
 - [ ] **T6.3** Search returns results
