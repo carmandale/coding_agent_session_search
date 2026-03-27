@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# post-commit hook for cass
+#
+# If src/ or Cargo.toml changed in this commit, rebuilds the binary
+# in the background via `cargo install --path .` and verifies the
+# ~/.local/bin/cass symlink is intact.
+#
+# Activated via: git config core.hooksPath hooks
+# (dev-install.sh does this automatically)
+
+REPO_DIR="$(git rev-parse --show-toplevel)"
+LOCAL_LINK="$HOME/.local/bin/cass"
+CARGO_BIN="$HOME/.cargo/bin/cass"
+LOG="$HOME/Library/Logs/cass-post-commit-build.log"
+
+warn() { echo -e "\033[1;33m⚠ cass:\033[0m $*" >&2; }
+ok()   { echo -e "\033[0;32m✓ cass:\033[0m $*" >&2; }
+info() { echo -e "\033[0;34m▸ cass:\033[0m $*" >&2; }
+
+# ── 1. Check if this commit touched source files ──────────────────────────────
+CHANGED=$(git diff-tree --no-commit-id -r --name-only HEAD 2>/dev/null)
+SOURCE_CHANGED=0
+if echo "$CHANGED" | grep -qE '^(src/|Cargo\.toml|Cargo\.lock)'; then
+  SOURCE_CHANGED=1
+fi
+
+if [[ "$SOURCE_CHANGED" -eq 0 ]]; then
+  # Non-source commit (docs, specs, beads, etc.) — just verify symlink
+  if [[ -L "$LOCAL_LINK" ]] && [[ "$(readlink "$LOCAL_LINK")" == "$CARGO_BIN" ]] && [[ -x "$CARGO_BIN" ]]; then
+    : # all good, stay quiet
+  else
+    warn "~/.local/bin/cass symlink is broken or missing — run: ./dev-install.sh"
+  fi
+  exit 0
+fi
+
+# ── 2. Source changed — rebuild in background ─────────────────────────────────
+info "Source changed — rebuilding cass in background (log: $LOG)"
+
+# Launch detached so the commit doesn't block
+nohup bash -c "
+  set -euo pipefail
+  cd '$REPO_DIR'
+  echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] Starting cargo install (commit \$(git rev-parse --short HEAD))\" >> '$LOG'
+  if cargo install --path . --quiet >> '$LOG' 2>&1; then
+    echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] Build succeeded: \$('$CARGO_BIN' --version 2>/dev/null)\" >> '$LOG'
+  else
+    echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] Build FAILED — check $LOG\" >> '$LOG'
+  fi
+" >/dev/null 2>&1 &
+
+# ── 3. Verify symlink is wired correctly (synchronous, fast) ──────────────────
+if [[ -L "$LOCAL_LINK" ]] && [[ "$(readlink "$LOCAL_LINK")" == "$CARGO_BIN" ]]; then
+  ok "Rebuild started in background. Symlink OK: ~/.local/bin/cass → ~/.cargo/bin/cass"
+else
+  warn "Rebuild started in background, but ~/.local/bin/cass symlink is wrong — run: ./dev-install.sh"
+fi
+
+exit 0

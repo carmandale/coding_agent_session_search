@@ -1,0 +1,54 @@
+#!/bin/sh
+#
+# br (beads_rust) pre-push hook — v2.0
+#
+# Ensures .beads/ JSONL is fresh before push. Fails if uncommitted
+# .beads/ changes exist (unless sync-branch is configured).
+
+# Guard: skip if br not installed
+command -v br >/dev/null 2>&1 || exit 0
+
+# Guard: skip during rebase
+git_dir="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
+if [ -d "$git_dir/rebase-merge" ] || [ -d "$git_dir/rebase-apply" ]; then
+  exit 0
+fi
+
+# Guard: resolve .beads/ (worktree-safe)
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+beads_dir="$repo_root/.beads"
+if [ ! -d "$beads_dir" ]; then
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+  main_root="$(dirname "$common")"
+  beads_dir="$main_root/.beads"
+  [ -d "$beads_dir" ] || exit 0
+fi
+
+# Check env var first (existing behavior), then config.yaml
+sync_branch="${BEADS_SYNC_BRANCH:-}"
+if [ -z "$sync_branch" ]; then
+  config="$beads_dir/config.yaml"
+  if [ -f "$config" ]; then
+    sync_branch=$(grep -E '^sync-branch:' "$config" 2>/dev/null | head -1 | \
+      sed 's/^sync-branch:[[:space:]]*//' | sed 's/^["'"'"']//' | sed 's/["'"'"']$//')
+  fi
+fi
+if [ -n "$sync_branch" ]; then
+  # Changes go to sync branch via worktree, not the current branch
+  exit 0
+fi
+
+# Flush pending changes so they surface in JSONL
+br sync --flush-only --quiet 2>/dev/null || true
+
+# Check for uncommitted .beads/ changes
+if [ -n "$(git status --porcelain -- .beads/ 2>/dev/null)" ]; then
+  echo "❌ Uncommitted .beads/ changes detected before push" >&2
+  echo "" >&2
+  echo "Run:" >&2
+  echo "  git add .beads/ && git commit --amend --no-edit" >&2
+  echo "" >&2
+  exit 1
+fi
+
+exit 0

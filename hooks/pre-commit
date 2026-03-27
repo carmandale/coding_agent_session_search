@@ -1,0 +1,40 @@
+#!/bin/sh
+#
+# br (beads_rust) pre-commit hook — v2.0
+#
+# Flushes pending br issue changes to .beads/issues.jsonl before commit.
+# Stages only the explicit JSONL files that br produces.
+
+# Guard: skip if br not installed
+command -v br >/dev/null 2>&1 || exit 0
+
+# Guard: skip during rebase
+git_dir="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
+if [ -d "$git_dir/rebase-merge" ] || [ -d "$git_dir/rebase-apply" ]; then
+  exit 0
+fi
+
+# Guard: resolve .beads/ (worktree-safe)
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+beads_dir="$repo_root/.beads"
+if [ ! -d "$beads_dir" ]; then
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+  main_root="$(dirname "$common")"
+  beads_dir="$main_root/.beads"
+  [ -d "$beads_dir" ] || exit 0
+fi
+
+# Flush pending changes to JSONL
+if ! br sync --flush-only --quiet 2>/dev/null; then
+  echo "Error: Failed to flush br changes to JSONL" >&2
+  echo "Run 'br sync --flush-only' manually to diagnose" >&2
+  exit 1
+fi
+
+# Stage only the explicit JSONL files br produces
+# Skip in worktrees — files are in the main repo's working tree
+if [ "$(git rev-parse --git-dir)" = "$(git rev-parse --git-common-dir)" ]; then
+  git add .beads/issues.jsonl .beads/interactions.jsonl 2>/dev/null || true
+fi
+
+exit 0
