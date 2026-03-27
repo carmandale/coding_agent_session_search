@@ -19,31 +19,34 @@ pub trait DoctorConnector {
 }
 
 /// Compatibility extension trait — adds `scan_with_callback` and
-/// `supports_streaming_scan` methods that exist in upstream's private FAD
-/// fork but not in the public v0.1.3 release.
+/// `supports_streaming_scan` that exist in upstream's private FAD fork
+/// but not in the public v0.1.3 release.
 ///
-/// Implemented as a blanket impl over all `Connector + Sync` types.
-/// Uses the standard `scan()` method internally (non-streaming fallback).
-pub trait ConnectorExt: Connector {
-    /// Streaming scan callback variant. Falls back to `scan()` + callback iteration.
+/// Not blanket-implemented over Connector to avoid conflicts.
+/// Call via `connector_scan_with_callback(conn, ctx, cb)` free function
+/// OR implement explicitly for types that need custom streaming behavior.
+pub trait ConnectorExt {
     fn scan_with_callback(
         &self,
         ctx: &ScanContext,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        let conversations = self.scan(ctx)?;
-        for conv in conversations {
-            on_conversation(conv)?;
-        }
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
 
-    /// Returns true if this connector natively supports streaming scan.
-    /// FAD public connectors all use buffered scan, so this returns false.
     fn supports_streaming_scan(&self) -> bool {
         false
     }
 }
 
-// Blanket impl for all FAD connectors
-impl<T: Connector + ?Sized> ConnectorExt for T {}
+/// Default scan_with_callback implementation via scan() for any Connector.
+/// Used as a free function by the indexer when a connector doesn't override ConnectorExt.
+pub fn connector_scan_with_callback<C: Connector + ?Sized>(
+    conn: &C,
+    ctx: &ScanContext,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let conversations = conn.scan(ctx)?;
+    for conv in conversations {
+        on_conversation(conv)?;
+    }
+    Ok(())
+}

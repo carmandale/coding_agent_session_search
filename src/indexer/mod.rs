@@ -30,7 +30,7 @@ use crate::connectors::{
     vibe::VibeConnector,
 };
 use crate::connectors::{NormalizedConversation, NormalizedMessage};
-use crate::doctor::ConnectorExt as _; // compat shim: scan_with_callback, supports_streaming_scan
+use crate::doctor::{ConnectorExt, connector_scan_with_callback};
 use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
 
@@ -1267,7 +1267,7 @@ fn spawn_connector_producer(
             let local_origin = Origin::local();
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
-            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+            match connector_scan_with_callback(&*conn, &ctx, &mut |mut conversation| {
                 inject_provenance(&mut conversation, &local_origin);
                 batch_sender.push(conversation)
             }) {
@@ -1318,7 +1318,7 @@ fn spawn_connector_producer(
             );
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
-            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+            match connector_scan_with_callback(&*conn, &ctx, &mut |mut conversation| {
                 inject_provenance(&mut conversation, &root.origin);
                 apply_workspace_rewrite(&mut conversation, root);
 
@@ -1640,7 +1640,7 @@ fn run_streaming_index_with_connector_factories(
         .iter()
         .filter_map(|(name, factory)| {
             let connector = factory();
-            (!connector.supports_streaming_scan()).then_some(*name)
+            Some(*name)
         })
         .collect();
     let num_connectors = connector_factories.len();
@@ -5304,6 +5304,9 @@ mod tests {
             Ok(Vec::new())
         }
 
+    }
+
+    impl crate::doctor::ConnectorExt for DetectedRemoteFailureConnector {
         fn scan_with_callback(
             &self,
             ctx: &crate::connectors::ScanContext,
@@ -5339,6 +5342,9 @@ mod tests {
             Ok(Vec::new())
         }
 
+    }
+
+    impl crate::doctor::ConnectorExt for PanicConnector {
         fn scan_with_callback(
             &self,
             _ctx: &crate::connectors::ScanContext,
@@ -5372,6 +5378,9 @@ mod tests {
             Ok(Vec::new())
         }
 
+    }
+
+    impl crate::doctor::ConnectorExt for DisconnectAwareConnector {
         fn scan_with_callback(
             &self,
             ctx: &crate::connectors::ScanContext,

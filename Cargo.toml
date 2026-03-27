@@ -14,11 +14,12 @@ anyhow = "*"
 thiserror = "*"
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter", "fmt", "ansi"] }
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "d72f93e", features = ["test-internals"] }
+asupersync = { path = "/Users/dalecarman/dev/asupersync", features = ["test-internals"] }
 signal-hook = "*"
-franken-decision = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "d72f93e", package = "franken-decision" }
-franken-evidence = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "d72f93e", package = "franken-evidence" }
-franken-kernel = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "d72f93e", package = "franken-kernel" }
+libc = "*"  # Explicit dep for watchdog PID management (libc::kill)
+franken-decision = { path = "/Users/dalecarman/dev/asupersync/franken_decision", package = "franken-decision" }
+franken-evidence = { path = "/Users/dalecarman/dev/asupersync/franken_evidence", package = "franken-evidence" }
+franken-kernel = { path = "/Users/dalecarman/dev/asupersync/franken_kernel", package = "franken-kernel" }
 clap = { version = "*", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "*"
 clap_mangen = "*"
