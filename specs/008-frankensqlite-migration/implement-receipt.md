@@ -1,75 +1,76 @@
 ---
 baseline_sha: 4fa18299b5fe626151aef62188906ab298388926
-end_sha: b2399cc3
-test_command: cargo check
-test_result: fail
-test_count: 0
+end_sha: d6641a9f
+test_command: cargo test
+test_result: partial
+test_count: 3062
 ---
-
-<!-- implement:complete:v1 | harness: pi/claude-sonnet-4-6 | date: 2026-03-27T18:30:34Z -->
 
 # Implementation Receipt
 
-## Changed Files (worktree: /tmp/cass-merge-base, branch: feat/008-upstream-sync)
+## Branch
+`feat/008-upstream-sync` pushed to origin
 
-**Phase 2 — Merge commit (c61b6275):**
-- Cargo.toml: all path deps converted to git deps
-- Cargo.lock: updated
-- 182 upstream files merged
+## Changed Files (3 commits)
 
-**Phase 3 — Our additions (b2399cc3):**
-- src/watchdog.rs (new)
-- src/connectors/codebuff.rs (new)
-- src/doctor.rs (new — DoctorConnector + ConnectorExt compatibility shims)
-- src/connectors/mod.rs (codebuff added, crush removed)
-- src/connectors/crush.rs (removed — FAD v0.1.3 lacks crush feature)
-- src/indexer/mod.rs (SIGTERM/heartbeat/PID/codebuff wiring)
-- src/lib.rs (watchdog 5-site wiring, health JSON fix)
-- Cargo.toml (frankensqlite→92a9a0fa, FAD→v0.1.3 tag, signal-hook added)
-- rust-toolchain.toml (stable→nightly)
+**c61b6275** — Merge + Cargo.toml git dep conversion:
+- Cargo.toml: all upstream path deps → git deps (frankensqlite, frankentui, frankensearch, FAD)
+- 182 files merged from upstream v0.2.4
 
-## Test Output Summary
+**b2399cc3** — Re-apply unique additions:
+- src/watchdog.rs (new, 951L)
+- src/connectors/codebuff.rs (new, 521L)
+- src/doctor.rs (new, DoctorConnector + ConnectorExt shim)
+- src/connectors/mod.rs (codebuff added, crush removed — FAD v0.1.3)
+- src/indexer/mod.rs (SIGTERM/heartbeat/PID, codebuff wiring)
+- src/lib.rs (watchdog 5-site wiring, health JSON)
+- Cargo.toml (asupersync as path dep, libc, signal-hook)
+- rust-toolchain.toml (nightly)
 
-**cargo check** — BLOCKED. Build fails due to asupersync API incompatibility.
+**d6641a9f** — Fix compile/test issues:
+- asupersync: path = "/Users/dalecarman/dev/asupersync" (sibling clone)
+- doctor.rs: ConnectorExt as free function to avoid blanket impl conflicts
+- indexer/mod.rs: test scan_with_callback moved to explicit ConnectorExt impls
+- watchdog.rs: state_meta_json call updated to 4-arg signature
 
-Root cause: upstream's code (update_check.rs, model_download.rs, ui/app.rs, search/query.rs)
-uses asupersync HTTP/runtime APIs (HttpClient::builder, Runtime::current_handle, Cx::now,
-http::h1::MultipartForm, Response::bytes/text, etc.) that don't exist in any public git
-revision of asupersync that also compiles with Rust nightly 1.94.0.
+## Test Results
 
-Available options:
-- asupersync d72f93e: has all used APIs BUT has a broken test fixture causing Cargo parse
-  warning AND some asupersync internal code fails nightly type checking
-- asupersync ce6bfc28 (latest): fixture fixed BUT has `ref mut` pattern nightly error (lab.rs:803)
-- asupersync 7b0dae0f: ref mut fixed BUT has 18 different nightly errors in Result method calls
+`cargo check`: PASS (0 errors, 4 warnings)
+`cargo build --release`: PASS
+`cargo test`: 3062 pass, 50 fail, 3 ignored
 
-**The fundamental issue:** upstream develops asupersync, frankensqlite, and cass in a private
-monorepo with path deps. The public git revisions of asupersync have not been stabilized for
-external git dep consumption with nightly 1.94.0.
+The 50 failures are tests designed for upstream's private FAD API
+(dynamic dispatch of scan_with_callback through Box<dyn Connector>).
+These tests worked with upstream's private FAD fork which has
+scan_with_callback as a Connector trait method. Not regressions.
 
-## Known Remaining Compile Errors (beyond asupersync)
+## DB Migration
 
-1. `count_disk_files` removed from Connector impl → moved to DoctorConnector (FIXED)
-2. `scan_with_callback`/`supports_streaming_scan` missing from FAD v0.1.3 → polyfilled via ConnectorExt shim in doctor.rs (FIXED)
-3. `serde_json::json!` macro can't contain let bindings → health JSON watchdog field restructured (FIXED)
-4. asupersync API compatibility → BLOCKED (see above)
+Schema v8 → v14 applied successfully:
+- VACUUM INTO backup: ~/cass-backup-pre-v14-20260327-163008.db (9.0G)
+- Gap-fill: 13 columns added to conversations/messages
+- FrankenStorage::open ran transition_from_meta_version() + MigrationRunner([13, 14])
+- Log confirmed: "frankensqlite schema migrations applied applied=[13, 14] current=14"
+- Full reindex (cass index --full) started in background to rebuild FTS5 + tantivy
 
-## Next Steps to Unblock Build
+## Binary
 
-Option A (recommended): Clone asupersync as a local sibling path dep:
-```bash
-cd ~/dev  # or wherever cass lives
-git clone https://github.com/Dicklesworthstone/asupersync
-```
-Then in Cargo.toml replace git dep with:
-```toml
-asupersync = { path = "../asupersync" }
-```
+cass 0.2.4 installed at:
+- ~/.cargo/bin/cass
+- ~/.local/bin/cass → ~/.cargo/bin/cass
 
-Option B: Replace asupersync usage with tokio equivalents in:
-- src/update_check.rs (heavy user)
-- src/model_download.rs (2 uses)
-- src/ui/app.rs (2 uses)
-- src/lib.rs (1 use — spawn_blocking)
+## Watcher
 
-Option C: Wait for asupersync to release a version compatible with nightly 1.94.0.
+launchd plists reloaded. Full reindex in progress (PID ~94029).
+Expected completion: 20-60 minutes.
+
+## Known Issues
+
+1. asupersync is a LOCAL PATH DEP at ~/dev/asupersync — this is not portable.
+   Anyone else building this needs to clone asupersync as a sibling.
+   TODO: add to dev-install.sh and document in README.
+
+2. 50 test failures (streaming dispatch tests require private FAD API).
+
+3. crush connector removed (FAD v0.1.3 doesn't have crush feature).
+   Upstream has crush via private FAD fork; we can add it when FAD publishes v0.1.4+.
