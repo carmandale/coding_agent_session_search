@@ -16,7 +16,7 @@ Work against the live checkout, not the stale shaping snapshot. The old `doctor.
 
 ## Step 0 — Reconcile spec contract
 
-- [ ] **T0.1** Update acceptance language during writeback so it matches the live codebase:
+- [x] **T0.1** Acceptance language is aligned on disk via the Codex-reviewed spec/plan writeback:
   - generic `cass doctor` reconciliation stays
   - `src/connectors/crush.rs` is restored as a local wrapper with adapter-backed integration
   - doctor/shim cleanup is recorded as already satisfied in this checkout
@@ -54,8 +54,8 @@ Work against the live checkout, not the stale shaping snapshot. The old `doctor.
   ```bash
   rg -n "codebuff|Codebuff" README.md src tests Cargo.toml Cargo.lock
   ```
-- [ ] **T4.8** Request explicit written permission before deleting `src/connectors/codebuff.rs`
-- [ ] **T4.9** Delete `src/connectors/codebuff.rs` only if that permission is granted
+- [x] **T4.8** Request explicit written permission before deleting `src/connectors/codebuff.rs`
+- [x] **T4.9** Leave `src/connectors/codebuff.rs` detached in-tree because explicit delete approval was not granted
 
 ## Step 5 — Restore `src/connectors/crush.rs` with adapter-backed integration
 
@@ -93,9 +93,9 @@ Work against the live checkout, not the stale shaping snapshot. The old `doctor.
 
 ## Step 8 — Finalize implementation diff and commit
 
-- [ ] **T8.1** Confirm the final diff reflects the intentional current-fork delta, not stale doctor/shim deletions
-- [ ] **T8.2** If delete approval was not granted, note `src/connectors/codebuff.rs` as the only remaining cleanup precondition
-- [ ] **T8.3** `git add -A`
-- [ ] **T8.4** `git commit -m "refactor: drop codebuff, bump FAD, restore crush"`
-- [ ] **T8.5** `git push origin <current-branch>`
-- [ ] **T8.6** `br close coding_agent_session_search-hhm0`
+- [x] **T8.1** Confirm the final diff reflects the intentional current-fork delta, not stale doctor/shim deletions
+- [x] **T8.2** If delete approval was not granted, note `src/connectors/codebuff.rs` as the only remaining cleanup precondition
+- [x] **T8.3** `git add -A`
+- [x] **T8.4** `git commit -m "refactor: drop codebuff, bump FAD, restore crush"`
+- [x] **T8.5** `git push origin <current-branch>`
+- [x] **T8.6** `br close coding_agent_session_search-hhm0`
