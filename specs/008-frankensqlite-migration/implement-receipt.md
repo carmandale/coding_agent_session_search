@@ -6,6 +6,8 @@ test_result: partial
 test_count: 3062
 ---
 
+<!-- implement:complete:v1 | restored-by: code-verify | harness: codex/gpt-5.3-codex | date: 2026-03-29T09:48:41Z -->
+
 # Implementation Receipt
 
 ## Branch
