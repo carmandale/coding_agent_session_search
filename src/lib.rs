@@ -9877,32 +9877,66 @@ fn run_doctor(
         );
     }
 
-    // 8. Disk-vs-DB reconciliation for connectors that implement DoctorConnector
+    // 8. Disk-vs-DB reconciliation for connectors that implement DoctorConnector.
     //    Currently only CodebuffConnector; FAD-backed connectors report N/A.
     {
         use crate::doctor::DoctorConnector;
         let codebuff = crate::connectors::codebuff::CodebuffConnector::new();
         match codebuff.count_disk_files() {
             Some(disk_count) => {
-                let db_count = db_conversations
-                    .map(|n| {
-                        // Approximate: count conversations from this connector in DB
-                        // (full connector-aware count requires a DB query; use disk as proxy)
-                        n
-                    })
-                    .unwrap_or(0);
-                add_check!(
-                    "codebuff_reconciliation",
-                    "pass",
-                    format!(
-                        "Codebuff: {} session file(s) on disk{}",
-                        disk_count,
-                        codebuff.reconciliation_notes()
-                            .map(|n| format!(" ({})", n))
-                            .unwrap_or_default()
-                    ),
-                    false
-                );
+                // Query DB for Codebuff conversation count
+                let db_codebuff_count: usize = with_frankensqlite_connection(
+                    &db_path,
+                    "codebuff reconciliation",
+                    |conn: &frankensqlite::Connection| {
+                        use frankensqlite::compat::{ConnectionExt, RowExt};
+                        conn.query_row_map(
+                            "SELECT COUNT(*) FROM conversations c \
+                             JOIN agents a ON c.agent_id = a.id \
+                             WHERE a.slug = 'codebuff'",
+                            &[] as &[frankensqlite::compat::ParamValue],
+                            |row| row.get_typed(0),
+                        )
+                    },
+                )
+                .ok()
+                .flatten()
+                .map(|n: i64| n as usize)
+                .unwrap_or(0);
+
+                let notes = codebuff.reconciliation_notes()
+                    .map(|n| format!(" ({})", n))
+                    .unwrap_or_default();
+
+                if disk_count == 0 {
+                    add_check!(
+                        "codebuff_reconciliation",
+                        "pass",
+                        format!("Codebuff: detected but 0 session files on disk{notes}"),
+                        false
+                    );
+                } else if db_codebuff_count == 0 {
+                    add_check!(
+                        "codebuff_reconciliation",
+                        "warn",
+                        format!(
+                            "Codebuff: {} session file(s) on disk but 0 in DB — \
+                             run 'cass index --full' to index{notes}",
+                            disk_count
+                        ),
+                        true
+                    );
+                } else {
+                    add_check!(
+                        "codebuff_reconciliation",
+                        "pass",
+                        format!(
+                            "Codebuff: {} session file(s) on disk, {} conversation(s) in DB{notes}",
+                            disk_count, db_codebuff_count
+                        ),
+                        false
+                    );
+                }
             }
             None => {
                 add_check!(

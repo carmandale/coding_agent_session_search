@@ -528,44 +528,67 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_returns_root_paths_when_dir_exists() {
-        use tempfile::TempDir;
-        // Create a tempdir and write a fake chat file so the connector detects it
-        let tmp = TempDir::new().unwrap();
-        let manicode = tmp.path().join("manicode");
-        std::fs::create_dir_all(&manicode).unwrap();
-
-        // detect() with no real ~/.config/manicode should not detect
+    fn test_detect_invariant_detected_implies_nonempty_root_paths() {
+        // The production invariant: detected=true must always come with non-empty root_paths.
+        // This directly validates the bug fix (previously root_paths was always vec![]).
         let connector = CodebuffConnector::new();
         let result = connector.detect();
-        // If detected, root_paths must be non-empty (the bug we fixed)
         if result.detected {
             assert!(
                 !result.root_paths.is_empty(),
-                "detect() must not return detected=true with empty root_paths"
+                "detect() returned detected=true with empty root_paths — the bug is back"
+            );
+            // Every root in root_paths must exist on disk
+            for root in &result.root_paths {
+                assert!(root.exists(), "root_path {:?} in detect() result does not exist", root);
+            }
+        } else {
+            assert!(
+                result.root_paths.is_empty(),
+                "detect() returned detected=false but non-empty root_paths"
             );
         }
     }
 
     #[test]
-    fn test_detect_not_found_returns_empty_root_paths() {
-        // When not detected, root_paths should also be empty (DetectionResult::not_found())
-        let result = DetectionResult::not_found();
-        assert!(!result.detected);
-        assert!(result.root_paths.is_empty());
+    fn test_detect_candidate_roots_to_root_paths_consistency() {
+        // Verify that root_paths is exactly the subset of candidate_roots() that exist.
+        // This tests the core logic of the fix independent of HOME.
+        let exists: Vec<_> = CodebuffConnector::candidate_roots()
+            .into_iter()
+            .filter(|r| r.exists())
+            .collect();
+        let connector = CodebuffConnector::new();
+        let result = connector.detect();
+        assert_eq!(
+            result.root_paths, exists,
+            "root_paths must equal the existing candidate roots"
+        );
     }
 
     #[test]
-    fn test_scan_with_fixture() {
+    fn test_detect_not_found_returns_empty() {
+        // DetectionResult::not_found() contract
+        let result = DetectionResult::not_found();
+        assert!(!result.detected);
+        assert!(result.root_paths.is_empty());
+        assert!(result.evidence.is_empty());
+    }
+
+    #[test]
+    fn test_scan_with_manicode_fixture() {
+        // scan() uses ctx.data_dir directly when it contains "manicode" in the filename.
+        // We create a fixture path whose last component contains "manicode" and put
+        // a session structure inside it.
         use crate::connectors::ScanContext;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
-        // Create a fake Codebuff session structure
-        let chat_dir = tmp
-            .path()
-            .join("projects/myproject/chats/2025-12-19T09-07-21.203Z");
+        // Path whose basename contains "manicode" triggers the test override branch
+        let manicode_root = tmp.path().join("manicode");
+        let chat_dir = manicode_root.join("projects/myproject/chats/2025-12-19T09-07-21.203Z");
         std::fs::create_dir_all(&chat_dir).unwrap();
+
         let messages = serde_json::json!([
             {
                 "id": "user-1766137957000-abc",
@@ -587,10 +610,12 @@ mod tests {
         .unwrap();
 
         let connector = CodebuffConnector::new();
-        let ctx = ScanContext::local_default(tmp.path().to_path_buf(), None);
+        // ctx.data_dir = manicode_root — triggers the "manicode" branch in scan()
+        let ctx = ScanContext::local_default(manicode_root, None);
         let convs = connector.scan(&ctx).unwrap();
-        assert_eq!(convs.len(), 1, "should find one conversation");
+        assert_eq!(convs.len(), 1, "should find one conversation in manicode fixture");
         assert_eq!(convs[0].messages.len(), 2, "should have 2 messages");
         assert_eq!(convs[0].messages[0].content, "Hello codebuff");
+        assert_eq!(convs[0].messages[1].content, "Hello user");
     }
 }
