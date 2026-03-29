@@ -4,98 +4,98 @@ date: 2026-03-29
 bead: coding_agent_session_search-hhm0
 ---
 
+<!-- Codex Review: APPROVED after 3 rounds | model: gpt-5.3-codex | date: 2026-03-29 -->
+<!-- Status: REVISED -->
+<!-- Revisions: removed stale doctor/shim tasks; made crush restoration mandatory and adapter-backed; moved watch-state compatibility ahead of Codebuff removal; upgraded verification to checkout-local fmt/check/clippy/test plus sandboxed watchdog smoke -->
 <!-- plan:complete:v1 | harness: pi/claude-sonnet-4-6 | date: 2026-03-29T12:02:22Z -->
 
 # Tasks — Spec 009: Fork Cleanup
 
-All work on branch `feat/008-upstream-sync` in worktree `/tmp/cass-merge-base`.
-Single atomic commit at the end.
+Work against the live checkout, not the stale shaping snapshot. The old `doctor.rs` /
+`ConnectorExt` tasks are removed because those artifacts are already absent in the current tree.
 
-## Step 1 — Cargo.toml
+## Step 0 — Reconcile spec contract
 
-- [ ] **T1.1** Bump FAD: change `tag = "v0.1.3"` → `rev = "de450843"`, add `"crush"` to features list
-- [ ] **T1.2** Add `[patch]` section before `[workspace.metadata.dist]`:
-  ```toml
-  [patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
-  frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "92a9a0fa", package = "fsqlite" }
-  ```
-- [ ] **T1.3** Verify: `cargo check` still passes after Cargo.toml change
+- [ ] **T0.1** Update acceptance language during writeback so it matches the live codebase:
+  - generic `cass doctor` reconciliation stays
+  - `src/connectors/crush.rs` is restored as a local wrapper with adapter-backed integration
+  - doctor/shim cleanup is recorded as already satisfied in this checkout
 
-## Step 2 — src/connectors/mod.rs
+## Step 1 — Cargo + dependency update
 
-- [ ] **T2.1** Remove `pub mod codebuff;`
-- [ ] **T2.2** Add `pub mod crush;` in alphabetical position (after `pub mod copilot_cli;`)
+- [x] **T1.1** Bump FAD from `rev = "5b0eb1a"` to `rev = "de450843"` and enable `"crush"`
+- [x] **T1.2** Add `[patch."https://github.com/Dicklesworthstone/franken_agent_detection"]` for `fsqlite`
+- [x] **T1.3** Regenerate and inspect `Cargo.lock` so the dependency-source delta is explicit
+- [x] **T1.4** Run `cargo check --all-targets` immediately after the dependency change
 
-## Step 3 — File operations
+## Step 2 — Re-baseline stale doctor/shim work as already satisfied
 
-- [ ] **T3.1** Delete `src/connectors/codebuff.rs`
-- [ ] **T3.2** Create `src/connectors/crush.rs`:
-  ```rust
-  //! Connector for Charm's Crush AI coding agent sessions.
-  //!
-  //! Implementation lives in `franken_agent_detection::connectors::crush`.
-  pub use franken_agent_detection::connectors::crush::CrushConnector;
-  ```
+- [x] **T2.1** Record that `src/doctor.rs` is already absent in the live tree
+- [x] **T2.2** Record that `pub mod doctor;` is already absent from `src/lib.rs`
+- [x] **T2.3** Record that `ConnectorExt` / `connector_scan_with_callback` call sites are already absent
+- [x] **T2.4** Remove stale doctor/shim implementation tasks from this task list and keep only the writeback note
 
-## Step 4a — indexer/mod.rs: R1 ConnectorExt migration (6 sites)
+## Step 3 — Make watch-state loading tolerant before connector removal
 
-- [ ] **T4a.1** Remove import line ~37: `use crate::doctor::{ConnectorExt, connector_scan_with_callback};`
-- [ ] **T4a.2** Change call site ~1290: `connector_scan_with_callback(&*conn, &ctx, ...)` → `conn.scan_with_callback(&ctx, ...)`
-- [ ] **T4a.3** Change call site ~1342: same pattern as T4a.2
-- [ ] **T4a.4** Migrate `DetectedRemoteFailureConnector`: move `scan_with_callback` from `impl crate::doctor::ConnectorExt` into `impl Connector` block
-- [ ] **T4a.5** Migrate `PanicConnector`: same pattern as T4a.4
-- [ ] **T4a.6** Migrate `DisconnectAwareConnector`: same pattern as T4a.4
-  - Note: FAD main's Connector trait has default impl for `supports_streaming_scan` — only migrate `scan_with_callback`
+- [x] **T3.1** Replace strict `load_watch_state()` enum-map parsing with tolerant object parsing
+- [x] **T3.2** Ignore unknown or removed connector keys instead of zeroing the whole state
+- [x] **T3.3** Add regression test: legacy removed key + current keys still loads current keys
+- [x] **T3.4** Add regression test: current save/load round-trip remains unchanged
 
-## Step 4b — indexer/mod.rs: R0 Codebuff removal from ConnectorKind (4 sites)
+## Step 4 — Remove Codebuff from the live registry
 
-- [ ] **T4b.1** Remove from imports ~line 30: `codebuff::CodebuffConnector,`
-- [ ] **T4b.2** Remove from `from_slug()` ~line 3398: `"codebuff" => Some(Self::Codebuff),`
-- [ ] **T4b.3** Remove from `create_connector()` ~line 3425: `Self::Codebuff => Box::new(CodebuffConnector::new()),`
-- [ ] **T4b.4** Remove from enum ~lines 3908-3909: `#[serde(rename = "bf", alias = "Codebuff")] Codebuff,`
-
-## Step 4c — indexer/mod.rs: WatchState forward-compat fix
-
-- [ ] **T4c.1** Remove `#[serde(deny_unknown_fields)]` from `WatchState` struct (~line 3688)
-  - Reason: without this, any user with `"bf"` in watch_state.json loses ALL connector timestamps silently
-
-## Step 5 — VERIFY streaming tests pass (gate before cleanup)
-
-- [ ] **T5.1** Run:
+- [x] **T4.1** Remove `pub mod codebuff;` from `src/connectors/mod.rs`
+- [x] **T4.2** Remove `codebuff::CodebuffConnector` from the `src/indexer/mod.rs` import block
+- [x] **T4.3** Remove the `"codebuff"` entry from `get_connector_factories()`
+- [x] **T4.4** Remove `"codebuff"` from `ConnectorKind::from_slug()`
+- [x] **T4.5** Remove `Self::Codebuff` from `ConnectorKind::create_connector()`
+- [x] **T4.6** Remove the `Codebuff` variant from `ConnectorKind`
+- [x] **T4.7** Search for remaining live `codebuff` references with:
   ```bash
-  RUSTFLAGS="-C link-arg=-L/Library/Developer/CommandLineTools/usr/lib/clang/21/lib/darwin" \
-    cargo test --lib 2>&1 | grep -E "FAILED|passed|failed" | tail -5
+  rg -n "codebuff|Codebuff" README.md src tests Cargo.toml Cargo.lock
   ```
-- [ ] **T5.2** Confirm: streaming dispatch tests (~30) now pass; only analytics failures remain
-  - **STOP if streaming tests still fail** — investigate FAD API mismatch before continuing
+- [ ] **T4.8** Request explicit written permission before deleting `src/connectors/codebuff.rs`
+- [ ] **T4.9** Delete `src/connectors/codebuff.rs` only if that permission is granted
 
-## Step 6 — src/lib.rs
+## Step 5 — Restore `src/connectors/crush.rs` with adapter-backed integration
 
-- [ ] **T6.1** Remove line 19: `pub mod doctor;`
-- [ ] **T6.2** Remove the codebuff reconciliation block (~72 lines, lines ~9734-9805):
-  starts `// 8. Disk-vs-DB reconciliation...`, ends with closing `}` after the `None` branch
+- [x] **T5.1** Create/restore `src/connectors/crush.rs` as a local wrapper module
+- [x] **T5.2** Extend `src/connectors/fad_adapter.rs` to import FAD's `CrushConnector`
+- [x] **T5.3** Add `fad_adapter::crush()` returning `Box<dyn Connector + Send>`
+- [x] **T5.4** Make the `crush.rs` wrapper delegate to the adapter-backed integration
+- [x] **T5.5** Wire Crush into `src/connectors/mod.rs`
+- [x] **T5.6** Wire Crush into `src/indexer/mod.rs` factories, slug mapping, and `ConnectorKind`
+- [x] **T5.7** Add/update crush factory or registry test coverage
 
-## Step 7 — Delete doctor.rs
+## Step 6 — Preserve generic doctor reconciliation
 
-- [ ] **T7.1** Delete `src/doctor.rs`
+- [x] **T6.1** Do not remove the `run_doctor()` reconciliation loop in `src/lib.rs`
+- [x] **T6.2** Verify Codebuff disappears from reconciliation naturally because it is no longer in `get_connector_factories()`
+- [x] **T6.3** Add/update a focused regression test if current coverage does not already prove that behavior
 
-## Step 8 — Analytics test failures
+## Step 7 — Verification in this checkout only
 
-- [ ] **T8.1** Create bead: "Analytics tests fail under frankensqlite — upstream regression"
-- [ ] **T8.2** Add `#[ignore = "frankensqlite behavior difference from rusqlite — bead <ID>"]` to each of ~25 failing analytics/indexer tests
-  - These are in upstream code (analytics/query.rs, etc.) — not caused by spec 009 changes
-
-## Step 9 — Final check and commit
-
-- [ ] **T9.1** `cargo check` — must be clean
-- [ ] **T9.2** Confirm fork diff is exactly 4 files: watchdog.rs, indexer/mod.rs, lib.rs, Cargo.toml
+- [x] **T7.1** `cargo fmt --check`
+- [x] **T7.2** `cargo check --all-targets`
+- [x] **T7.3** `cargo clippy --all-targets -- -D warnings`
+- [x] **T7.4** `cargo test --lib`
+- [x] **T7.5** Ensure watch-state regression tests pass
+- [x] **T7.6** Ensure Crush integration tests pass
+- [x] **T7.7** Run sandboxed watchdog smoke with the checkout-local binary:
   ```bash
-  git diff --name-only upstream/main -- src/ Cargo.toml | sort
+  CASS_DATA_DIR=/tmp/cass-watchdog-<run-id> target/debug/cass watchdog run
   ```
-- [ ] **T9.3** Commit:
-  ```bash
-  git add -A
-  git commit -m "refactor: drop codebuff/doctor, bump FAD to main, restore crush"
-  ```
-- [ ] **T9.4** Push: `git push origin feat/008-upstream-sync`
-- [ ] **T9.5** Close bead: `br close coding_agent_session_search-hhm0`
+- [x] **T7.8** Treat documented watchdog exit codes as valid smoke outcomes:
+  - `0` healthy or already locked
+  - `1` stale watcher restarted
+  - `2` watcher not running
+  - any undocumented exit code, panic, or CLI crash is a failure
+
+## Step 8 — Finalize implementation diff and commit
+
+- [ ] **T8.1** Confirm the final diff reflects the intentional current-fork delta, not stale doctor/shim deletions
+- [ ] **T8.2** If delete approval was not granted, note `src/connectors/codebuff.rs` as the only remaining cleanup precondition
+- [ ] **T8.3** `git add -A`
+- [ ] **T8.4** `git commit -m "refactor: drop codebuff, bump FAD, restore crush"`
+- [ ] **T8.5** `git push origin <current-branch>`
+- [ ] **T8.6** `br close coding_agent_session_search-hhm0`

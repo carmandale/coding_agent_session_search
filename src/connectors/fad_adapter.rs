@@ -2,8 +2,8 @@
 //!
 //! Bridges FAD's 2-method `Connector` trait to our 4-method trait, converting
 //! FAD types to our structurally-identical types. This lets us use FAD
-//! connectors for agents we don't have in-tree (copilot, clawdbot, openclaw,
-//! vibe) without rewriting connector logic.
+//! connectors for agents we don't have native implementations for (copilot,
+//! clawdbot, crush, openclaw, vibe) without rewriting connector logic.
 //!
 //! See: specs/006-fork-sync-upstream
 
@@ -17,8 +17,9 @@ use anyhow::Result;
 mod fad {
     pub use franken_agent_detection::connectors::Connector;
     pub use franken_agent_detection::{
-        ClawdbotConnector, CopilotConnector, NormalizedConversation, NormalizedMessage,
-        NormalizedSnippet, OpenClawConnector, ScanContext, ScanRoot, VibeConnector,
+        ClawdbotConnector, CopilotConnector, CrushConnector, NormalizedConversation,
+        NormalizedMessage, NormalizedSnippet, OpenClawConnector, ScanContext, ScanRoot,
+        VibeConnector,
     };
 }
 
@@ -150,7 +151,7 @@ impl<T: fad::Connector + Send> Connector for FadAdapter<T> {
 }
 
 // ---------------------------------------------------------------------------
-// Convenience constructors for the 4 new FAD connectors
+// Convenience constructors for FAD-backed connectors.
 // ---------------------------------------------------------------------------
 
 pub fn copilot() -> Box<dyn Connector + Send> {
@@ -159,6 +160,10 @@ pub fn copilot() -> Box<dyn Connector + Send> {
 
 pub fn clawdbot() -> Box<dyn Connector + Send> {
     Box::new(FadAdapter::new(fad::ClawdbotConnector::new()))
+}
+
+pub fn crush() -> Box<dyn Connector + Send> {
+    Box::new(FadAdapter::new(fad::CrushConnector::new()))
 }
 
 pub fn openclaw() -> Box<dyn Connector + Send> {

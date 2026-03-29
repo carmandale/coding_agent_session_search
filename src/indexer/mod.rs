@@ -13,8 +13,8 @@ use notify::{RecursiveMode, Watcher, recommended_watcher};
 use crate::connectors::NormalizedConversation;
 use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
-    claude_code::ClaudeCodeConnector, cline::ClineConnector, codebuff::CodebuffConnector,
-    codex::CodexConnector, cursor::CursorConnector, factory::FactoryConnector,
+    claude_code::ClaudeCodeConnector, cline::ClineConnector, codex::CodexConnector,
+    crush::CrushConnector, cursor::CursorConnector, factory::FactoryConnector,
     gemini::GeminiConnector, opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
 };
 use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
@@ -786,8 +786,8 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("chatgpt", || Box::new(ChatGptConnector::new())),
         ("pi_agent", || Box::new(PiAgentConnector::new())),
         ("factory", || Box::new(FactoryConnector::new())),
-        ("codebuff", || Box::new(CodebuffConnector::new())),
         // FAD-adapted connectors (spec 006-fork-sync-upstream)
+        ("crush", || Box::new(CrushConnector::new())),
         ("copilot", crate::connectors::fad_adapter::copilot),
         ("clawdbot", crate::connectors::fad_adapter::clawdbot),
         ("openclaw", crate::connectors::fad_adapter::openclaw),
@@ -842,7 +842,29 @@ impl ConnectorKind {
             "chatgpt" => Some(Self::ChatGpt),
             "pi_agent" => Some(Self::PiAgent),
             "factory" => Some(Self::Factory),
-            "codebuff" => Some(Self::Codebuff),
+            "crush" => Some(Self::Crush),
+            "copilot" => Some(Self::Copilot),
+            "clawdbot" => Some(Self::Clawdbot),
+            "openclaw" => Some(Self::OpenClaw),
+            "vibe" => Some(Self::Vibe),
+            _ => None,
+        }
+    }
+
+    fn from_watch_state_key(key: &str) -> Option<Self> {
+        match normalize_connector_key(key).as_str() {
+            "codex" => Some(Self::Codex),
+            "cline" => Some(Self::Cline),
+            "gemini" => Some(Self::Gemini),
+            "claude" | "claudecode" => Some(Self::Claude),
+            "amp" => Some(Self::Amp),
+            "opencode" => Some(Self::OpenCode),
+            "aider" => Some(Self::Aider),
+            "cursor" => Some(Self::Cursor),
+            "chatgpt" => Some(Self::ChatGpt),
+            "piagent" => Some(Self::PiAgent),
+            "factory" => Some(Self::Factory),
+            "crush" => Some(Self::Crush),
             "copilot" => Some(Self::Copilot),
             "clawdbot" => Some(Self::Clawdbot),
             "openclaw" => Some(Self::OpenClaw),
@@ -866,13 +888,20 @@ impl ConnectorKind {
             Self::ChatGpt => Box::new(ChatGptConnector::new()),
             Self::PiAgent => Box::new(PiAgentConnector::new()),
             Self::Factory => Box::new(FactoryConnector::new()),
-            Self::Codebuff => Box::new(CodebuffConnector::new()),
+            Self::Crush => Box::new(CrushConnector::new()),
             Self::Copilot => crate::connectors::fad_adapter::copilot(),
             Self::Clawdbot => crate::connectors::fad_adapter::clawdbot(),
             Self::OpenClaw => crate::connectors::fad_adapter::openclaw(),
             Self::Vibe => crate::connectors::fad_adapter::vibe(),
         }
     }
+}
+
+fn normalize_connector_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
 }
 
 /// Write a heartbeat timestamp to disk. The watchdog script checks this file's
@@ -1273,7 +1302,7 @@ enum ConnectorKind {
     ChatGpt,
     PiAgent,
     Factory,
-    Codebuff,
+    Crush,
     Copilot,
     Clawdbot,
     OpenClaw,
@@ -1286,12 +1315,24 @@ fn state_path(data_dir: &Path) -> PathBuf {
 
 fn load_watch_state(data_dir: &Path) -> HashMap<ConnectorKind, i64> {
     let path = state_path(data_dir);
-    if let Ok(bytes) = fs::read(&path)
-        && let Ok(map) = serde_json::from_slice(&bytes)
-    {
-        return map;
-    }
-    HashMap::new()
+    let Ok(bytes) = fs::read(&path) else {
+        return HashMap::new();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return HashMap::new();
+    };
+    let Some(object) = value.as_object() else {
+        return HashMap::new();
+    };
+
+    object
+        .iter()
+        .filter_map(|(key, value)| {
+            let kind = ConnectorKind::from_watch_state_key(key)?;
+            let timestamp = value.as_i64()?;
+            Some((kind, timestamp))
+        })
+        .collect()
 }
 
 fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Result<()> {
@@ -2121,6 +2162,50 @@ mod tests {
         let loaded = load_watch_state(&data_dir);
         assert_eq!(loaded.get(&ConnectorKind::Codex), Some(&123));
         assert_eq!(loaded.get(&ConnectorKind::Gemini), Some(&456));
+    }
+
+    #[test]
+    fn watch_state_ignores_removed_codebuff_keys_and_preserves_known_values() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let legacy_json = serde_json::json!({
+            "Codex": 123,
+            "gemini": 456,
+            "pi_agent": 789,
+            "Codebuff": 999
+        });
+        std::fs::write(
+            state_path(&data_dir),
+            serde_json::to_vec_pretty(&legacy_json).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_watch_state(&data_dir);
+
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded.get(&ConnectorKind::Codex), Some(&123));
+        assert_eq!(loaded.get(&ConnectorKind::Gemini), Some(&456));
+        assert_eq!(loaded.get(&ConnectorKind::PiAgent), Some(&789));
+    }
+
+    #[test]
+    fn connector_registry_includes_crush_and_excludes_codebuff() {
+        let factories = get_connector_factories();
+        let names: std::collections::HashSet<_> = factories.iter().map(|(name, _)| *name).collect();
+
+        assert!(names.contains("crush"));
+        assert!(!names.contains("codebuff"));
+        assert_eq!(
+            ConnectorKind::from_slug("crush"),
+            Some(ConnectorKind::Crush)
+        );
+        assert_eq!(ConnectorKind::from_slug("codebuff"), None);
+
+        let crush = ConnectorKind::Crush.create_connector();
+        assert_eq!(crush.count_disk_files(), None);
+        assert_eq!(crush.reconciliation_notes(), None);
     }
 
     #[test]
