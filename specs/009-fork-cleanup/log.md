@@ -4,3 +4,6 @@
 2026-03-29 06:18 | FastRaven | pi/claude-sonnet-4-6 | /shape | started with BrightYak (crew-challenger)
 2026-03-29 06:45 | FastRaven | pi/claude-sonnet-4-6 | /shape | completed — shaping-transcript.md — Shape A selected
 
+2026-03-29 06:46 | FastRaven | pi/claude-sonnet-4-6 | /plan | started — researching
+2026-03-29 06:49 | WildCastle | pi/claude-sonnet-4-6 | /plan | started with TrueViper (crew-challenger)
+2026-03-29 07:01 | WildCastle | pi/claude-sonnet-4-6 | /plan | completed — plan.md + tasks.md
