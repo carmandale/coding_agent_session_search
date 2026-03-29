@@ -4622,7 +4622,28 @@ fn state_meta_json(
             "timestamp": ts_str,
             "data_dir": data_dir.display().to_string(),
             "db_path": db_path.display().to_string()
-        }
+        },
+        "watchdog": watchdog_plist_status_json(),
+    })
+}
+
+/// Build the watchdog plist status JSON for health output.
+fn watchdog_plist_status_json() -> serde_json::Value {
+    #[cfg(target_os = "macos")]
+    let watcher_plist_installed = dirs::home_dir()
+        .map(|h| h.join("Library/LaunchAgents/com.cass.index-watch.plist").exists())
+        .unwrap_or(false);
+    #[cfg(not(target_os = "macos"))]
+    let watcher_plist_installed = false;
+    #[cfg(target_os = "macos")]
+    let plist_installed = dirs::home_dir()
+        .map(|h| h.join("Library/LaunchAgents/com.cass.health-watchdog.plist").exists())
+        .unwrap_or(false);
+    #[cfg(not(target_os = "macos"))]
+    let plist_installed = false;
+    serde_json::json!({
+        "watcher_plist_installed": watcher_plist_installed,
+        "plist_installed": plist_installed,
     })
 }
 
@@ -8474,26 +8495,10 @@ fn run_status(
             "recommended_action": recommended_action,
             "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
         });
-        // Append watchdog field (needs let bindings, can't go inside json! macro)
+        // watchdog field is now included in state_meta_json via watchdog_plist_status_json()
+        let watchdog_val = state.get("watchdog").cloned().unwrap_or_else(watchdog_plist_status_json);
         let mut payload = payload;
-        {
-            #[cfg(target_os = "macos")]
-            let watcher_plist = dirs::home_dir()
-                .map(|h| h.join("Library/LaunchAgents/com.cass.index-watch.plist").exists())
-                .unwrap_or(false);
-            #[cfg(not(target_os = "macos"))]
-            let watcher_plist = false;
-            #[cfg(target_os = "macos")]
-            let watchdog_plist = dirs::home_dir()
-                .map(|h| h.join("Library/LaunchAgents/com.cass.health-watchdog.plist").exists())
-                .unwrap_or(false);
-            #[cfg(not(target_os = "macos"))]
-            let watchdog_plist = false;
-            payload["watchdog"] = serde_json::json!({
-                "watcher_plist_installed": watcher_plist,
-                "plist_installed": watchdog_plist,
-            });
-        }
+        payload["watchdog"] = watchdog_val;
         return output_structured_value(payload, fmt);
     }
 
