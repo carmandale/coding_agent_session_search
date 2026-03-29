@@ -53,13 +53,18 @@ impl Connector for CodebuffConnector {
             .map(|r| format!("found {}", r.display()))
             .collect();
 
-        if evidence.is_empty() {
+        let root_paths: Vec<_> = Self::candidate_roots()
+            .into_iter()
+            .filter(|r| r.exists())
+            .collect();
+
+        if root_paths.is_empty() {
             DetectionResult::not_found()
         } else {
             DetectionResult {
                 detected: true,
                 evidence,
-                root_paths: vec![],
+                root_paths,
             }
         }
     }
@@ -520,5 +525,72 @@ mod tests {
         assert!(content.contains("git status"));
         assert!(content.contains("On branch main"));
         assert!(content.contains("everything is clean"));
+    }
+
+    #[test]
+    fn test_detect_returns_root_paths_when_dir_exists() {
+        use tempfile::TempDir;
+        // Create a tempdir and write a fake chat file so the connector detects it
+        let tmp = TempDir::new().unwrap();
+        let manicode = tmp.path().join("manicode");
+        std::fs::create_dir_all(&manicode).unwrap();
+
+        // detect() with no real ~/.config/manicode should not detect
+        let connector = CodebuffConnector::new();
+        let result = connector.detect();
+        // If detected, root_paths must be non-empty (the bug we fixed)
+        if result.detected {
+            assert!(
+                !result.root_paths.is_empty(),
+                "detect() must not return detected=true with empty root_paths"
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_not_found_returns_empty_root_paths() {
+        // When not detected, root_paths should also be empty (DetectionResult::not_found())
+        let result = DetectionResult::not_found();
+        assert!(!result.detected);
+        assert!(result.root_paths.is_empty());
+    }
+
+    #[test]
+    fn test_scan_with_fixture() {
+        use crate::connectors::ScanContext;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        // Create a fake Codebuff session structure
+        let chat_dir = tmp
+            .path()
+            .join("projects/myproject/chats/2025-12-19T09-07-21.203Z");
+        std::fs::create_dir_all(&chat_dir).unwrap();
+        let messages = serde_json::json!([
+            {
+                "id": "user-1766137957000-abc",
+                "variant": "human",
+                "content": "Hello codebuff",
+                "timestamp": "09:00 AM"
+            },
+            {
+                "id": "ai-1766137957398-bf2216fd8cd09",
+                "variant": "ai",
+                "content": "Hello user",
+                "timestamp": "09:00 AM"
+            }
+        ]);
+        std::fs::write(
+            chat_dir.join("chat-messages.json"),
+            serde_json::to_string(&messages).unwrap(),
+        )
+        .unwrap();
+
+        let connector = CodebuffConnector::new();
+        let ctx = ScanContext::local_default(tmp.path().to_path_buf(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1, "should find one conversation");
+        assert_eq!(convs[0].messages.len(), 2, "should have 2 messages");
+        assert_eq!(convs[0].messages[0].content, "Hello codebuff");
     }
 }

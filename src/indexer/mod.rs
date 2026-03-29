@@ -3343,14 +3343,21 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
 
     // Write PID file so watchdog can identify us reliably
     let pid_path = data_dir.join("watcher.pid");
-    let _ = fs::write(&pid_path, std::process::id().to_string());
-    tracing::info!(pid = std::process::id(), path = %pid_path.display(), "wrote PID file");
+    if let Err(e) = fs::write(&pid_path, std::process::id().to_string()) {
+        tracing::warn!(path = %pid_path.display(), error = %e, "failed to write PID file (watchdog health checks may not work)");
+    } else {
+        tracing::info!(pid = std::process::id(), path = %pid_path.display(), "wrote PID file");
+    }
 
     // Register SIGTERM/SIGINT handler for graceful shutdown
     let shutdown = Arc::new(AtomicBool::new(false));
     {
-        let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown));
-        let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown));
+        if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown)) {
+            tracing::warn!(error = %e, "failed to register SIGTERM handler — graceful shutdown unavailable");
+        }
+        if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown)) {
+            tracing::warn!(error = %e, "failed to register SIGINT handler");
+        }
         tracing::info!("registered SIGTERM/SIGINT handlers for graceful shutdown");
     }
 
@@ -3532,8 +3539,11 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
 
     // Clean up PID file on shutdown
     if pid_path.exists() {
-        let _ = fs::remove_file(&pid_path);
-        tracing::info!(path = %pid_path.display(), "removed PID file on shutdown");
+        if let Err(e) = fs::remove_file(&pid_path) {
+            tracing::warn!(path = %pid_path.display(), error = %e, "failed to remove PID file on shutdown");
+        } else {
+            tracing::info!(path = %pid_path.display(), "removed PID file on shutdown");
+        }
     }
 
     Ok(())
