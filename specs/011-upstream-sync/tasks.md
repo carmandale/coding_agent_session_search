@@ -3,6 +3,9 @@ title: "Tasks: Sync fork to upstream HEAD with GJ version string"
 date: 2026-03-31
 bead: coding_agent_session_search-2n2u
 ---
+<!-- Codex Review: APPROVED after 4 rounds | model: gpt-5.3-codex | date: 2026-04-01 -->
+<!-- Status: REVISED -->
+<!-- Revisions: added outer dispatch site (Site 3 — Commands::Watchdog in outer OR pattern); updated smoke test to cass watchdog run (not status); compiler gates now bare commands; added binary path verification step -->
 
 <!-- plan:complete:v1 | harness: pi/claude-sonnet-4-6 | date: 2026-04-01T10:23:12Z -->
 
@@ -124,6 +127,8 @@ All edits to `Cargo.toml` in one pass.
 
 Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
 
+**Key architecture note**: Upstream uses a TWO-STAGE dispatch. Site 3 (outer pattern) and Site 4 (inner arm) must BOTH be applied — missing either makes `cass watchdog` unreachable.
+
 - [ ] **T3.1** Site 1 — Module declaration. Find `pub mod update_check;` and add the line after it:
   ```bash
   grep -n "pub mod update_check" src/lib.rs
@@ -145,24 +150,35 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   },
   ```
 
-- [ ] **T3.3** Site 3 — Dispatch arm. Find the main command match block (near `Commands::Index { .. } =>`):
+- [ ] **T3.3** Site 3 — **OUTER** dispatch pattern (two-stage dispatch). Find the outer match arm for non-TUI commands:
   ```bash
-  grep -n "Commands::Index {" src/lib.rs | head -5
+  grep -n "Commands::Analytics" src/lib.rs
   ```
-  Add a new match arm alongside the other commands:
+  Add `| Commands::Watchdog { .. }` to the OR pattern BEFORE the `=>`, e.g.:
+  ```rust
+  | Commands::Analytics(..)
+  | Commands::Watchdog { .. } => {
+  ```
+
+- [ ] **T3.4** Site 4 — **INNER** dispatch arm. Inside the non-TUI branch's inner `match command { ... }`, add:
+  ```bash
+  grep -n "Commands::Index {" src/lib.rs | head -3
+  ```
+  Add in the SAME inner match:
   ```rust
   Commands::Watchdog { command } => {
       crate::watchdog::run_watchdog_command(command).map_err(|e| CliError {
-          code: 9,
-          kind: "watchdog".to_string(),
+          code: 3,
+          kind: "watchdog",
           message: format!("{e}"),
           hint: None,
           retryable: false,
-      })
+      })?;
   }
   ```
+  Note: `kind: "watchdog"` is `&'static str` (NOT `.to_string()`), `code: 3`, ends with `?;`
 
-- [ ] **T3.4** Site 4 — Health JSON watchdog block. Find the `"_meta":` block inside `state_meta_json`:
+- [ ] **T3.5** Site 5 — Health JSON watchdog block. Find the `"_meta":` block inside `state_meta_json`:
   ```bash
   grep -n '"_meta"' src/lib.rs | grep -v test | head -3
   ```
@@ -178,7 +194,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   },
   ```
 
-- [ ] **T3.5** Site 5 — Subcommand string mapping. Find the match that maps commands to strings:
+- [ ] **T3.6** Site 6 — Subcommand string mapping. Find the match that maps commands to strings:
   ```bash
   grep -n '"index"\|"search"\|"tui"' src/lib.rs | grep "Commands::" | head -5
   ```
@@ -187,7 +203,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   Some(Commands::Watchdog { .. }) => "watchdog".to_string(),
   ```
 
-- [ ] **T3.6** Site 6 — Fix `state_meta_json` call in watchdog.rs tests (NOT in lib.rs — this is in our watchdog.rs):
+- [ ] **T3.7** Site 7 — Fix `state_meta_json` call in watchdog.rs tests (NOT in lib.rs — this is in our watchdog.rs):
   ```bash
   grep -n "state_meta_json" src/watchdog.rs
   ```
@@ -204,25 +220,18 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
 
 ## Phase 4 — First Build Check
 
-- [ ] **T4.1** Run cargo check to find any remaining compile errors:
+- [ ] **T4.1** Compiler gates — each command must exit 0. If any fails, fix before continuing:
   ```bash
-  ~/.cargo/bin/cargo check --all-targets 2>&1 | grep "^error" | head -20
+  ~/.cargo/bin/cargo check --all-targets
+  ~/.cargo/bin/cargo clippy --all-targets -- -D warnings
+  ~/.cargo/bin/cargo fmt --check
+  ~/.cargo/bin/cargo test --lib
   ```
 
-- [ ] **T4.2** If errors: resolve each. Common expected issues:
-  - Any call to a function that changed signature between our fork and upstream
-  - Any use of a type that moved modules
-  - API changes in the upgraded dependencies
-
-- [ ] **T4.3** Clippy check:
-  ```bash
-  ~/.cargo/bin/cargo clippy --all-targets -- -D warnings 2>&1 | grep "^error" | head -20
-  ```
-
-- [ ] **T4.4** Run tests:
-  ```bash
-  ~/.cargo/bin/cargo test --lib 2>&1 | tail -20
-  ```
+- [ ] **T4.2** If any gate fails: read compiler output to understand the error; do NOT pipe through grep/head as that masks the exit code. Common expected issues:
+  - Function signature changes between our fork and upstream
+  - Types that moved modules in upstream
+  - API changes in upgraded dependencies
 
 ---
 
@@ -236,7 +245,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
 - [ ] **T5.2** Verify version:
   ```bash
   ./target/release/cass --version
-  # Expected: cass 0.2.7-gj.1
+  # Required: cass 0.2.7-gj.1
   ```
 
 - [ ] **T5.3** Deploy (macOS gatekeeper quarantine workaround):
@@ -252,7 +261,10 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   PLIST="$HOME/Library/LaunchAgents/com.cass.index-watch.plist"
   launchctl unload "$PLIST" 2>/dev/null && sleep 1 && launchctl load "$PLIST"
   sleep 5
-  pgrep -fa "cass index --watch" | head -3
+  WATCHER_PID=$(pgrep -f "cass index --watch" | head -1)
+  WATCHER_PATH=$(ps -o args= -p "$WATCHER_PID" | awk '{print $1}')
+  "$WATCHER_PATH" --version
+  # Required: cass 0.2.7-gj.1
   ```
 
 ---
@@ -263,6 +275,12 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   ```bash
   cass --version
   # Must show: cass 0.2.7-gj.1
+  ```
+
+- [ ] **T6.1b** Smoke test watchdog command is reachable:
+  ```bash
+  cass watchdog run
+  # Must NOT print "error: unrecognized subcommand"
   ```
 
 - [ ] **T6.2** Confirm git diff shows only our additions:
