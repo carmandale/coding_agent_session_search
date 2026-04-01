@@ -1789,3 +1789,45 @@ fn analytics_rebuild_parses_force_and_json_flags() {
         other => panic!("expected analytics rebuild, got {other:?}"),
     }
 }
+
+/// Verify `cass watchdog <subcommand>` is reachable through the two-stage CLI dispatch.
+///
+/// This test guards against the watchdog wiring being accidentally removed from
+/// `src/lib.rs` — specifically Sites 1 (module decl), 2 (enum variant),
+/// 3 (outer OR pattern), and 4 (inner match arm). Without the wiring,
+/// `Cli::try_parse_from(["cass", "watchdog", "run"])` panics with an
+/// "unrecognized subcommand" error.
+#[test]
+fn watchdog_subcommand_is_reachable_via_cli_dispatch() {
+    use clap::Parser;
+    use coding_agent_search::{Cli, Commands};
+
+    // Site 2: Commands::Watchdog variant must exist for this to parse.
+    // Site 1: pub mod watchdog must be declared for WatchdogCommand to resolve.
+    let cli = Cli::try_parse_from(["cass", "watchdog", "run"])
+        .expect("`cass watchdog run` must parse — watchdog wiring sites 1-4 in lib.rs");
+
+    assert!(
+        matches!(cli.command, Some(Commands::Watchdog { .. })),
+        "parsed command must be Commands::Watchdog, got: {:?}",
+        cli.command
+    );
+}
+
+/// Verify `cass watchdog` with no subcommand (None) also parses correctly.
+/// This guards Site 2's `command: Option<watchdog::WatchdogCommand>` optionality.
+#[test]
+fn watchdog_subcommand_with_no_args_parses_as_none() {
+    use clap::Parser;
+    use coding_agent_search::{Cli, Commands};
+
+    let cli = Cli::try_parse_from(["cass", "watchdog"])
+        .expect("`cass watchdog` with no subcommand must parse");
+
+    match cli.command {
+        Some(Commands::Watchdog { command }) => {
+            assert!(command.is_none(), "no subcommand arg should yield None");
+        }
+        other => panic!("expected Commands::Watchdog, got {other:?}"),
+    }
+}
