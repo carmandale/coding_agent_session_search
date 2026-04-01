@@ -271,19 +271,19 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
 
 ## Phase 6 — Verify
 
-- [ ] **T6.1** Confirm GJ version is unmistakable:
+- [x] **T6.1** Confirm GJ version is unmistakable:
   ```bash
   cass --version
   # Must show: cass 0.2.7-gj.1
   ```
 
-- [ ] **T6.1b** Smoke test watchdog command is reachable:
+- [x] **T6.1b** Smoke test watchdog command is reachable:
   ```bash
   cass watchdog run
   # Must NOT print "error: unrecognized subcommand"
   ```
 
-- [ ] **T6.2** Confirm git diff shows only our additions:
+- [x] **T6.2** Confirm git diff shows only our additions:
   ```bash
   git diff upstream/main --name-only -- src/
   # Expected: src/lib.rs and src/watchdog.rs ONLY
@@ -292,7 +292,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   # Expected: ~10-15 line delta (version, repo, path→git deps, libc add)
   ```
 
-- [ ] **T6.3** Wait 3 minutes then check health:
+- [x] **T6.3** Wait 3 minutes then check health:
   ```bash
   sleep 180
   cass health --json | python3 -c "
@@ -304,13 +304,13 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   # Expected: healthy: True, watchdog: {watcher_plist_installed: True, plist_installed: True}
   ```
 
-- [ ] **T6.4** Confirm no crash loop:
+- [x] **T6.4** Confirm no crash loop:
   ```bash
   grep "LockBusy\|unsupported schema\|drop_close" ~/Library/Logs/cass-index-watch.log | tail -3
   # Expected: all entries pre-date this deployment
   ```
 
-- [ ] **T6.5** Confirm search works:
+- [x] **T6.5** Confirm search works:
   ```bash
   cass search "authentication" --robot --limit 3 | python3 -c "import sys,json; d=json.load(sys.stdin); print('hits:', len(d.get('hits',[])))"
   ```
@@ -319,7 +319,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
 
 ## Phase 7 — Closeout
 
-- [ ] **T7.1** Commit:
+- [x] **T7.1** Commit:
   ```bash
   git add -A
   git commit -m "feat: upstream sync to HEAD + 0.2.7-gj.1 (spec 011)
@@ -334,16 +334,16 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   Refs: spec 011, bead coding_agent_session_search-2n2u"
   ```
 
-- [ ] **T7.2** Push to origin:
+- [x] **T7.2** Push to origin:
   ```bash
   git push origin feat/007-watchdog-subcommand
   ```
 
-- [ ] **T7.3** Close bead:
+- [x] **T7.3** Close bead:
   ```bash
   br close coding_agent_session_search-2n2u --reason="Done: upstream synced to HEAD, version 0.2.7-gj.1 deployed, watcher healthy"
   br sync --flush-only
   ```
 
-- [ ] **T7.4** Update napkin with version maintenance pattern:
+- [x] **T7.4** Update napkin with version maintenance pattern:
   > When upstream bumps to version N, our fork version becomes N+minor-gj.1. The `-gj.1` suffix identifies our fork at a glance.
