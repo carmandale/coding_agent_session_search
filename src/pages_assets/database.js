@@ -2,8 +2,10 @@
  * cass Archive Database Module
  *
  * sqlite-wasm integration for browser-based database queries.
- * Uses OPFS for persistence when available, falls back to in-memory.
+ * Uses OPFS for persistence when user has opted in, falls back to in-memory.
  */
+
+import { getArchiveOpfsDbFiles, getArchiveOpfsPrimaryDbName, isOpfsEnabled } from './storage.js';
 
 // Module state
 let sqlite3 = null;
@@ -26,15 +28,17 @@ export async function initDatabase(dbBytes) {
     // Load sqlite-wasm module
     sqlite3 = await loadSqliteWasm();
 
-    // Try OPFS first (better performance, persists in cache)
-    if (sqlite3.oo1.OpfsDb && navigator.storage?.getDirectory) {
+    // Try OPFS first (better performance, persists in cache) if user opted in
+    if (isOpfsEnabled() && sqlite3.oo1.OpfsDb && navigator.storage?.getDirectory) {
         try {
+            const opfsDbName = getArchiveOpfsPrimaryDbName();
             await writeBytesToOPFS(dbBytes);
-            db = new sqlite3.oo1.OpfsDb('/cass-archive.sqlite3');
+            db = new sqlite3.oo1.OpfsDb(`/${opfsDbName}`);
             console.log('[DB] Loaded from OPFS');
             isInitialized = true;
             return;
         } catch (error) {
+            await cleanupArchiveOpfsDatabaseFiles();
             console.warn('[DB] OPFS unavailable, using in-memory:', error.message);
         }
     }
@@ -73,10 +77,27 @@ async function loadSqliteWasm() {
  */
 async function writeBytesToOPFS(bytes) {
     const root = await navigator.storage.getDirectory();
-    const handle = await root.getFileHandle('cass-archive.sqlite3', { create: true });
+    const handle = await root.getFileHandle(getArchiveOpfsPrimaryDbName(), { create: true });
     const writable = await handle.createWritable();
     await writable.write(bytes);
     await writable.close();
+}
+
+async function cleanupArchiveOpfsDatabaseFiles() {
+    try {
+        const root = await navigator.storage.getDirectory();
+        for (const name of getArchiveOpfsDbFiles()) {
+            try {
+                await root.removeEntry(name);
+            } catch (error) {
+                if (error?.name !== 'NotFoundError') {
+                    console.warn('[DB] Failed to clean up OPFS database file:', name, error);
+                }
+            }
+        }
+    } catch (error) {
+        console.warn('[DB] Failed to clean up OPFS database directory:', error);
+    }
 }
 
 /**
@@ -231,19 +252,80 @@ export function getConversationMessages(convId) {
 }
 
 /**
+ * Search mode for FTS5 query routing
+ * @typedef {'auto' | 'prose' | 'code'} SearchMode
+ */
+
+/**
  * Detect if query looks like code (for FTS table routing)
+ *
+ * Checks for code patterns:
+ * - Underscores (snake_case)
+ * - Dots (file extensions, method calls)
+ * - Path separators (/ or \)
+ * - Namespaces (::)
+ * - Special chars (#, @, $, %)
+ * - camelCase (lowercase followed by uppercase)
+ * - kebab-case (letter-hyphen-letter)
+ *
+ * Also checks for prose indicators to reduce false positives:
+ * - Question words (how, what, why, when, where)
+ * - Common articles (the, is, are, was, were)
+ * - Multiple words (>3 space-separated words)
+ *
  * @param {string} query - Search query
  * @returns {boolean} True if query contains code patterns
  */
 function isCodeQuery(query) {
-    // Check for underscores (snake_case)
-    if (query.includes('_')) return true;
-    // Check for dots (file extensions)
-    if (query.includes('.')) return true;
-    // Check for path separators
-    if (query.includes('/') || query.includes('\\')) return true;
+    // Check for code-like characters
+    const hasCodeChars =
+        query.includes('_') ||
+        query.includes('.') ||
+        query.includes('/') ||
+        query.includes('\\') ||
+        query.includes('::') ||
+        query.includes('#') ||
+        query.includes('@') ||
+        query.includes('$') ||
+        query.includes('%');
+
     // Check for camelCase (lowercase followed by uppercase)
-    if (/[a-z][A-Z]/.test(query)) return true;
+    const hasCamelCase = /[a-z][A-Z]/.test(query);
+
+    // Check for kebab-case (letter-hyphen-letter)
+    const hasKebabCase = /[a-zA-Z]-[a-zA-Z]/.test(query);
+
+    const isCode = hasCodeChars || hasCamelCase || hasKebabCase;
+
+    // Check for prose indicators
+    const words = query.trim().split(/\s+/);
+    const wordCount = words.length;
+    const lower = query.toLowerCase();
+
+    const hasProseIndicators =
+        wordCount > 3 ||
+        lower.startsWith('how ') ||
+        lower.startsWith('what ') ||
+        lower.startsWith('why ') ||
+        lower.startsWith('when ') ||
+        lower.startsWith('where ') ||
+        lower.includes(' the ') ||
+        lower.includes(' is ') ||
+        lower.includes(' are ') ||
+        lower.includes(' was ') ||
+        lower.includes(' were ');
+
+    // Code patterns win unless prose indicators are strong
+    if (isCode && !hasProseIndicators) {
+        return true;
+    }
+    if (hasProseIndicators && !isCode) {
+        return false;
+    }
+    if (isCode) {
+        // Both indicators present - code chars are more specific
+        return true;
+    }
     return false;
 }
 
@@ -266,12 +348,17 @@ function escapeFts5Query(query) {
  * Automatically routes to the appropriate FTS table:
  * - messages_fts (porter stemmer) for natural language
  * - messages_code_fts (unicode61) for code identifiers/paths
+ *
  * @param {string} query - Search query
  * @param {Object} options - Search options
+ * @param {number} [options.limit=50] - Maximum results
+ * @param {number} [options.offset=0] - Result offset for pagination
+ * @param {string|null} [options.agent=null] - Filter by agent name
+ * @param {SearchMode} [options.searchMode='auto'] - Search mode: 'auto', 'prose', or 'code'
  * @returns {Array<Object>} Search results
  */
 export function searchConversations(query, options = {}) {
-    const { limit = 50, offset = 0, agent = null, forceCodeSearch = false } = options;
+    const { limit = 50, offset = 0, agent = null, searchMode = 'auto' } = options;
 
     // Escape query for FTS5
     const escapedQuery = escapeFts5Query(query);
@@ -279,10 +366,16 @@ export function searchConversations(query, options = {}) {
         return [];
     }
 
-    // Route to appropriate FTS table based on query type
-    const ftsTable = (forceCodeSearch || isCodeQuery(query))
-        ? 'messages_code_fts'
-        : 'messages_fts';
+    // Route to appropriate FTS table based on search mode
+    let ftsTable;
+    if (searchMode === 'code') {
+        ftsTable = 'messages_code_fts';
+    } else if (searchMode === 'prose') {
+        ftsTable = 'messages_fts';
+    } else {
+        // Auto mode - detect based on query content
+        ftsTable = isCodeQuery(query) ? 'messages_code_fts' : 'messages_fts';
+    }
 
     let sql = `
         SELECT
@@ -412,10 +505,15 @@ export function checkMemoryPressure() {
  */
 export function closeDatabase() {
     if (db) {
-        db.close();
-        db = null;
-        isInitialized = false;
-        console.log('[DB] Closed');
+        try {
+            db.close();
+            console.log('[DB] Closed');
+        } catch (error) {
+            console.warn('[DB] Close failed, resetting handle anyway:', error);
+        } finally {
+            db = null;
+            isInitialized = false;
+        }
     }
 }
 
@@ -425,6 +523,17 @@ export function closeDatabase() {
  */
 export function isDatabaseReady() {
     return isInitialized;
+}
+
+/**
+ * Detect which search mode would be used for a query
+ * Useful for showing the user which FTS table will be used
+ *
+ * @param {string} query - Search query
+ * @returns {'prose' | 'code'} Detected search mode
+ */
+export function detectSearchMode(query) {
+    return isCodeQuery(query) ? 'code' : 'prose';
 }
 
 // Export default instance
@@ -441,6 +550,7 @@ export default {
     getConversation,
     getConversationMessages,
     searchConversations,
+    detectSearchMode,
     getConversationsByAgent,
     getConversationsByWorkspace,
     getConversationsByTimeRange,

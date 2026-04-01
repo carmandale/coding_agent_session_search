@@ -20,6 +20,7 @@ fn sample_conv(i: i64, msgs: i64) -> NormalizedConversation {
             content: format!("conversation {i} message {m} lorem ipsum dolor sit amet"),
             extra: serde_json::json!({}),
             snippets: Vec::new(),
+            invocations: Vec::new(),
         });
     }
     NormalizedConversation {
@@ -41,13 +42,13 @@ fn seed_index(conv_count: i64, msgs: i64) -> (TempDir, SearchClient) {
     let db_path = data_dir.join("bench.db");
     let index_path = index_dir(&data_dir).expect("index path");
 
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
     let mut t_index =
         coding_agent_search::search::tantivy::TantivyIndex::open_or_create(&index_path).unwrap();
 
     for i in 0..conv_count {
         let conv = sample_conv(i, msgs);
-        persist_conversation(&mut storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
     }
     t_index.commit().unwrap();
 
@@ -75,11 +76,11 @@ fn bench_indexing(c: &mut Criterion) {
                         .unwrap(),
                 )
             },
-            |(temp, mut storage, mut idx)| {
+            |(temp, storage, mut idx)| {
                 let _keep = temp; // keep tempdir alive
                 for i in 0..10 {
                     let conv = sample_conv(i, 10);
-                    persist_conversation(&mut storage, &mut idx, &conv).unwrap();
+                    persist_conversation(&storage, &mut idx, &conv).unwrap();
                 }
                 idx.commit().unwrap();
             },
@@ -166,6 +167,7 @@ fn wildcard_sample_conv(i: i64, msgs: i64) -> NormalizedConversation {
             ),
             extra: serde_json::json!({}),
             snippets: Vec::new(),
+            invocations: Vec::new(),
         });
     }
     NormalizedConversation {
@@ -191,13 +193,13 @@ fn seed_wildcard_index(conv_count: i64, msgs_per_conv: i64) -> (TempDir, SearchC
     let db_path = data_dir.join("wildcard_bench.db");
     let index_path = index_dir(&data_dir).expect("index path");
 
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
     let mut t_index =
         coding_agent_search::search::tantivy::TantivyIndex::open_or_create(&index_path).unwrap();
 
     for i in 0..conv_count {
         let conv = wildcard_sample_conv(i, msgs_per_conv);
-        persist_conversation(&mut storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
     }
     t_index.commit().unwrap();
 

@@ -19,19 +19,19 @@ Read plan.md before starting. Every task here references decisions made there.
 
 ## Phase 0 — Pre-flight
 
-- [ ] **T0.1** Confirm upstream is fetched and current:
+- [x] **T0.1** Confirm upstream is fetched and current:
   ```bash
   git fetch upstream
   git log --oneline upstream/main | head -5
   # Note the top commit SHA for the record
   ```
 
-- [ ] **T0.2** Check current watcher health so we know baseline:
+- [x] **T0.2** Check current watcher health so we know baseline:
   ```bash
   cass health --json | python3 -c "import sys,json; d=json.load(sys.stdin); print('pre-sync health:', d['healthy'])"
   ```
 
-- [ ] **T0.3** Back up `src/watchdog.rs` to a safe location:
+- [x] **T0.3** Back up `src/watchdog.rs` to a safe location:
   ```bash
   cp src/watchdog.rs /tmp/watchdog.rs.bak
   echo "backed up to /tmp/watchdog.rs.bak"
@@ -41,7 +41,7 @@ Read plan.md before starting. Every task here references decisions made there.
 
 ## Phase 1 — Copy Upstream Source
 
-- [ ] **T1.1** Copy upstream source, tests, Cargo files, and build script — then immediately restore our watchdog (single chain, no interruption):
+- [x] **T1.1** Copy upstream source, tests, Cargo files, and build script — then immediately restore our watchdog (single chain, no interruption):
   ```bash
   git checkout upstream/main -- src/ tests/ benches/ Cargo.toml rust-toolchain.toml build.rs \
     && git checkout HEAD -- src/watchdog.rs
@@ -49,12 +49,12 @@ Read plan.md before starting. Every task here references decisions made there.
 
   ⚠️ This DELETES `src/fad_adapter.rs`, `src/connectors/codebuff.rs`, `src/ui/sessions.rs`, `src/ui/components/message_render.rs` — that is intentional per the spec.
 
-- [ ] **T1.2** Restore local scripts (NOT replaced by upstream checkout):
+- [x] **T1.2** Restore local scripts (NOT replaced by upstream checkout):
   ```bash
   git checkout HEAD -- scripts/watchdog.sh dev-install.sh hooks/
   ```
 
-- [ ] **T1.3** Verify watchdog.rs is present and lib.rs is upstream's version:
+- [x] **T1.3** Verify watchdog.rs is present and lib.rs is upstream's version:
   ```bash
   ls src/watchdog.rs && echo "watchdog present"
   wc -l src/lib.rs
@@ -67,12 +67,12 @@ Read plan.md before starting. Every task here references decisions made there.
 
 All edits to `Cargo.toml` in one pass.
 
-- [ ] **T2.1** Set version and repository:
+- [x] **T2.1** Set version and repository:
   - Change `version = "0.2.5"` → `version = "0.2.7-gj.1"`
   - Change `license-file = "LICENSE"` → `license = "MIT"`
   - Change `repository = "https://github.com/Dicklesworthstone/coding_agent_session_search"` → `repository = "https://github.com/carmandale/coding_agent_session_search"`
 
-- [ ] **T2.2** Replace path dep — `asupersync`:
+- [x] **T2.2** Replace path dep — `asupersync`:
   ```toml
   # Remove this line:
   asupersync = { path = "../asupersync", features = ["test-internals", "tls-native-roots"] }
@@ -81,7 +81,7 @@ All edits to `Cargo.toml` in one pass.
   asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "95476b32", features = ["test-internals", "tls-native-roots"] }
   ```
 
-- [ ] **T2.3** Replace path dep — `frankensqlite`:
+- [x] **T2.3** Replace path dep — `frankensqlite`:
   ```toml
   # Remove this line:
   frankensqlite = { path = "../frankensqlite/crates/fsqlite", package = "fsqlite", features = ["fts5"] }
@@ -90,7 +90,7 @@ All edits to `Cargo.toml` in one pass.
   frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "92a9a0fa", package = "fsqlite", features = ["fts5"] }
   ```
 
-- [ ] **T2.4** Replace path dep — `franken-agent-detection`:
+- [x] **T2.4** Replace path dep — `franken-agent-detection`:
   ```toml
   # Remove this line:
   franken-agent-detection = { path = "../franken_agent_detection", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
@@ -99,7 +99,7 @@ All edits to `Cargo.toml` in one pass.
   franken-agent-detection = { git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "de450843", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
   ```
 
-- [ ] **T2.5** Replace path dev-dep — `fsqlite-types`:
+- [x] **T2.5** Replace path dev-dep — `fsqlite-types`:
   ```toml
   # Remove this line (under [dev-dependencies]):
   fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
@@ -108,14 +108,14 @@ All edits to `Cargo.toml` in one pass.
   fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "92a9a0fa", package = "fsqlite-types" }
   ```
 
-- [ ] **T2.6** Remove the `[patch."https://github.com/Dicklesworthstone/asupersync"]` section entirely (including all 4 sub-entries: asupersync, franken-decision, franken-evidence, franken-kernel).
+- [x] **T2.6** Remove the `[patch."https://github.com/Dicklesworthstone/asupersync"]` section entirely (including all 4 sub-entries: asupersync, franken-decision, franken-evidence, franken-kernel).
 
-- [ ] **T2.7** Add `libc = "*"` to `[dependencies]` (watchdog.rs requires it; upstream does not include it):
+- [x] **T2.7** Add `libc = "*"` to `[dependencies]` (watchdog.rs requires it; upstream does not include it):
   ```toml
   libc = "*"  # required by src/watchdog.rs for PID management
   ```
 
-- [ ] **T2.8** Verify Cargo.toml has no remaining `path = "../"` references:
+- [x] **T2.8** Verify Cargo.toml has no remaining `path = "../"` references:
   ```bash
   grep 'path = "\.\.' Cargo.toml
   # Expected: no output
@@ -129,7 +129,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
 
 **Key architecture note**: Upstream uses a TWO-STAGE dispatch. Site 3 (outer pattern) and Site 4 (inner arm) must BOTH be applied — missing either makes `cass watchdog` unreachable.
 
-- [ ] **T3.1** Site 1 — Module declaration. Find `pub mod update_check;` and add the line after it:
+- [x] **T3.1** Site 1 — Module declaration. Find `pub mod update_check;` and add the line after it:
   ```bash
   grep -n "pub mod update_check" src/lib.rs
   ```
@@ -138,7 +138,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   pub mod watchdog;
   ```
 
-- [ ] **T3.2** Site 2 — Commands enum variant. Find the `pub enum Commands {` closing brace and add a new variant before it:
+- [x] **T3.2** Site 2 — Commands enum variant. Find the `pub enum Commands {` closing brace and add a new variant before it:
   ```bash
   grep -n "^pub enum Commands" src/lib.rs
   ```
@@ -150,7 +150,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   },
   ```
 
-- [ ] **T3.3** Site 3 — **OUTER** dispatch pattern (two-stage dispatch). Find the outer match arm for non-TUI commands:
+- [x] **T3.3** Site 3 — **OUTER** dispatch pattern (two-stage dispatch). Find the outer match arm for non-TUI commands:
   ```bash
   grep -n "Commands::Analytics" src/lib.rs
   ```
@@ -160,7 +160,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   | Commands::Watchdog { .. } => {
   ```
 
-- [ ] **T3.4** Site 4 — **INNER** dispatch arm. Inside the non-TUI branch's inner `match command { ... }`, add:
+- [x] **T3.4** Site 4 — **INNER** dispatch arm. Inside the non-TUI branch's inner `match command { ... }`, add:
   ```bash
   grep -n "Commands::Index {" src/lib.rs | head -3
   ```
@@ -178,7 +178,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   ```
   Note: `kind: "watchdog"` is `&'static str` (NOT `.to_string()`), `code: 3`, ends with `?;`
 
-- [ ] **T3.5** Site 5 — Health JSON watchdog block. Find the `"_meta":` block inside `state_meta_json`:
+- [x] **T3.5** Site 5 — Health JSON watchdog block. Find the `"_meta":` block inside `state_meta_json`:
   ```bash
   grep -n '"_meta"' src/lib.rs | grep -v test | head -3
   ```
@@ -194,7 +194,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   },
   ```
 
-- [ ] **T3.6** Site 6 — Subcommand string mapping. Find the match that maps commands to strings:
+- [x] **T3.6** Site 6 — Subcommand string mapping. Find the match that maps commands to strings:
   ```bash
   grep -n '"index"\|"search"\|"tui"' src/lib.rs | grep "Commands::" | head -5
   ```
@@ -203,7 +203,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   Some(Commands::Watchdog { .. }) => "watchdog".to_string(),
   ```
 
-- [ ] **T3.7** Site 7 — Fix `state_meta_json` call in watchdog.rs tests (NOT in lib.rs — this is in our watchdog.rs):
+- [x] **T3.7** Site 7 — Fix `state_meta_json` call in watchdog.rs tests (NOT in lib.rs — this is in our watchdog.rs):
   ```bash
   grep -n "state_meta_json" src/watchdog.rs
   ```
@@ -220,7 +220,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
 
 ## Phase 4 — First Build Check
 
-- [ ] **T4.1** Compiler gates — each command must exit 0. If any fails, fix before continuing:
+- [x] **T4.1** Compiler gates — each command must exit 0. If any fails, fix before continuing:
   ```bash
   ~/.cargo/bin/cargo check --all-targets
   ~/.cargo/bin/cargo clippy --all-targets -- -D warnings
@@ -228,7 +228,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   ~/.cargo/bin/cargo test --lib
   ```
 
-- [ ] **T4.2** If any gate fails: read compiler output to understand the error; do NOT pipe through grep/head as that masks the exit code. Common expected issues:
+- [x] **T4.2** If any gate fails: read compiler output to understand the error; do NOT pipe through grep/head as that masks the exit code. Common expected issues:
   - Function signature changes between our fork and upstream
   - Types that moved modules in upstream
   - API changes in upgraded dependencies
@@ -237,18 +237,18 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
 
 ## Phase 5 — Build and Deploy
 
-- [ ] **T5.1** Full release build (expect 2-5 extra minutes for vendored OpenSSL on first build):
+- [x] **T5.1** Full release build (expect 2-5 extra minutes for vendored OpenSSL on first build):
   ```bash
   ~/.cargo/bin/cargo build --release 2>&1 | tail -5
   ```
 
-- [ ] **T5.2** Verify version:
+- [x] **T5.2** Verify version:
   ```bash
   ./target/release/cass --version
   # Required: cass 0.2.7-gj.1
   ```
 
-- [ ] **T5.3** Deploy (macOS gatekeeper quarantine workaround):
+- [x] **T5.3** Deploy (macOS gatekeeper quarantine workaround):
   ```bash
   cp ./target/release/cass ~/.cargo/bin/cass
   xattr -d com.apple.quarantine ~/.cargo/bin/cass 2>/dev/null || true
@@ -256,7 +256,7 @@ Edit `src/lib.rs` to wire in our watchdog subcommand. Apply all 6 sites.
   # Expected: cass 0.2.7-gj.1
   ```
 
-- [ ] **T5.4** Reload the watcher with new binary:
+- [x] **T5.4** Reload the watcher with new binary:
   ```bash
   PLIST="$HOME/Library/LaunchAgents/com.cass.index-watch.plist"
   launchctl unload "$PLIST" 2>/dev/null && sleep 1 && launchctl load "$PLIST"

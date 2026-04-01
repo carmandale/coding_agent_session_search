@@ -49,6 +49,7 @@ export class VirtualList {
             recycled: 0,
             created: 0,
         };
+        this.destroyed = false;
 
         this._init();
     }
@@ -92,9 +93,16 @@ export class VirtualList {
     _createThrottledHandler(fn, wait) {
         let pending = false;
         return () => {
+            if (this.destroyed || pending) {
+                return;
+            }
             if (!pending) {
                 pending = true;
                 requestAnimationFrame(() => {
+                    if (this.destroyed) {
+                        pending = false;
+                        return;
+                    }
                     fn();
                     pending = false;
                 });
@@ -107,6 +115,9 @@ export class VirtualList {
      * @private
      */
     _onResize() {
+        if (this.destroyed) {
+            return;
+        }
         this.containerHeight = this.container.clientHeight;
         this._render();
     }
@@ -116,6 +127,9 @@ export class VirtualList {
      * @private
      */
     _onScroll() {
+        if (this.destroyed) {
+            return;
+        }
         this.scrollTop = this.container.scrollTop;
         this._render();
 
@@ -154,6 +168,9 @@ export class VirtualList {
      * @private
      */
     _render() {
+        if (this.destroyed || !this.inner) {
+            return;
+        }
         const { start, end } = this._getVisibleRange();
 
         // Skip render if range unchanged
@@ -225,6 +242,8 @@ export class VirtualList {
         }
 
         this.container.scrollTop = Math.max(0, targetTop);
+        this.scrollTop = this.container.scrollTop;
+        this._render();
     }
 
     /**
@@ -260,6 +279,8 @@ export class VirtualList {
      * Clean up resources
      */
     destroy() {
+        this.destroyed = true;
+
         if (this._resizeObserver) {
             this._resizeObserver.disconnect();
             this._resizeObserver = null;
@@ -325,6 +346,9 @@ export class VariableHeightVirtualList {
         // DOM tracking
         this.items = new Map(); // index -> element
         this.lastVisibleRange = { start: -1, end: -1 };
+        this.destroyed = false;
+        this._scrollFramePending = false;
+        this._scrollFrameId = null;
 
         this._init();
     }
@@ -356,7 +380,19 @@ export class VariableHeightVirtualList {
 
         // Scroll handler
         this._scrollHandler = () => {
-            requestAnimationFrame(() => this._onScroll());
+            if (this.destroyed || this._scrollFramePending) {
+                return;
+            }
+
+            this._scrollFramePending = true;
+            this._scrollFrameId = requestAnimationFrame(() => {
+                this._scrollFramePending = false;
+                this._scrollFrameId = null;
+                if (this.destroyed) {
+                    return;
+                }
+                this._onScroll();
+            });
         };
         this.container.addEventListener('scroll', this._scrollHandler, { passive: true });
 
@@ -430,6 +466,9 @@ export class VariableHeightVirtualList {
      * @private
      */
     _onResize() {
+        if (this.destroyed) {
+            return;
+        }
         this.containerHeight = this.container.clientHeight;
         this._render();
     }
@@ -439,6 +478,9 @@ export class VariableHeightVirtualList {
      * @private
      */
     _onScroll() {
+        if (this.destroyed) {
+            return;
+        }
         this.scrollTop = this.container.scrollTop;
         this._render();
     }
@@ -461,6 +503,9 @@ export class VariableHeightVirtualList {
      * @private
      */
     _render() {
+        if (this.destroyed || !this.inner) {
+            return;
+        }
         const { start, end } = this._getVisibleRange();
 
         // Skip if unchanged
@@ -488,6 +533,9 @@ export class VariableHeightVirtualList {
 
                 // Measure actual height after render
                 requestAnimationFrame(() => {
+                    if (this.destroyed) {
+                        return;
+                    }
                     this._measureItem(i, element);
                 });
             }
@@ -509,6 +557,9 @@ export class VariableHeightVirtualList {
      * @private
      */
     _measureItem(index, element) {
+        if (this.destroyed || !this.inner || !element?.isConnected) {
+            return;
+        }
         const measuredHeight = element.offsetHeight;
         const previousHeight = this.heights.get(index);
 
@@ -548,6 +599,8 @@ export class VariableHeightVirtualList {
         }
 
         this.container.scrollTop = Math.max(0, targetTop);
+        this.scrollTop = this.container.scrollTop;
+        this._render();
     }
 
     /**
@@ -578,6 +631,8 @@ export class VariableHeightVirtualList {
      * Clean up resources
      */
     destroy() {
+        this.destroyed = true;
+
         if (this._resizeObserver) {
             this._resizeObserver.disconnect();
         }
@@ -586,6 +641,12 @@ export class VariableHeightVirtualList {
             this.container.removeEventListener('scroll', this._scrollHandler);
         }
 
+        if (this._scrollFrameId !== null && typeof cancelAnimationFrame === 'function') {
+            cancelAnimationFrame(this._scrollFrameId);
+            this._scrollFrameId = null;
+        }
+        this._scrollFramePending = false;
+
         for (const [, element] of this.items) {
             element.remove();
         }
@@ -593,6 +654,7 @@ export class VariableHeightVirtualList {
 
         if (this.inner) {
             this.inner.remove();
+            this.inner = null;
         }
 
         console.debug('[VariableVirtualList] Destroyed');

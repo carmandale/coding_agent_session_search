@@ -938,7 +938,7 @@ mod tests {
         )
         .unwrap();
 
-        let state = crate::state_meta_json(dir.path(), &db_path, 1800);
+        let state = crate::state_meta_json(dir.path(), &db_path, 1800, true);
         let watchdog = state.get("watchdog");
         assert!(
             watchdog.is_some(),

@@ -7,10 +7,10 @@
 //! - Hourly check cadence (configurable)
 
 use anyhow::{Context, Result};
-use reqwest::Client;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
@@ -22,6 +22,13 @@ const HTTP_TIMEOUT_SECS: u64 = 5;
 
 /// GitHub repo for release checks
 const GITHUB_REPO: &str = "Dicklesworthstone/coding_agent_session_search";
+
+fn updates_disabled() -> bool {
+    dotenvy::var("CASS_SKIP_UPDATE").is_ok()
+        || dotenvy::var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT").is_ok()
+        || dotenvy::var("TUI_HEADLESS").is_ok()
+        || dotenvy::var("CI").is_ok()
+}
 
 /// Persistent state for update checker
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -38,16 +45,32 @@ impl UpdateState {
         let path = state_path();
         match std::fs::read_to_string(&path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Self::default(),
+            Err(_) => {
+                let legacy = legacy_state_path();
+                if legacy != path
+                    && let Ok(content) = std::fs::read_to_string(&legacy)
+                {
+                    return serde_json::from_str(&content).unwrap_or_default();
+                }
+                Self::default()
+            }
         }
     }
 
     /// Load state from disk (asynchronous)
     pub async fn load_async() -> Self {
         let path = state_path();
-        match tokio::fs::read_to_string(&path).await {
+        match asupersync::fs::read_to_string(&path).await {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Self::default(),
+            Err(_) => {
+                let legacy = legacy_state_path();
+                if legacy != path
+                    && let Ok(content) = asupersync::fs::read_to_string(&legacy).await
+                {
+                    return serde_json::from_str(&content).unwrap_or_default();
+                }
+                Self::default()
+            }
         }
     }
 
@@ -67,12 +90,12 @@ impl UpdateState {
     pub async fn save_async(&self) -> Result<()> {
         let path = state_path();
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
+            asupersync::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("creating update state directory {}", parent.display()))?;
         }
-        let json = serde_json::to_string_pretty(self)?;
-        tokio::fs::write(&path, json)
+        let json = serde_json::to_string_pretty(self).context("serializing update state")?;
+        asupersync::fs::write(&path, json)
             .await
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
@@ -81,7 +104,10 @@ impl UpdateState {
     /// Check if enough time has passed since last check
     pub fn should_check(&self) -> bool {
         let now = now_unix();
-        (now - self.last_check_ts) >= CHECK_INTERVAL_SECS as i64
+        if self.last_check_ts <= 0 || self.last_check_ts > now {
+            return true;
+        }
+        now.saturating_sub(self.last_check_ts) >= CHECK_INTERVAL_SECS as i64
     }
 
     /// Mark that we just checked
@@ -110,6 +136,8 @@ impl UpdateState {
 pub struct UpdateInfo {
     /// Latest version available
     pub latest_version: String,
+    /// Git tag name for the release
+    pub tag_name: String,
     /// Current running version
     pub current_version: String,
     /// URL to release notes
@@ -137,26 +165,27 @@ struct GitHubRelease {
 /// Check for updates asynchronously
 ///
 /// Returns None if:
-/// - Not enough time since last check
+/// - Not enough time since last successful check
 /// - Network error (offline-friendly)
 /// - Parse error
-/// - Already on latest
 pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
+    check_for_updates_async_impl(current_version, false).await
+}
+
+async fn check_for_updates_async_impl(current_version: &str, force: bool) -> Option<UpdateInfo> {
+    // Escape hatch for CI/CD or restricted environments
+    if updates_disabled() {
+        return None;
+    }
+
     let mut state = UpdateState::load_async().await;
 
     // Respect check interval
-    if !state.should_check() {
+    if !force && !state.should_check() {
         debug!("update check: skipping, checked recently");
         return None;
     }
 
-    // Mark that we're checking (even if it fails)
-    state.mark_checked();
-    if let Err(e) = state.save_async().await {
-        warn!("update check: failed to save state: {e}");
-    }
-
-    // Fetch latest release
     let release = match fetch_latest_release().await {
         Ok(r) => r,
         Err(e) => {
@@ -165,44 +194,21 @@ pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
         }
     };
 
-    // Parse versions
-    let latest_str = release.tag_name.trim_start_matches('v');
-    let latest = match Version::parse(latest_str) {
-        Ok(v) => v,
-        Err(e) => {
-            debug!("update check: invalid version '{}': {e}", release.tag_name);
-            return None;
-        }
-    };
+    let info = build_update_info(current_version, release, &state)?;
 
-    let current = match Version::parse(current_version) {
-        Ok(v) => v,
-        Err(e) => {
-            debug!("update check: invalid current version '{current_version}': {e}");
-            return None;
-        }
-    };
+    // Persist cadence only after a successful fetch + parse so transient
+    // network or server errors do not suppress future checks for an hour.
+    state.mark_checked();
+    if let Err(e) = state.save_async().await {
+        warn!("update check: failed to save state: {e}");
+    }
 
-    let is_newer = latest > current;
-    let is_skipped = state.is_skipped(latest_str);
-
-    Some(UpdateInfo {
-        latest_version: latest_str.to_string(),
-        current_version: current_version.to_string(),
-        release_url: release.html_url,
-        is_newer,
-        is_skipped,
-    })
+    Some(info)
 }
 
 /// Force a check regardless of interval (for manual refresh)
 pub async fn force_check(current_version: &str) -> Option<UpdateInfo> {
-    let mut state = UpdateState::load_async().await;
-    state.last_check_ts = 0; // Reset to force check
-    if let Err(e) = state.save_async().await {
-        warn!("update check: failed to reset state: {e}");
-    }
-    check_for_updates(current_version).await
+    check_for_updates_async_impl(current_version, true).await
 }
 
 /// Skip the specified version
@@ -241,17 +247,31 @@ pub fn open_in_browser(url: &str) -> std::io::Result<()> {
 /// Run the self-update installer script interactively.
 /// This function does NOT return - it replaces the current process with the installer.
 /// The caller should ensure the terminal is in a clean state before calling.
-pub fn run_self_update() -> ! {
+pub fn run_self_update(version: &str) -> ! {
+    // Defense-in-depth: validate version contains only safe characters before
+    // using it in shell commands. Semver upstream validation already rejects
+    // metacharacters, but this function is pub and must be safe standalone.
+    if !version
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'v'))
+    {
+        eprintln!("Invalid version string: {}", version);
+        std::process::exit(1);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use std::os::unix::process::CommandExt;
         let install_url =
-            format!("https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.sh");
-        // exec replaces the current process, so we don't return
+            format!("https://raw.githubusercontent.com/{GITHUB_REPO}/{version}/install.sh");
+        // Use positional args ($1, $2) instead of string interpolation to prevent injection
         let err = std::process::Command::new("bash")
             .args([
                 "-c",
-                &format!("curl -fsSL '{}' | bash -s -- --easy-mode", install_url),
+                r#"curl -fsSL "$1" | bash -s -- --easy-mode --version "$2""#,
+                "cass-updater",
+                &install_url,
+                version,
             ])
             .exec();
         // If we get here, exec failed
@@ -262,16 +282,17 @@ pub fn run_self_update() -> ! {
     #[cfg(target_os = "windows")]
     {
         let install_url =
-            format!("https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.ps1");
-        // Windows doesn't have exec(), so we spawn and wait
+            format!("https://raw.githubusercontent.com/{GITHUB_REPO}/{version}/install.ps1");
+        // Version is validated above to contain only [0-9A-Za-z.+-v], safe for interpolation.
+        // Windows doesn't have exec(), so we spawn and wait.
         let status = std::process::Command::new("powershell")
             .args([
                 "-ExecutionPolicy",
                 "Bypass",
                 "-Command",
                 &format!(
-                    "Invoke-WebRequest -Uri '{}' -UseBasicParsing | Invoke-Expression",
-                    install_url
+                    "& $([scriptblock]::Create((Invoke-WebRequest -Uri '{}' -UseBasicParsing).Content)) -EasyMode -Version {}",
+                    install_url, version
                 ),
             ])
             .status();
@@ -285,35 +306,18 @@ pub fn run_self_update() -> ! {
     }
 }
 
-/// Fetch latest release from GitHub API
-async fn fetch_latest_release() -> Result<GitHubRelease> {
-    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
-
-    let client = Client::builder()
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building http client")?;
-
-    let response = client
-        .get(&url)
-        .header("Accept", "application/vnd.github.v3+json")
-        .send()
-        .await
-        .context("fetching release")?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("GitHub API returned {}", response.status());
-    }
-
-    response
-        .json::<GitHubRelease>()
-        .await
-        .context("parsing release JSON")
+/// Get the base URL for release API (overridable for testing)
+fn release_api_base_url() -> String {
+    dotenvy::var("CASS_UPDATE_API_BASE_URL")
+        .unwrap_or_else(|_| format!("https://api.github.com/repos/{GITHUB_REPO}"))
 }
 
 /// Get path to update state file
 fn state_path() -> PathBuf {
+    crate::default_data_dir().join("update_state.json")
+}
+
+fn legacy_state_path() -> PathBuf {
     directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search").map_or_else(
         || PathBuf::from("update_state.json"),
         |dirs| dirs.data_dir().join("update_state.json"),
@@ -322,10 +326,13 @@ fn state_path() -> PathBuf {
 
 /// Current unix timestamp
 fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 // ============================================================================
@@ -333,20 +340,18 @@ fn now_unix() -> i64 {
 // ============================================================================
 
 /// Synchronous version of `check_for_updates` for use in sync TUI code.
-/// Uses reqwest blocking client with short timeout.
+/// Uses a short-lived asupersync runtime and native HTTP client.
 pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
+    if updates_disabled() {
+        return None;
+    }
+
     let mut state = UpdateState::load();
 
     // Respect check interval
     if !state.should_check() {
         debug!("update check: skipping, checked recently");
         return None;
-    }
-
-    // Mark that we're checking (even if it fails)
-    state.mark_checked();
-    if let Err(e) = state.save() {
-        warn!("update check: failed to save state: {e}");
     }
 
     // Fetch latest release (blocking)
@@ -358,12 +363,29 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
         }
     };
 
-    // Parse versions
-    let latest_str = release.tag_name.trim_start_matches('v');
-    let latest = match Version::parse(latest_str) {
+    let info = build_update_info(current_version, release, &state)?;
+
+    // Persist cadence only after a successful fetch + parse so transient
+    // network or server errors do not suppress future checks for an hour.
+    state.mark_checked();
+    if let Err(e) = state.save() {
+        warn!("update check: failed to save state: {e}");
+    }
+
+    Some(info)
+}
+
+fn build_update_info(
+    current_version: &str,
+    release: GitHubRelease,
+    state: &UpdateState,
+) -> Option<UpdateInfo> {
+    let GitHubRelease { tag_name, html_url } = release;
+    let latest_version = tag_name.trim_start_matches('v').to_string();
+    let latest = match Version::parse(&latest_version) {
         Ok(v) => v,
         Err(e) => {
-            debug!("update check: invalid version '{}': {e}", release.tag_name);
+            debug!("update check: invalid version '{}': {e}", tag_name);
             return None;
         }
     };
@@ -375,42 +397,83 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
             return None;
         }
     };
-
-    let is_newer = latest > current;
-    let is_skipped = state.is_skipped(latest_str);
+    let is_skipped = state.is_skipped(&latest_version);
 
     Some(UpdateInfo {
-        latest_version: latest_str.to_string(),
+        latest_version,
+        tag_name,
         current_version: current_version.to_string(),
-        release_url: release.html_url,
-        is_newer,
+        release_url: html_url,
+        is_newer: latest > current,
         is_skipped,
     })
 }
 
-/// Fetch latest release using blocking HTTP client
-fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
-    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+/// Fetch latest release using the native asupersync HTTP client.
+async fn fetch_latest_release() -> Result<GitHubRelease> {
+    if let Some(cx) = asupersync::Cx::current() {
+        return fetch_latest_release_with_cx(&cx).await;
+    }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+    let handle = asupersync::runtime::Runtime::current_handle()
+        .context("update check requires an active asupersync runtime")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle
+        .try_spawn_with_cx(move |cx| async move {
+            let _ = tx.send(fetch_latest_release_with_cx(&cx).await);
+        })
+        .context("spawning update check task")?;
+
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return result,
+            Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
+            Err(TryRecvError::Disconnected) => {
+                anyhow::bail!("update check task exited before returning a result");
+            }
+        }
+    }
+}
+
+async fn fetch_latest_release_with_cx(cx: &asupersync::Cx) -> Result<GitHubRelease> {
+    let url = format!("{}/releases/latest", release_api_base_url());
+    let client = asupersync::http::h1::HttpClient::builder()
         .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building http client")?;
+        .build();
+    let response = asupersync::time::timeout(
+        cx.now(),
+        Duration::from_secs(HTTP_TIMEOUT_SECS),
+        client.request(
+            cx,
+            asupersync::http::h1::Method::Get,
+            &url,
+            vec![(
+                "Accept".to_string(),
+                "application/vnd.github.v3+json".to_string(),
+            )],
+            Vec::new(),
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("timed out fetching release: {e}"))?
+    .context("fetching release")?;
 
-    let response = client
-        .get(&url)
-        .header("Accept", "application/vnd.github.v3+json")
-        .send()
-        .context("fetching release")?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("GitHub API returned {}", response.status());
+    if !response.is_success() {
+        anyhow::bail!("GitHub API returned {}", response.status);
     }
 
     response
         .json::<GitHubRelease>()
         .context("parsing release JSON")
+}
+
+/// Fetch latest release using a dedicated synchronous runtime.
+fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .context("building update-check runtime")?
+        .block_on(fetch_latest_release())
 }
 
 /// Start a background thread to check for updates.
@@ -419,21 +482,24 @@ pub fn spawn_update_check(
     current_version: String,
 ) -> std::sync::mpsc::Receiver<Option<UpdateInfo>> {
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("update-checker".into())
-        .spawn(move || {
-            let result = check_for_updates_sync(&current_version);
-            let _ = tx.send(result);
-        })
-        .expect("failed to spawn update-checker thread");
+    if updates_disabled() {
+        let _ = tx.send(None);
+        return rx;
+    }
+    std::thread::spawn(move || {
+        let result = check_for_updates_sync(&current_version);
+        let _ = tx.send(result);
+    });
     rx
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_state_should_check() {
         let mut state = UpdateState::default();
         assert!(state.should_check()); // Fresh state should check
@@ -444,9 +510,15 @@ mod tests {
         // Simulate time passing
         state.last_check_ts = now_unix() - CHECK_INTERVAL_SECS as i64 - 1;
         assert!(state.should_check()); // Enough time passed
+
+        // Future timestamps should not suppress checks indefinitely after
+        // clock skew or state-file corruption.
+        state.last_check_ts = now_unix() + CHECK_INTERVAL_SECS as i64;
+        assert!(state.should_check());
     }
 
     #[test]
+    #[serial]
     fn test_skip_version() {
         let mut state = UpdateState::default();
         assert!(!state.is_skipped("1.0.0"));
@@ -460,9 +532,11 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_update_info_should_show() {
         let info = UpdateInfo {
             latest_version: "1.0.0".into(),
+            tag_name: "v1.0.0".into(),
             current_version: "0.9.0".into(),
             release_url: "https://example.com".into(),
             is_newer: true,
@@ -488,6 +562,7 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[serial]
     fn test_version_comparison_upgrade_scenarios() {
         // Test various upgrade scenarios with semver comparison
         let test_cases = vec![
@@ -518,6 +593,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_update_state_persistence_round_trip() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let state_file = temp_dir.path().join("update_state.json");
@@ -554,12 +630,14 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_update_info_upgrade_workflow() {
         // Simulate the full upgrade decision workflow
 
         // Case 1: New version available, not skipped -> should show
         let info = UpdateInfo {
             latest_version: "0.2.0".into(),
+            tag_name: "v0.2.0".into(),
             current_version: "0.1.52".into(),
             release_url: "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0".into(),
             is_newer: true,
@@ -587,6 +665,7 @@ mod tests {
         state.clear_skip();
         let newer_info = UpdateInfo {
             latest_version: "0.3.0".into(),
+            tag_name: "v0.3.0".into(),
             current_version: "0.1.52".into(),
             release_url: "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.0".into(),
             is_newer: true,
@@ -599,6 +678,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_check_interval_respects_cadence() {
         let mut state = UpdateState::default();
 
@@ -619,6 +699,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_github_repo_constant_is_valid() {
         // Verify the repo constant is properly formatted
         assert!(GITHUB_REPO.contains('/'));
@@ -628,5 +709,532 @@ mod tests {
         assert!(!parts[1].is_empty(), "repo should not be empty");
         assert_eq!(parts[0], "Dicklesworthstone");
         assert_eq!(parts[1], "coding_agent_session_search");
+    }
+
+    // =========================================================================
+    // Integration Tests with Local HTTP Server (br-e3ze)
+    // Tests real HTTP client behavior against ephemeral local servers
+    // =========================================================================
+
+    /// Helper to create a simple HTTP response
+    fn http_response(status: u16, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {} {}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            status,
+            match status {
+                200 => "OK",
+                404 => "Not Found",
+                500 => "Internal Server Error",
+                _ => "Unknown",
+            },
+            body.len(),
+            body
+        )
+    }
+
+    /// Start a simple HTTP server on an ephemeral port that serves a single response
+    fn start_test_server(
+        response_body: &str,
+        status: u16,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to ephemeral port");
+        let addr = listener.local_addr().expect("get local addr");
+
+        let response = http_response(status, response_body);
+
+        let handle = std::thread::spawn(move || {
+            // Accept one connection and respond
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        // Small delay to ensure server is ready
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        (addr, handle)
+    }
+
+    #[test]
+    #[serial]
+    fn integration_fetch_release_success() {
+        // Start local server with valid release JSON
+        let release_json = r#"{
+            "tag_name": "v0.2.0",
+            "html_url": "https://github.com/test/repo/releases/tag/v0.2.0"
+        }"#;
+
+        let (addr, handle) = start_test_server(release_json, 200);
+
+        // Set env var to point to our local server
+        // Safety: Tests run sequentially in same process, but this is still racy
+        // We use a unique port each time so it's safe for our purposes
+        unsafe {
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", format!("http://{}", addr));
+        }
+
+        // Make the request using blocking client
+        let result = fetch_latest_release_blocking();
+
+        // Clean up env var
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+        }
+
+        handle.join().expect("server thread");
+
+        let release = result.expect("fetch should succeed");
+        assert_eq!(release.tag_name, "v0.2.0");
+        assert!(release.html_url.contains("v0.2.0"));
+    }
+
+    #[test]
+    #[serial]
+    fn integration_fetch_release_404_error() {
+        let (addr, handle) = start_test_server(r#"{"message": "Not Found"}"#, 404);
+
+        unsafe {
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", format!("http://{}", addr));
+        }
+
+        let result = fetch_latest_release_blocking();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+        }
+
+        handle.join().expect("server thread");
+
+        assert!(result.is_err(), "should return error for 404");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("404") || err.to_string().contains("Not Found"),
+            "error should mention 404: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn integration_fetch_release_malformed_json() {
+        let (addr, handle) = start_test_server("this is not json", 200);
+
+        unsafe {
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", format!("http://{}", addr));
+        }
+
+        let result = fetch_latest_release_blocking();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+        }
+
+        handle.join().expect("server thread");
+
+        assert!(result.is_err(), "should return error for malformed JSON");
+    }
+
+    #[test]
+    #[serial]
+    fn integration_fetch_release_missing_fields() {
+        // JSON that doesn't have required fields
+        let incomplete_json = r#"{"some_other_field": "value"}"#;
+
+        let (addr, handle) = start_test_server(incomplete_json, 200);
+
+        unsafe {
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", format!("http://{}", addr));
+        }
+
+        let result = fetch_latest_release_blocking();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+        }
+
+        handle.join().expect("server thread");
+
+        // Should fail to parse because tag_name is missing
+        assert!(result.is_err(), "should error on missing required fields");
+    }
+
+    #[test]
+    #[serial]
+    fn integration_fetch_release_server_error() {
+        let (addr, handle) = start_test_server(r#"{"error": "Internal error"}"#, 500);
+
+        unsafe {
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", format!("http://{}", addr));
+        }
+
+        let result = fetch_latest_release_blocking();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+        }
+
+        handle.join().expect("server thread");
+
+        assert!(result.is_err(), "should return error for 500");
+    }
+
+    #[test]
+    #[serial]
+    fn integration_version_comparison_with_real_fetch() {
+        // Test the full flow: fetch -> parse -> compare
+        let release_json = r#"{
+            "tag_name": "v0.3.0",
+            "html_url": "https://github.com/test/repo/releases/tag/v0.3.0"
+        }"#;
+
+        let (addr, handle) = start_test_server(release_json, 200);
+
+        unsafe {
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", format!("http://{}", addr));
+        }
+
+        let result = fetch_latest_release_blocking();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+        }
+
+        handle.join().expect("server thread");
+
+        let release = result.expect("fetch should succeed");
+
+        // Parse and compare versions like the real code does
+        let latest_str = release.tag_name.trim_start_matches('v');
+        let latest = Version::parse(latest_str).expect("parse latest version");
+        let current = Version::parse("0.1.50").expect("parse current version");
+
+        assert!(latest > current, "0.3.0 should be newer than 0.1.50");
+    }
+
+    #[test]
+    #[serial]
+    fn integration_prerelease_version_handling() {
+        // Test handling of pre-release versions from server
+        let release_json = r#"{
+            "tag_name": "v0.2.0-beta.1",
+            "html_url": "https://github.com/test/repo/releases/tag/v0.2.0-beta.1"
+        }"#;
+
+        let (addr, handle) = start_test_server(release_json, 200);
+
+        unsafe {
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", format!("http://{}", addr));
+        }
+
+        let result = fetch_latest_release_blocking();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+        }
+
+        handle.join().expect("server thread");
+
+        let release = result.expect("fetch should succeed");
+        let latest_str = release.tag_name.trim_start_matches('v');
+        let latest = Version::parse(latest_str).expect("parse prerelease version");
+
+        // Prerelease 0.2.0-beta.1 should be less than 0.2.0
+        let stable = Version::parse("0.2.0").expect("parse stable version");
+        assert!(
+            latest < stable,
+            "prerelease 0.2.0-beta.1 should be older than stable 0.2.0"
+        );
+
+        // But newer than 0.1.50
+        let older = Version::parse("0.1.50").expect("parse older version");
+        assert!(
+            latest > older,
+            "prerelease 0.2.0-beta.1 should be newer than 0.1.50"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn integration_connection_refused_is_offline_friendly() {
+        // Point to a port that's not listening
+        unsafe {
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", "http://127.0.0.1:1");
+        }
+
+        let result = fetch_latest_release_blocking();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+        }
+
+        // Should fail gracefully, not panic
+        assert!(
+            result.is_err(),
+            "should return error when server unreachable"
+        );
+        // The error is wrapped in context, so check the full chain
+        let err = result.unwrap_err();
+        let err_chain = format!("{:?}", err).to_lowercase();
+        assert!(
+            err_chain.contains("connection")
+                || err_chain.contains("connect")
+                || err_chain.contains("refused")
+                || err_chain.contains("fetch")
+                || err_chain.contains("os error"),
+            "should be a network/fetch error: {}",
+            err_chain
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn integration_failed_sync_check_does_not_throttle_future_checks() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_file = temp_dir.path().join("update_state.json");
+        unsafe {
+            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", "http://127.0.0.1:1");
+            std::env::remove_var("CASS_SKIP_UPDATE");
+            std::env::remove_var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT");
+            std::env::remove_var("TUI_HEADLESS");
+            std::env::remove_var("CI");
+        }
+
+        let result = check_for_updates_sync("0.1.0");
+        assert!(result.is_none(), "offline sync check should fail quietly");
+
+        assert!(
+            !state_file.exists(),
+            "failed sync checks must not persist cadence state"
+        );
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+            std::env::remove_var("CASS_DATA_DIR");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn integration_failed_async_check_does_not_throttle_future_checks() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_file = temp_dir.path().join("update_state.json");
+        unsafe {
+            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", "http://127.0.0.1:1");
+            std::env::remove_var("CASS_SKIP_UPDATE");
+            std::env::remove_var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT");
+            std::env::remove_var("TUI_HEADLESS");
+            std::env::remove_var("CI");
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let result = runtime.block_on(check_for_updates("0.1.0"));
+        assert!(result.is_none(), "offline async check should fail quietly");
+
+        assert!(
+            !state_file.exists(),
+            "failed async checks must not persist cadence state"
+        );
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+            std::env::remove_var("CASS_DATA_DIR");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn integration_force_check_bypasses_cadence_even_when_state_save_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_file = temp_dir.path().join("update_state.json");
+        let state = UpdateState {
+            last_check_ts: now_unix(),
+            skipped_version: None,
+        };
+        std::fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+        let release_json = r#"{
+            "tag_name": "v9.9.9",
+            "html_url": "https://github.com/test/repo/releases/tag/v9.9.9"
+        }"#;
+        let (addr, handle) = start_test_server(release_json, 200);
+
+        let dir_metadata = std::fs::metadata(temp_dir.path()).unwrap();
+        let file_metadata = std::fs::metadata(&state_file).unwrap();
+        let dir_mode = dir_metadata.permissions().mode();
+        let file_mode = file_metadata.permissions().mode();
+
+        let mut readonly_dir = dir_metadata.permissions();
+        readonly_dir.set_mode(0o555);
+        std::fs::set_permissions(temp_dir.path(), readonly_dir).unwrap();
+
+        let mut readonly_file = file_metadata.permissions();
+        readonly_file.set_mode(0o444);
+        std::fs::set_permissions(&state_file, readonly_file).unwrap();
+
+        unsafe {
+            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", format!("http://{}", addr));
+            std::env::remove_var("CASS_SKIP_UPDATE");
+            std::env::remove_var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT");
+            std::env::remove_var("TUI_HEADLESS");
+            std::env::remove_var("CI");
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let result = runtime.block_on(force_check("0.1.0"));
+
+        let mut restore_file = std::fs::metadata(&state_file).unwrap().permissions();
+        restore_file.set_mode(file_mode);
+        std::fs::set_permissions(&state_file, restore_file).unwrap();
+
+        let mut restore_dir = std::fs::metadata(temp_dir.path()).unwrap().permissions();
+        restore_dir.set_mode(dir_mode);
+        std::fs::set_permissions(temp_dir.path(), restore_dir).unwrap();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+            std::env::remove_var("CASS_DATA_DIR");
+        }
+
+        handle.join().expect("server thread");
+
+        let info = result.expect("force check should bypass cadence and succeed");
+        assert_eq!(info.latest_version, "9.9.9");
+        assert!(info.is_newer);
+    }
+
+    #[test]
+    #[serial]
+    fn integration_blocking_fetch_release_success_v1() {
+        // Validates the synchronous wrapper over the native HTTP client.
+        let release_json = r#"{
+            "tag_name": "v1.0.0",
+            "html_url": "https://github.com/test/repo/releases/tag/v1.0.0"
+        }"#;
+
+        let (addr, handle) = start_test_server(release_json, 200);
+
+        unsafe {
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", format!("http://{}", addr));
+        }
+
+        let result = fetch_latest_release_blocking();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+        }
+
+        handle.join().expect("server thread");
+
+        let release = result.expect("blocking fetch should succeed");
+        assert_eq!(release.tag_name, "v1.0.0");
+    }
+
+    #[test]
+    #[serial]
+    fn integration_blocking_fetch_release_403_error() {
+        let (addr, handle) = start_test_server(r#"{"error": "forbidden"}"#, 403);
+
+        unsafe {
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", format!("http://{}", addr));
+        }
+
+        let result = fetch_latest_release_blocking();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+        }
+
+        handle.join().expect("server thread");
+
+        assert!(result.is_err(), "should error on 403");
+    }
+
+    #[test]
+    #[serial]
+    fn integration_release_api_base_url_default() {
+        // When env var is not set, should use GitHub API
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+        }
+
+        let url = release_api_base_url();
+        assert!(
+            url.contains("api.github.com"),
+            "default should use GitHub API"
+        );
+        assert!(
+            url.contains(GITHUB_REPO),
+            "default should include repo path"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn integration_release_api_base_url_override() {
+        let custom_url = "http://localhost:8080/api";
+        unsafe {
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", custom_url);
+        }
+
+        let url = release_api_base_url();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+        }
+
+        assert_eq!(url, custom_url, "should use custom URL from env var");
+    }
+
+    #[test]
+    #[serial]
+    fn integration_http_timeout_is_reasonable() {
+        const _: () = {
+            // Verify the timeout constant is short enough for startup
+            assert!(
+                HTTP_TIMEOUT_SECS <= 10,
+                "HTTP timeout should be short to avoid blocking startup"
+            );
+            assert!(
+                HTTP_TIMEOUT_SECS >= 3,
+                "HTTP timeout should be long enough for slow networks"
+            );
+        };
+    }
+
+    #[test]
+    #[serial]
+    fn integration_check_interval_is_reasonable() {
+        const _: () = {
+            // Verify check interval is reasonable (not too frequent, not too rare)
+            assert!(
+                CHECK_INTERVAL_SECS >= 3600,
+                "should not check more than once per hour"
+            );
+            assert!(
+                CHECK_INTERVAL_SECS <= 86400,
+                "should check at least once per day"
+            );
+        };
     }
 }

@@ -5,10 +5,35 @@
  * CSP-safe: No inline event handlers, no eval.
  */
 
+import { createStrengthMeter } from './password-strength.js';
+import { COI_STATE, getCOIState, initCOIDetection, onServiceWorkerActivated } from './coi-detector.js';
+import { StorageMode, getArchiveScopeId, getStorageMode, getStoredMode, isOpfsEnabled } from './storage.js';
+import { SESSION_CONFIG } from './session.js';
+import { registerServiceWorker } from './sw-register.js';
+
 // State
 let config = null;
 let worker = null;
 let qrScanner = null;
+let strengthMeter = null;
+let isUnencryptedArchive = false;
+let tofuStatus = { valid: true, isFirstVisit: true };
+let unlockInFlight = false;
+let decryptInFlight = false;
+let activeQrScannerSession = 0;
+let activeUnlockRequestId = null;
+let activeDecryptRequestId = null;
+let nextWorkerRequestId = 1;
+let activeAppInitToken = 0;
+let qrLibraryLoadPromise = null;
+let qrScannerTeardownPromise = null;
+let activeSessionExpiryTs = 0;
+let activeSessionExpiryTimerId = null;
+const LEGACY_SESSION_KEYS = {
+    DEK: 'cass_session_dek',
+    EXPIRY: 'cass_session_expiry',
+    UNLOCKED: 'cass_unlocked',
+};
 
 // DOM Elements
 const elements = {
@@ -44,10 +69,18 @@ async function init() {
     // Load configuration
     try {
         config = await loadConfig();
-        await displayFingerprint();
+        tofuStatus = await displayFingerprint();
     } catch (error) {
         showError('Failed to load archive configuration. The archive may be corrupted.');
         console.error('Config load error:', error);
+        return;
+    }
+
+    if (config?.encrypted === false) {
+        clearStoredSession();
+        window.cassSession = null;
+        setupUnencryptedMode();
+        enableForm();
         return;
     }
 
@@ -60,10 +93,21 @@ async function init() {
     } catch (error) {
         showError('Failed to initialize decryption worker. Your browser may not support Web Workers.');
         console.error('Worker init error:', error);
+        disableForm();
+        return;
     }
 
     // Check for existing session
     checkExistingSession();
+
+    // Initialize password strength meter
+    if (elements.passwordInput && elements.strengthMeter) {
+        strengthMeter = createStrengthMeter(elements.passwordInput, {
+            meterContainer: elements.strengthMeter,
+            labelElement: elements.strengthLabel,
+            suggestionsList: elements.strengthSuggestions,
+        });
+    }
 
     // Enable form
     elements.unlockBtn.disabled = false;
@@ -91,21 +135,18 @@ function cacheElements() {
     elements.progressFill = elements.authProgress?.querySelector('.progress-fill');
     elements.progressText = elements.authProgress?.querySelector('.progress-text');
     elements.lockBtn = document.getElementById('lock-btn');
+    elements.strengthMeter = document.getElementById('strength-meter');
+    elements.strengthLabel = document.getElementById('strength-label');
+    elements.strengthSuggestions = document.getElementById('strength-suggestions');
 }
 
 /**
  * Set up event listeners (CSP-safe, no inline handlers)
  */
 function setupEventListeners() {
-    // Password unlock
-    elements.unlockBtn?.addEventListener('click', handleUnlockClick);
-
-    // Enter key in password field
-    elements.passwordInput?.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') {
-            handleUnlockClick();
-        }
-    });
+    // Password unlock: use form submit as the single entry point.
+    // Separate click/keypress handlers can fire duplicate unlock requests.
+    document.getElementById('auth-form')?.addEventListener('submit', handleUnlockClick);
 
     // Toggle password visibility
     elements.togglePassword?.addEventListener('click', togglePasswordVisibility);
@@ -118,14 +159,154 @@ function setupEventListeners() {
     elements.fingerprintHelp?.addEventListener('click', toggleFingerprintTooltip);
 
     // Lock button (re-lock archive)
-    elements.lockBtn?.addEventListener('click', lockArchive);
+    elements.lockBtn?.addEventListener('click', handleLockButtonClick);
+    window.addEventListener('cass:lock', handleExternalLockEvent);
+    window.addEventListener('cass:session-mode-change', (event) => {
+        const mode = event?.detail?.mode;
+        if (mode === StorageMode.MEMORY) {
+            clearStoredSession();
+            return;
+        }
+
+        if (window.cassSession?.dek) {
+            persistSession(window.cassSession.dek, activeSessionExpiryTs);
+        }
+    });
 
     // Escape key to close QR scanner
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && !elements.qrScanner?.classList.contains('hidden')) {
-            closeQrScanner();
+            void closeQrScanner();
         }
     });
+
+    document.addEventListener('visibilitychange', handleSessionVisibilityChange);
+}
+
+function allocateWorkerRequestId() {
+    const requestId = nextWorkerRequestId;
+    nextWorkerRequestId += 1;
+    return requestId;
+}
+
+function beginAppInitAttempt() {
+    activeAppInitToken += 1;
+    return activeAppInitToken;
+}
+
+function isCurrentAppInitToken(token) {
+    return token === activeAppInitToken;
+}
+
+function invalidateAppInitAttempt() {
+    activeAppInitToken += 1;
+}
+
+function beginQrScannerSession() {
+    activeQrScannerSession += 1;
+    return activeQrScannerSession;
+}
+
+function invalidateQrScannerSession() {
+    activeQrScannerSession += 1;
+}
+
+function isCurrentQrScannerSession(sessionToken) {
+    return sessionToken === activeQrScannerSession;
+}
+
+function clearWorkerKeys() {
+    try {
+        worker?.postMessage({ type: 'CLEAR_KEYS' });
+    } catch (error) {
+        console.warn('Failed to clear worker keys:', error);
+    }
+}
+
+function clearActiveSessionExpiryTimer() {
+    if (activeSessionExpiryTimerId !== null) {
+        clearTimeout(activeSessionExpiryTimerId);
+        activeSessionExpiryTimerId = null;
+    }
+}
+
+function clearActiveSessionExpiry() {
+    clearActiveSessionExpiryTimer();
+    activeSessionExpiryTs = 0;
+}
+
+async function expireActiveSession() {
+    if (!window.cassSession?.dek) {
+        clearActiveSessionExpiry();
+        return;
+    }
+
+    await lockArchive({ broadcast: true, action: 'expired' });
+    showError('Your session expired. Please unlock the archive again.');
+}
+
+function scheduleActiveSessionExpiry(expiryTs) {
+    clearActiveSessionExpiryTimer();
+
+    const numericExpiry = Number(expiryTs);
+    if (!Number.isFinite(numericExpiry) || numericExpiry <= 0) {
+        activeSessionExpiryTs = 0;
+        return;
+    }
+
+    activeSessionExpiryTs = Math.trunc(numericExpiry);
+    const remainingMs = activeSessionExpiryTs - Date.now();
+    if (remainingMs <= 0) {
+        void expireActiveSession();
+        return;
+    }
+
+    activeSessionExpiryTimerId = window.setTimeout(() => {
+        activeSessionExpiryTimerId = null;
+        void expireActiveSession();
+    }, remainingMs);
+}
+
+function handleSessionVisibilityChange() {
+    if (document.hidden || activeSessionExpiryTs <= 0) {
+        return;
+    }
+
+    if (Date.now() >= activeSessionExpiryTs) {
+        void expireActiveSession();
+        return;
+    }
+
+    scheduleActiveSessionExpiry(activeSessionExpiryTs);
+}
+
+function broadcastAuthLock(action = 'lock') {
+    window.dispatchEvent(new CustomEvent('cass:lock', {
+        detail: {
+            action,
+            source: 'auth',
+        },
+    }));
+}
+
+function isCurrentWorkerMessage(type, requestId) {
+    if (requestId === null || requestId === undefined) {
+        return true;
+    }
+
+    switch (type) {
+        case 'UNLOCK_SUCCESS':
+        case 'UNLOCK_FAILED':
+            return requestId === activeUnlockRequestId;
+        case 'DECRYPT_SUCCESS':
+        case 'DECRYPT_FAILED':
+        case 'DB_READY':
+            return requestId === activeDecryptRequestId;
+        case 'PROGRESS':
+            return requestId === activeUnlockRequestId || requestId === activeDecryptRequestId;
+        default:
+            return true;
+    }
 }
 
 /**
@@ -139,12 +320,25 @@ async function loadConfig() {
     return response.json();
 }
 
+function getSessionKeys() {
+    const scopeId = getArchiveScopeId();
+    return {
+        DEK: `cass_session_dek_${scopeId}`,
+        EXPIRY: `cass_session_expiry_${scopeId}`,
+        UNLOCKED: `cass_unlocked_${scopeId}`,
+    };
+}
+
+function getTofuKey() {
+    // Scope TOFU to the archive location, not the archive's self-declared export_id.
+    // Otherwise a full archive swap at the same URL looks like a first visit.
+    return `cass_fingerprint_v2_${getArchiveScopeId()}`;
+}
+
 /**
  * Display integrity fingerprint with TOFU verification
  */
 async function displayFingerprint() {
-    const tofuKey = `cass_fingerprint_${config?.export_id || 'default'}`;
-
     try {
         // Try to load integrity.json if it exists
         const response = await fetch('./integrity.json');
@@ -154,15 +348,17 @@ async function displayFingerprint() {
             elements.fingerprintValue.textContent = fingerprint;
 
             // TOFU verification
-            const result = await verifyTofu(fingerprint, tofuKey);
+            const result = await verifyTofu(fingerprint, getTofuKey());
             displayTofuStatus(result);
+            return result;
         } else {
             // Fall back to config fingerprint
             const fingerprint = await computeFingerprint(JSON.stringify(config));
             elements.fingerprintValue.textContent = fingerprint;
 
-            const result = await verifyTofu(fingerprint, tofuKey);
+            const result = await verifyTofu(fingerprint, getTofuKey());
             displayTofuStatus(result);
+            return result;
         }
     } catch (error) {
         // Use export_id as fallback fingerprint
@@ -173,6 +369,61 @@ async function displayFingerprint() {
         } else {
             elements.fingerprintValue.textContent = 'unavailable';
         }
+
+        return { valid: true, isFirstVisit: true };
+    }
+}
+
+function setupUnencryptedMode() {
+    isUnencryptedArchive = true;
+
+    const subtitle = document.querySelector('.auth-header .subtitle');
+    if (subtitle) {
+        subtitle.textContent = 'This archive is NOT encrypted. Anyone with access can read it.';
+    }
+
+    if (elements.passwordInput) {
+        elements.passwordInput.required = false;
+    }
+
+    const passwordGroup = elements.passwordInput?.closest('.form-group');
+    passwordGroup?.classList.add('hidden');
+
+    const divider = document.querySelector('.auth-form .divider');
+    divider?.classList.add('hidden');
+
+    elements.qrBtn?.classList.add('hidden');
+    elements.togglePassword?.classList.add('hidden');
+
+    if (elements.unlockBtn) {
+        const label = elements.unlockBtn.querySelector('.btn-text');
+        if (label) {
+            label.textContent = 'Open Archive';
+        }
+    }
+
+    const warning = document.createElement('div');
+    warning.className = 'tofu-warning-banner';
+
+    const warningContent = document.createElement('div');
+    warningContent.className = 'tofu-warning-content';
+
+    const warningTitle = document.createElement('strong');
+    warningTitle.textContent = 'Unencrypted archive';
+    warningContent.appendChild(warningTitle);
+
+    const warningBody = document.createElement('p');
+    warningBody.textContent =
+        'This export was generated WITHOUT encryption. Treat it as public data.';
+    warningContent.appendChild(warningBody);
+
+    warning.appendChild(warningContent);
+
+    const authForm = document.querySelector('.auth-form');
+    if (authForm) {
+        authForm.parentNode.insertBefore(warning, authForm);
+    } else {
+        elements.authScreen?.appendChild(warning);
     }
 }
 
@@ -291,7 +542,7 @@ function showTofuWarning(result) {
  * Accept new fingerprint (user acknowledges the change)
  */
 function acceptNewFingerprint(newFingerprint) {
-    const tofuKey = `cass_fingerprint_${config?.export_id || 'default'}`;
+    const tofuKey = getTofuKey();
     try {
         localStorage.setItem(tofuKey, newFingerprint);
 
@@ -330,7 +581,20 @@ function formatFingerprint(bytes) {
 /**
  * Handle unlock button click
  */
-async function handleUnlockClick() {
+async function handleUnlockClick(event) {
+    if (event) {
+        event.preventDefault();
+    }
+
+    if (unlockInFlight || decryptInFlight) {
+        return;
+    }
+
+    if (isUnencryptedArchive) {
+        await transitionToAppUnencrypted();
+        return;
+    }
+
     const password = elements.passwordInput.value.trim();
 
     if (!password) {
@@ -347,12 +611,15 @@ async function handleUnlockClick() {
     hideError();
     showProgress('Deriving key...');
     disableForm();
+    unlockInFlight = true;
+    activeUnlockRequestId = allocateWorkerRequestId();
 
     // Send unlock request to worker
     worker.postMessage({
         type: 'UNLOCK_PASSWORD',
         password: password,
         config: config,
+        requestId: activeUnlockRequestId,
     });
 }
 
@@ -383,34 +650,44 @@ function toggleFingerprintTooltip() {
  * Open QR code scanner
  */
 async function openQrScanner() {
+    await waitForQrScannerTeardown();
+    if (qrScanner && !elements.qrScanner?.classList.contains('hidden')) {
+        return;
+    }
+    const sessionToken = beginQrScannerSession();
     elements.qrScanner.classList.remove('hidden');
 
-    // Dynamically load QR scanner library if not loaded
-    if (!window.Html5Qrcode) {
-        try {
-            // Try to load from vendor folder
-            const script = document.createElement('script');
-            script.src = './vendor/html5-qrcode.min.js';
-            await new Promise((resolve, reject) => {
-                script.onload = resolve;
-                script.onerror = reject;
-                document.head.appendChild(script);
-            });
-        } catch (error) {
-            showError('Failed to load QR scanner library');
-            closeQrScanner();
-            return;
-        }
+    try {
+        await loadQrScannerLibrary();
+    } catch (error) {
+        showError('Failed to load QR scanner library');
+        await closeQrScanner();
+        return;
+    }
+
+    if (
+        !isCurrentQrScannerSession(sessionToken)
+        || elements.qrScanner?.classList.contains('hidden')
+    ) {
+        return;
     }
 
     try {
-        qrScanner = new window.Html5Qrcode('qr-reader');
-        await qrScanner.start(
+        const scanner = new window.Html5Qrcode('qr-reader');
+        qrScanner = scanner;
+        await scanner.start(
             { facingMode: 'environment' },
             { fps: 10, qrbox: { width: 250, height: 250 } },
             handleQrSuccess,
             handleQrError
         );
+        if (
+            !isCurrentQrScannerSession(sessionToken)
+            || elements.qrScanner?.classList.contains('hidden')
+        ) {
+            await finalizeQrScannerClose(scanner);
+            return;
+        }
     } catch (error) {
         console.error('QR scanner error:', error);
         if (error.name === 'NotAllowedError') {
@@ -418,7 +695,7 @@ async function openQrScanner() {
         } else {
             showError('Failed to start camera. Please enter password manually.');
         }
-        closeQrScanner();
+        await closeQrScanner();
     }
 }
 
@@ -426,26 +703,35 @@ async function openQrScanner() {
  * Close QR code scanner
  */
 async function closeQrScanner() {
-    if (qrScanner) {
-        try {
-            await qrScanner.stop();
-        } catch (e) {
-            // Ignore stop errors
-        }
-        qrScanner = null;
-    }
+    invalidateQrScannerSession();
+    const scanner = qrScanner;
+    qrScanner = null;
     elements.qrScanner.classList.add('hidden');
+    let teardown = finalizeQrScannerClose(scanner);
+    teardown = teardown.finally(() => {
+        if (qrScannerTeardownPromise === teardown) {
+            qrScannerTeardownPromise = null;
+        }
+    });
+    qrScannerTeardownPromise = teardown;
+    await teardown;
 }
 
 /**
  * Handle successful QR code scan
  */
 function handleQrSuccess(decodedText) {
-    closeQrScanner();
+    if (unlockInFlight || decryptInFlight) {
+        return;
+    }
+
+    void closeQrScanner();
 
     hideError();
     showProgress('Deriving key from QR...');
     disableForm();
+    unlockInFlight = true;
+    activeUnlockRequestId = allocateWorkerRequestId();
 
     // Try to parse as JSON recovery data, or use raw text as recovery secret
     let recoverySecret;
@@ -461,6 +747,7 @@ function handleQrSuccess(decodedText) {
         type: 'UNLOCK_RECOVERY',
         recoverySecret: recoverySecret,
         config: config,
+        requestId: activeUnlockRequestId,
     });
 }
 
@@ -478,7 +765,19 @@ function handleQrError(error) {
  * Handle messages from crypto worker
  */
 function handleWorkerMessage(event) {
-    const { type, ...data } = event.data;
+    const payload = event?.data && typeof event.data === 'object' ? event.data : null;
+    if (!payload || typeof payload.type !== 'string' || payload.type.length === 0) {
+        console.warn('Ignoring malformed worker message payload');
+        void handleWorkerError(new Error('Malformed worker response'));
+        return;
+    }
+
+    const { type, ...data } = payload;
+
+    if (!isCurrentWorkerMessage(type, data.requestId)) {
+        console.debug('Ignoring stale worker message:', type, data.requestId);
+        return;
+    }
 
     switch (type) {
         case 'UNLOCK_SUCCESS':
@@ -505,18 +804,44 @@ function handleWorkerMessage(event) {
             handleDatabaseReady(data);
             break;
 
+        case 'WORKER_ERROR':
+            void handleWorkerError(new Error(data.error || 'Worker error'));
+            break;
+
         default:
             console.warn('Unknown worker message type:', type);
+            void handleWorkerError(new Error(`Unknown worker message type: ${type}`));
     }
 }
 
 /**
  * Handle worker errors
  */
-function handleWorkerError(error) {
+async function handleWorkerError(error) {
     console.error('Worker error:', error);
+    const hadActiveSession =
+        decryptInFlight
+        || unlockInFlight
+        || !!window.cassSession?.dek;
+    invalidateAppInitAttempt();
+    unlockInFlight = false;
+    decryptInFlight = false;
+    await closeQrScanner();
+    activeUnlockRequestId = null;
+    activeDecryptRequestId = null;
+    clearActiveSessionExpiry();
+    clearWorkerKeys();
+    clearStoredSession();
+    window.cassSession = null;
+    await closeLiveDatabase();
     hideProgress();
     enableForm();
+    if (hadActiveSession) {
+        broadcastAuthLock('lock');
+        elements.appScreen.classList.add('hidden');
+        elements.authScreen.classList.remove('hidden');
+        elements.passwordInput.value = '';
+    }
     showError('An error occurred during decryption. Please try again.');
 }
 
@@ -524,6 +849,8 @@ function handleWorkerError(error) {
  * Handle successful unlock
  */
 function handleUnlockSuccess(data) {
+    unlockInFlight = false;
+    activeUnlockRequestId = null;
     hideProgress();
 
     // Store session key in memory
@@ -532,13 +859,8 @@ function handleUnlockSuccess(data) {
         config: config,
     };
 
-    // Optionally store in sessionStorage for page refresh persistence
-    // (Less secure, but better UX)
-    try {
-        sessionStorage.setItem('cass_unlocked', 'true');
-    } catch (e) {
-        // SessionStorage may be disabled
-    }
+    // Persist session based on selected storage mode
+    persistSession(data.dek);
 
     // Transition to app
     transitionToApp();
@@ -548,6 +870,8 @@ function handleUnlockSuccess(data) {
  * Handle failed unlock
  */
 function handleUnlockFailed(data) {
+    unlockInFlight = false;
+    activeUnlockRequestId = null;
     hideProgress();
     enableForm();
 
@@ -562,60 +886,340 @@ function handleUnlockFailed(data) {
 /**
  * Handle successful decryption
  */
-function handleDecryptSuccess(data) {
+async function handleDecryptSuccess(data) {
+    const initToken = activeAppInitToken;
     updateProgress('Database decrypted', 100);
-    // Database will be loaded next
+
+    if (!data?.dbBytes) {
+        await recoverFromAppInitFailure(
+            'Decryption did not return a database payload',
+            new Error('Missing database payload'),
+            initToken
+        );
+        return;
+    }
+
+    try {
+        const dbModule = await import('./database.js');
+        let dbBytes;
+        if (data.dbBytes instanceof ArrayBuffer) {
+            dbBytes = new Uint8Array(data.dbBytes);
+        } else if (ArrayBuffer.isView(data.dbBytes)) {
+            dbBytes = new Uint8Array(
+                data.dbBytes.buffer,
+                data.dbBytes.byteOffset,
+                data.dbBytes.byteLength
+            );
+        } else {
+            throw new Error('Invalid database payload');
+        }
+        await dbModule.initDatabase(dbBytes);
+        if (!isCurrentAppInitToken(initToken)) {
+            await closeLiveDatabase();
+            return;
+        }
+        const stats = dbModule.getStatistics();
+        if (!isCurrentAppInitToken(initToken)) {
+            await closeLiveDatabase();
+            return;
+        }
+        window.dispatchEvent(new CustomEvent('cass:db-ready', {
+            detail: {
+                conversationCount: stats.conversations || 0,
+                messageCount: stats.messages || 0,
+            },
+        }));
+        if (!isCurrentAppInitToken(initToken)) {
+            await closeLiveDatabase();
+            return;
+        }
+        decryptInFlight = false;
+        activeDecryptRequestId = null;
+    } catch (error) {
+        if (!isCurrentAppInitToken(initToken)) {
+            await closeLiveDatabase();
+            return;
+        }
+        await recoverFromAppInitFailure('Failed to initialize database', error, initToken);
+    }
 }
 
 /**
  * Handle failed decryption
  */
 function handleDecryptFailed(data) {
+    invalidateAppInitAttempt();
+    decryptInFlight = false;
+    activeDecryptRequestId = null;
+    void closeQrScanner();
     hideProgress();
     showError(`Decryption failed: ${data.error}`);
+    enableForm();
+    elements.appScreen.classList.add('hidden');
+    elements.authScreen.classList.remove('hidden');
+    clearActiveSessionExpiry();
+    clearWorkerKeys();
+    clearStoredSession();
+    window.cassSession = null;
+    void closeLiveDatabase();
+    broadcastAuthLock('lock');
+    elements.passwordInput.value = '';
 }
 
 /**
  * Handle database ready
  */
 function handleDatabaseReady(data) {
+    decryptInFlight = false;
+    activeDecryptRequestId = null;
     hideProgress();
     // The viewer.js module will handle database queries
     window.dispatchEvent(new CustomEvent('cass:db-ready', { detail: data }));
+}
+
+async function recoverFromAppInitFailure(message, error, initToken = activeAppInitToken) {
+    if (!isCurrentAppInitToken(initToken)) {
+        return;
+    }
+    invalidateAppInitAttempt();
+    console.error(message, error);
+    unlockInFlight = false;
+    decryptInFlight = false;
+    await closeQrScanner();
+    activeUnlockRequestId = null;
+    activeDecryptRequestId = null;
+    clearActiveSessionExpiry();
+    clearWorkerKeys();
+    clearStoredSession();
+    window.cassSession = null;
+    await closeLiveDatabase();
+    broadcastAuthLock('lock');
+    hideProgress();
+    enableForm();
+    elements.appScreen.classList.add('hidden');
+    elements.authScreen.classList.remove('hidden');
+    if (elements.passwordInput) {
+        elements.passwordInput.value = '';
+    }
+    showError(message);
 }
 
 /**
  * Transition from auth screen to app screen
  */
 function transitionToApp() {
+    if (decryptInFlight) {
+        return;
+    }
+
+    const appInitToken = beginAppInitAttempt();
+    decryptInFlight = true;
+    activeDecryptRequestId = allocateWorkerRequestId();
     elements.authScreen.classList.add('hidden');
     elements.appScreen.classList.remove('hidden');
 
     // Start decryption and database loading
-    worker.postMessage({
-        type: 'DECRYPT_DATABASE',
-        dek: window.cassSession.dek,
-        config: config,
-    });
+    try {
+        worker.postMessage({
+            type: 'DECRYPT_DATABASE',
+            dek: window.cassSession.dek,
+            config: config,
+            opfsEnabled: isOpfsEnabled(),
+            requestId: activeDecryptRequestId,
+        });
+    } catch (error) {
+        void recoverFromAppInitFailure('Failed to start archive decryption', error, appInitToken);
+        return;
+    }
 
     // Load viewer module
-    loadViewerModule();
+    void loadViewerModule(appInitToken).catch((error) => {
+        void recoverFromAppInitFailure('Failed to load archive viewer', error, appInitToken);
+    });
+}
+
+async function transitionToAppUnencrypted() {
+    if (decryptInFlight) {
+        return;
+    }
+
+    const appInitToken = beginAppInitAttempt();
+    decryptInFlight = true;
+    hideError();
+    disableForm();
+
+    elements.authScreen.classList.add('hidden');
+    elements.appScreen.classList.remove('hidden');
+
+    try {
+        await loadViewerModule(appInitToken);
+    } catch (error) {
+        await recoverFromAppInitFailure('Failed to load archive viewer', error, appInitToken);
+        return;
+    }
+
+    try {
+        const didLoad = await loadUnencryptedDatabase(appInitToken);
+        if (!didLoad || !isCurrentAppInitToken(appInitToken)) {
+            return;
+        }
+        decryptInFlight = false;
+    } catch (error) {
+        await recoverFromAppInitFailure('Failed to load unencrypted database', error, appInitToken);
+    }
+}
+
+async function loadUnencryptedDatabase(initToken = activeAppInitToken) {
+    const payloadPath = getUnencryptedPayloadPath();
+    const response = await fetch(payloadPath);
+    if (!response.ok) {
+        throw new Error(`Failed to load database: ${response.status}`);
+    }
+
+    const dbBytes = new Uint8Array(await response.arrayBuffer());
+    if (!isCurrentAppInitToken(initToken)) {
+        return false;
+    }
+    const dbModule = await import('./database.js');
+    await dbModule.initDatabase(dbBytes);
+    if (!isCurrentAppInitToken(initToken)) {
+        await closeLiveDatabase();
+        return false;
+    }
+
+    const stats = dbModule.getStatistics();
+    window.dispatchEvent(new CustomEvent('cass:db-ready', {
+        detail: {
+            conversationCount: stats.conversations || 0,
+            messageCount: stats.messages || 0,
+        },
+    }));
+    return true;
+}
+
+function getUnencryptedPayloadPath() {
+    const rawPath = config?.payload?.path;
+    if (typeof rawPath === 'string' && rawPath.trim().length > 0) {
+        return normalizeUnencryptedPayloadPath(rawPath);
+    }
+    return './payload/data.db';
+}
+
+function normalizeUnencryptedPayloadPath(rawPath) {
+    const trimmed = rawPath.trim();
+    if (!trimmed) {
+        throw new Error('Unencrypted payload path cannot be empty');
+    }
+    if (trimmed.startsWith('/') || trimmed.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(trimmed)) {
+        throw new Error('Unencrypted payload path must be relative');
+    }
+    if (trimmed.includes('?') || trimmed.includes('#') || trimmed.includes('\\')) {
+        throw new Error('Unencrypted payload path contains invalid characters');
+    }
+
+    let normalized = trimmed;
+    while (normalized.startsWith('./')) {
+        normalized = normalized.slice(2);
+    }
+
+    const segments = normalized.split('/');
+    if (segments.length < 2) {
+        throw new Error('Unencrypted payload path must reference a file under payload/');
+    }
+
+    const safeSegments = [];
+    for (const segment of segments) {
+        if (!segment || segment === '.' || segment === '..') {
+            throw new Error('Unencrypted payload path contains traversal segments');
+        }
+
+        let decodedSegment;
+        try {
+            decodedSegment = decodeURIComponent(segment);
+        } catch (error) {
+            throw new Error('Unencrypted payload path contains invalid escapes');
+        }
+
+        if (
+            decodedSegment === '.'
+            || decodedSegment === '..'
+            || decodedSegment.includes('/')
+            || decodedSegment.includes('\\')
+            || decodedSegment.includes('\0')
+        ) {
+            throw new Error('Unencrypted payload path contains invalid encoded segments');
+        }
+
+        safeSegments.push(segment);
+    }
+
+    if (safeSegments[0] !== 'payload') {
+        throw new Error('Unencrypted payload path must reside under payload/');
+    }
+
+    return `./${safeSegments.join('/')}`;
+}
+
+/**
+ * Handle lock button click from the app header.
+ */
+function handleLockButtonClick(event) {
+    if (event) {
+        event.preventDefault();
+    }
+    void lockArchive({ broadcast: true, action: 'lock' });
+}
+
+/**
+ * Handle lock requests emitted by other modules.
+ */
+function handleExternalLockEvent(event) {
+    if (event?.detail?.source === 'auth') {
+        return;
+    }
+    void lockArchive({
+        broadcast: false,
+        action: event?.detail?.action || 'lock',
+    });
+}
+
+/**
+ * Best-effort close of the decrypted browser database before re-locking.
+ */
+async function closeLiveDatabase() {
+    try {
+        const dbModule = await import('./database.js');
+        dbModule.closeDatabase();
+    } catch (error) {
+        console.warn('Failed to close live database during lock:', error);
+    }
 }
 
 /**
  * Lock the archive (return to auth screen)
  */
-function lockArchive() {
+async function lockArchive(options = {}) {
+    const { broadcast = false, action = 'lock' } = options;
+    invalidateAppInitAttempt();
+    unlockInFlight = false;
+    decryptInFlight = false;
+    await closeQrScanner();
+    activeUnlockRequestId = null;
+    activeDecryptRequestId = null;
+    clearActiveSessionExpiry();
+
     // Clear session
     window.cassSession = null;
-    try {
-        sessionStorage.removeItem('cass_unlocked');
-    } catch (e) {
-        // Ignore
-    }
+    clearStoredSession();
 
     // Tell worker to clear keys
-    worker?.postMessage({ type: 'CLEAR_KEYS' });
+    clearWorkerKeys();
+
+    if (broadcast) {
+        broadcastAuthLock(action);
+    }
+
+    await closeLiveDatabase();
 
     // Return to auth screen
     elements.appScreen.classList.add('hidden');
@@ -628,31 +1232,201 @@ function lockArchive() {
     hideProgress();
 }
 
+async function loadQrScannerLibrary() {
+    if (window.Html5Qrcode) {
+        return;
+    }
+    if (qrLibraryLoadPromise) {
+        await qrLibraryLoadPromise;
+        return;
+    }
+
+    qrLibraryLoadPromise = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = './vendor/html5-qrcode.min.js';
+        script.onload = () => {
+            qrLibraryLoadPromise = null;
+            resolve();
+        };
+        script.onerror = (error) => {
+            qrLibraryLoadPromise = null;
+            script.remove();
+            reject(error);
+        };
+        document.head.appendChild(script);
+    });
+
+    await qrLibraryLoadPromise;
+}
+
+async function waitForQrScannerTeardown() {
+    if (qrScannerTeardownPromise) {
+        await qrScannerTeardownPromise;
+    }
+}
+
+async function finalizeQrScannerClose(scanner) {
+    if (scanner) {
+        try {
+            await scanner.stop();
+        } catch (error) {
+            // Ignore stop errors
+        }
+        try {
+            await scanner.clear();
+        } catch (error) {
+            // Ignore clear errors
+        }
+    }
+    if (qrScanner === scanner) {
+        qrScanner = null;
+    }
+    elements.qrReader?.replaceChildren();
+}
+
 /**
  * Check for existing session on page load
  */
 function checkExistingSession() {
+    if (tofuStatus?.valid === false) {
+        clearStoredSession();
+        return;
+    }
+
+    const restored = restoreSession();
+    if (restored) {
+        transitionToApp();
+    }
+}
+
+function getPreferredSessionMode() {
+    const currentMode = getStorageMode();
+    if (
+        currentMode === StorageMode.MEMORY
+        || currentMode === StorageMode.SESSION
+        || currentMode === StorageMode.LOCAL
+    ) {
+        return currentMode;
+    }
+
+    const savedMode = getStoredMode();
+    if (
+        savedMode === StorageMode.MEMORY
+        || savedMode === StorageMode.SESSION
+        || savedMode === StorageMode.LOCAL
+    ) {
+        return savedMode;
+    }
+    return StorageMode.MEMORY;
+}
+
+function getSessionStorage(mode) {
     try {
-        const unlocked = sessionStorage.getItem('cass_unlocked');
-        if (unlocked === 'true' && window.cassSession?.dek) {
-            transitionToApp();
+        if (mode === StorageMode.SESSION) {
+            return sessionStorage;
+        }
+        if (mode === StorageMode.LOCAL) {
+            return localStorage;
         }
     } catch (e) {
-        // SessionStorage may be disabled
+        // Ignore
+    }
+    return null;
+}
+
+function persistSession(dekBase64, expiryTs = activeSessionExpiryTs) {
+    const expiry = Number.isFinite(Number(expiryTs)) && Number(expiryTs) > Date.now()
+        ? Math.trunc(Number(expiryTs))
+        : Date.now() + SESSION_CONFIG.DEFAULT_DURATION_MS;
+    scheduleActiveSessionExpiry(expiry);
+
+    const mode = getPreferredSessionMode();
+    // Remove stale copies from previously selected backends before persisting.
+    clearStoredSession();
+
+    const storage = getSessionStorage(mode);
+    if (!storage) {
+        return;
+    }
+
+    const sessionKeys = getSessionKeys();
+    try {
+        storage.setItem(sessionKeys.DEK, dekBase64);
+        storage.setItem(sessionKeys.EXPIRY, expiry.toString());
+        storage.setItem(sessionKeys.UNLOCKED, 'true');
+    } catch (e) {
+        // Ignore write failures
+    }
+}
+
+function restoreSession() {
+    const mode = getPreferredSessionMode();
+    const storage = getSessionStorage(mode);
+    if (!storage || !config) {
+        clearStoredSession();
+        return false;
+    }
+
+    try {
+        const sessionKeys = getSessionKeys();
+        const unlocked = storage.getItem(sessionKeys.UNLOCKED);
+        const dekStored = storage.getItem(sessionKeys.DEK);
+        const expiry = parseInt(storage.getItem(sessionKeys.EXPIRY) || '0', 10);
+
+        if (unlocked !== 'true' || !dekStored) {
+            clearStoredSession();
+            return false;
+        }
+
+        if (Date.now() > expiry) {
+            clearStoredSession();
+            return false;
+        }
+
+        window.cassSession = {
+            dek: dekStored,
+            config: config,
+        };
+        scheduleActiveSessionExpiry(expiry);
+        return true;
+    } catch (e) {
+        clearStoredSession();
+        return false;
+    }
+}
+
+function clearStoredSession() {
+    const sessionKeys = getSessionKeys();
+    for (const storage of [getSessionStorage(StorageMode.SESSION), getSessionStorage(StorageMode.LOCAL)]) {
+        if (!storage) {
+            continue;
+        }
+        try {
+            for (const key of [
+                sessionKeys.DEK,
+                sessionKeys.EXPIRY,
+                sessionKeys.UNLOCKED,
+                LEGACY_SESSION_KEYS.DEK,
+                LEGACY_SESSION_KEYS.EXPIRY,
+                LEGACY_SESSION_KEYS.UNLOCKED,
+            ]) {
+                storage.removeItem(key);
+            }
+        } catch (e) {
+            // Ignore
+        }
     }
 }
 
 /**
  * Dynamically load the viewer module
  */
-async function loadViewerModule() {
-    try {
-        const module = await import('./viewer.js');
-        module.init?.();
-    } catch (error) {
-        console.error('Failed to load viewer module:', error);
-        // Viewer may not exist yet - that's OK for now
+async function loadViewerModule(initToken = activeAppInitToken) {
+    const module = await import('./viewer.js');
+    if (!isCurrentAppInitToken(initToken)) {
+        return;
     }
+    module.init?.();
 }
 
 /**
@@ -727,9 +1501,57 @@ function base64ToBytes(base64) {
     return bytes;
 }
 
+function bootstrapCrossOriginIsolation() {
+    const coiStatus = document.getElementById('coi-status');
+    const authScreen = document.getElementById('auth-screen');
+    const appScreen = document.getElementById('app-screen');
+
+    const revealAuthScreenIfLocked = () => {
+        if (!authScreen) {
+            return;
+        }
+        if (appScreen && !appScreen.classList.contains('hidden')) {
+            return;
+        }
+        authScreen.classList.remove('hidden');
+    };
+
+    authScreen?.classList.add('hidden');
+
+    registerServiceWorker().catch((error) => {
+        console.warn('Service worker registration failed:', error);
+    });
+
+    initCOIDetection({
+        statusContainer: coiStatus,
+        authContainer: authScreen,
+        onReady: revealAuthScreenIfLocked,
+        maxWaitMs: 3000,
+    }).then((state) => {
+        console.log('[App] COI initialization complete, state:', state);
+    }).catch((error) => {
+        console.error('[App] COI initialization failed:', error);
+        coiStatus?.classList.add('hidden');
+        revealAuthScreenIfLocked();
+    });
+
+    onServiceWorkerActivated(async () => {
+        const state = await getCOIState();
+        if (state === COI_STATE.READY && authScreen?.classList.contains('hidden')) {
+            coiStatus?.classList.add('hidden');
+            revealAuthScreenIfLocked();
+        }
+    });
+}
+
+function startApp() {
+    bootstrapCrossOriginIsolation();
+    void init();
+}
+
 // Initialize when DOM is ready
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
+    document.addEventListener('DOMContentLoaded', startApp);
 } else {
-    init();
+    startApp();
 }

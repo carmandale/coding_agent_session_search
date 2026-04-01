@@ -18,6 +18,12 @@ pub struct RedactionConfig {
     pub custom_patterns: Vec<CustomPattern>,
     /// Preserve structure but anonymize project directory names.
     pub anonymize_project_names: bool,
+    /// Redact hostnames (e.g., internal server names).
+    pub redact_hostnames: bool,
+    /// Redact email addresses.
+    pub redact_emails: bool,
+    /// Block export if critical secrets are detected (private keys, cloud credentials).
+    pub block_on_critical_secrets: bool,
 }
 
 impl Default for RedactionConfig {
@@ -29,6 +35,9 @@ impl Default for RedactionConfig {
             path_replacements: Vec::new(),
             custom_patterns: Vec::new(),
             anonymize_project_names: false,
+            redact_hostnames: false,
+            redact_emails: true,
+            block_on_critical_secrets: true,
         }
     }
 }
@@ -45,6 +54,8 @@ pub struct CustomPattern {
 pub enum RedactionKind {
     HomePath,
     Username,
+    Email,
+    Hostname,
     PathReplacement,
     CustomPattern,
     ProjectName,
@@ -55,6 +66,8 @@ impl RedactionKind {
         match self {
             RedactionKind::HomePath => "home_path",
             RedactionKind::Username => "username",
+            RedactionKind::Email => "email",
+            RedactionKind::Hostname => "hostname",
             RedactionKind::PathReplacement => "path_replace",
             RedactionKind::CustomPattern => "custom_pattern",
             RedactionKind::ProjectName => "project_name",
@@ -140,9 +153,9 @@ impl RedactionEngine {
 
         if self.config.redact_home_paths
             && let Some(home_str) = &self.home_str
-            && output.contains(home_str)
+            && let Some(redacted) = replace_home_path_prefixes(&output, home_str)
         {
-            output = output.replace(home_str, "~");
+            output = redacted;
             changes.push(RedactionChange {
                 kind: RedactionKind::HomePath,
                 original: home_str.clone(),
@@ -175,6 +188,37 @@ impl RedactionEngine {
                     redacted: to.clone(),
                 });
             }
+        }
+
+        if self.config.redact_emails && EMAIL_RE.is_match(&output) {
+            output = EMAIL_RE
+                .replace_all(&output, "[EMAIL_REDACTED]")
+                .to_string();
+            changes.push(RedactionChange {
+                kind: RedactionKind::Email,
+                original: "email".to_string(),
+                redacted: "[EMAIL_REDACTED]".to_string(),
+            });
+        }
+
+        if self.config.redact_hostnames && URL_HOST_RE.is_match(&output) {
+            output = URL_HOST_RE
+                .replace_all(&output, |caps: &regex::Captures| {
+                    let scheme = caps.name("scheme").map_or("", |m| m.as_str());
+                    let userinfo = caps.name("userinfo").map_or("", |m| m.as_str());
+                    let port = caps.name("port").map_or("", |m| m.as_str());
+                    if userinfo.is_empty() {
+                        format!("{scheme}://[HOST_REDACTED]{port}")
+                    } else {
+                        format!("{scheme}://{userinfo}@[HOST_REDACTED]{port}")
+                    }
+                })
+                .to_string();
+            changes.push(RedactionChange {
+                kind: RedactionKind::Hostname,
+                original: "url_hostname".to_string(),
+                redacted: "[HOST_REDACTED]".to_string(),
+            });
         }
 
         for pattern in &self.config.custom_patterns {
@@ -224,6 +268,18 @@ impl RedactionEngine {
     }
 }
 
+static EMAIL_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+        .expect("email redaction regex must compile")
+});
+
+static URL_HOST_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    Regex::new(
+        r"(?i)\b(?P<scheme>https?|ssh|wss?)://(?:(?P<userinfo>[A-Z0-9._%+-]+)@)?(?P<host>[A-Z0-9][A-Z0-9.-]*\.[A-Z]{2,})(?P<port>:\d+)?",
+    )
+    .expect("URL hostname redaction regex must compile")
+});
+
 impl RedactionReport {
     pub fn new(max_samples: usize) -> Self {
         Self {
@@ -266,16 +322,11 @@ impl RedactionReport {
 }
 
 fn truncate_for_report(input: &str, max: usize) -> String {
-    if input.chars().count() <= max {
-        return input.to_string();
-    }
-    let mut out = String::new();
-    for (idx, ch) in input.chars().enumerate() {
-        if idx + 1 >= max {
-            out.push('…');
-            break;
-        }
-        out.push(ch);
+    let mut chars = input.chars();
+    let mut out: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() && !out.is_empty() {
+        out.pop(); // remove the last character to make room for the ellipsis
+        out.push('…');
     }
     out
 }
@@ -333,6 +384,36 @@ where
     Some(format!("{}{}", &path[..idx + sep.len_utf8()], replacement))
 }
 
+fn replace_home_path_prefixes(input: &str, home_str: &str) -> Option<String> {
+    if home_str.is_empty() {
+        return None;
+    }
+
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    let mut changed = false;
+
+    for (idx, matched) in input.match_indices(home_str) {
+        let after_idx = idx + matched.len();
+        let next_char = input[after_idx..].chars().next();
+        if !matches!(next_char, None | Some('/' | '\\')) {
+            continue;
+        }
+
+        changed = true;
+        output.push_str(&input[cursor..idx]);
+        output.push('~');
+        cursor = after_idx;
+    }
+
+    if !changed {
+        return None;
+    }
+
+    output.push_str(&input[cursor..]);
+    Some(output)
+}
+
 fn find_last_separator(path: &str) -> Option<(char, usize)> {
     let slash_idx = path.rfind('/');
     let backslash_idx = path.rfind('\\');
@@ -382,6 +463,15 @@ mod tests {
     }
 
     #[test]
+    fn test_home_path_redaction_respects_segment_boundaries() {
+        let engine = engine_with_context("/home/alice");
+        let input = "/home/alice2/projects/cass/src/main.rs";
+        let result = engine.redact_text(input);
+        assert_eq!(result.output, input);
+        assert!(result.changes.is_empty());
+    }
+
+    #[test]
     fn test_username_redaction_in_paths() {
         let mut engine = engine_with_context("/home/alice");
         engine.config.redact_home_paths = false;
@@ -415,6 +505,63 @@ mod tests {
         let result2 = engine.redact_workspace("/home/alice/project-alpha");
         assert!(result1.output.contains("project-1"));
         assert!(result2.output.contains("project-1"));
+    }
+
+    #[test]
+    fn test_email_redaction_enabled() {
+        let engine = engine_with_context("/home/alice");
+        let result = engine.redact_text("Contact me at alice@example.com for details");
+        assert!(!result.output.contains("alice@example.com"));
+        assert!(result.output.contains("[EMAIL_REDACTED]"));
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|change| change.kind == RedactionKind::Email)
+        );
+    }
+
+    #[test]
+    fn test_email_redaction_disabled() {
+        let config = RedactionConfig {
+            redact_emails: false,
+            ..Default::default()
+        };
+        let engine = RedactionEngine::new(config);
+        let result = engine.redact_text("Email bob@example.com");
+        assert!(result.output.contains("bob@example.com"));
+    }
+
+    #[test]
+    fn test_hostname_redaction_in_urls() {
+        let config = RedactionConfig {
+            redact_hostnames: true,
+            redact_emails: false,
+            ..Default::default()
+        };
+        let engine = RedactionEngine::new(config);
+        let result = engine.redact_text("Fetch https://internal.example.corp:8443/api now");
+        assert!(result.output.contains("https://[HOST_REDACTED]:8443/api"));
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|change| change.kind == RedactionKind::Hostname)
+        );
+    }
+
+    #[test]
+    fn test_hostname_redaction_preserves_non_url_paths() {
+        let config = RedactionConfig {
+            redact_hostnames: true,
+            redact_home_paths: false,
+            redact_usernames: false,
+            ..Default::default()
+        };
+        let engine = RedactionEngine::new(config);
+        let input = "/home/alice/project/main.rs";
+        let result = engine.redact_text(input);
+        assert_eq!(result.output, input);
     }
 
     #[test]

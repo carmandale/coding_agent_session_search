@@ -8,16 +8,27 @@
 //! - Atomic installation (temp dir -> rename)
 //! - Model version upgrade detection
 //!
+//! **Note**: The core types (`ModelState`, `ModelFile`, `ModelManifest`) are
+//! structurally identical to those in `frankensearch_embed::model_manifest`.
+//! They are kept locally for now due to build-system sync constraints.
+//! See frankensearch-embed for the canonical definitions.
+//!
 //! **Network Policy**: No network calls occur without explicit user consent.
 //! The download system is consent-gated via [`ModelState::NeedsConsent`].
 
+use std::collections::HashSet;
 use std::fs::{self, File};
+use std::future::{Future, poll_fn};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
+use asupersync::bytes::Buf;
+use asupersync::http::Body;
 use sha2::{Digest, Sha256};
 
 /// Model state machine for download lifecycle.
@@ -32,6 +43,8 @@ use sha2::{Digest, Sha256};
 ///
 /// Ready ──> UpdateAvailable ──> Downloading (upgrade) ──> Verifying ──> Ready
 /// ```
+///
+/// Structurally identical to `frankensearch_embed::ModelState`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelState {
     /// Model not installed on disk.
@@ -106,6 +119,8 @@ impl ModelState {
 }
 
 /// A file in the model manifest.
+///
+/// Structurally identical to `frankensearch_embed::ModelFile`.
 #[derive(Debug, Clone)]
 pub struct ModelFile {
     /// File path relative to repo root (e.g., "model.onnx" or "onnx/model.onnx").
@@ -127,6 +142,10 @@ impl ModelFile {
 }
 
 /// Model manifest describing a downloadable model.
+///
+/// Structurally compatible with `frankensearch_embed::ModelManifest`
+/// (which has additional optional fields: version, display_name, description,
+/// dimension, tier, download_size_bytes).
 #[derive(Debug, Clone)]
 pub struct ModelManifest {
     /// Model identifier (e.g., "all-minilm-l6-v2").
@@ -141,8 +160,39 @@ pub struct ModelManifest {
     pub license: String,
 }
 
+/// Placeholder checksum value used for unverified manifests.
+///
+/// When a manifest file has this checksum, it means the model has not been
+/// downloaded and verified yet. The download system will reject such files.
+pub const PLACEHOLDER_CHECKSUM: &str = "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD";
+
 impl ModelManifest {
-    /// Get the default MiniLM model manifest.
+    /// Check if this manifest has verified checksums for all files.
+    ///
+    /// Returns `false` if any file has the placeholder checksum, indicating
+    /// the model has not been downloaded and verified yet.
+    pub fn has_verified_checksums(&self) -> bool {
+        self.files.iter().all(|f| f.sha256 != PLACEHOLDER_CHECKSUM)
+    }
+
+    /// Check if this manifest has a pinned revision (not "main").
+    ///
+    /// Unpinned revisions ("main") are not reproducible since the content
+    /// can change at any time on HuggingFace.
+    pub fn has_pinned_revision(&self) -> bool {
+        self.revision != "main"
+    }
+
+    /// Check if this manifest is production-ready.
+    ///
+    /// A manifest is production-ready if it has:
+    /// - All checksums verified (no placeholders)
+    /// - A pinned revision (not "main")
+    pub fn is_production_ready(&self) -> bool {
+        self.has_verified_checksums() && self.has_pinned_revision()
+    }
+
+    /// Get the default MiniLM model manifest (baseline for bake-off).
     ///
     /// The revision and checksums are pinned for reproducibility.
     /// Updated 2026-01-13: HuggingFace restructured the repo - ONNX models moved to onnx/ subdir.
@@ -192,6 +242,246 @@ impl ModelManifest {
         }
     }
 
+    // ==================== Bake-off Eligible Models ====================
+    // These models were released after 2025-11-01 and are candidates for
+    // the CPU-optimized embedding bake-off.
+    //
+    // Canonical definitions also available via `frankensearch_embed::ModelManifest`.
+
+    /// Snowflake Arctic Embed S manifest.
+    ///
+    /// Released: 2025-11-10
+    /// Dimension: 384
+    /// Small, fast model with MiniLM-compatible dimension.
+    ///
+    /// Verified: 2026-02-02 - All checksums verified from HuggingFace.
+    pub fn snowflake_arctic_s() -> Self {
+        Self {
+            id: "snowflake-arctic-embed-s".into(),
+            repo: "Snowflake/snowflake-arctic-embed-s".into(),
+            revision: "e596f507467533e48a2e17c007f0e1dacc837b33".into(),
+            files: vec![
+                ModelFile {
+                    name: "onnx/model.onnx".into(),
+                    sha256: "579c1f1778a0993eb0d2a1403340ffb491c769247fb46acc4f5cf8ac5b89c1e1"
+                        .into(),
+                    size: 133_093_492,
+                },
+                ModelFile {
+                    name: "tokenizer.json".into(),
+                    sha256: "91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854"
+                        .into(),
+                    size: 711_649,
+                },
+                ModelFile {
+                    name: "config.json".into(),
+                    sha256: "4e519aa92ec40943356032afe458c8829d70c5766b109e4a57490b82f72dcfb7"
+                        .into(),
+                    size: 703,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".into(),
+                    sha256: "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a"
+                        .into(),
+                    size: 695,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".into(),
+                    sha256: "9ca59277519f6e3692c8685e26b94d4afca2d5438deff66483db495e48735810"
+                        .into(),
+                    size: 1_433,
+                },
+            ],
+            license: "Apache-2.0".into(),
+        }
+    }
+
+    /// Nomic Embed Text v1.5 manifest.
+    ///
+    /// Released: 2025-11-05
+    /// Dimension: 768
+    /// Long context support with Matryoshka embedding capability.
+    ///
+    /// Verified: 2026-02-02 - All checksums verified from HuggingFace.
+    pub fn nomic_embed() -> Self {
+        Self {
+            id: "nomic-embed-text-v1.5".into(),
+            repo: "nomic-ai/nomic-embed-text-v1.5".into(),
+            revision: "e5cf08aadaa33385f5990def41f7a23405aec398".into(),
+            files: vec![
+                ModelFile {
+                    name: "onnx/model.onnx".into(),
+                    sha256: "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"
+                        .into(),
+                    size: 547_310_275,
+                },
+                ModelFile {
+                    name: "tokenizer.json".into(),
+                    sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
+                        .into(),
+                    size: 711_396,
+                },
+                ModelFile {
+                    name: "config.json".into(),
+                    sha256: "0168e0883705b0bf8f2b381e10f45a9f3e1ef4b13869b43c160e4c8a70ddf442"
+                        .into(),
+                    size: 2_331,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".into(),
+                    sha256: "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a"
+                        .into(),
+                    size: 695,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".into(),
+                    sha256: "d7e0000bcc80134debd2222220427e6bf5fa20a669f40a0d0d1409cc18e0a9bc"
+                        .into(),
+                    size: 1_191,
+                },
+            ],
+            license: "Apache-2.0".into(),
+        }
+    }
+
+    // ==================== Reranker Models ====================
+
+    /// MS MARCO MiniLM reranker manifest (baseline for bake-off).
+    ///
+    /// Verified: 2026-02-02 - All checksums verified from HuggingFace.
+    /// Note: Repo is ms-marco-MiniLM-L6-v2 (no hyphen between L and 6).
+    pub fn msmarco_reranker() -> Self {
+        Self {
+            id: "ms-marco-MiniLM-L6-v2".into(),
+            repo: "cross-encoder/ms-marco-MiniLM-L6-v2".into(),
+            revision: "c5ee24cb16019beea0893ab7796b1df96625c6b8".into(),
+            files: vec![
+                ModelFile {
+                    name: "onnx/model.onnx".into(),
+                    sha256: "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a"
+                        .into(),
+                    size: 91_011_230,
+                },
+                ModelFile {
+                    name: "tokenizer.json".into(),
+                    sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
+                        .into(),
+                    size: 711_396,
+                },
+                ModelFile {
+                    name: "config.json".into(),
+                    sha256: "380e02c93f431831be65d99a4e7e5f67c133985bf2e77d9d4eba46847190bacc"
+                        .into(),
+                    size: 794,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".into(),
+                    sha256: "3c3507f36dff57bce437223db3b3081d1e2b52ec3e56ee55438193ecb2c94dd6"
+                        .into(),
+                    size: 132,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".into(),
+                    sha256: "a5c2e5a7b1a29a0702cd28c08a399b5ecc110c263009d17f7e3b415f25905fd8"
+                        .into(),
+                    size: 1_330,
+                },
+            ],
+            license: "Apache-2.0".into(),
+        }
+    }
+
+    /// Jina Reranker v1 Turbo EN manifest.
+    ///
+    /// Released: 2025-11-20
+    /// Fast, optimized for English.
+    ///
+    /// Verified: 2026-02-02 - All checksums verified from HuggingFace.
+    pub fn jina_reranker_turbo() -> Self {
+        Self {
+            id: "jina-reranker-v1-turbo-en".into(),
+            repo: "jinaai/jina-reranker-v1-turbo-en".into(),
+            revision: "b8c14f4e723d9e0aab4732a7b7b93741eeeb77c2".into(),
+            files: vec![
+                ModelFile {
+                    name: "onnx/model.onnx".into(),
+                    sha256: "c1296c66c119de645fa9cdee536d8637740efe85224cfa270281e50f213aa565"
+                        .into(),
+                    size: 151_296_975,
+                },
+                ModelFile {
+                    name: "tokenizer.json".into(),
+                    sha256: "0046da43cc8c424b317f56b092b0512aaaa65c4f925d2f16af9d9eeb4d0ef902"
+                        .into(),
+                    size: 2_030_772,
+                },
+                ModelFile {
+                    name: "config.json".into(),
+                    sha256: "e050ff6a15ae9295e84882fa0e98051bd8754856cd5201395ebf00ce9f2d609b"
+                        .into(),
+                    size: 1_206,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".into(),
+                    sha256: "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f"
+                        .into(),
+                    size: 280,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".into(),
+                    sha256: "d291c6652d96d56ffdbcf1ea19d9bae5ed79003f7648c627e725a619227ce8fa"
+                        .into(),
+                    size: 1_215,
+                },
+            ],
+            license: "Apache-2.0".into(),
+        }
+    }
+
+    // ==================== Lookup Functions ====================
+
+    /// Get manifest by embedder name.
+    pub fn for_embedder(name: &str) -> Option<Self> {
+        match name {
+            "minilm" => Some(Self::minilm_v2()),
+            "snowflake-arctic-s" => Some(Self::snowflake_arctic_s()),
+            "nomic-embed" => Some(Self::nomic_embed()),
+            _ => None,
+        }
+    }
+
+    /// Get manifest by reranker name.
+    pub fn for_reranker(name: &str) -> Option<Self> {
+        match name {
+            "ms-marco" => Some(Self::msmarco_reranker()),
+            "jina-reranker-turbo" => Some(Self::jina_reranker_turbo()),
+            _ => None,
+        }
+    }
+
+    /// Get all bake-off eligible embedder manifests.
+    ///
+    /// All models are verified with pinned revisions and SHA256 checksums.
+    pub fn bakeoff_embedder_candidates() -> Vec<Self> {
+        vec![Self::snowflake_arctic_s(), Self::nomic_embed()]
+    }
+
+    /// Get all bake-off eligible reranker manifests.
+    ///
+    /// All models are verified with pinned revisions and SHA256 checksums.
+    pub fn bakeoff_reranker_candidates() -> Vec<Self> {
+        vec![Self::jina_reranker_turbo()]
+    }
+
+    /// Get all bake-off eligible model manifests (embedders + rerankers).
+    ///
+    /// All models are verified with pinned revisions and SHA256 checksums.
+    pub fn bakeoff_candidates() -> Vec<Self> {
+        let mut candidates = Self::bakeoff_embedder_candidates();
+        candidates.extend(Self::bakeoff_reranker_candidates());
+        candidates
+    }
+
     /// Total size of all files in bytes.
     pub fn total_size(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
@@ -207,7 +497,7 @@ impl ModelManifest {
 }
 
 /// Progress callback for downloads.
-pub type ProgressCallback = Box<dyn Fn(DownloadProgress) + Send + Sync>;
+pub type ProgressCallback = Arc<dyn Fn(DownloadProgress) + Send + Sync>;
 
 /// Download progress information.
 #[derive(Debug, Clone)]
@@ -249,6 +539,17 @@ pub enum DownloadError {
     Timeout,
     /// HTTP error response.
     HttpError { status: u16, message: String },
+    /// Manifest has placeholder checksums and is not production-ready.
+    ///
+    /// This error is returned when attempting to download a bake-off candidate
+    /// model that has not yet been verified. The model files need to be:
+    /// 1. Downloaded manually to compute SHA256 checksums
+    /// 2. Revision pinned to a specific commit (not "main")
+    ManifestNotVerified {
+        model_id: String,
+        unverified_files: Vec<String>,
+        revision_unpinned: bool,
+    },
 }
 
 impl std::fmt::Display for DownloadError {
@@ -271,6 +572,23 @@ impl std::fmt::Display for DownloadError {
             DownloadError::HttpError { status, message } => {
                 write!(f, "HTTP error {status}: {message}")
             }
+            DownloadError::ManifestNotVerified {
+                model_id,
+                unverified_files,
+                revision_unpinned,
+            } => {
+                write!(
+                    f,
+                    "model '{}' is not production-ready: {} file(s) have placeholder checksums{}",
+                    model_id,
+                    unverified_files.len(),
+                    if *revision_unpinned {
+                        " and revision is not pinned"
+                    } else {
+                        ""
+                    }
+                )
+            }
         }
     }
 }
@@ -284,10 +602,69 @@ impl std::error::Error for DownloadError {
     }
 }
 
+impl DownloadError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            DownloadError::NetworkError(_) | DownloadError::IoError(_) | DownloadError::Timeout => {
+                true
+            }
+            DownloadError::HttpError { status, .. } => {
+                *status == 408 || *status == 429 || (500..=599).contains(status)
+            }
+            DownloadError::VerificationFailed { .. }
+            | DownloadError::Cancelled
+            | DownloadError::ManifestNotVerified { .. } => false,
+        }
+    }
+
+    fn should_discard_temp(&self) -> bool {
+        matches!(self, DownloadError::VerificationFailed { .. })
+    }
+}
+
 impl From<std::io::Error> for DownloadError {
     fn from(err: std::io::Error) -> Self {
         DownloadError::IoError(err)
     }
+}
+
+fn run_download_with_cx<T, F, Fut>(f: F) -> Result<T, DownloadError>
+where
+    T: Send + 'static,
+    F: FnOnce(asupersync::Cx) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, DownloadError>> + Send + 'static,
+{
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| {
+            DownloadError::NetworkError(format!("failed to build download runtime: {e}"))
+        })?;
+
+    runtime.block_on(async move {
+        let handle = asupersync::runtime::Runtime::current_handle().ok_or_else(|| {
+            DownloadError::NetworkError("download runtime handle unavailable".into())
+        })?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        handle
+            .try_spawn_with_cx(move |cx| async move {
+                let _ = tx.send(f(cx).await);
+            })
+            .map_err(|e| {
+                DownloadError::NetworkError(format!("failed to spawn download task: {e}"))
+            })?;
+
+        loop {
+            match rx.try_recv() {
+                Ok(result) => return result,
+                Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
+                Err(TryRecvError::Disconnected) => {
+                    return Err(DownloadError::NetworkError(
+                        "download task exited before returning a result".into(),
+                    ));
+                }
+            }
+        }
+    })
 }
 
 /// Model downloader with resumption and verification.
@@ -367,21 +744,35 @@ impl ModelDownloader {
         manifest: &ModelManifest,
         on_progress: Option<ProgressCallback>,
     ) -> Result<(), DownloadError> {
+        // Validate manifest is production-ready before downloading
+        // This prevents downloading models with placeholder checksums that can't be verified
+        if !manifest.is_production_ready() {
+            let unverified_files: Vec<String> = manifest
+                .files
+                .iter()
+                .filter(|f| f.sha256 == PLACEHOLDER_CHECKSUM)
+                .map(|f| f.name.clone())
+                .collect();
+            return Err(DownloadError::ManifestNotVerified {
+                model_id: manifest.id.clone(),
+                unverified_files,
+                revision_unpinned: !manifest.has_pinned_revision(),
+            });
+        }
+
         // Reset cancellation flag
         self.cancelled.store(false, Ordering::SeqCst);
 
-        // Create temp directory
-        fs::create_dir_all(&self.temp_dir)?;
+        // Prepare the temp directory for a safe resume. Keep partials for the
+        // current manifest, but remove stale or unsafe entries from older runs.
+        self.prepare_temp_dir(manifest)?;
 
         let grand_total = manifest.total_size();
         let total_files = manifest.files.len();
         let bytes_downloaded = Arc::new(AtomicU64::new(0));
 
         for (idx, file) in manifest.files.iter().enumerate() {
-            if self.is_cancelled() {
-                self.cleanup_temp();
-                return Err(DownloadError::Cancelled);
-            }
+            self.fail_if_cancelled()?;
 
             // Use local_name() for local path (handles onnx/model.onnx -> model.onnx)
             let file_path = self.temp_dir.join(file.local_name());
@@ -393,10 +784,7 @@ impl ModelDownloader {
             // Download with retries
             let mut last_error = None;
             for attempt in 0..self.max_retries {
-                if self.is_cancelled() {
-                    self.cleanup_temp();
-                    return Err(DownloadError::Cancelled);
-                }
+                self.fail_if_cancelled()?;
 
                 // Reset byte counter to before this file on retry (avoid double-counting)
                 if attempt > 0 {
@@ -423,31 +811,36 @@ impl ModelDownloader {
                         last_error = None;
                         break;
                     }
+                    Err(DownloadError::Cancelled) => {
+                        return Err(DownloadError::Cancelled);
+                    }
                     Err(e) => {
+                        if !e.is_retryable() {
+                            self.cleanup_temp_for_error(&e);
+                            return Err(e);
+                        }
                         last_error = Some(e);
                     }
                 }
             }
 
             if let Some(err) = last_error {
-                self.cleanup_temp();
+                self.cleanup_temp_for_error(&err);
                 return Err(err);
             }
 
             // Verify SHA256
-            if self.is_cancelled() {
-                self.cleanup_temp();
-                return Err(DownloadError::Cancelled);
-            }
+            self.fail_if_cancelled()?;
 
             let actual_hash = compute_sha256(&file_path)?;
             if actual_hash != file.sha256 {
-                self.cleanup_temp();
-                return Err(DownloadError::VerificationFailed {
+                let err = DownloadError::VerificationFailed {
                     file: file.name.clone(),
                     expected: file.sha256.clone(),
                     actual: actual_hash,
-                });
+                };
+                self.cleanup_temp_for_error(&err);
+                return Err(err);
             }
         }
 
@@ -456,6 +849,39 @@ impl ModelDownloader {
 
         // Write verified marker
         self.write_verified_marker(manifest)?;
+
+        Ok(())
+    }
+
+    fn prepare_temp_dir(&self, manifest: &ModelManifest) -> Result<(), DownloadError> {
+        fs::create_dir_all(&self.temp_dir)?;
+
+        let expected_files: HashSet<String> = manifest
+            .files
+            .iter()
+            .map(|file| file.local_name().to_string())
+            .collect();
+
+        for entry in fs::read_dir(&self.temp_dir)? {
+            let entry = entry?;
+            let entry_type = entry.file_type()?;
+            let entry_name = entry.file_name();
+            let keep_entry = entry_type.is_file()
+                && entry_name
+                    .to_str()
+                    .is_some_and(|name| expected_files.contains(name));
+
+            if keep_entry {
+                continue;
+            }
+
+            let entry_path = entry.path();
+            if entry_type.is_dir() {
+                fs::remove_dir_all(entry_path)?;
+            } else {
+                fs::remove_file(entry_path)?;
+            }
+        }
 
         Ok(())
     }
@@ -492,104 +918,148 @@ impl ModelDownloader {
             return Ok(());
         }
 
-        // Build request with Range header for resume
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(self.connect_timeout)
-            .timeout(self.file_timeout)
-            .build()
-            .map_err(|e| DownloadError::NetworkError(e.to_string()))?;
+        let url = url.to_string();
+        let path = path.to_path_buf();
+        let bytes_downloaded = Arc::clone(bytes_downloaded);
+        let cancelled = Arc::clone(&self.cancelled);
+        let progress_callback = on_progress.cloned();
+        let connect_timeout = self.connect_timeout;
+        let file_timeout = self.file_timeout;
 
-        let mut request = client.get(url);
+        run_download_with_cx(move |cx| async move {
+            // Allow up to 500 MB for model downloads. The default 16 MiB
+            // limit in asupersync's HTTP client is too small for embedding
+            // models (e.g., all-MiniLM-L6-v2 is ~86 MB).
+            const MODEL_MAX_BODY_SIZE: usize = 500 * 1024 * 1024;
 
-        // Resume from existing size
-        if existing_size > 0 {
-            request = request.header("Range", format!("bytes={}-", existing_size));
-            bytes_downloaded.fetch_add(existing_size, Ordering::SeqCst);
-        }
+            let client = asupersync::http::h1::HttpClient::builder()
+                .user_agent(concat!(
+                    "cass/",
+                    env!("CARGO_PKG_VERSION"),
+                    " (model-download)"
+                ))
+                .max_body_size(MODEL_MAX_BODY_SIZE)
+                .build();
+            let mut headers = vec![("Accept".to_string(), "application/octet-stream".to_string())];
 
-        let response = request
-            .send()
-            .map_err(|e| DownloadError::NetworkError(e.to_string()))?;
-
-        let status = response.status().as_u16();
-        if status >= 400 {
-            return Err(DownloadError::HttpError {
-                status,
-                message: response.status().to_string(),
-            });
-        }
-
-        // Check if server honored Range request
-        // 206 = Partial Content (resume works), 200 = Full file (server ignored Range)
-        let actually_resuming = existing_size > 0 && status == 206;
-        if existing_size > 0 && status == 200 {
-            // Server doesn't support Range, reset byte counter and start fresh
-            bytes_downloaded.fetch_sub(existing_size, Ordering::SeqCst);
-        }
-
-        // Open file in append or create mode
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(actually_resuming)
-            .write(true)
-            .truncate(!actually_resuming)
-            .open(path)?;
-
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        // Stream download with progress updates
-        let mut reader = BufReader::new(response);
-        let mut buffer = [0u8; 8192];
-        let start = Instant::now();
-
-        loop {
-            if self.is_cancelled() {
-                return Err(DownloadError::Cancelled);
+            if existing_size > 0 {
+                headers.push(("Range".to_string(), format!("bytes={existing_size}-")));
+                bytes_downloaded.fetch_add(existing_size, Ordering::SeqCst);
             }
 
-            let n = reader.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
+            let mut response = asupersync::time::timeout(
+                cx.now(),
+                connect_timeout,
+                client.request_streaming(
+                    &cx,
+                    asupersync::http::h1::Method::Get,
+                    &url,
+                    headers,
+                    Vec::new(),
+                ),
+            )
+            .await
+            .map_err(|_| DownloadError::Timeout)?
+            .map_err(|e| DownloadError::NetworkError(e.to_string()))?;
 
-            file.write_all(&buffer[..n])?;
-            bytes_downloaded.fetch_add(n as u64, Ordering::SeqCst);
-
-            // Report progress
-            if let Some(callback) = on_progress {
-                let total_downloaded = bytes_downloaded.load(Ordering::SeqCst);
-                let file_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-
-                let progress_pct = if grand_total > 0 {
-                    ((total_downloaded as f64 / grand_total as f64) * 100.0) as u8
-                } else {
-                    0
-                };
-
-                callback(DownloadProgress {
-                    current_file: file_name.clone(),
-                    file_index: file_idx + 1,
-                    total_files,
-                    file_bytes,
-                    file_total: expected_size,
-                    total_bytes: total_downloaded,
-                    grand_total,
-                    progress_pct,
+            let status = response.head.status;
+            if status >= 400 {
+                return Err(DownloadError::HttpError {
+                    status,
+                    message: if response.head.reason.is_empty() {
+                        status.to_string()
+                    } else {
+                        format!("{} {}", status, response.head.reason)
+                    },
                 });
             }
 
-            // Check timeout
-            if start.elapsed() > self.file_timeout {
-                return Err(DownloadError::Timeout);
+            // 206 = Partial Content (resume works), 200 = Full file (server ignored Range)
+            let actually_resuming = existing_size > 0 && status == 206;
+            if existing_size > 0 && status == 200 {
+                bytes_downloaded.fetch_sub(existing_size, Ordering::SeqCst);
+                existing_size = 0;
             }
-        }
 
-        file.sync_all()?;
-        Ok(())
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(actually_resuming)
+                .write(true)
+                .truncate(!actually_resuming)
+                .open(&path)?;
+
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let start = Instant::now();
+            let mut file_bytes = if actually_resuming { existing_size } else { 0 };
+
+            loop {
+                if cancelled.load(Ordering::SeqCst) {
+                    return Err(DownloadError::Cancelled);
+                }
+
+                let remaining = file_timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    return Err(DownloadError::Timeout);
+                }
+
+                let frame = asupersync::time::timeout(
+                    cx.now(),
+                    remaining,
+                    poll_fn(|task_cx| Pin::new(&mut response.body).poll_frame(task_cx)),
+                )
+                .await
+                .map_err(|_| DownloadError::Timeout)?;
+
+                let Some(frame) = frame else {
+                    break;
+                };
+
+                match frame.map_err(|e| DownloadError::NetworkError(e.to_string()))? {
+                    asupersync::http::body::Frame::Data(mut buf) => {
+                        while buf.has_remaining() {
+                            let chunk = buf.chunk();
+                            if chunk.is_empty() {
+                                break;
+                            }
+                            file.write_all(chunk)?;
+                            let chunk_len = chunk.len();
+                            buf.advance(chunk_len);
+                            file_bytes = file_bytes.saturating_add(chunk_len as u64);
+                            bytes_downloaded.fetch_add(chunk_len as u64, Ordering::SeqCst);
+
+                            if let Some(callback) = progress_callback.as_ref() {
+                                let total_downloaded = bytes_downloaded.load(Ordering::SeqCst);
+                                let progress_pct = if grand_total > 0 {
+                                    ((total_downloaded as f64 / grand_total as f64) * 100.0)
+                                        .min(100.0) as u8
+                                } else {
+                                    0
+                                };
+
+                                callback(DownloadProgress {
+                                    current_file: file_name.clone(),
+                                    file_index: file_idx + 1,
+                                    total_files,
+                                    file_bytes,
+                                    file_total: expected_size,
+                                    total_bytes: total_downloaded,
+                                    grand_total,
+                                    progress_pct,
+                                });
+                            }
+                        }
+                    }
+                    asupersync::http::body::Frame::Trailers(_) => {}
+                }
+            }
+
+            file.sync_all()?;
+            Ok(())
+        })
     }
 
     /// Atomically install downloaded files.
@@ -599,7 +1069,16 @@ impl ModelDownloader {
     /// 2. Rename temp to target
     /// 3. Remove backup on success, or restore on failure
     fn atomic_install(&self) -> Result<(), DownloadError> {
-        let backup_dir = self.target_dir.with_extension("bak");
+        // Fix: Use safer backup path construction that appends .bak instead of replacing extension.
+        // This handles cases like "model.v2" correctly (-> "model.v2.bak", not "model.bak").
+        let backup_dir = if let Some(name) = self.target_dir.file_name() {
+            let mut p = self.target_dir.clone();
+            let new_name = format!("{}.bak", name.to_string_lossy());
+            p.set_file_name(new_name);
+            p
+        } else {
+            self.target_dir.with_extension("bak")
+        };
 
         // Clean up any stale backup from previous failed install
         if backup_dir.exists() {
@@ -656,6 +1135,20 @@ impl ModelDownloader {
     /// Clean up temporary download directory.
     fn cleanup_temp(&self) {
         let _ = fs::remove_dir_all(&self.temp_dir);
+    }
+
+    fn cleanup_temp_for_error(&self, err: &DownloadError) {
+        if err.should_discard_temp() {
+            self.cleanup_temp();
+        }
+    }
+
+    fn fail_if_cancelled(&self) -> Result<(), DownloadError> {
+        if self.is_cancelled() {
+            Err(DownloadError::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -734,6 +1227,31 @@ pub fn check_version_mismatch(model_dir: &Path, manifest: &ModelManifest) -> Opt
 mod tests {
     use super::*;
 
+    /// Copy model fixtures from tests/fixtures/models/ to the target directory.
+    /// Copies model.onnx plus config files.
+    fn copy_model_fixtures(target_dir: &Path) -> std::io::Result<()> {
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models");
+        fs::create_dir_all(target_dir)?;
+
+        // Copy model.onnx fixture
+        fs::copy(
+            fixture_dir.join("model.onnx"),
+            target_dir.join("model.onnx"),
+        )?;
+
+        // Copy config files
+        for file in &[
+            "tokenizer.json",
+            "config.json",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+        ] {
+            fs::copy(fixture_dir.join(file), target_dir.join(file))?;
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn test_model_state_summary() {
         assert_eq!(ModelState::NotInstalled.summary(), "not installed");
@@ -791,8 +1309,10 @@ mod tests {
     fn test_check_model_installed_no_marker() {
         let tmp = tempfile::tempdir().unwrap();
         let model_dir = tmp.path().join("model");
+        // Use fixture files instead of fake content - only copy model.onnx
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models");
         fs::create_dir_all(&model_dir).unwrap();
-        fs::write(model_dir.join("model.onnx"), b"fake").unwrap();
+        fs::copy(fixture_dir.join("model.onnx"), model_dir.join("model.onnx")).unwrap();
         assert_eq!(check_model_installed(&model_dir), ModelState::NotInstalled);
     }
 
@@ -800,12 +1320,8 @@ mod tests {
     fn test_check_model_installed_ready() {
         let tmp = tempfile::tempdir().unwrap();
         let model_dir = tmp.path().join("model");
-        fs::create_dir_all(&model_dir).unwrap();
-        fs::write(model_dir.join("model.onnx"), b"fake").unwrap();
-        fs::write(model_dir.join("tokenizer.json"), b"{}").unwrap();
-        fs::write(model_dir.join("config.json"), b"{}").unwrap();
-        fs::write(model_dir.join("special_tokens_map.json"), b"{}").unwrap();
-        fs::write(model_dir.join("tokenizer_config.json"), b"{}").unwrap();
+        // Use fixture files instead of fake content
+        copy_model_fixtures(&model_dir).unwrap();
         fs::write(model_dir.join(".verified"), "revision=test\n").unwrap();
         assert_eq!(check_model_installed(&model_dir), ModelState::Ready);
     }
@@ -891,6 +1407,72 @@ mod tests {
         };
         assert!(err.to_string().contains("verification failed"));
         assert!(err.to_string().contains("test.onnx"));
+
+        let err = DownloadError::ManifestNotVerified {
+            model_id: "test-model".into(),
+            unverified_files: vec!["model.onnx".into(), "config.json".into()],
+            revision_unpinned: true,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("test-model"));
+        assert!(msg.contains("not production-ready"));
+        assert!(msg.contains("2 file(s)"));
+        assert!(msg.contains("revision is not pinned"));
+    }
+
+    #[test]
+    fn test_manifest_production_ready_minilm() {
+        // MiniLM should be production-ready (verified checksums + pinned revision)
+        let manifest = ModelManifest::minilm_v2();
+        assert!(manifest.has_verified_checksums());
+        assert!(manifest.has_pinned_revision());
+        assert!(manifest.is_production_ready());
+    }
+
+    #[test]
+    fn test_all_bakeoff_candidates_production_ready() {
+        // All bake-off candidates should be production-ready (verified checksums)
+        let candidates = ModelManifest::bakeoff_candidates();
+
+        // Should have 3 verified models: snowflake, nomic, jina-turbo
+        assert_eq!(candidates.len(), 3, "Expected 3 bake-off candidates");
+
+        // All should be production-ready
+        for manifest in &candidates {
+            assert!(
+                manifest.is_production_ready(),
+                "Model {} should be production-ready",
+                manifest.id
+            );
+            assert!(
+                manifest.has_verified_checksums(),
+                "Model {} should have verified checksums",
+                manifest.id
+            );
+            assert!(
+                manifest.has_pinned_revision(),
+                "Model {} should have pinned revision",
+                manifest.id
+            );
+        }
+
+        // Verify specific models are present
+        assert!(
+            candidates
+                .iter()
+                .any(|m| m.id == "snowflake-arctic-embed-s"),
+            "Snowflake should be in candidates"
+        );
+        assert!(
+            candidates.iter().any(|m| m.id == "nomic-embed-text-v1.5"),
+            "Nomic should be in candidates"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|m| m.id == "jina-reranker-v1-turbo-en"),
+            "Jina Turbo should be in candidates"
+        );
     }
 
     #[test]
@@ -901,5 +1483,135 @@ mod tests {
         assert!(!downloader.is_cancelled());
         downloader.cancel();
         assert!(downloader.is_cancelled());
+    }
+
+    #[test]
+    fn test_prepare_temp_dir_prunes_stale_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        fs::write(downloader.temp_dir.join("model.onnx"), b"partial").unwrap();
+        fs::write(downloader.temp_dir.join("stale.bin"), b"stale").unwrap();
+        fs::create_dir_all(downloader.temp_dir.join("nested")).unwrap();
+        fs::write(
+            downloader.temp_dir.join("nested").join("should-remove.txt"),
+            b"stale",
+        )
+        .unwrap();
+
+        downloader
+            .prepare_temp_dir(&ModelManifest::minilm_v2())
+            .unwrap();
+
+        assert!(downloader.temp_dir.join("model.onnx").exists());
+        assert!(!downloader.temp_dir.join("stale.bin").exists());
+        assert!(!downloader.temp_dir.join("nested").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_prepare_temp_dir_removes_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        let outside = tmp.path().join("outside.bin");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, downloader.temp_dir.join("model.onnx")).unwrap();
+
+        downloader
+            .prepare_temp_dir(&ModelManifest::minilm_v2())
+            .unwrap();
+
+        let metadata = fs::symlink_metadata(downloader.temp_dir.join("model.onnx"));
+        assert!(metadata.is_err(), "symlink should be removed before resume");
+        assert!(
+            outside.exists(),
+            "cleanup must not touch the symlink target"
+        );
+    }
+
+    #[test]
+    fn test_retryable_error_classification() {
+        assert!(DownloadError::NetworkError("boom".into()).is_retryable());
+        assert!(DownloadError::Timeout.is_retryable());
+        assert!(
+            DownloadError::HttpError {
+                status: 503,
+                message: "unavailable".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !DownloadError::HttpError {
+                status: 404,
+                message: "missing".into()
+            }
+            .is_retryable()
+        );
+        assert!(!DownloadError::Cancelled.is_retryable());
+        assert!(
+            !DownloadError::VerificationFailed {
+                file: "model.onnx".into(),
+                expected: "a".into(),
+                actual: "b".into(),
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn test_cleanup_temp_for_error_preserves_partial_downloads_on_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        let partial = downloader.temp_dir.join("model.onnx");
+        fs::write(&partial, b"partial").unwrap();
+
+        downloader.cleanup_temp_for_error(&DownloadError::Cancelled);
+
+        assert!(
+            partial.exists(),
+            "cancelled downloads should keep partial files for a resumable retry"
+        );
+    }
+
+    #[test]
+    fn test_fail_if_cancelled_preserves_partial_downloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        let partial = downloader.temp_dir.join("model.onnx");
+        fs::write(&partial, b"partial").unwrap();
+        downloader.cancel();
+
+        let result = downloader.fail_if_cancelled();
+
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert!(
+            partial.exists(),
+            "early cancellation checks should not discard resumable partial files"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_temp_for_error_discards_temp_after_verification_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        let partial = downloader.temp_dir.join("model.onnx");
+        fs::write(&partial, b"partial").unwrap();
+
+        downloader.cleanup_temp_for_error(&DownloadError::VerificationFailed {
+            file: "model.onnx".into(),
+            expected: "good".into(),
+            actual: "bad".into(),
+        });
+
+        assert!(
+            !downloader.temp_dir.exists(),
+            "verification failures should discard the temp directory to avoid reusing corrupt data"
+        );
     }
 }

@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
+use frankensqlite::compat::{ParamValue, RowExt, params_from_iter};
 use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -62,6 +62,7 @@ pub enum SecretLocation {
     ConversationMetadata,
     MessageContent,
     MessageMetadata,
+    MessageSnippet,
 }
 
 impl SecretLocation {
@@ -71,6 +72,7 @@ impl SecretLocation {
             SecretLocation::ConversationMetadata => "conversation.metadata",
             SecretLocation::MessageContent => "message.content",
             SecretLocation::MessageMetadata => "message.metadata",
+            SecretLocation::MessageSnippet => "message.snippet",
         }
     }
 }
@@ -188,6 +190,9 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         SecretPattern {
             id: "openai_key",
             severity: SecretSeverity::High,
+            // Note: this also matches Anthropic keys (sk-ant-...) — the anthropic_key
+            // pattern below is more specific and checked separately. Dedup by position
+            // in the caller prevents double-reporting.
             regex: Regex::new(r"\bsk-[A-Za-z0-9]{20,}\b").expect("openai key regex"),
         },
         SecretPattern {
@@ -204,8 +209,10 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         SecretPattern {
             id: "private_key",
             severity: SecretSeverity::Critical,
-            regex: Regex::new(r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----")
-                .expect("private key regex"),
+            regex: Regex::new(
+                r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----",
+            )
+            .expect("private key regex"),
         },
         SecretPattern {
             id: "database_url",
@@ -257,11 +264,8 @@ pub fn scan_database<P: AsRef<Path>>(
     running: Option<Arc<AtomicBool>>,
     progress: Option<&ProgressBar>,
 ) -> Result<SecretScanReport> {
-    let conn = Connection::open_with_flags(
-        db_path.as_ref(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .context("Failed to open database for secret scan")?;
+    let conn = super::open_existing_sqlite_db(db_path.as_ref())
+        .context("Failed to open database for secret scan")?;
 
     let mut findings: Vec<SecretFinding> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -272,24 +276,22 @@ pub fn scan_database<P: AsRef<Path>>(
         "SELECT c.id, c.title, c.metadata_json, c.source_path, a.slug, w.path\n         FROM conversations c\n         JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
         conv_where
     );
-    let mut conv_stmt = conn.prepare(&conv_sql)?;
-    let mut conv_rows = conv_stmt.query(rusqlite::params_from_iter(
-        conv_params.iter().map(|p| p.as_ref()),
-    ))?;
+    let conv_param_values = params_from_iter(conv_params);
+    let conv_rows = conn.query_with_params(&conv_sql, &conv_param_values)?;
 
-    while let Some(row) = conv_rows.next()? {
+    for row in &conv_rows {
         if running
             .as_ref()
             .is_some_and(|flag| !flag.load(Ordering::Relaxed))
         {
             break;
         }
-        let conv_id: i64 = row.get(0)?;
-        let title: Option<String> = row.get(1)?;
-        let metadata_json: Option<String> = row.get(2)?;
-        let source_path: String = row.get(3)?;
-        let agent_slug: String = row.get(4)?;
-        let workspace_path: Option<String> = row.get(5)?;
+        let conv_id: i64 = row.get_typed(0)?;
+        let title: Option<String> = row.get_typed(1)?;
+        let metadata_json: Option<String> = row.get_typed(2)?;
+        let source_path: String = row.get_typed(3)?;
+        let agent_slug: String = row.get_typed(4)?;
+        let workspace_path: Option<String> = row.get_typed(5)?;
 
         let ctx = ScanContext {
             agent: Some(agent_slug),
@@ -338,26 +340,24 @@ pub fn scan_database<P: AsRef<Path>>(
             "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, a.slug, w.path\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
             msg_where
         );
-        let mut msg_stmt = conn.prepare(&msg_sql)?;
-        let mut msg_rows = msg_stmt.query(rusqlite::params_from_iter(
-            msg_params.iter().map(|p| p.as_ref()),
-        ))?;
+        let msg_param_values = params_from_iter(msg_params);
+        let msg_rows = conn.query_with_params(&msg_sql, &msg_param_values)?;
 
-        while let Some(row) = msg_rows.next()? {
+        for row in &msg_rows {
             if running
                 .as_ref()
                 .is_some_and(|flag| !flag.load(Ordering::Relaxed))
             {
                 break;
             }
-            let msg_id: i64 = row.get(0)?;
-            let msg_idx: i64 = row.get(1)?;
-            let content: String = row.get(2)?;
-            let extra_json: Option<String> = row.get(3)?;
-            let conv_id: i64 = row.get(4)?;
-            let source_path: String = row.get(5)?;
-            let agent_slug: String = row.get(6)?;
-            let workspace_path: Option<String> = row.get(7)?;
+            let msg_id: i64 = row.get_typed(0)?;
+            let msg_idx: i64 = row.get_typed(1)?;
+            let content: String = row.get_typed(2)?;
+            let extra_json: Option<String> = row.get_typed(3)?;
+            let conv_id: i64 = row.get_typed(4)?;
+            let source_path: String = row.get_typed(5)?;
+            let agent_slug: String = row.get_typed(6)?;
+            let workspace_path: Option<String> = row.get_typed(7)?;
 
             let ctx = ScanContext {
                 agent: Some(agent_slug),
@@ -388,6 +388,59 @@ pub fn scan_database<P: AsRef<Path>>(
                     &mut truncated,
                 );
             }
+
+            if truncated {
+                break;
+            }
+
+            if let Some(pb) = progress {
+                pb.inc(1);
+            }
+        }
+    }
+
+    if !truncated {
+        let (snip_where, snip_params) = build_where_clause(filters)?;
+        let snip_sql = format!(
+            "SELECT s.snippet_text, m.id, m.idx, c.id, c.source_path, a.slug, w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
+            snip_where
+        );
+        let snip_param_values = params_from_iter(snip_params);
+        let snip_rows = conn.query_with_params(&snip_sql, &snip_param_values)?;
+
+        for row in &snip_rows {
+            if running
+                .as_ref()
+                .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+            {
+                break;
+            }
+            let snippet_text: String = row.get_typed(0)?;
+            let msg_id: i64 = row.get_typed(1)?;
+            let msg_idx: i64 = row.get_typed(2)?;
+            let conv_id: i64 = row.get_typed(3)?;
+            let source_path: String = row.get_typed(4)?;
+            let agent_slug: String = row.get_typed(5)?;
+            let workspace_path: Option<String> = row.get_typed(6)?;
+
+            let ctx = ScanContext {
+                agent: Some(agent_slug),
+                workspace: workspace_path,
+                source_path: Some(source_path),
+                conversation_id: Some(conv_id),
+                message_id: Some(msg_id),
+                message_idx: Some(msg_idx),
+            };
+
+            scan_text(
+                &snippet_text,
+                SecretLocation::MessageSnippet,
+                &ctx,
+                config,
+                &mut findings,
+                &mut seen,
+                &mut truncated,
+            );
 
             if truncated {
                 break;
@@ -639,6 +692,12 @@ fn scan_text(
         if is_allowlisted(candidate, config) {
             continue;
         }
+        // Heuristic: Pure alphabetic strings are likely code identifiers (CamelCase), not secrets.
+        // Secrets usually have digits or symbols.
+        if candidate.chars().all(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+
         let entropy = shannon_entropy(candidate);
         if entropy >= config.entropy_threshold {
             push_finding(
@@ -743,11 +802,11 @@ fn redact_token(token: &str) -> String {
     if len <= 8 {
         return "[redacted]".to_string();
     }
-    let prefix: String = chars.iter().take(4).collect();
+    let prefix: String = chars.iter().take(2).collect();
     let suffix: String = chars
         .iter()
         .rev()
-        .take(4)
+        .take(2)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -842,36 +901,42 @@ fn is_allowlisted(matched: &str, config: &SecretScanConfig) -> bool {
     false
 }
 
-fn build_where_clause(
-    filters: &SecretScanFilters,
-) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
+fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamValue>)> {
     let mut conditions: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut params: Vec<ParamValue> = Vec::new();
 
-    if let Some(agents) = filters.agents.as_ref().filter(|a| !a.is_empty()) {
-        let placeholders: Vec<&str> = agents.iter().map(|_| "?").collect();
-        conditions.push(format!("a.slug IN ({})", placeholders.join(", ")));
-        for agent in agents {
-            params.push(Box::new(agent.clone()));
+    if let Some(agents) = filters.agents.as_ref() {
+        if agents.is_empty() {
+            conditions.push("1=0".to_string());
+        } else {
+            let placeholders: Vec<&str> = agents.iter().map(|_| "?").collect();
+            conditions.push(format!("a.slug IN ({})", placeholders.join(", ")));
+            for agent in agents {
+                params.push(ParamValue::from(agent.as_str()));
+            }
         }
     }
 
-    if let Some(workspaces) = filters.workspaces.as_ref().filter(|w| !w.is_empty()) {
-        let placeholders: Vec<&str> = workspaces.iter().map(|_| "?").collect();
-        conditions.push(format!("w.path IN ({})", placeholders.join(", ")));
-        for ws in workspaces {
-            params.push(Box::new(ws.to_string_lossy().to_string()));
+    if let Some(workspaces) = filters.workspaces.as_ref() {
+        if workspaces.is_empty() {
+            conditions.push("1=0".to_string());
+        } else {
+            let placeholders: Vec<&str> = workspaces.iter().map(|_| "?").collect();
+            conditions.push(format!("w.path IN ({})", placeholders.join(", ")));
+            for ws in workspaces {
+                params.push(ParamValue::from(ws.to_string_lossy().to_string()));
+            }
         }
     }
 
     if let Some(since) = filters.since_ts {
         conditions.push("c.started_at >= ?".to_string());
-        params.push(Box::new(since));
+        params.push(ParamValue::from(since));
     }
 
     if let Some(until) = filters.until_ts {
         conditions.push("c.started_at <= ?".to_string());
-        params.push(Box::new(until));
+        params.push(ParamValue::from(until));
     }
 
     let where_clause = if conditions.is_empty() {
@@ -903,4 +968,671 @@ fn compile_regexes(patterns: &[String], label: &str) -> Result<Vec<Regex>> {
         compiled.push(regex);
     }
     Ok(compiled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // Shannon entropy tests
+    // =========================================================================
+
+    #[test]
+    fn shannon_entropy_empty_string_returns_zero() {
+        assert_eq!(shannon_entropy(""), 0.0);
+    }
+
+    #[test]
+    fn shannon_entropy_single_repeated_char_returns_zero() {
+        assert_eq!(shannon_entropy("aaaaaaaaaa"), 0.0);
+    }
+
+    #[test]
+    fn shannon_entropy_two_equal_chars_returns_one() {
+        let e = shannon_entropy("ab");
+        assert!((e - 1.0).abs() < 0.001, "expected ~1.0, got {}", e);
+    }
+
+    #[test]
+    fn shannon_entropy_high_entropy_base64() {
+        // A string with many distinct chars should have high entropy
+        let token = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let e = shannon_entropy(token);
+        assert!(e > 4.0, "expected entropy > 4.0, got {}", e);
+    }
+
+    #[test]
+    fn shannon_entropy_hex_string() {
+        let hex = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4";
+        let e = shannon_entropy(hex);
+        assert!(e > 3.0, "expected entropy > 3.0 for hex, got {}", e);
+    }
+
+    // =========================================================================
+    // Redact token tests
+    // =========================================================================
+
+    #[test]
+    fn redact_token_short_returns_redacted() {
+        assert_eq!(redact_token("abcd"), "[redacted]");
+        assert_eq!(redact_token("12345678"), "[redacted]");
+    }
+
+    #[test]
+    fn redact_token_long_shows_prefix_suffix_len() {
+        let result = redact_token("sk-abcdefghijklmnop");
+        assert!(
+            result.starts_with("sk"),
+            "should start with first 2 chars: {}",
+            result
+        );
+        assert!(
+            result.contains("op"),
+            "should end with last 2 chars: {}",
+            result
+        );
+        assert!(result.contains("len 19"), "should show length: {}", result);
+    }
+
+    #[test]
+    fn redact_token_nine_chars_shows_format() {
+        let result = redact_token("123456789");
+        assert!(result.starts_with("12"), "{}", result);
+        assert!(result.contains("89"), "{}", result);
+        assert!(result.contains("len 9"), "{}", result);
+    }
+
+    // =========================================================================
+    // Redact context tests
+    // =========================================================================
+
+    #[test]
+    fn redact_context_empty_text_returns_empty() {
+        assert_eq!(redact_context("", 0, 0, 120, "[REDACTED]"), "");
+    }
+
+    #[test]
+    fn redact_context_replaces_match_with_replacement() {
+        let text = "The key is sk-ABCDEFGHIJ and more";
+        let start = 11;
+        let end = 25;
+        let result = redact_context(text, start, end, 120, "[REDACTED]");
+        assert!(result.contains("[REDACTED]"), "result: {}", result);
+        assert!(
+            !result.contains("sk-ABCDEFGHIJ"),
+            "secret should be removed: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn redact_context_match_at_start() {
+        let text = "sk-SECRET rest of the text";
+        let result = redact_context(text, 0, 9, 120, "[R]");
+        assert!(result.starts_with("[R]"), "result: {}", result);
+    }
+
+    #[test]
+    fn redact_context_match_at_end() {
+        let text = "prefix sk-SECRET";
+        let result = redact_context(text, 7, 16, 120, "[R]");
+        assert!(result.ends_with("[R]"), "result: {}", result);
+    }
+
+    #[test]
+    fn redact_context_start_beyond_text_returns_empty() {
+        assert_eq!(redact_context("short", 10, 15, 120, "[R]"), "");
+    }
+
+    // =========================================================================
+    // Allowlist tests
+    // =========================================================================
+
+    #[test]
+    fn is_allowlisted_returns_true_for_matching_pattern() {
+        let config =
+            SecretScanConfig::from_inputs_with_env(&["sk-test.*".to_string()], &[], false).unwrap();
+        assert!(is_allowlisted("sk-test1234567890abcdef", &config));
+    }
+
+    #[test]
+    fn is_allowlisted_returns_false_when_no_match() {
+        let config =
+            SecretScanConfig::from_inputs_with_env(&["sk-test.*".to_string()], &[], false).unwrap();
+        assert!(!is_allowlisted("sk-prod1234567890abcdef", &config));
+    }
+
+    #[test]
+    fn is_allowlisted_empty_list_returns_false() {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false).unwrap();
+        assert!(!is_allowlisted("anything", &config));
+    }
+
+    // =========================================================================
+    // Adjust to char boundary tests
+    // =========================================================================
+
+    #[test]
+    fn adjust_to_char_boundary_ascii() {
+        let text = "hello";
+        assert_eq!(adjust_to_char_boundary(text, 3, true), 3);
+        assert_eq!(adjust_to_char_boundary(text, 3, false), 3);
+    }
+
+    #[test]
+    fn adjust_to_char_boundary_multibyte_forward() {
+        let text = "héllo"; // 'é' is 2 bytes (0xC3 0xA9)
+        // Index 2 is in the middle of 'é', forward should skip to next boundary
+        let idx = adjust_to_char_boundary(text, 2, true);
+        assert!(
+            text.is_char_boundary(idx),
+            "idx {} not a char boundary",
+            idx
+        );
+    }
+
+    #[test]
+    fn adjust_to_char_boundary_multibyte_backward() {
+        let text = "héllo";
+        let idx = adjust_to_char_boundary(text, 2, false);
+        assert!(
+            text.is_char_boundary(idx),
+            "idx {} not a char boundary",
+            idx
+        );
+    }
+
+    #[test]
+    fn adjust_to_char_boundary_beyond_len() {
+        let text = "abc";
+        assert_eq!(adjust_to_char_boundary(text, 100, true), 3);
+    }
+
+    // =========================================================================
+    // Config construction tests
+    // =========================================================================
+
+    #[test]
+    fn config_from_inputs_with_valid_patterns() {
+        let config = SecretScanConfig::from_inputs_with_env(
+            &["allowed_.*".to_string()],
+            &["denied_.*".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(config.allowlist.len(), 1);
+        assert_eq!(config.denylist.len(), 1);
+        assert_eq!(config.entropy_threshold, DEFAULT_ENTROPY_THRESHOLD);
+    }
+
+    #[test]
+    fn config_from_inputs_with_invalid_regex_returns_error() {
+        let result = SecretScanConfig::from_inputs_with_env(&["[invalid".to_string()], &[], false);
+        assert!(result.is_err(), "invalid regex should return error");
+    }
+
+    #[test]
+    fn config_from_inputs_empty_lists() {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false).unwrap();
+        assert!(config.allowlist.is_empty());
+        assert!(config.denylist.is_empty());
+        assert_eq!(config.max_findings, DEFAULT_MAX_FINDINGS);
+    }
+
+    // =========================================================================
+    // Scan text tests (via scan_database with crafted DB)
+    // =========================================================================
+
+    #[test]
+    fn builtin_patterns_aws_access_key_detected() {
+        let text = "Found key AKIAIOSFODNN7EXAMPLE in config";
+        let pattern = &BUILTIN_PATTERNS[0]; // aws_access_key_id
+        assert!(
+            pattern.regex.is_match(text),
+            "should detect AWS access key ID"
+        );
+    }
+
+    #[test]
+    fn builtin_patterns_github_pat_detected() {
+        let text = "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+        let pattern = &BUILTIN_PATTERNS[2]; // github_pat
+        assert!(pattern.regex.is_match(text), "should detect GitHub PAT");
+    }
+
+    #[test]
+    fn builtin_patterns_anthropic_key_detected() {
+        let text = "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh";
+        let pattern = &BUILTIN_PATTERNS[4]; // anthropic_key
+        assert!(pattern.regex.is_match(text), "should detect Anthropic key");
+    }
+
+    #[test]
+    fn builtin_patterns_jwt_detected() {
+        let text = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123";
+        let pattern = &BUILTIN_PATTERNS[5]; // jwt
+        assert!(pattern.regex.is_match(text), "should detect JWT");
+    }
+
+    #[test]
+    fn builtin_patterns_private_key_detected() {
+        let text = "-----BEGIN RSA PRIVATE KEY-----\nMIIE...";
+        let pattern = &BUILTIN_PATTERNS[6]; // private_key
+        assert!(pattern.regex.is_match(text), "should detect private key");
+    }
+
+    #[test]
+    fn builtin_patterns_database_url_detected() {
+        let text = "database_url=postgres://user:pass@host:5432/db";
+        let pattern = &BUILTIN_PATTERNS[7]; // database_url
+        assert!(pattern.regex.is_match(text), "should detect database URL");
+    }
+
+    #[test]
+    fn builtin_patterns_generic_api_key_detected() {
+        let text = "api_key=abcdefgh12345678";
+        let pattern = &BUILTIN_PATTERNS[8]; // generic_api_key
+        assert!(
+            pattern.regex.is_match(text),
+            "should detect generic API key"
+        );
+    }
+
+    #[test]
+    fn builtin_patterns_safe_text_not_detected() {
+        let safe_text = "This is a normal message about Rust programming.";
+        for pattern in BUILTIN_PATTERNS.iter() {
+            assert!(
+                !pattern.regex.is_match(safe_text),
+                "pattern {} should not match safe text",
+                pattern.id,
+            );
+        }
+    }
+
+    // =========================================================================
+    // Severity ranking tests
+    // =========================================================================
+
+    #[test]
+    fn severity_rank_ordering() {
+        assert!(SecretSeverity::Critical.rank() < SecretSeverity::High.rank());
+        assert!(SecretSeverity::High.rank() < SecretSeverity::Medium.rank());
+        assert!(SecretSeverity::Medium.rank() < SecretSeverity::Low.rank());
+    }
+
+    #[test]
+    fn severity_label_values() {
+        assert_eq!(SecretSeverity::Critical.label(), "critical");
+        assert_eq!(SecretSeverity::High.label(), "high");
+        assert_eq!(SecretSeverity::Medium.label(), "medium");
+        assert_eq!(SecretSeverity::Low.label(), "low");
+    }
+
+    // =========================================================================
+    // SecretLocation label tests
+    // =========================================================================
+
+    #[test]
+    fn location_labels() {
+        assert_eq!(
+            SecretLocation::ConversationTitle.label(),
+            "conversation.title"
+        );
+        assert_eq!(
+            SecretLocation::ConversationMetadata.label(),
+            "conversation.metadata"
+        );
+        assert_eq!(SecretLocation::MessageContent.label(), "message.content");
+        assert_eq!(SecretLocation::MessageMetadata.label(), "message.metadata");
+    }
+
+    // =========================================================================
+    // Build where clause tests
+    // =========================================================================
+
+    #[test]
+    fn build_where_clause_empty_filters() {
+        let filters = SecretScanFilters {
+            agents: None,
+            workspaces: None,
+            since_ts: None,
+            until_ts: None,
+        };
+        let (clause, params) = build_where_clause(&filters).unwrap();
+        assert!(clause.is_empty(), "empty filters should give empty clause");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn build_where_clause_with_agent_filter() {
+        let filters = SecretScanFilters {
+            agents: Some(vec!["claude".to_string(), "codex".to_string()]),
+            workspaces: None,
+            since_ts: None,
+            until_ts: None,
+        };
+        let (clause, params) = build_where_clause(&filters).unwrap();
+        assert!(clause.contains("a.slug IN"), "clause: {}", clause);
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn build_where_clause_with_time_range() {
+        let filters = SecretScanFilters {
+            agents: None,
+            workspaces: None,
+            since_ts: Some(1000),
+            until_ts: Some(2000),
+        };
+        let (clause, params) = build_where_clause(&filters).unwrap();
+        assert!(clause.contains("c.started_at >="), "clause: {}", clause);
+        assert!(clause.contains("c.started_at <="), "clause: {}", clause);
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn build_where_clause_with_workspace_filter() {
+        let filters = SecretScanFilters {
+            agents: None,
+            workspaces: Some(vec![PathBuf::from("/home/user/project")]),
+            since_ts: None,
+            until_ts: None,
+        };
+        let (clause, params) = build_where_clause(&filters).unwrap();
+        assert!(clause.contains("w.path IN"), "clause: {}", clause);
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn build_where_clause_empty_agent_list_matches_nothing() {
+        let filters = SecretScanFilters {
+            agents: Some(vec![]),
+            workspaces: None,
+            since_ts: None,
+            until_ts: None,
+        };
+        let (clause, _) = build_where_clause(&filters).unwrap();
+        assert!(
+            clause.contains("1=0"),
+            "empty agent list should match nothing: {}",
+            clause
+        );
+    }
+
+    #[test]
+    fn build_where_clause_empty_workspace_list_matches_nothing() {
+        let filters = SecretScanFilters {
+            agents: None,
+            workspaces: Some(vec![]),
+            since_ts: None,
+            until_ts: None,
+        };
+        let (clause, _) = build_where_clause(&filters).unwrap();
+        assert!(
+            clause.contains("1=0"),
+            "empty workspace list should match nothing: {}",
+            clause
+        );
+    }
+
+    // =========================================================================
+    // Entropy regex tests
+    // =========================================================================
+
+    #[test]
+    fn entropy_base64_regex_matches_long_strings() {
+        assert!(ENTROPY_BASE64_RE.is_match("ABCDEFGHIJKLMNOPQRSTuv"));
+        assert!(!ENTROPY_BASE64_RE.is_match("short"));
+    }
+
+    #[test]
+    fn entropy_hex_regex_matches_32_plus_chars() {
+        assert!(ENTROPY_HEX_RE.is_match("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"));
+        assert!(!ENTROPY_HEX_RE.is_match("a1b2c3d4"));
+    }
+
+    // =========================================================================
+    // Edge case tests — malformed input robustness (br-ig84)
+    // =========================================================================
+
+    #[test]
+    fn scan_text_empty_text_no_findings() {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false).unwrap();
+        let ctx = ScanContext {
+            agent: None,
+            workspace: None,
+            source_path: None,
+            conversation_id: None,
+            message_id: None,
+            message_idx: None,
+        };
+        let mut findings = Vec::new();
+        let mut seen = HashSet::new();
+        let mut truncated = false;
+
+        scan_text(
+            "",
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut seen,
+            &mut truncated,
+        );
+        assert!(findings.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn scan_text_already_truncated_skips() {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false).unwrap();
+        let ctx = ScanContext {
+            agent: None,
+            workspace: None,
+            source_path: None,
+            conversation_id: None,
+            message_id: None,
+            message_idx: None,
+        };
+        let mut findings = Vec::new();
+        let mut seen = HashSet::new();
+        let mut truncated = true; // pre-set
+
+        scan_text(
+            "sk-test1234567890abcdefghijklmnopqr",
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut seen,
+            &mut truncated,
+        );
+        assert!(findings.is_empty(), "should skip when already truncated");
+    }
+
+    #[test]
+    fn scan_text_denylist_always_critical() {
+        let config =
+            SecretScanConfig::from_inputs_with_env(&[], &["FORBIDDEN_TOKEN_.*".to_string()], false)
+                .unwrap();
+        let ctx = ScanContext {
+            agent: Some("test".to_string()),
+            workspace: None,
+            source_path: None,
+            conversation_id: Some(1),
+            message_id: Some(1),
+            message_idx: Some(0),
+        };
+        let mut findings = Vec::new();
+        let mut seen = HashSet::new();
+        let mut truncated = false;
+
+        scan_text(
+            "prefix FORBIDDEN_TOKEN_abc suffix",
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut seen,
+            &mut truncated,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, SecretSeverity::Critical);
+        assert_eq!(findings[0].kind, "denylist");
+    }
+
+    #[test]
+    fn scan_text_allowlist_suppresses_builtin_match() {
+        let config =
+            SecretScanConfig::from_inputs_with_env(&["sk-test.*".to_string()], &[], false).unwrap();
+        let ctx = ScanContext {
+            agent: None,
+            workspace: None,
+            source_path: None,
+            conversation_id: Some(1),
+            message_id: Some(1),
+            message_idx: Some(0),
+        };
+        let mut findings = Vec::new();
+        let mut seen = HashSet::new();
+        let mut truncated = false;
+
+        scan_text(
+            "sk-testABCDEFGHIJKLMNOPQRSTUVWXYZ12345",
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut seen,
+            &mut truncated,
+        );
+
+        // The openai_key pattern should match but be suppressed by allowlist
+        assert!(
+            !findings.iter().any(|f| f.kind == "openai_key"),
+            "allowlisted key should be suppressed"
+        );
+    }
+
+    #[test]
+    fn scan_text_deduplicates_findings() {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false).unwrap();
+        let ctx = ScanContext {
+            agent: None,
+            workspace: None,
+            source_path: None,
+            conversation_id: Some(1),
+            message_id: Some(1),
+            message_idx: Some(0),
+        };
+        let mut findings = Vec::new();
+        let mut seen = HashSet::new();
+        let mut truncated = false;
+
+        // Scan same text twice — same context, so duplicates should be skipped
+        let text = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789";
+        scan_text(
+            text,
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut seen,
+            &mut truncated,
+        );
+        let count_after_first = findings.len();
+
+        scan_text(
+            text,
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut seen,
+            &mut truncated,
+        );
+        assert_eq!(
+            findings.len(),
+            count_after_first,
+            "duplicate findings should be skipped"
+        );
+    }
+
+    #[test]
+    fn scan_text_max_findings_truncates() {
+        // Use longer tokens (>8 chars) so each gets a unique redacted form for dedup
+        let mut config =
+            SecretScanConfig::from_inputs_with_env(&[], &["LONG_SECRET_\\d+".to_string()], false)
+                .unwrap();
+        config.max_findings = 3;
+
+        let ctx = ScanContext {
+            agent: None,
+            workspace: None,
+            source_path: None,
+            conversation_id: Some(1),
+            message_id: Some(1),
+            message_idx: Some(0),
+        };
+        let mut findings = Vec::new();
+        let mut seen = HashSet::new();
+        let mut truncated = false;
+
+        // Each match is >8 chars so redact_token produces unique output per token
+        let text =
+            "LONG_SECRET_001 LONG_SECRET_002 LONG_SECRET_003 LONG_SECRET_004 LONG_SECRET_005";
+        scan_text(
+            text,
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut seen,
+            &mut truncated,
+        );
+
+        assert!(
+            findings.len() <= 3,
+            "should cap at max_findings: {}",
+            findings.len()
+        );
+        assert!(truncated, "should set truncated flag");
+    }
+
+    #[test]
+    fn scan_text_pure_alphabetic_base64_skipped() {
+        // Pure alphabetic strings (CamelCase identifiers) should NOT trigger entropy detection
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false).unwrap();
+        let ctx = ScanContext {
+            agent: None,
+            workspace: None,
+            source_path: None,
+            conversation_id: Some(1),
+            message_id: Some(1),
+            message_idx: Some(0),
+        };
+        let mut findings = Vec::new();
+        let mut seen = HashSet::new();
+        let mut truncated = false;
+
+        // This is a pure alphabetic string — should be skipped by the heuristic
+        let text = "SecretScanConfigFromInputsWithEnvTest";
+        scan_text(
+            text,
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut seen,
+            &mut truncated,
+        );
+
+        assert!(
+            !findings.iter().any(|f| f.kind == "high_entropy_base64"),
+            "pure alphabetic strings should not trigger entropy detection"
+        );
+    }
 }

@@ -101,6 +101,8 @@ fn escape_markdown(text: &str) -> String {
         .replace('<', "\\<")
         .replace('>', "\\>")
         .replace('`', "\\`")
+        .replace('\n', " ") // Replace newlines with space to prevent breaking tables
+        .replace('\r', "") // Remove carriage returns
 }
 
 /// Determine the appropriate code block delimiter (e.g., ``` or ````) based on content.
@@ -150,8 +152,8 @@ fn export_markdown(hits: &[SearchHit], options: &ExportOptions) -> String {
         output.push_str("|-------|-------|\n");
         output.push_str(&format!("| Agent | {} |\n", escape_markdown(&hit.agent)));
         output.push_str(&format!(
-            "| Workspace | `{}` |\n",
-            escape_markdown(&hit.workspace.replace('`', ""))
+            "| Workspace | {} |\n",
+            escape_markdown(&hit.workspace)
         ));
 
         if options.include_score {
@@ -175,8 +177,8 @@ fn export_markdown(hits: &[SearchHit], options: &ExportOptions) -> String {
                 hit.source_path.clone()
             };
             output.push_str(&format!(
-                "| Source | `{}` |\n",
-                escape_markdown(&path_display.replace('`', ""))
+                "| Source | {} |\n",
+                escape_markdown(&path_display)
             ));
 
             if let Some(line) = hit.line_number {
@@ -231,7 +233,12 @@ fn export_json(hits: &[SearchHit], options: &ExportOptions) -> String {
             });
 
             if options.include_score {
-                obj["score"] = serde_json::json!(hit.score);
+                let score = if hit.score.is_finite() {
+                    hit.score
+                } else {
+                    0.0
+                };
+                obj["score"] = serde_json::json!(score);
             }
 
             if options.include_path {
@@ -335,19 +342,22 @@ fn truncate_text(text: &str, max_len: usize) -> String {
         return text.to_string();
     }
 
-    let char_count = text.chars().count();
-    if char_count <= max_len {
-        return text.to_string();
+    let mut chars = text.chars();
+    let mut preview: String = chars.by_ref().take(max_len).collect();
+
+    if chars.next().is_none() {
+        return preview;
     }
 
     // For very small max_len (≤3), truncate without ellipsis to avoid exceeding limit
     if max_len <= 3 {
-        return text.chars().take(max_len).collect();
+        return preview;
     }
 
-    let mut truncated: String = text.chars().take(max_len - 3).collect();
-    truncated.push_str("...");
-    truncated
+    let take = max_len.saturating_sub(3);
+    preview.truncate(preview.chars().take(take).map(|c| c.len_utf8()).sum());
+    preview.push_str("...");
+    preview
 }
 
 #[cfg(test)]

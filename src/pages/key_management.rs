@@ -15,6 +15,7 @@
 //! - Add/revoke only modifies config.json; payload unchanged
 //! - Rotate re-encrypts entire payload with new DEK
 
+use crate::pages::attachments::reencrypt_blobs_into_dir;
 use crate::pages::encrypt::{
     Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType, load_config,
 };
@@ -23,20 +24,19 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::prelude::*;
 use chrono::{DateTime, Utc};
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
 use hkdf::Hkdf;
-use rand::{RngCore, rngs::OsRng};
+use rand::Rng;
 use serde::Serialize;
 use sha2::Sha256;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use tracing::info;
-use zeroize::Zeroize;
 
 /// Argon2id default parameters
 const ARGON2_MEMORY_KB: u32 = 65536; // 64 MB
@@ -92,7 +92,8 @@ pub struct RotateResult {
 
 /// List all key slots in an archive
 pub fn key_list(archive_dir: &Path) -> Result<KeyListResult> {
-    let config = load_config(archive_dir)?;
+    let archive_dir = super::resolve_site_dir(archive_dir)?;
+    let config = load_config(&archive_dir)?;
 
     let slots: Vec<KeySlotInfo> = config
         .key_slots
@@ -126,11 +127,12 @@ pub fn key_add_password(
     current_password: &str,
     new_password: &str,
 ) -> Result<u8> {
+    let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config_path = archive_dir.join("config.json");
-    let mut config = load_config(archive_dir)?;
+    let mut config = load_config(&archive_dir)?;
 
     // Unlock with current password to get DEK
-    let mut dek = unwrap_dek_with_password(&config, current_password)?;
+    let dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
 
     // Create new slot (use max ID + 1 since IDs are stable after revocation)
     // If no slots exist, start at 0; otherwise use max + 1
@@ -142,17 +144,14 @@ pub fn key_add_password(
     };
     let new_slot = create_password_slot(new_password, &dek, &config.export_id, slot_id)?;
 
-    // Zeroize DEK before any potential early return
-    dek.zeroize();
-
     config.key_slots.push(new_slot);
 
     // Write updated config
-    let file = File::create(&config_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &config)?;
+    write_json_pretty_atomically(&config_path, &config)?;
 
     // Update integrity.json if present
-    update_integrity_hash(archive_dir, "config.json")?;
+    let manifest = regenerate_integrity_manifest(&archive_dir)?;
+    refresh_private_artifacts(&archive_dir, &config, manifest.as_ref(), None, false)?;
 
     info!(slot_id, "Added password key slot");
     Ok(slot_id)
@@ -163,11 +162,12 @@ pub fn key_add_recovery(
     archive_dir: &Path,
     current_password: &str,
 ) -> Result<(u8, RecoverySecret)> {
+    let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config_path = archive_dir.join("config.json");
-    let mut config = load_config(archive_dir)?;
+    let mut config = load_config(&archive_dir)?;
 
     // Unlock with current password to get DEK
-    let mut dek = unwrap_dek_with_password(&config, current_password)?;
+    let dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
 
     // Generate recovery secret
     let secret = RecoverySecret::generate();
@@ -182,17 +182,20 @@ pub fn key_add_recovery(
     };
     let new_slot = create_recovery_slot(secret.as_bytes(), &dek, &config.export_id, slot_id)?;
 
-    // Zeroize DEK before any potential early return
-    dek.zeroize();
-
     config.key_slots.push(new_slot);
 
     // Write updated config
-    let file = File::create(&config_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &config)?;
+    write_json_pretty_atomically(&config_path, &config)?;
 
     // Update integrity.json if present
-    update_integrity_hash(archive_dir, "config.json")?;
+    let manifest = regenerate_integrity_manifest(&archive_dir)?;
+    refresh_private_artifacts(
+        &archive_dir,
+        &config,
+        manifest.as_ref(),
+        Some(secret.as_bytes()),
+        false,
+    )?;
 
     info!(slot_id, "Added recovery key slot");
     Ok((slot_id, secret))
@@ -204,21 +207,20 @@ pub fn key_revoke(
     current_password: &str,
     slot_id_to_revoke: u8,
 ) -> Result<RevokeResult> {
+    let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config_path = archive_dir.join("config.json");
-    let mut config = load_config(archive_dir)?;
+    let mut config = load_config(&archive_dir)?;
 
     // Safety: Cannot revoke last slot
     if config.key_slots.len() <= 1 {
-        bail!("Cannot revoke the last remaining key slot");
+        anyhow::bail!("Cannot revoke the last remaining key slot. Add another key first.");
     }
 
     // Find which slot authenticates with this password
-    let (auth_slot_id, mut dek) = unwrap_dek_with_slot_id(&config, current_password)?;
+    let (auth_slot_id, dek) = unwrap_dek_with_slot_id(&config, current_password)?;
+    let mut _dek = zeroize::Zeroizing::new(dek); // Zeroize on drop
 
-    // Zeroize DEK immediately - we only needed to verify the password works
-    dek.zeroize();
-
-    // Safety: Cannot revoke slot used for authentication
+    // Verify they aren't trying to revoke the slot they are currently using
     if auth_slot_id == slot_id_to_revoke {
         bail!(
             "Cannot revoke slot {} used for authentication. Use a different password.",
@@ -231,15 +233,32 @@ pub fn key_revoke(
         bail!("Slot {} not found", slot_id_to_revoke);
     }
 
+    let revoked_slot_is_recovery = config
+        .key_slots
+        .iter()
+        .find(|s| s.id == slot_id_to_revoke)
+        .map(|s| s.slot_type == SlotType::Recovery)
+        .unwrap_or(false);
+
     // Remove the slot (keeping IDs stable - they're part of the AAD binding)
     config.key_slots.retain(|s| s.id != slot_id_to_revoke);
 
     // Write updated config
-    let file = File::create(&config_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &config)?;
+    write_json_pretty_atomically(&config_path, &config)?;
 
     // Update integrity.json if present
-    update_integrity_hash(archive_dir, "config.json")?;
+    let manifest = regenerate_integrity_manifest(&archive_dir)?;
+    let has_recovery_slot = config
+        .key_slots
+        .iter()
+        .any(|slot| slot.slot_type == SlotType::Recovery);
+    refresh_private_artifacts(
+        &archive_dir,
+        &config,
+        manifest.as_ref(),
+        None,
+        revoked_slot_is_recovery || !has_recovery_slot,
+    )?;
 
     info!(slot_id = slot_id_to_revoke, "Revoked key slot");
     Ok(RevokeResult {
@@ -256,57 +275,82 @@ pub fn key_rotate(
     keep_recovery: bool,
     progress: impl Fn(f32),
 ) -> Result<RotateResult> {
-    let config_path = archive_dir.join("config.json");
-    let config = load_config(archive_dir)?;
+    let archive_dir = super::resolve_site_dir(archive_dir)?;
+    let config = load_config(&archive_dir)?;
+    let old_export_id_raw = BASE64_STANDARD.decode(&config.export_id)?;
+    let old_export_id: [u8; 16] = old_export_id_raw.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid export_id length: expected 16, got {}",
+            old_export_id_raw.len()
+        )
+    })?;
 
     // 1. Decrypt payload with old password
-    let mut old_dek = unwrap_dek_with_password(&config, old_password)?;
-    let plaintext = decrypt_all_chunks(archive_dir, &old_dek, &config, |p| progress(p * 0.5))?;
+    let old_dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, old_password)?);
+    let plaintext =
+        zeroize::Zeroizing::new(decrypt_all_chunks(&archive_dir, &old_dek, &config, |p| {
+            progress(p * 0.5)
+        })?);
 
     // 2. Generate new DEK and export_id
-    let mut new_dek = [0u8; 32];
+    let mut new_dek = zeroize::Zeroizing::new([0u8; 32]);
     let mut new_export_id = [0u8; 16];
     let mut new_base_nonce = [0u8; 12];
-    OsRng.fill_bytes(&mut new_dek);
-    OsRng.fill_bytes(&mut new_export_id);
-    OsRng.fill_bytes(&mut new_base_nonce);
+    let mut rng = rand::rng();
+    rng.fill_bytes(new_dek.as_mut());
+    rng.fill_bytes(&mut new_export_id);
+    rng.fill_bytes(&mut new_base_nonce);
 
-    // 3. Re-encrypt payload with new DEK
+    let staged_site_dir = unique_staged_site_dir(&archive_dir);
+    copy_site_except_runtime_state(&archive_dir, &staged_site_dir)?;
+
+    // 3. Re-encrypt payload with new DEK into the staged site
     let chunk_count = encrypt_all_chunks(
         &plaintext,
         &new_dek,
         &new_export_id,
         &new_base_nonce,
         config.payload.chunk_size,
-        &archive_dir.join("payload"),
+        &staged_site_dir.join("payload"),
         |p| progress(0.5 + p * 0.5),
+    )?;
+
+    reencrypt_blobs_into_dir(
+        &archive_dir,
+        &staged_site_dir,
+        &old_dek,
+        &old_export_id,
+        &new_dek,
+        &new_export_id,
     )?;
 
     // 4. Create new key slots
     let mut new_slots = vec![create_password_slot(
         new_password,
         &new_dek,
-        &BASE64.encode(new_export_id),
+        &BASE64_STANDARD.encode(new_export_id),
         0,
     )?];
 
     let mut recovery_secret_encoded: Option<String> = None;
+    let mut recovery_secret_bytes: Option<Vec<u8>> = None;
     if keep_recovery {
         let secret = RecoverySecret::generate();
         new_slots.push(create_recovery_slot(
             secret.as_bytes(),
             &new_dek,
-            &BASE64.encode(new_export_id),
+            &BASE64_STANDARD.encode(new_export_id),
             1,
         )?);
+        recovery_secret_bytes = Some(secret.as_bytes().to_vec());
         recovery_secret_encoded = Some(secret.encoded().to_string());
     }
 
     // 5. Write new config
     let new_config = EncryptionConfig {
         version: config.version,
-        export_id: BASE64.encode(new_export_id),
-        base_nonce: BASE64.encode(new_base_nonce),
+        export_id: BASE64_STANDARD.encode(new_export_id),
+        base_nonce: BASE64_STANDARD.encode(new_base_nonce),
         compression: config.compression,
         kdf_defaults: Argon2Params::default(),
         payload: crate::pages::encrypt::PayloadMeta {
@@ -321,19 +365,22 @@ pub fn key_rotate(
         key_slots: new_slots.clone(),
     };
 
-    let file = File::create(&config_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &new_config)?;
+    write_json_pretty(&staged_site_dir.join("config.json"), &new_config)?;
 
-    // 6. Regenerate integrity.json
-    regenerate_integrity_manifest(archive_dir)?;
+    // 6. Regenerate integrity.json for the staged site, then swap atomically
+    let manifest = crate::pages::bundle::generate_integrity_manifest(&staged_site_dir)?;
+    write_json_pretty(&staged_site_dir.join("integrity.json"), &manifest)?;
+    replace_dir_from_temp(&staged_site_dir, &archive_dir)?;
+    refresh_private_artifacts(
+        &archive_dir,
+        &new_config,
+        Some(&manifest),
+        recovery_secret_bytes.as_deref(),
+        !keep_recovery,
+    )?;
 
-    // 7. Zeroize sensitive key material
-    old_dek.zeroize();
-    new_dek.zeroize();
-
-    info!("Key rotation complete");
     Ok(RotateResult {
-        new_dek_created_at: Utc::now(),
+        new_dek_created_at: chrono::Utc::now(),
         slot_count: new_slots.len(),
         recovery_secret: recovery_secret_encoded,
     })
@@ -345,20 +392,19 @@ pub fn key_rotate(
 
 /// Unwrap DEK using password (tries all password slots)
 fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result<[u8; 32]> {
-    let export_id = BASE64.decode(&config.export_id)?;
+    let export_id = BASE64_STANDARD.decode(&config.export_id)?;
 
     for slot in &config.key_slots {
         if slot.slot_type != SlotType::Password {
             continue;
         }
 
-        let salt = BASE64.decode(&slot.salt)?;
-        let wrapped_dek = BASE64.decode(&slot.wrapped_dek)?;
-        let nonce = BASE64.decode(&slot.nonce)?;
+        let salt = BASE64_STANDARD.decode(&slot.salt)?;
+        let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
+        let nonce = BASE64_STANDARD.decode(&slot.nonce)?;
 
-        if let Ok(mut kek) = derive_kek_argon2id(password, &salt) {
+        if let Ok(kek) = derive_kek_argon2id(password, &salt) {
             let result = unwrap_key(&kek, &wrapped_dek, &nonce, &export_id, slot.id);
-            kek.zeroize(); // Always zeroize KEK after use
             if let Ok(dek) = result {
                 return Ok(dek);
             }
@@ -370,20 +416,19 @@ fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result
 
 /// Unwrap DEK and return which slot was used
 fn unwrap_dek_with_slot_id(config: &EncryptionConfig, password: &str) -> Result<(u8, [u8; 32])> {
-    let export_id = BASE64.decode(&config.export_id)?;
+    let export_id = BASE64_STANDARD.decode(&config.export_id)?;
 
     for slot in &config.key_slots {
         if slot.slot_type != SlotType::Password {
             continue;
         }
 
-        let salt = BASE64.decode(&slot.salt)?;
-        let wrapped_dek = BASE64.decode(&slot.wrapped_dek)?;
-        let nonce = BASE64.decode(&slot.nonce)?;
+        let salt = BASE64_STANDARD.decode(&slot.salt)?;
+        let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
+        let nonce = BASE64_STANDARD.decode(&slot.nonce)?;
 
-        if let Ok(mut kek) = derive_kek_argon2id(password, &salt) {
+        if let Ok(kek) = derive_kek_argon2id(password, &salt) {
             let result = unwrap_key(&kek, &wrapped_dek, &nonce, &export_id, slot.id);
-            kek.zeroize(); // Always zeroize KEK after use
             if let Ok(dek) = result {
                 return Ok((slot.id, dek));
             }
@@ -394,7 +439,7 @@ fn unwrap_dek_with_slot_id(config: &EncryptionConfig, password: &str) -> Result<
 }
 
 /// Derive KEK from password using Argon2id
-fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
+fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<zeroize::Zeroizing<[u8; 32]>> {
     let params = Params::new(
         ARGON2_MEMORY_KB,
         ARGON2_ITERATIONS,
@@ -405,19 +450,19 @@ fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
-    let mut kek = [0u8; 32];
+    let mut kek = zeroize::Zeroizing::new([0u8; 32]);
     argon2
-        .hash_password_into(password.as_bytes(), salt, &mut kek)
-        .map_err(|e| anyhow::anyhow!("Argon2id derivation failed: {}", e))?;
+        .hash_password_into(password.as_bytes(), salt, kek.as_mut())
+        .map_err(|e| anyhow::anyhow!("Argon2 derivation failed: {:?}", e))?;
 
     Ok(kek)
 }
 
 /// Derive KEK from recovery secret using HKDF-SHA256
-fn derive_kek_hkdf(secret: &[u8], salt: &[u8]) -> Result<[u8; 32]> {
+fn derive_kek_hkdf(secret: &[u8], salt: &[u8]) -> Result<zeroize::Zeroizing<[u8; 32]>> {
     let hkdf = Hkdf::<Sha256>::new(Some(salt), secret);
-    let mut kek = [0u8; 32];
-    hkdf.expand(b"cass-pages-kek-v2", &mut kek)
+    let mut kek = zeroize::Zeroizing::new([0u8; 32]);
+    hkdf.expand(b"cass-pages-kek-v2", kek.as_mut())
         .map_err(|_| anyhow::anyhow!("HKDF expansion failed"))?;
     Ok(kek)
 }
@@ -431,6 +476,10 @@ fn unwrap_key(
     slot_id: u8,
 ) -> Result<[u8; 32]> {
     let cipher = Aes256Gcm::new_from_slice(kek).expect("Invalid key length");
+
+    let nonce: &[u8; 12] = nonce
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid nonce length: expected 12, got {}", nonce.len()))?;
 
     // AAD: export_id || slot_id
     let mut aad = Vec::with_capacity(export_id.len() + 1);
@@ -458,20 +507,18 @@ fn create_password_slot(
     export_id_b64: &str,
     slot_id: u8,
 ) -> Result<KeySlot> {
-    let export_id = BASE64.decode(export_id_b64)?;
+    let export_id = BASE64_STANDARD.decode(export_id_b64)?;
 
     // Generate salt
     let mut salt = [0u8; 32];
-    OsRng.fill_bytes(&mut salt);
+    let mut rng = rand::rng();
+    rng.fill_bytes(&mut salt);
 
     // Derive KEK from password
-    let mut kek = derive_kek_argon2id(password, &salt)?;
+    let kek = derive_kek_argon2id(password, &salt)?;
 
     // Wrap DEK
     let result = wrap_key(&kek, dek, &export_id, slot_id);
-
-    // Zeroize KEK immediately after use
-    kek.zeroize();
 
     let (wrapped_dek, nonce) = result?;
 
@@ -479,9 +526,9 @@ fn create_password_slot(
         id: slot_id,
         slot_type: SlotType::Password,
         kdf: KdfAlgorithm::Argon2id,
-        salt: BASE64.encode(salt),
-        wrapped_dek: BASE64.encode(&wrapped_dek),
-        nonce: BASE64.encode(nonce),
+        salt: BASE64_STANDARD.encode(salt),
+        wrapped_dek: BASE64_STANDARD.encode(&wrapped_dek),
+        nonce: BASE64_STANDARD.encode(nonce),
         argon2_params: Some(Argon2Params::default()),
     })
 }
@@ -493,20 +540,18 @@ fn create_recovery_slot(
     export_id_b64: &str,
     slot_id: u8,
 ) -> Result<KeySlot> {
-    let export_id = BASE64.decode(export_id_b64)?;
+    let export_id = BASE64_STANDARD.decode(export_id_b64)?;
 
     // Generate salt
     let mut salt = [0u8; 16];
-    OsRng.fill_bytes(&mut salt);
+    let mut rng = rand::rng();
+    rng.fill_bytes(&mut salt);
 
     // Derive KEK from recovery secret
-    let mut kek = derive_kek_hkdf(secret, &salt)?;
+    let kek = derive_kek_hkdf(secret, &salt)?;
 
     // Wrap DEK
     let result = wrap_key(&kek, dek, &export_id, slot_id);
-
-    // Zeroize KEK immediately after use
-    kek.zeroize();
 
     let (wrapped_dek, nonce) = result?;
 
@@ -514,9 +559,9 @@ fn create_recovery_slot(
         id: slot_id,
         slot_type: SlotType::Recovery,
         kdf: KdfAlgorithm::HkdfSha256,
-        salt: BASE64.encode(salt),
-        wrapped_dek: BASE64.encode(&wrapped_dek),
-        nonce: BASE64.encode(nonce),
+        salt: BASE64_STANDARD.encode(salt),
+        wrapped_dek: BASE64_STANDARD.encode(&wrapped_dek),
+        nonce: BASE64_STANDARD.encode(nonce),
         argon2_params: None,
     })
 }
@@ -531,7 +576,8 @@ fn wrap_key(
     let cipher = Aes256Gcm::new_from_slice(kek).expect("Invalid key length");
 
     let mut nonce = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce);
+    let mut rng = rand::rng();
+    rng.fill_bytes(&mut nonce);
 
     // AAD: export_id || slot_id
     let mut aad = Vec::with_capacity(export_id.len() + 1);
@@ -559,16 +605,70 @@ fn decrypt_all_chunks(
     progress: impl Fn(f32),
 ) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(dek).expect("Invalid key length");
-    let base_nonce = BASE64.decode(&config.base_nonce)?;
-    let export_id = BASE64.decode(&config.export_id)?;
+    let base_nonce_raw = BASE64_STANDARD.decode(&config.base_nonce)?;
+    let base_nonce: [u8; 12] = base_nonce_raw.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid base_nonce length: expected 12, got {}",
+            base_nonce_raw.len()
+        )
+    })?;
+    let export_id_raw = BASE64_STANDARD.decode(&config.export_id)?;
+    let export_id: [u8; 16] = export_id_raw.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid export_id length: expected 16, got {}",
+            export_id_raw.len()
+        )
+    })?;
+    let canonical_archive_dir = archive_dir.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve archive root {} before decrypting chunks",
+            archive_dir.display()
+        )
+    })?;
 
     let mut plaintext = Vec::new();
 
     for (chunk_index, chunk_file) in config.payload.files.iter().enumerate() {
         progress(chunk_index as f32 / config.payload.chunk_count as f32);
 
+        let expected_chunk_file = format!("payload/chunk-{chunk_index:05}.bin");
+        if chunk_file != &expected_chunk_file {
+            bail!(
+                "Invalid chunk path in config.json: expected {}, got {}",
+                expected_chunk_file,
+                chunk_file
+            );
+        }
         let chunk_path = archive_dir.join(chunk_file);
-        let ciphertext = std::fs::read(&chunk_path)?;
+        let chunk_meta = std::fs::symlink_metadata(&chunk_path).with_context(|| {
+            format!(
+                "Failed to inspect encrypted chunk {} at {}",
+                chunk_index,
+                chunk_path.display()
+            )
+        })?;
+        if chunk_meta.file_type().is_symlink() {
+            bail!("Encrypted chunk must not be a symlink: {}", chunk_file);
+        }
+        if !chunk_meta.file_type().is_file() {
+            bail!("Encrypted chunk must be a regular file: {}", chunk_file);
+        }
+
+        let canonical_chunk_path = chunk_path.canonicalize().with_context(|| {
+            format!(
+                "Failed to resolve encrypted chunk {} at {}",
+                chunk_index,
+                chunk_path.display()
+            )
+        })?;
+        if !canonical_chunk_path.starts_with(&canonical_archive_dir) {
+            bail!(
+                "Encrypted chunk path escapes archive directory: {}",
+                chunk_file
+            );
+        }
+
+        let ciphertext = std::fs::read(&canonical_chunk_path)?;
 
         // Derive nonce
         let nonce = derive_chunk_nonce(&base_nonce, chunk_index as u32);
@@ -612,6 +712,9 @@ fn encrypt_all_chunks(
     std::fs::create_dir_all(payload_dir)?;
 
     let cipher = Aes256Gcm::new_from_slice(dek).expect("Invalid key length");
+    if chunk_size == 0 {
+        anyhow::bail!("chunk_size must be > 0");
+    }
     let total_chunks = plaintext.len().div_ceil(chunk_size);
     let mut chunk_index = 0u32;
 
@@ -649,7 +752,13 @@ fn encrypt_all_chunks(
         let mut chunk_file = File::create(&chunk_path)?;
         chunk_file.write_all(&ciphertext)?;
 
-        chunk_index += 1;
+        chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!(
+                "File too large: exceeds maximum of {} chunks ({} bytes with current chunk size)",
+                u32::MAX,
+                (u32::MAX as u64) * (chunk_size as u64)
+            )
+        })?;
     }
 
     progress(1.0);
@@ -657,16 +766,15 @@ fn encrypt_all_chunks(
 }
 
 /// Derive chunk nonce from base nonce and chunk index
-fn derive_chunk_nonce(base_nonce: &[u8], chunk_index: u32) -> [u8; 12] {
-    let mut nonce = [0u8; 12];
-    nonce[..base_nonce.len().min(12)].copy_from_slice(&base_nonce[..base_nonce.len().min(12)]);
+fn derive_chunk_nonce(base_nonce: &[u8; 12], chunk_index: u32) -> [u8; 12] {
+    let mut nonce = *base_nonce;
     // Set the last 4 bytes to the chunk index (big-endian)
     nonce[8..12].copy_from_slice(&chunk_index.to_be_bytes());
     nonce
 }
 
 /// Build AAD for chunk encryption
-fn build_chunk_aad(export_id: &[u8], chunk_index: u32) -> Vec<u8> {
+fn build_chunk_aad(export_id: &[u8; 16], chunk_index: u32) -> Vec<u8> {
     let mut aad = Vec::with_capacity(21);
     aad.extend_from_slice(export_id);
     aad.extend_from_slice(&chunk_index.to_be_bytes());
@@ -674,110 +782,405 @@ fn build_chunk_aad(export_id: &[u8], chunk_index: u32) -> Vec<u8> {
     aad
 }
 
-/// Update integrity.json for a single file
-fn update_integrity_hash(archive_dir: &Path, filename: &str) -> Result<()> {
+/// Regenerate entire integrity.json
+fn regenerate_integrity_manifest(
+    archive_dir: &Path,
+) -> Result<Option<crate::pages::bundle::IntegrityManifest>> {
     let integrity_path = archive_dir.join("integrity.json");
     if !integrity_path.exists() {
+        return Ok(None);
+    }
+
+    let integrity = crate::pages::bundle::generate_integrity_manifest(archive_dir)?;
+    write_json_pretty(&integrity_path, &integrity)?;
+
+    Ok(Some(integrity))
+}
+
+fn write_json_pretty_atomically<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let temp_path = unique_atomic_temp_path(path);
+    {
+        let file = File::create(&temp_path)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, value)?;
+        writer.flush()?;
+    }
+    replace_file_from_temp(&temp_path, path)
+}
+
+fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
+    if cfg!(windows) {
+        match std::fs::rename(temp_path, final_path) {
+            Ok(()) => Ok(()),
+            Err(first_err) if final_path.exists() => {
+                let backup_path = unique_atomic_backup_path(final_path);
+                std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    anyhow::anyhow!(
+                        "failed replacing {} with {}: {}; failed moving existing file to backup {}: {}",
+                        final_path.display(),
+                        temp_path.display(),
+                        first_err,
+                        backup_path.display(),
+                        backup_err
+                    )
+                })?;
+
+                match std::fs::rename(temp_path, final_path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&backup_path);
+                        Ok(())
+                    }
+                    Err(second_err) => match std::fs::rename(&backup_path, final_path) {
+                        Ok(()) => {
+                            let _ = std::fs::remove_file(temp_path);
+                            anyhow::bail!(
+                                "failed replacing {} with {}: {}; restored original file",
+                                final_path.display(),
+                                temp_path.display(),
+                                second_err
+                            );
+                        }
+                        Err(restore_err) => {
+                            anyhow::bail!(
+                                "failed replacing {} with {}: {}; restore error: {}; temp file retained at {}",
+                                final_path.display(),
+                                temp_path.display(),
+                                second_err,
+                                restore_err,
+                                temp_path.display()
+                            );
+                        }
+                    },
+                }
+            }
+            Err(err) => Err(err.into()),
+        }
+    } else {
+        std::fs::rename(temp_path, final_path)?;
+        Ok(())
+    }
+}
+
+fn unique_atomic_temp_path(path: &Path) -> std::path::PathBuf {
+    unique_atomic_sidecar_path(path, "tmp", "config.json")
+}
+
+fn unique_atomic_backup_path(path: &Path) -> std::path::PathBuf {
+    unique_atomic_sidecar_path(path, "bak", "config.json")
+}
+
+fn unique_staged_site_dir(path: &Path) -> std::path::PathBuf {
+    unique_atomic_sidecar_path(path, "rotate", "site")
+}
+
+fn unique_staged_site_backup_dir(path: &Path) -> std::path::PathBuf {
+    unique_atomic_sidecar_path(path, "bak", "site")
+}
+
+fn unique_atomic_sidecar_path(
+    path: &Path,
+    suffix: &str,
+    fallback_name: &str,
+) -> std::path::PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+
+    path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
+}
+
+fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
+    if !final_dir.exists() {
+        std::fs::rename(temp_dir, final_dir).with_context(|| {
+            format!(
+                "failed renaming staged site {} into place at {}",
+                temp_dir.display(),
+                final_dir.display()
+            )
+        })?;
         return Ok(());
     }
 
-    // Read current integrity.json
-    let file = File::open(&integrity_path)?;
-    let mut integrity: serde_json::Value = serde_json::from_reader(BufReader::new(file))?;
+    let backup_dir = unique_staged_site_backup_dir(final_dir);
+    std::fs::rename(final_dir, &backup_dir).with_context(|| {
+        format!(
+            "failed preparing backup {} before replacing {}",
+            backup_dir.display(),
+            final_dir.display()
+        )
+    })?;
 
-    // Calculate new hash for file
-    let file_path = archive_dir.join(filename);
-    let content = std::fs::read(&file_path)?;
-    let hash = sha256_hex(&content);
-
-    // Update hash in integrity
-    if let Some(files) = integrity.get_mut("files").and_then(|f| f.as_object_mut()) {
-        files.insert(filename.to_string(), serde_json::json!(hash));
+    match std::fs::rename(temp_dir, final_dir) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&backup_dir);
+            Ok(())
+        }
+        Err(second_err) => match std::fs::rename(&backup_dir, final_dir) {
+            Ok(()) => anyhow::bail!(
+                "failed replacing {} with {}: {}; restored original site",
+                final_dir.display(),
+                temp_dir.display(),
+                second_err
+            ),
+            Err(restore_err) => anyhow::bail!(
+                "failed replacing {} with {}: {}; restore error: {}; staged site retained at {}",
+                final_dir.display(),
+                temp_dir.display(),
+                second_err,
+                restore_err,
+                temp_dir.display()
+            ),
+        },
     }
-
-    // Write updated integrity.json
-    let file = File::create(&integrity_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &integrity)?;
-
-    Ok(())
 }
 
-/// Regenerate entire integrity.json
-fn regenerate_integrity_manifest(archive_dir: &Path) -> Result<()> {
-    let integrity_path = archive_dir.join("integrity.json");
+fn copy_site_except_runtime_state(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)
+        .with_context(|| format!("Failed to create staged site directory {}", dst.display()))?;
+    let canonical_base = src.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve archive root {} before staging key rotation",
+            src.display()
+        )
+    })?;
+    copy_site_except_runtime_state_recursive(src, dst, src, &canonical_base)
+}
 
-    // Find all files to hash
-    let mut files_map = serde_json::Map::new();
+fn copy_site_except_runtime_state_recursive(
+    src: &Path,
+    dst: &Path,
+    base: &Path,
+    canonical_base: &Path,
+) -> Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel_path = path.strip_prefix(base)?;
+        let skip_root_entry = rel_path.components().count() == 1
+            && matches!(
+                rel_path.to_str(),
+                Some("payload" | "blobs" | "config.json" | "integrity.json")
+            );
+        if skip_root_entry {
+            continue;
+        }
 
-    // Hash config.json
-    let config_path = archive_dir.join("config.json");
-    if config_path.exists() {
-        let content = std::fs::read(&config_path)?;
-        files_map.insert(
-            "config.json".to_string(),
-            serde_json::json!(sha256_hex(&content)),
-        );
-    }
-
-    // Hash all payload chunks
-    let payload_dir = archive_dir.join("payload");
-    if payload_dir.exists() {
-        for entry in std::fs::read_dir(&payload_dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                let filename = entry.file_name().to_string_lossy().to_string();
-                let content = std::fs::read(entry.path())?;
-                files_map.insert(
-                    format!("payload/{}", filename),
-                    serde_json::json!(sha256_hex(&content)),
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
+        let dest_path = dst.join(rel_path);
+        if file_type.is_dir() {
+            std::fs::create_dir_all(&dest_path)?;
+            copy_site_except_runtime_state_recursive(&path, dst, base, canonical_base)?;
+        } else if file_type.is_symlink() {
+            let canonical_target = path.canonicalize().with_context(|| {
+                format!(
+                    "Failed to resolve symlinked site entry {} while staging key rotation",
+                    rel_path.display()
+                )
+            })?;
+            if !canonical_target.starts_with(canonical_base) {
+                bail!(
+                    "Refusing to rotate symlinked site entry outside archive root: {}",
+                    rel_path.display()
                 );
             }
+
+            let target_meta = std::fs::metadata(&path).with_context(|| {
+                format!(
+                    "Failed to read symlink target metadata for {} while staging key rotation",
+                    rel_path.display()
+                )
+            })?;
+            if !target_meta.is_file() {
+                bail!(
+                    "Refusing to rotate symlinked site entry that does not point to a regular file: {}",
+                    rel_path.display()
+                );
+            }
+
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Materialize safe symlink targets into the staged site so the staged
+            // integrity pass stays self-contained before the final atomic swap.
+            std::fs::copy(&canonical_target, &dest_path).with_context(|| {
+                format!(
+                    "Failed copying symlink target {} into staged site path {}",
+                    canonical_target.display(),
+                    dest_path.display()
+                )
+            })?;
+        } else if file_type.is_file() {
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&path, &dest_path).with_context(|| {
+                format!(
+                    "Failed copying staged site file {} to {}",
+                    path.display(),
+                    dest_path.display()
+                )
+            })?;
         }
     }
 
-    let integrity = serde_json::json!({
-        "version": 1,
-        "algorithm": "sha256",
-        "files": files_map,
-        "generated_at": Utc::now().to_rfc3339(),
-    });
+    Ok(())
+}
 
-    let file = File::create(&integrity_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &integrity)?;
+fn refresh_private_artifacts(
+    archive_dir: &Path,
+    config: &EncryptionConfig,
+    manifest: Option<&crate::pages::bundle::IntegrityManifest>,
+    recovery_secret: Option<&[u8]>,
+    remove_recovery_artifacts: bool,
+) -> Result<()> {
+    let Some(private_dir) = private_dir_for_archive(archive_dir) else {
+        return Ok(());
+    };
+
+    if let Some(manifest) = manifest {
+        let fingerprint = crate::pages::bundle::compute_fingerprint(manifest);
+        crate::pages::bundle::write_private_fingerprint(&private_dir, &fingerprint)?;
+    }
+
+    let should_generate_qr = recovery_secret.is_some()
+        && (private_dir.join("qr-code.png").exists() || private_dir.join("qr-code.svg").exists());
+
+    crate::pages::bundle::write_private_artifacts_encrypted(
+        &private_dir,
+        config,
+        recovery_secret,
+        should_generate_qr,
+        remove_recovery_artifacts,
+    )?;
 
     Ok(())
 }
 
-/// Calculate SHA-256 hash as hex string
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+fn private_dir_for_archive(archive_dir: &Path) -> Option<std::path::PathBuf> {
+    if archive_dir
+        .file_name()
+        .map(|name| name == "site")
+        .unwrap_or(false)
+    {
+        let parent = archive_dir.parent()?;
+        let private_dir = parent.join("private");
+        if private_dir.is_dir() {
+            return Some(private_dir);
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pages::attachments::{
+        AttachmentConfig, AttachmentData, AttachmentProcessor, decrypt_blob, decrypt_manifest,
+    };
+    use crate::pages::bundle::BundleBuilder;
     use crate::pages::encrypt::{DecryptionEngine, EncryptionEngine};
+    use crate::pages::verify::verify_bundle;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn replace_viewer_with_in_tree_symlink(site_dir: &Path) {
+        use std::os::unix::fs::symlink;
+
+        let real_viewer = site_dir.join("viewer-real.js");
+        std::fs::rename(site_dir.join("viewer.js"), &real_viewer).unwrap();
+        symlink("viewer-real.js", site_dir.join("viewer.js")).unwrap();
+
+        let manifest = crate::pages::bundle::generate_integrity_manifest(site_dir).unwrap();
+        write_json_pretty(&site_dir.join("integrity.json"), &manifest).unwrap();
+
+        assert_eq!(verify_bundle(site_dir, false).unwrap().status, "valid");
+    }
 
     fn setup_test_archive() -> (TempDir, std::path::PathBuf) {
         let temp_dir = TempDir::new().unwrap();
         let input_path = temp_dir.path().join("input.txt");
-        let output_dir = temp_dir.path().join("site");
+        let bundle_root = temp_dir.path().join("bundle");
+        let encrypted_dir = temp_dir.path().join("encrypted");
 
         // Create test file
         std::fs::write(&input_path, b"Test data for key management").unwrap();
 
         // Encrypt
-        let mut engine = EncryptionEngine::new(1024);
+        let mut engine = EncryptionEngine::new(1024).unwrap();
         engine.add_password_slot("test-password").unwrap();
         engine
-            .encrypt_file(&input_path, &output_dir, |_, _| {})
+            .encrypt_file(&input_path, &encrypted_dir, |_, _| {})
             .unwrap();
 
-        (temp_dir, output_dir)
+        BundleBuilder::new()
+            .build(&encrypted_dir, &bundle_root, |_, _| {})
+            .unwrap();
+
+        (temp_dir, bundle_root)
+    }
+
+    fn setup_test_archive_with_attachments() -> (TempDir, std::path::PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.txt");
+        let bundle_root = temp_dir.path().join("bundle");
+        let encrypted_dir = temp_dir.path().join("encrypted");
+
+        std::fs::write(&input_path, b"Test data for key management").unwrap();
+
+        let mut engine = EncryptionEngine::new(1024).unwrap();
+        engine.add_password_slot("test-password").unwrap();
+        engine
+            .encrypt_file(&input_path, &encrypted_dir, |_, _| {})
+            .unwrap();
+
+        let config = load_config(&encrypted_dir).unwrap();
+        let dek = unwrap_dek_with_password(&config, "test-password").unwrap();
+        let export_id_raw = BASE64_STANDARD.decode(&config.export_id).unwrap();
+        let export_id: [u8; 16] = export_id_raw.as_slice().try_into().unwrap();
+
+        let mut processor = AttachmentProcessor::new(AttachmentConfig::enabled());
+        processor
+            .process_attachments(
+                1,
+                &[AttachmentData {
+                    filename: "proof.txt".to_string(),
+                    mime_type: "text/plain".to_string(),
+                    data: b"attachment payload".to_vec(),
+                }],
+            )
+            .unwrap();
+        processor
+            .write_encrypted_blobs(&encrypted_dir, &dek, &export_id)
+            .unwrap();
+
+        BundleBuilder::new()
+            .build(&encrypted_dir, &bundle_root, |_, _| {})
+            .unwrap();
+
+        (temp_dir, bundle_root)
     }
 
     #[test]
@@ -948,5 +1351,270 @@ mod tests {
         assert!(unwrap_dek_with_password(&config, "password-1").is_err()); // Revoked
         assert!(unwrap_dek_with_password(&config, "password-2").is_ok());
         assert!(unwrap_dek_with_password(&config, "password-3").is_ok());
+    }
+
+    #[test]
+    fn test_key_add_password_preserves_valid_integrity_manifest() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+
+        key_add_password(&archive_dir, "test-password", "new-password").unwrap();
+
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+    }
+
+    #[test]
+    fn test_key_rotate_preserves_valid_integrity_manifest() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+
+        key_rotate(&archive_dir, "test-password", "new-password", true, |_| {}).unwrap();
+
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_key_add_password_preserves_in_tree_symlinked_required_asset() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        replace_viewer_with_in_tree_symlink(&site_dir);
+
+        key_add_password(&archive_dir, "test-password", "new-password").unwrap();
+
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+        assert!(
+            std::fs::symlink_metadata(site_dir.join("viewer.js"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_key_rotate_materializes_in_tree_symlinked_required_asset() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        replace_viewer_with_in_tree_symlink(&site_dir);
+        let expected_viewer = std::fs::read(site_dir.join("viewer-real.js")).unwrap();
+
+        key_rotate(&archive_dir, "test-password", "new-password", true, |_| {}).unwrap();
+
+        let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js")).unwrap();
+        assert!(viewer_metadata.file_type().is_file());
+        assert!(!viewer_metadata.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read(site_dir.join("viewer.js")).unwrap(),
+            expected_viewer
+        );
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_key_rotate_rejects_payload_directory_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let (temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let payload_dir = site_dir.join("payload");
+        let outside_payload_dir = temp_dir.path().join("outside-payload");
+
+        std::fs::rename(&payload_dir, &outside_payload_dir).unwrap();
+        symlink(&outside_payload_dir, &payload_dir).unwrap();
+
+        let err =
+            key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes archive directory"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_key_add_password_updates_private_fingerprint_and_master_key() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let private_dir = site_dir.parent().unwrap().join("private");
+
+        let old_fingerprint =
+            std::fs::read_to_string(private_dir.join("integrity-fingerprint.txt")).unwrap();
+        let old_master_key = std::fs::read_to_string(private_dir.join("master-key.json")).unwrap();
+
+        key_add_password(&archive_dir, "test-password", "new-password").unwrap();
+
+        let new_fingerprint =
+            std::fs::read_to_string(private_dir.join("integrity-fingerprint.txt")).unwrap();
+        let new_master_key = std::fs::read_to_string(private_dir.join("master-key.json")).unwrap();
+
+        assert_ne!(old_fingerprint, new_fingerprint);
+        assert_ne!(old_master_key, new_master_key);
+    }
+
+    #[test]
+    fn test_key_add_recovery_writes_private_recovery_artifact() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let private_dir = site_dir.parent().unwrap().join("private");
+
+        assert!(!private_dir.join("recovery-secret.txt").exists());
+
+        let (_slot_id, secret) = key_add_recovery(&archive_dir, "test-password").unwrap();
+        let recovery_file =
+            std::fs::read_to_string(private_dir.join("recovery-secret.txt")).unwrap();
+
+        assert!(recovery_file.contains(secret.encoded()));
+    }
+
+    #[test]
+    fn test_key_revoke_recovery_removes_private_recovery_artifact() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let private_dir = site_dir.parent().unwrap().join("private");
+
+        let (recovery_slot_id, _secret) = key_add_recovery(&archive_dir, "test-password").unwrap();
+        key_add_password(&archive_dir, "test-password", "second-password").unwrap();
+        assert!(private_dir.join("recovery-secret.txt").exists());
+
+        key_revoke(&archive_dir, "second-password", recovery_slot_id).unwrap();
+
+        assert!(!private_dir.join("recovery-secret.txt").exists());
+    }
+
+    #[test]
+    fn test_key_revoke_one_of_multiple_recovery_slots_removes_stale_private_recovery_artifact() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let private_dir = site_dir.parent().unwrap().join("private");
+
+        let (first_recovery_slot_id, first_secret) =
+            key_add_recovery(&archive_dir, "test-password").unwrap();
+        let (second_recovery_slot_id, second_secret) =
+            key_add_recovery(&archive_dir, "test-password").unwrap();
+
+        let recovery_file_before =
+            std::fs::read_to_string(private_dir.join("recovery-secret.txt")).unwrap();
+        assert!(recovery_file_before.contains(second_secret.encoded()));
+
+        key_revoke(&archive_dir, "test-password", second_recovery_slot_id).unwrap();
+
+        assert!(!private_dir.join("recovery-secret.txt").exists());
+
+        let config = load_config(&archive_dir).unwrap();
+        assert!(DecryptionEngine::unlock_with_recovery(config, first_secret.as_bytes()).is_ok());
+
+        assert_ne!(first_recovery_slot_id, second_recovery_slot_id);
+    }
+
+    #[test]
+    fn test_key_rotate_refreshes_private_recovery_and_master_key() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let private_dir = site_dir.parent().unwrap().join("private");
+
+        let old_master_key = std::fs::read_to_string(private_dir.join("master-key.json")).unwrap();
+        let result =
+            key_rotate(&archive_dir, "test-password", "new-password", true, |_| {}).unwrap();
+
+        let new_master_key = std::fs::read_to_string(private_dir.join("master-key.json")).unwrap();
+        let recovery_file =
+            std::fs::read_to_string(private_dir.join("recovery-secret.txt")).unwrap();
+
+        assert_ne!(old_master_key, new_master_key);
+        assert!(recovery_file.contains(result.recovery_secret.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn test_key_rotate_without_recovery_removes_stale_private_recovery_artifact() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let private_dir = site_dir.parent().unwrap().join("private");
+
+        let (_slot_id, _secret) = key_add_recovery(&archive_dir, "test-password").unwrap();
+        assert!(private_dir.join("recovery-secret.txt").exists());
+
+        key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap();
+
+        assert!(!private_dir.join("recovery-secret.txt").exists());
+        assert!(!private_dir.join("qr-code.png").exists());
+        assert!(!private_dir.join("qr-code.svg").exists());
+    }
+
+    #[test]
+    fn test_key_rotate_reencrypts_attachment_blobs() {
+        let (_temp_dir, archive_dir) = setup_test_archive_with_attachments();
+
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+
+        key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap();
+
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let config = load_config(&archive_dir).unwrap();
+        let dek = unwrap_dek_with_password(&config, "new-password").unwrap();
+        let export_id_raw = BASE64_STANDARD.decode(&config.export_id).unwrap();
+        let export_id: [u8; 16] = export_id_raw.as_slice().try_into().unwrap();
+
+        let manifest_ciphertext =
+            std::fs::read(site_dir.join("blobs").join("manifest.enc")).unwrap();
+        let manifest = decrypt_manifest(&manifest_ciphertext, &dek, &export_id).unwrap();
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.entries[0].filename, "proof.txt");
+
+        let blob_ciphertext = std::fs::read(
+            site_dir
+                .join("blobs")
+                .join(format!("{}.bin", manifest.entries[0].hash)),
+        )
+        .unwrap();
+        let plaintext = decrypt_blob(
+            &blob_ciphertext,
+            &dek,
+            &export_id,
+            &manifest.entries[0].hash,
+        )
+        .unwrap();
+        assert_eq!(plaintext, b"attachment payload");
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+    }
+
+    #[test]
+    fn test_key_rotate_failure_before_site_swap_preserves_live_archive() {
+        let (temp_dir, archive_dir) = setup_test_archive_with_attachments();
+        let decrypted_path = temp_dir.path().join("decrypted-after-failure.txt");
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+
+        std::fs::write(site_dir.join("blobs").join("manifest.enc"), b"corrupted").unwrap();
+
+        let rotate_result =
+            key_rotate(&archive_dir, "test-password", "new-password", false, |_| {});
+        assert!(rotate_result.is_err());
+
+        let config = load_config(&archive_dir).unwrap();
+        assert!(unwrap_dek_with_password(&config, "new-password").is_err());
+
+        let decryptor = DecryptionEngine::unlock_with_password(config, "test-password").unwrap();
+        decryptor
+            .decrypt_to_file(&archive_dir, &decrypted_path, |_, _| {})
+            .unwrap();
+
+        let decrypted = std::fs::read(&decrypted_path).unwrap();
+        assert_eq!(decrypted, b"Test data for key management");
+    }
+
+    #[test]
+    fn test_write_json_pretty_atomically_overwrites_existing_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.json");
+        std::fs::write(&path, "{\"before\":true}\n").unwrap();
+
+        let value = serde_json::json!({ "after": true });
+        write_json_pretty_atomically(&path, &value).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written, value);
     }
 }

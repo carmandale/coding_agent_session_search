@@ -23,9 +23,9 @@
 #![allow(unexpected_cfgs)]
 
 use anyhow::{Context, Result, bail};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::prelude::*;
 use chrono::Utc;
-use rand::{RngCore, rngs::OsRng};
+use rand::Rng;
 use std::path::Path;
 use tracing::info;
 use zeroize::Zeroize;
@@ -61,29 +61,31 @@ impl RecoverySecret {
     /// Uses the system's cryptographically secure random number generator.
     pub fn generate() -> Self {
         let mut bytes = vec![0u8; RECOVERY_SECRET_BYTES];
-        OsRng.fill_bytes(&mut bytes);
-        let encoded = URL_SAFE_NO_PAD.encode(&bytes);
+        let mut rng = rand::rng();
+        rng.fill_bytes(&mut bytes);
+        let encoded = BASE64_URL_SAFE_NO_PAD.encode(&bytes);
         Self { bytes, encoded }
     }
 
     /// Create a recovery secret from existing bytes.
     ///
-    /// Returns None if the bytes are too short (< 16 bytes).
+    /// Returns None if the bytes are too short (< 24 bytes / 192 bits).
+    /// NIST recommends 192+ bits for long-term cryptographic material.
     pub fn from_bytes(bytes: Vec<u8>) -> Option<Self> {
-        if bytes.len() < 16 {
+        if bytes.len() < 24 {
             return None;
         }
-        let encoded = URL_SAFE_NO_PAD.encode(&bytes);
+        let encoded = BASE64_URL_SAFE_NO_PAD.encode(&bytes);
         Some(Self { bytes, encoded })
     }
 
     /// Create a recovery secret from a base64url-encoded string.
     pub fn from_encoded(encoded: &str) -> Result<Self> {
-        let bytes = URL_SAFE_NO_PAD
+        let bytes = BASE64_URL_SAFE_NO_PAD
             .decode(encoded)
             .context("Invalid base64url encoding")?;
-        if bytes.len() < 16 {
-            bail!("Recovery secret too short (minimum 128 bits)");
+        if bytes.len() < 24 {
+            bail!("Recovery secret too short (minimum 192 bits for long-term security)");
         }
         Ok(Self {
             bytes,
@@ -111,13 +113,9 @@ impl Drop for RecoverySecret {
     fn drop(&mut self) {
         // Use zeroize crate for secure erasure (prevents compiler optimization)
         self.bytes.zeroize();
-        // SAFETY: Zeroize encoded string by replacing with zeros then clearing
-        // This ensures the base64-encoded secret doesn't linger in memory
-        unsafe {
-            let encoded_bytes = self.encoded.as_bytes_mut();
-            encoded_bytes.zeroize();
-        }
-        self.encoded.clear();
+        // Move encoded bytes out, zeroize, then drop without unsafe string mutation.
+        let mut encoded_bytes = std::mem::take(&mut self.encoded).into_bytes();
+        encoded_bytes.zeroize();
     }
 }
 
@@ -135,15 +133,13 @@ pub struct RecoveryArtifacts {
 
 impl Drop for RecoveryArtifacts {
     fn drop(&mut self) {
-        // Zeroize secret_text which contains the encoded secret
-        // SAFETY: Same as RecoverySecret::drop - zeroize string contents
-        unsafe {
-            let text_bytes = self.secret_text.as_bytes_mut();
-            text_bytes.zeroize();
-        }
-        self.secret_text.clear();
+        // Zeroize all secret-bearing payloads before drop.
+        let mut text_bytes = std::mem::take(&mut self.secret_text).into_bytes();
+        text_bytes.zeroize();
+        self.qr_png.zeroize();
+        let mut svg_bytes = std::mem::take(&mut self.qr_svg).into_bytes();
+        svg_bytes.zeroize();
         // Note: secret field has its own Drop impl that zeroizes it
-        // qr_png and qr_svg don't contain plaintext secret (encoded in QR)
     }
 }
 
@@ -333,12 +329,12 @@ mod tests {
 
     #[test]
     fn test_recovery_secret_minimum_entropy() {
-        // Should reject secrets with < 128 bits
-        let short_bytes = vec![0u8; 15]; // Only 120 bits
+        // Should reject secrets with < 192 bits (NIST recommendation for long-term security)
+        let short_bytes = vec![0u8; 23]; // Only 184 bits (below 192-bit threshold)
         assert!(RecoverySecret::from_bytes(short_bytes).is_none());
 
-        // Should accept secrets with >= 128 bits
-        let min_bytes = vec![0u8; 16]; // 128 bits
+        // Should accept secrets with >= 192 bits
+        let min_bytes = vec![0u8; 24]; // 192 bits (minimum acceptable)
         assert!(RecoverySecret::from_bytes(min_bytes).is_some());
     }
 

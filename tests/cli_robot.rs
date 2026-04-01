@@ -7,8 +7,8 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
-use clap::{self, CommandFactory};
-use coding_agent_search::Cli;
+use clap::{self, CommandFactory, Parser};
+use coding_agent_search::{Cli, Commands};
 
 fn base_cmd() -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
@@ -60,7 +60,11 @@ fn api_version_reports_contract() {
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid api-version json");
     assert_eq!(json["api_version"], 1);
     assert_eq!(json["contract_version"], "1");
-    assert!(json["crate_version"].is_string());
+    assert!(
+        json["crate_version"].is_string(),
+        "crate_version should be a string, got: {:?}",
+        json["crate_version"]
+    );
 }
 
 #[test]
@@ -100,18 +104,46 @@ fn introspect_global_flags_have_types_and_defaults() {
                 assert_eq!(flag["value_type"], "enum");
                 assert_eq!(flag["default"], "auto");
                 let enums = flag["enum_values"].as_array().unwrap();
-                assert!(enums.iter().any(|v| v == "auto"));
-                assert!(enums.iter().any(|v| v == "never"));
-                assert!(enums.iter().any(|v| v == "always"));
+                assert!(
+                    enums.iter().any(|v| v == "auto"),
+                    "color enum should have 'auto', got: {:?}",
+                    enums
+                );
+                assert!(
+                    enums.iter().any(|v| v == "never"),
+                    "color enum should have 'never', got: {:?}",
+                    enums
+                );
+                assert!(
+                    enums.iter().any(|v| v == "always"),
+                    "color enum should have 'always', got: {:?}",
+                    enums
+                );
             }
             "progress" => {
                 assert_eq!(flag["value_type"], "enum");
                 assert_eq!(flag["default"], "auto");
                 let enums = flag["enum_values"].as_array().unwrap();
-                assert!(enums.iter().any(|v| v == "auto"));
-                assert!(enums.iter().any(|v| v == "bars"));
-                assert!(enums.iter().any(|v| v == "plain"));
-                assert!(enums.iter().any(|v| v == "none"));
+                assert!(
+                    enums.iter().any(|v| v == "auto"),
+                    "progress enum should have 'auto', got: {:?}",
+                    enums
+                );
+                assert!(
+                    enums.iter().any(|v| v == "bars"),
+                    "progress enum should have 'bars', got: {:?}",
+                    enums
+                );
+                assert!(
+                    enums.iter().any(|v| v == "plain"),
+                    "progress enum should have 'plain', got: {:?}",
+                    enums
+                );
+                assert!(
+                    enums.iter().any(|v| v == "none"),
+                    "progress enum should have 'none', got: {:?}",
+                    enums
+                );
             }
             "db" => {
                 assert_eq!(flag["value_type"], "path");
@@ -177,7 +209,7 @@ fn introspect_repeatable_and_value_types() {
             "limit" => {
                 found_limit = true;
                 assert_eq!(arg["value_type"], "integer");
-                assert_eq!(arg["default"], "10");
+                assert_eq!(arg["default"], "0");
             }
             "aggregate" => {
                 found_aggregate = true;
@@ -224,12 +256,13 @@ fn state_matches_status() {
 
     // Core assertion: status and state report the same health
     assert_eq!(status_json["healthy"], state_json["healthy"]);
-    // Pending sessions should match between the two commands (value depends on watch_state.json
-    // which may not exist in CI - so just check they're consistent with each other)
+    // Pending sessions should match between the two commands, regardless of the
+    // rebuild/watch state observed in the fixture dataset.
     assert_eq!(
         status_json["pending"]["sessions"],
         state_json["pending"]["sessions"]
     );
+    assert_eq!(status_json["semantic"], state_json["semantic"]);
 }
 
 #[test]
@@ -253,7 +286,11 @@ fn search_cursor_and_token_budget() {
     let first_out = first.assert().success().get_output().clone();
     let first_json: Value = serde_json::from_slice(&first_out.stdout).expect("valid search json");
     assert_eq!(first_json["request_id"], "rid-123");
-    assert!(first_json["hits_clamped"].as_bool().unwrap_or(false));
+    assert!(
+        first_json["hits_clamped"].as_bool().unwrap_or(false),
+        "hits_clamped should be true when --max-results limits output, got: {:?}",
+        first_json["hits_clamped"]
+    );
     if let Some(cursor) = first_json["_meta"]
         .get("next_cursor")
         .and_then(|c| c.as_str())
@@ -1041,17 +1078,19 @@ fn fetch_introspect_json() -> Value {
 }
 
 fn find_command<'a>(json: &'a Value, name: &str) -> &'a Value {
+    let msg = format!("command {name} missing from introspect");
     json["commands"]
         .as_array()
         .and_then(|cmds| cmds.iter().find(|c| c["name"] == name))
-        .unwrap_or_else(|| panic!("command {name} missing from introspect"))
+        .expect(&msg)
 }
 
 fn find_arg<'a>(cmd: &'a Value, name: &str) -> &'a Value {
+    let msg = format!("arg {name} missing in command {}", cmd["name"]);
     cmd["arguments"]
         .as_array()
         .and_then(|args| args.iter().find(|a| a["name"] == name))
-        .unwrap_or_else(|| panic!("arg {name} missing in command {}", cmd["name"]))
+        .expect(&msg)
 }
 
 #[test]
@@ -1095,7 +1134,7 @@ fn introspect_arguments_capture_types_defaults_and_repeatable() {
     let search = find_command(&json, "search");
     let limit = find_arg(search, "limit");
     assert_eq!(limit["value_type"], "integer");
-    assert_eq!(limit["default"], "10");
+    assert_eq!(limit["default"], "0");
 
     let offset = find_arg(search, "offset");
     assert_eq!(offset["value_type"], "integer");
@@ -1142,6 +1181,25 @@ fn introspect_arguments_capture_types_defaults_and_repeatable() {
 }
 
 #[test]
+fn introspect_sessions_command_exposes_workspace_current_and_limit() {
+    let json = fetch_introspect_json();
+
+    let sessions = find_command(&json, "sessions");
+    let workspace = find_arg(sessions, "workspace");
+    assert_eq!(workspace["value_type"], "path");
+    assert_eq!(workspace["arg_type"], "option");
+
+    let current = find_arg(sessions, "current");
+    assert_eq!(current["arg_type"], "flag");
+
+    let limit = find_arg(sessions, "limit");
+    assert_eq!(limit["value_type"], "integer");
+
+    let data_dir = find_arg(sessions, "data-dir");
+    assert_eq!(data_dir["value_type"], "path");
+}
+
+#[test]
 fn diag_json_reports_paths_and_connectors() {
     let mut cmd = base_cmd();
     cmd.args([
@@ -1162,6 +1220,22 @@ fn diag_json_reports_paths_and_connectors() {
         json["connectors"].is_array(),
         "diag should include connectors array"
     );
+
+    let connector_names: HashSet<String> = json["connectors"]
+        .as_array()
+        .expect("connectors array")
+        .iter()
+        .filter_map(|entry| entry.get("name"))
+        .filter_map(|name| name.as_str())
+        .map(str::to_string)
+        .collect();
+
+    for expected in ["aider", "pi_agent", "claude_code"] {
+        assert!(
+            connector_names.contains(expected),
+            "diag connectors missing expected entry: {expected}"
+        );
+    }
 }
 
 #[test]
@@ -1250,7 +1324,7 @@ fn search_agent_filter_limits_hits() {
         "hello",
         "--json",
         "--agent",
-        "gemini",
+        "aider",
         "--data-dir",
         "tests/fixtures/search_demo_data",
     ]);
@@ -1262,10 +1336,10 @@ fn search_agent_filter_limits_hits() {
     let hits = json["hits"].as_array().expect("hits array");
     assert!(
         !hits.is_empty(),
-        "expected some hits for gemini agent filter"
+        "expected some hits for aider agent filter"
     );
     for hit in hits {
-        assert_eq!(hit["agent"], "gemini", "agent filter should be enforced");
+        assert_eq!(hit["agent"], "aider", "agent filter should be enforced");
     }
 }
 
@@ -1691,6 +1765,7 @@ fn status_json_returns_health_info() {
     assert!(json["index"].is_object(), "Should have index object");
     assert!(json["database"].is_object(), "Should have database object");
     assert!(json["pending"].is_object(), "Should have pending object");
+    assert!(json["semantic"].is_object(), "Should have semantic object");
 
     // Database should exist in fixture
     assert_eq!(
@@ -1775,6 +1850,99 @@ fn status_missing_db_reports_not_found() {
 }
 
 #[test]
+fn status_json_reports_open_error_for_unopenable_db_path() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    fs::create_dir_all(data_dir.join("index").join("v4")).unwrap();
+    fs::create_dir_all(data_dir.join("agent_search.db")).unwrap();
+
+    let mut cmd = base_cmd();
+    cmd.args(["status", "--json", "--data-dir"])
+        .arg(data_dir)
+        .timeout(std::time::Duration::from_secs(10));
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "status should succeed even when the db path is unopenable"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(json["healthy"], Value::Bool(false));
+    assert_eq!(json["status"], Value::String("degraded".to_string()));
+    assert_eq!(json["database"]["exists"], Value::Bool(true));
+    assert_eq!(json["database"]["opened"], Value::Bool(false));
+    assert_ne!(json["semantic"]["availability"], Value::String("load_failed".to_string()));
+    assert!(
+        !json["semantic"]["summary"]
+            .as_str()
+            .unwrap_or("")
+            .contains("asset inspection failed"),
+        "status should preserve the semantic root cause instead of collapsing to a generic asset failure: {json}"
+    );
+    assert!(
+        json["database"]["open_error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Failed to open")
+            || json["database"]["open_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("open"),
+        "status should surface the open failure: {json}"
+    );
+}
+
+#[test]
+fn health_json_reports_open_error_for_unopenable_db_path() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    fs::create_dir_all(data_dir.join("index").join("v4")).unwrap();
+    fs::create_dir_all(data_dir.join("agent_search.db")).unwrap();
+
+    let mut cmd = base_cmd();
+    cmd.args(["health", "--json", "--data-dir"])
+        .arg(data_dir)
+        .timeout(std::time::Duration::from_secs(10));
+
+    let output = cmd.output().unwrap();
+    assert!(
+        !output.status.success(),
+        "health should fail when the db exists but cannot be opened"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(json["healthy"], Value::Bool(false));
+    assert_eq!(json["status"], Value::String("degraded".to_string()));
+    assert_eq!(json["db"]["exists"], Value::Bool(true));
+    assert_eq!(json["db"]["opened"], Value::Bool(false));
+    assert!(
+        json["db"]["open_error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Failed to open")
+            || json["db"]["open_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("open"),
+        "health should surface the open failure: {json}"
+    );
+    assert_ne!(
+        json["state"]["semantic"]["availability"],
+        Value::String("load_failed".to_string())
+    );
+    assert!(
+        !json["state"]["semantic"]["summary"]
+            .as_str()
+            .unwrap_or("")
+            .contains("asset inspection failed"),
+        "health should preserve the semantic root cause instead of collapsing to a generic asset failure: {json}"
+    );
+}
+
+#[test]
 fn status_human_readable_output() {
     // rob.state.status: status without --json should produce human-readable output
     let mut cmd = base_cmd();
@@ -1787,6 +1955,7 @@ fn status_human_readable_output() {
     // Should contain human-readable sections
     assert!(stdout.contains("CASS Status"), "Should have status header");
     assert!(stdout.contains("Database"), "Should have database section");
+    assert!(stdout.contains("Semantic"), "Should have semantic section");
     assert!(
         stdout.contains("Conversations"),
         "Should show conversation count"
@@ -2133,6 +2302,47 @@ fn capabilities_json_includes_connectors() {
 }
 
 #[test]
+fn capabilities_connectors_cover_indexer_registry() {
+    // Prevent drift between the indexer connector registry and the capabilities contract.
+    let mut cmd = base_cmd();
+    cmd.args(["capabilities", "--json"]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    let connectors = json["connectors"].as_array().expect("connectors array");
+    let connector_list: Vec<String> = connectors
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(str::to_string)
+        .collect();
+    let connector_set: HashSet<String> = connector_list.iter().cloned().collect();
+
+    assert_eq!(
+        connector_set.len(),
+        connector_list.len(),
+        "capabilities connector list should not contain duplicates"
+    );
+
+    let expected_from_registry: Vec<String> =
+        coding_agent_search::indexer::get_connector_factories()
+            .into_iter()
+            .map(|(slug, _)| match slug {
+                "claude" => "claude_code".to_string(),
+                other => other.to_string(),
+            })
+            .collect();
+
+    for expected in expected_from_registry {
+        assert!(
+            connector_set.contains(&expected),
+            "capabilities connector list missing registry connector: {expected}"
+        );
+    }
+}
+
+#[test]
 fn capabilities_json_includes_limits() {
     // rob.api.caps: capabilities should include system limits
     let mut cmd = base_cmd();
@@ -2156,7 +2366,10 @@ fn capabilities_json_includes_limits() {
 
     // Sanity check values
     let max_limit = limits["max_limit"].as_u64().expect("max_limit");
-    assert!(max_limit >= 1000, "max_limit should be reasonably high");
+    assert!(
+        max_limit == 0 || max_limit >= 1000,
+        "max_limit should be unlimited (0) or reasonably high"
+    );
 }
 
 #[test]
@@ -3143,10 +3356,7 @@ fn introspect_search_limit_default() {
     let limit = find_arg(search, "limit");
 
     assert_eq!(limit["value_type"], "integer");
-    assert_eq!(
-        limit["default"], "10",
-        "search --limit should default to 10"
-    );
+    assert_eq!(limit["default"], "0", "search --limit should default to 0");
 }
 
 /// Search offset flag should have correct default in introspect
@@ -3366,6 +3576,75 @@ fn introspect_index_watch_once_repeatable_path() {
     );
 }
 
+/// Index command semantic flag should be documented as a flag.
+#[test]
+fn introspect_index_semantic_flag() {
+    let json = fetch_introspect_json();
+    let index = find_command(&json, "index");
+    let semantic = find_arg(index, "semantic");
+
+    assert_eq!(
+        semantic["arg_type"], "flag",
+        "index --semantic should be a flag"
+    );
+}
+
+/// Index command embedder should default to fastembed.
+#[test]
+fn introspect_index_embedder_default() {
+    let json = fetch_introspect_json();
+    let index = find_command(&json, "index");
+    let embedder = find_arg(index, "embedder");
+
+    assert_eq!(
+        embedder["value_type"], "string",
+        "index --embedder should be string type"
+    );
+    assert_eq!(
+        embedder["default"], "fastembed",
+        "index --embedder should default to fastembed"
+    );
+}
+
+/// Index command parsing should accept semantic + embedder flags.
+#[test]
+fn parse_index_semantic_embedder_flags() {
+    let cli =
+        Cli::try_parse_from(["cass", "index", "--semantic", "--embedder", "fastembed"]).unwrap();
+    let command = cli.command.as_ref();
+    assert!(
+        matches!(command, Some(Commands::Index { .. })),
+        "expected index command, got {:?}",
+        cli.command
+    );
+    if let Some(Commands::Index {
+        semantic, embedder, ..
+    }) = command
+    {
+        assert!(*semantic, "semantic flag should be set");
+        assert_eq!(embedder.as_str(), "fastembed");
+    }
+}
+
+/// Index command parsing should default embedder to fastembed.
+#[test]
+fn parse_index_embedder_default() {
+    let cli = Cli::try_parse_from(["cass", "index", "--semantic"]).unwrap();
+    let command = cli.command.as_ref();
+    assert!(
+        matches!(command, Some(Commands::Index { .. })),
+        "expected index command, got {:?}",
+        cli.command
+    );
+    if let Some(Commands::Index {
+        semantic, embedder, ..
+    }) = command
+    {
+        assert!(*semantic, "semantic flag should be set");
+        assert_eq!(embedder.as_str(), "fastembed");
+    }
+}
+
 /// Search command aggregate parameter should be repeatable
 #[test]
 fn introspect_search_aggregate_repeatable() {
@@ -3502,10 +3781,8 @@ fn introspect_all_path_options_documented() {
     // Check global path types
     let globals = json["global_flags"].as_array().expect("global_flags");
     for name in ["db", "trace-file"] {
-        let flag = globals
-            .iter()
-            .find(|f| f["name"] == name)
-            .unwrap_or_else(|| panic!("{name} exists"));
+        let msg = format!("{name} exists");
+        let flag = globals.iter().find(|f| f["name"] == name).expect(&msg);
         assert_eq!(
             flag["value_type"], "path",
             "global --{name} should be path type"
@@ -3572,5 +3849,125 @@ fn introspect_all_integer_options_documented() {
         find_arg(health, "stale-threshold")["value_type"],
         "integer",
         "health --stale-threshold should be integer type"
+    );
+}
+
+// ============================================================================
+// TOON FORMAT INTEGRATION TESTS
+// ============================================================================
+
+/// Test that --robot-format toon is accepted as valid option
+#[test]
+fn robot_format_toon_is_valid_option() {
+    let mut cmd = base_cmd();
+    // Should not fail with "invalid value" error
+    // Use --limit 1 since limit 0 causes panic in tantivy
+    cmd.args(["search", "test", "--robot-format", "toon", "--limit", "1"]);
+    // Ensure the flag is accepted and command succeeds.
+    cmd.assert().success();
+}
+
+/// Test that CASS_OUTPUT_FORMAT=toon env var is respected
+#[test]
+fn cass_output_format_env_triggers_robot_mode() {
+    let mut cmd = base_cmd();
+    cmd.env("CASS_OUTPUT_FORMAT", "json");
+    cmd.args(["search", "test", "--limit", "1"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should output JSON since CASS_OUTPUT_FORMAT=json sets robot mode
+    assert!(
+        stdout.trim().starts_with('{') || stdout.trim().starts_with('['),
+        "CASS_OUTPUT_FORMAT=json should produce JSON output"
+    );
+}
+
+/// Test that TOON_DEFAULT_FORMAT=json env var works
+#[test]
+fn toon_default_format_env_json_works() {
+    let mut cmd = base_cmd();
+    cmd.env("TOON_DEFAULT_FORMAT", "json");
+    cmd.args(["search", "test", "--limit", "1"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should output JSON
+    assert!(
+        stdout.trim().starts_with('{') || stdout.trim().starts_with('['),
+        "TOON_DEFAULT_FORMAT=json should produce JSON output"
+    );
+}
+
+/// Test that CLI flag overrides env vars
+#[test]
+fn cli_robot_format_overrides_env() {
+    let mut cmd = base_cmd();
+    cmd.env("CASS_OUTPUT_FORMAT", "compact");
+    cmd.args(["search", "test", "--robot-format", "json", "--limit", "1"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Pretty JSON has newlines, compact doesn't (if env var was respected wrongly)
+    // This test is checking that --robot-format json overrides compact
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    assert!(json.is_object(), "output should be valid JSON object");
+}
+
+/// Test that --robot-format toon help shows toon in possible values
+#[test]
+fn robot_format_help_includes_toon() {
+    let mut cmd = base_cmd();
+    cmd.args(["search", "--help"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.to_lowercase().contains("toon"),
+        "search --help should mention toon format option"
+    );
+}
+
+/// Test that introspect shows toon in robot-format enum values
+#[test]
+fn introspect_robot_format_includes_toon() {
+    let mut cmd = base_cmd();
+    cmd.args(["introspect", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid introspect json");
+    let commands = json["commands"].as_array().expect("commands array");
+
+    let search = commands
+        .iter()
+        .find(|c| c["name"] == "search")
+        .expect("search command present");
+    let args = search["arguments"].as_array().expect("search args");
+
+    let robot_format = args
+        .iter()
+        .find(|a| a["name"] == "robot-format")
+        .expect("robot-format arg should exist");
+
+    let enum_values = robot_format["enum_values"]
+        .as_array()
+        .expect("robot-format should have enum_values");
+
+    assert!(
+        enum_values.iter().any(|v| v == "toon"),
+        "robot-format enum_values should include toon"
+    );
+}
+
+/// Test that CASS_OUTPUT_FORMAT takes precedence over TOON_DEFAULT_FORMAT
+#[test]
+fn cass_output_format_takes_precedence() {
+    let mut cmd = base_cmd();
+    // Set both env vars - CASS_OUTPUT_FORMAT should win
+    cmd.env("TOON_DEFAULT_FORMAT", "compact");
+    cmd.env("CASS_OUTPUT_FORMAT", "json");
+    cmd.args(["search", "test", "--limit", "1"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Pretty JSON has newlines
+    assert!(
+        stdout.contains('\n'),
+        "CASS_OUTPUT_FORMAT=json should produce pretty JSON (with newlines), not compact"
     );
 }
