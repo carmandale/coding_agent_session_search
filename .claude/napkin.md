@@ -48,6 +48,10 @@
 - **Trusting watch_state.json alone**: The `Claude` timestamp being recent does NOT mean sessions were ingested - the watcher can update timestamps without actually writing to DB if something goes wrong silently
 - **Filename-only dedup for subagents**: Same agent ID hash can exist under different session UUIDs. Must include session UUID in external_id.
 
+## Corrections (continued)
+| 2026-03-31 | Self | Spec 008 was a partial upstream sync — upstream v0.2.5 has 70+ source files we don't have (analytics, daemon, html_export, 7 native connectors). Our Cargo.toml version was left at 0.1.55 while the installed binary reported 0.2.5 (built from upstream). This caused binary confusion and schema mismatch (upstream wrote schema v14, our source only knows v8). | Always bump Cargo.toml version and set repository = carmandale fork URL when doing upstream syncs. Version 0.2.6 = our fork based on upstream 0.2.5 era + local additions. |
+| 2026-03-31 | Self | `cargo install --path .` fails in this repo due to Homebrew cargo (1.88) vs nightly toolchain. `cargo build --release` works (respects rust-toolchain.toml). Deploy by: `~/.cargo/bin/cargo build --release && cp ./target/release/cass ~/.cargo/bin/cass && xattr -d com.apple.quarantine ~/.cargo/bin/cass 2>/dev/null` | Never use `./dev-install.sh` until its `cargo install` is fixed to use `~/.cargo/bin/cargo`. |
+
 ## Domain Notes
 - **Fork ownership**: This is a fork (`carmandale/coding_agent_session_search`) of upstream (`Dicklesworthstone/coding_agent_session_search`). We do NOT push to upstream. Push to `origin` (our fork) only. Upstream is tracked as `upstream` remote. As of 2026-03-15, fork main is 51 commits behind upstream (frankensqlite migration, new connectors, semantic embeddings). Spec 006 tracks the sync.
 - **PiAgent root_paths FIXED (spec 005)**: `detect()` now returns `~/.pi/agent/sessions` instead of `~/.pi/agent`. Reduces watched files from 22K to 1.7K. `scan()` uses exact `Self::home()` comparison instead of path-substring heuristic.
