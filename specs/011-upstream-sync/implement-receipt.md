@@ -6,6 +6,8 @@ test_result: partial-pass
 test_count: 3162
 ---
 
+<!-- implement:complete:v1 | harness: pi/claude-sonnet-4-6 | date: 2026-04-01T15:39:40Z -->
+
 # Implementation Receipt
 
 ## Summary
