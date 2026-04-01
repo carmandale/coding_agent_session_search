@@ -1,3 +1,5 @@
+<!-- code-verify:approved:v1 | harness: codex/gpt-5.3-codex | date: 2026-04-01T16:40:58Z | rounds: 3 -->
+
 1. **6 wiring sites in `src/lib.rs`: Yes, present and correct.**  
 Verified at [lib.rs](/Users/dalecarman/dev/coding_agent_session_search/src/lib.rs:20), [lib.rs](/Users/dalecarman/dev/coding_agent_session_search/src/lib.rs:785), [lib.rs](/Users/dalecarman/dev/coding_agent_session_search/src/lib.rs:2752), [lib.rs](/Users/dalecarman/dev/coding_agent_session_search/src/lib.rs:3488), [lib.rs](/Users/dalecarman/dev/coding_agent_session_search/src/lib.rs:4790), [lib.rs](/Users/dalecarman/dev/coding_agent_session_search/src/lib.rs:5020).
 
