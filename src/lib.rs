@@ -5024,7 +5024,6 @@ fn describe_command(cli: &Cli) -> String {
 
 /// Returns true if the command is using robot/JSON output mode.
 /// Used to auto-suppress INFO logs for clean machine-parseable output.
-#[allow(clippy::collapsible_match)]
 fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
     // Env-driven output formats should behave like robot mode (suppresses INFO logs).
     let env_robot_mode = robot_format_from_env().is_some();
@@ -5049,17 +5048,17 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         | Commands::Expand { .. }
         | Commands::ExportHtml { .. }
         | Commands::Timeline { .. } => cli.robot_format.is_some() || env_robot_mode,
-        Commands::Sources(cmd) => match cmd {
+        Commands::Sources(
             SourcesCommand::List { .. }
             | SourcesCommand::Doctor { .. }
             | SourcesCommand::Sync { .. }
             | SourcesCommand::Discover { .. }
-            | SourcesCommand::Setup { .. } => cli.robot_format.is_some() || env_robot_mode,
-            _ => false,
-        },
-        Commands::Import(cmd) => match cmd {
-            ImportCommand::Chatgpt { .. } => cli.robot_format.is_some() || env_robot_mode,
-        },
+            | SourcesCommand::Setup { .. },
+        ) => cli.robot_format.is_some() || env_robot_mode,
+        Commands::Sources(_) => false,
+        Commands::Import(ImportCommand::Chatgpt { .. }) => {
+            cli.robot_format.is_some() || env_robot_mode
+        }
         Commands::Analytics(_) => {
             // Analytics subcommands now rely on the global robot_format or environment.
             cli.robot_format.is_some() || env_robot_mode
