@@ -4883,7 +4883,20 @@ impl FrankenStorage {
         let mut fts_pending_chars = 0usize;
         let mut _fts_inserted_total = 0usize;
         let mut total_chars: i64 = 0;
+        // Guard against connectors emitting duplicate idx values within a single conversation.
+        // All other insert paths (append, batched) maintain this invariant; the fresh-insert
+        // path must too or the UNIQUE(conversation_id, idx) constraint fires and crashes the watcher.
+        let mut seen_idx = std::collections::HashSet::<i64>::new();
         for msg in &conv.messages {
+            if !seen_idx.insert(msg.idx) {
+                tracing::warn!(
+                    conversation_id = conv_id,
+                    idx = msg.idx,
+                    source_path = %conv.source_path.display(),
+                    "duplicate message idx in fresh conversation insert; skipping to prevent UNIQUE constraint violation"
+                );
+                continue;
+            }
             let msg_id = franken_insert_message(&tx, conv_id, msg)?;
             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
             if !defer_lexical_updates {
@@ -6326,14 +6339,15 @@ fn franken_existing_message_fingerprints_by_idx(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
 ) -> Result<HashMap<i64, MessageMergeFingerprint>> {
-    // Optimization: only fetch fingerprints for recent messages to avoid O(N^2) scaling
-    // on huge conversations. Most incremental updates happen at the end.
+    // Fetch ALL existing message fingerprints for this conversation. No LIMIT — a partial
+    // fingerprint map causes UNIQUE(conversation_id, idx) violations when a connector
+    // resends the full conversation (e.g. any modified codex JSONL). We've seen conversations
+    // with 2000+ messages; missing early fingerprints led to re-insert attempts on
+    // messages already in the DB.  O(M) per conversation is acceptable.
     let rows = tx.query_params(
         "SELECT idx, role, author, created_at, content
          FROM messages
-         WHERE conversation_id = ?1
-         ORDER BY idx DESC
-         LIMIT 1000",
+         WHERE conversation_id = ?1",
         fparams![conversation_id],
     )?;
     let mut fingerprints = HashMap::with_capacity(rows.len());
@@ -6359,13 +6373,12 @@ fn franken_existing_message_replay_fingerprints(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
 ) -> Result<HashSet<MessageReplayFingerprint>> {
-    // Optimization: only fetch fingerprints for recent messages.
+    // Fetch ALL replay fingerprints — same reason the merge fingerprints have no LIMIT.
+    // Partial coverage lets duplicates slip through for long conversations.
     let rows = tx.query_params(
         "SELECT role, author, created_at, content
          FROM messages
-         WHERE conversation_id = ?1
-         ORDER BY idx DESC
-         LIMIT 100",
+         WHERE conversation_id = ?1",
         fparams![conversation_id],
     )?;
     let mut fingerprints = HashSet::with_capacity(rows.len());
