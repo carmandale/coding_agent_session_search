@@ -948,4 +948,54 @@ mod tests {
         assert!(wd.get("plist_installed").is_some());
         assert!(wd.get("watcher_plist_installed").is_some());
     }
+
+    // ── T13: run_health_check behavioral tests ────────────────────────
+
+    #[test]
+    fn run_health_check_returns_already_locked_when_lock_held() {
+        // If the lock is already held (another watchdog instance running),
+        // run_health_check must return AlreadyLocked without side effects.
+        let dir = TempDir::new().unwrap();
+        // Acquire lock in this thread first
+        let _guard = acquire_lock(dir.path()).expect("should acquire lock");
+        // Now run_health_check on same dir — lock acquisition fails
+        let result = run_health_check(dir.path());
+        assert_eq!(
+            result,
+            WatchdogResult::AlreadyLocked,
+            "when lock is held, run_health_check must return AlreadyLocked"
+        );
+    }
+
+    #[test]
+    fn run_health_check_returns_not_running_when_no_pid_file() {
+        // With no PID file, run_health_check must return NotRunning.
+        let dir = TempDir::new().unwrap();
+        let result = run_health_check(dir.path());
+        assert_eq!(
+            result,
+            WatchdogResult::NotRunning,
+            "without a PID file, run_health_check must return NotRunning"
+        );
+    }
+
+    #[test]
+    fn run_health_check_returns_not_running_for_stale_pid() {
+        // With a PID file pointing to a non-existent process,
+        // run_health_check must return NotRunning and clean up the PID file.
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("watcher.pid");
+        // PID 4_000_000 does not exist
+        fs::write(&pid_path, "4000000").unwrap();
+        let result = run_health_check(dir.path());
+        assert_eq!(
+            result,
+            WatchdogResult::NotRunning,
+            "stale PID (non-existent process) must yield NotRunning"
+        );
+        assert!(
+            !pid_path.exists(),
+            "run_health_check must clean up the stale PID file"
+        );
+    }
 }
