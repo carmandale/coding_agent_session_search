@@ -1836,7 +1836,10 @@ fn watchdog_subcommand_with_no_args_parses_as_none() {
 ///
 /// The two parse-level tests above only confirm clap routing. This integration test
 /// guards Sites 3 (outer OR pattern) and 4 (inner match arm) by running the binary
-/// as a subprocess and asserting the output is NOT clap's "unrecognized subcommand" error.
+/// as a subprocess and asserting:
+/// 1. stderr does NOT contain "unrecognized subcommand" (clap routing failure)
+/// 2. The binary produces watchdog-specific output (proves dispatch arm executed,
+///    not the fallback `_ => {}` arm)
 #[test]
 fn watchdog_subcommand_dispatches_at_runtime() {
     let mut cmd = assert_cmd::Command::cargo_bin("cass").expect("cass binary must be built");
@@ -1844,11 +1847,27 @@ fn watchdog_subcommand_dispatches_at_runtime() {
     cmd.args(["watchdog", "run"]);
     let output = cmd.output().expect("failed to execute cass");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // The only failure mode we guard is clap's "unrecognized subcommand" error,
-    // which indicates Site 3 or Site 4 wiring was broken.
-    // Watchdog-specific output (healthy/not-running/error/macOS-only) is all acceptable.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Guard: clap must not have rejected the subcommand.
     assert!(
         !stderr.contains("unrecognized subcommand"),
         "`cass watchdog run` was not dispatched — Sites 3+4 wiring broken.\nstderr: {stderr}"
+    );
+
+    // Guard: the dispatch arm must have produced watchdog-specific output.
+    // Acceptable outputs:
+    //   macOS healthy/restarted/not-running/locked: stdout contains "Watcher" or "watchdog"
+    //   macOS lock error: stderr contains "watchdog lock error"
+    //   non-macOS stub: stderr contains "only supported on macOS"
+    // A missing dispatch arm would hit the fallback `_ => {}` and produce no output at all.
+    let watchdog_output = stdout.contains("Watcher")
+        || stdout.contains("watchdog")
+        || stderr.contains("watchdog")
+        || stderr.contains("only supported on macOS");
+    assert!(
+        watchdog_output,
+        "`cass watchdog run` produced no watchdog output — dispatch arm may be absent.\n\
+        stdout: {stdout}\nstderr: {stderr}"
     );
 }

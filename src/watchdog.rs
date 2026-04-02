@@ -253,9 +253,16 @@ mod platform {
             let _ = writeln!(f, "{}", std::process::id());
             Ok(file)
         } else {
-            // Prefix with "contention:" so callers can distinguish this
-            // from real I/O errors (permission denied, disk full, etc.).
-            bail!("contention: another watchdog instance is already running")
+            // Inspect errno to distinguish contention from real I/O errors.
+            // EWOULDBLOCK / EAGAIN → another process holds the lock (contention).
+            // Any other errno → real I/O error (permission denied, disk full, etc.).
+            let io_err = std::io::Error::last_os_error();
+            let errno = io_err.raw_os_error().unwrap_or(0);
+            if errno == libc::EWOULDBLOCK || errno == libc::EAGAIN {
+                bail!("contention: another watchdog instance is already running")
+            } else {
+                bail!("io: flock failed on watchdog lock: {io_err}")
+            }
         }
     }
 
