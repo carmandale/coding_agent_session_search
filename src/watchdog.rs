@@ -12,6 +12,23 @@ mod platform {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // ── Typed lock error ──────────────────────────────────────────────────
+
+    /// Typed lock-contention marker. `acquire_lock` raises this when
+    /// `flock(LOCK_EX | LOCK_NB)` fails with `EWOULDBLOCK`/`EAGAIN`.
+    /// `run_health_check` uses `anyhow::Error::is::<LockContention>()` to
+    /// distinguish contention from real I/O failures — no string parsing.
+    #[derive(Debug)]
+    pub struct LockContention;
+
+    impl std::fmt::Display for LockContention {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "another watchdog instance is already running")
+        }
+    }
+
+    impl std::error::Error for LockContention {}
+
     // ── Constants (unit-testable) ──────────────────────────────────────────
 
     /// Heartbeat age threshold in seconds. If the watcher hasn't written a
@@ -259,9 +276,10 @@ mod platform {
             let io_err = std::io::Error::last_os_error();
             let errno = io_err.raw_os_error().unwrap_or(0);
             if errno == libc::EWOULDBLOCK || errno == libc::EAGAIN {
-                bail!("contention: another watchdog instance is already running")
+                // Contention: another process holds the lock.
+                return Err(anyhow::Error::new(LockContention));
             } else {
-                bail!("io: flock failed on watchdog lock: {io_err}")
+                bail!("flock failed on watchdog lock: {io_err}")
             }
         }
     }
@@ -274,12 +292,11 @@ mod platform {
         let _lock_guard = match acquire_lock(data_dir) {
             Ok(f) => f,
             Err(e) => {
-                let msg = e.to_string();
-                if msg.starts_with("contention:") {
-                    // Another watchdog instance is holding the lock — expected scenario.
+                if e.is::<LockContention>() {
+                    // Another watchdog instance holds the lock — expected scenario.
                     return WatchdogResult::AlreadyLocked;
                 }
-                // Real I/O error (permission denied, disk full, etc.) — not contention.
+                // Real I/O error (permission denied, disk full, ENOLCK, etc.).
                 return WatchdogResult::Error(format!("watchdog lock error: {e}"));
             }
         };
@@ -658,6 +675,7 @@ mod tests {
     use super::platform::*;
     use std::fs;
     use std::io::Write;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
@@ -967,6 +985,25 @@ mod tests {
     }
 
     // ── T13: run_health_check behavioral tests ────────────────────────
+
+    #[test]
+    fn run_health_check_returns_error_for_io_failure() {
+        // Passing a non-existent directory causes acquire_lock's file open to fail
+        // with a real I/O error (ENOENT). This must propagate as WatchdogResult::Error,
+        // not WatchdogResult::AlreadyLocked.
+        let result = run_health_check(Path::new("/nonexistent/watchdog/test/dir"));
+        assert!(
+            matches!(result, WatchdogResult::Error(_)),
+            "non-existent dir must yield WatchdogResult::Error, got {result:?}"
+        );
+        // Verify the error message is informative
+        if let WatchdogResult::Error(msg) = result {
+            assert!(
+                msg.contains("watchdog lock error"),
+                "error message should mention lock error, got: {msg}"
+            );
+        }
+    }
 
     #[test]
     fn run_health_check_returns_already_locked_when_lock_held() {
