@@ -55,6 +55,7 @@
 ## Corrections (continued)
 | 2026-04-01 | Spec 011 | frankensqlite pin must balance stable-compat AND pragma_table_info support. 92a9a0fa lacks pragma_table_info (14 test failures); HEAD requires nightly. dd9b457 is the stable-safe sweet spot. | When upgrading frankensqlite, test pragma_table_info support AND check for `#![feature(core_intrinsics)]`. |
 | 2026-04-01 | Spec 011 | New binary + new frankensqlite rev causes WAL frame salt mismatch on first start. Watcher crash-loops on historical salvage at source_row_id=7. | After frankensqlite upgrades: expect WAL mismatch on first watcher start; clear historical bundles if salvage loop detected. |
+| 2026-04-02 | Spec 011 code-verify | Upstream sync specs that say "all tests pass" will always fail code-verify because 55 upstream tests fail due to frankensqlite FTS5 behavior differences between git pins and local path dep. This is a pre-existing upstream issue — cannot fix without frankensqlite dev access. | For future upstream sync specs: write acceptance criterion as "watchdog/wiring tests pass; upstream test failures documented in receipt are acceptable." Never write "cargo test --lib — all tests pass" for upstream sync work without qualifying which modules must pass. |
 
 ## Domain Notes
 - **Version pattern**: When upstream bumps to version N, our fork version becomes `N+minor-gj.1`. The `-gj.1` suffix identifies our fork at a glance. Current: upstream `0.2.5` → fork `0.2.7-gj.1`.
