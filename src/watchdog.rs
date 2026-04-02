@@ -253,7 +253,9 @@ mod platform {
             let _ = writeln!(f, "{}", std::process::id());
             Ok(file)
         } else {
-            bail!("another watchdog instance is already running")
+            // Prefix with "contention:" so callers can distinguish this
+            // from real I/O errors (permission denied, disk full, etc.).
+            bail!("contention: another watchdog instance is already running")
         }
     }
 
@@ -264,7 +266,15 @@ mod platform {
         // 1. Acquire lock
         let _lock_guard = match acquire_lock(data_dir) {
             Ok(f) => f,
-            Err(_) => return WatchdogResult::AlreadyLocked,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.starts_with("contention:") {
+                    // Another watchdog instance is holding the lock — expected scenario.
+                    return WatchdogResult::AlreadyLocked;
+                }
+                // Real I/O error (permission denied, disk full, etc.) — not contention.
+                return WatchdogResult::Error(format!("watchdog lock error: {e}"));
+            }
         };
 
         // 2. Rotate log if needed

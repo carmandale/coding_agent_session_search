@@ -1831,3 +1831,24 @@ fn watchdog_subcommand_with_no_args_parses_as_none() {
         other => panic!("expected Commands::Watchdog, got {other:?}"),
     }
 }
+
+/// Verify `cass watchdog run` actually reaches the dispatch arm in `execute_cli` at runtime.
+///
+/// The two parse-level tests above only confirm clap routing. This integration test
+/// guards Sites 3 (outer OR pattern) and 4 (inner match arm) by running the binary
+/// as a subprocess and asserting the output is NOT clap's "unrecognized subcommand" error.
+#[test]
+fn watchdog_subcommand_dispatches_at_runtime() {
+    let mut cmd = assert_cmd::Command::cargo_bin("cass").expect("cass binary must be built");
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    cmd.args(["watchdog", "run"]);
+    let output = cmd.output().expect("failed to execute cass");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The only failure mode we guard is clap's "unrecognized subcommand" error,
+    // which indicates Site 3 or Site 4 wiring was broken.
+    // Watchdog-specific output (healthy/not-running/error/macOS-only) is all acceptable.
+    assert!(
+        !stderr.contains("unrecognized subcommand"),
+        "`cass watchdog run` was not dispatched — Sites 3+4 wiring broken.\nstderr: {stderr}"
+    );
+}
