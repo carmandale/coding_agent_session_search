@@ -24,8 +24,11 @@ temp_*.rs
 # bv (beads viewer) local config and caches
 .bv/
 
-# Claude Code artifacts
-.claude/
+# Claude Code session-local artifacts (napkin.md IS committed)
+.claude/ground-cache*
+.claude/settings.local.json
+.claude/cache/
+.claude/worktrees/
 
 # Local backup directories
 .local_backup_*/
