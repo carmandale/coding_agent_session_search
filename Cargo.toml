@@ -1,12 +1,12 @@
 [package]
 name = "coding-agent-search"
-version = "0.2.5"
+version = "0.2.7-gj.1"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
-license-file = "LICENSE"
+license = "MIT"
 resolver = "2"
-repository = "https://github.com/Dicklesworthstone/coding_agent_session_search"
+repository = "https://github.com/carmandale/coding_agent_session_search"
 default-run = "cass"
 
 [dependencies]
@@ -14,7 +14,8 @@ anyhow = "*"
 thiserror = "*"
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter", "fmt", "ansi"] }
-asupersync = { path = "../asupersync", features = ["test-internals", "tls-native-roots"] }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "95476b32", features = ["test-internals", "tls-native-roots"] }
+libc = "*"  # required by src/watchdog.rs for PID management
 clap = { version = "*", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "*"
 clap_mangen = "*"
@@ -32,7 +33,7 @@ which = "*"
 shell-words = "*"
 dotenvy = "*"
 notify = "*"
-frankensqlite = { path = "../frankensqlite/crates/fsqlite", package = "fsqlite", features = ["fts5"] }
+frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dd9b457", package = "fsqlite", features = ["fts5"] }
 rayon = "*"
 crossbeam-channel = "*"
 parking_lot = "*"
@@ -70,7 +71,7 @@ memmap2 = "*"
 bytemuck = "*"
 fastembed = { version = "*", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
 frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3eec663", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
-franken-agent-detection = { path = "../franken_agent_detection", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
+franken-agent-detection = { git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "c5d3273c", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
 wide = "*"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "*"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "*"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -80,10 +81,10 @@ ouroboros = "*"  # Safe self-referential wrapper for HNSW loader lifetime
 # Crypto for ChatGPT encrypted conversations and HTML export encryption
 aes-gcm = "*"
 ring = "*"
-pbkdf2 = "*"  # PBKDF2 key derivation for Web Crypto compatible HTML export encryption
+pbkdf2 = "=0.12.2"  # pinned to match upstream (digest 0.10.7 chain)
 
 # SHA256 hashing for model verification
-sha2 = "*"
+sha2 = "=0.10.9"  # pinned to match upstream (digest 0.10.7 chain)
 hex = "*"
 
 # Interactive terminal prompts for setup wizard
@@ -94,7 +95,7 @@ ssh2 = "*"
 # Statically link OpenSSL so release binaries don't require system libssl.so.3
 openssl = { version = "*", features = ["vendored"] }
 argon2 = "*"
-hkdf = "*"
+hkdf = "=0.12.4"  # pinned to match upstream digest chain
 zeroize = { version = "*", features = ["derive"] }
 flate2 = "*"
 rand = "0.10"
@@ -133,7 +134,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
+fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dd9b457", package = "fsqlite-types" }
 
 [[bin]]
 name = "cass"
@@ -153,11 +154,10 @@ inherits = "release"
 debug = true
 strip = false
 
-[patch."https://github.com/Dicklesworthstone/asupersync"]
-asupersync = { path = "../asupersync" }
-franken-decision = { path = "../asupersync/franken_decision" }
-franken-evidence = { path = "../asupersync/franken_evidence" }
-franken-kernel = { path = "../asupersync/franken_kernel" }
+# Patch FAD's internal path dep on frankensqlite (fsqlite) — FAD's crush feature
+# uses a path dep to ../frankensqlite. We redirect it to our git dep instead.
+[patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
+frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "dd9b457", package = "fsqlite" }
 
 [workspace.metadata.dist]
 targets = ["x86_64-unknown-linux-gnu"]
