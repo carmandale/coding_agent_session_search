@@ -3841,6 +3841,16 @@ fn reindex_paths(
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
 
+    // Seed the WAL with a no-op write before any ingest attempt.
+    // After a full streaming scan the WAL file is checkpointed to 0 bytes;
+    // frankensqlite's "rebuild" path then fails with "WAL file too small
+    // for header: read 0, need 32".  A trivial write produces a valid WAL
+    // header so subsequent write transactions open cleanly.  Errors here
+    // are non-fatal -- the scan loop will surface any real issues.
+    if let Ok(storage_guard) = storage.try_lock() {
+        let _ = storage_guard.set_last_indexed_at(FrankenStorage::now_millis());
+    }
+
     let triggers = classify_paths(
         paths,
         roots,
