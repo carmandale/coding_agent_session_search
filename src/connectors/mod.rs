@@ -53,7 +53,7 @@ pub mod factory;
 pub mod gemini;
 pub mod kimi;
 pub mod openclaw;
-pub mod opencode;
+pub mod opencode; // stub — see opencode.rs; disabled 2026-04-03 due to 26of OOM
 pub mod pi_agent;
 pub mod qwen;
 pub mod vibe;
