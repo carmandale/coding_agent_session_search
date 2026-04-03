@@ -4812,7 +4812,7 @@ impl FrankenStorage {
                         );
                         continue;
                     }
-                    let msg_id = franken_insert_message(&tx, existing_id, msg)?;
+                    let Some(msg_id) = franken_insert_message(&tx, existing_id, msg)? else { continue; };
                     franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                     if !defer_lexical_updates {
                         fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -4897,7 +4897,7 @@ impl FrankenStorage {
                 );
                 continue;
             }
-            let msg_id = franken_insert_message(&tx, conv_id, msg)?;
+            let Some(msg_id) = franken_insert_message(&tx, conv_id, msg)? else { continue; };
             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
             if !defer_lexical_updates {
                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -4983,7 +4983,7 @@ impl FrankenStorage {
                 );
                 continue;
             }
-            let msg_id = franken_insert_message(tx, conversation_id, msg)?;
+            let Some(msg_id) = franken_insert_message(tx, conversation_id, msg)? else { continue; };
             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
             if !defer_lexical_updates {
                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -5521,7 +5521,7 @@ impl FrankenStorage {
                         );
                         continue;
                     }
-                    let msg_id = franken_insert_message(&tx, existing_id, msg)?;
+                    let Some(msg_id) = franken_insert_message(&tx, existing_id, msg)? else { continue; };
                     franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                     if !defer_lexical_updates {
                         fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -5588,7 +5588,7 @@ impl FrankenStorage {
                             {
                                 continue;
                             }
-                            let msg_id = franken_insert_message(&tx, new_conv_id, msg)?;
+                            let Some(msg_id) = franken_insert_message(&tx, new_conv_id, msg)? else { continue; };
                             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                             if !defer_lexical_updates {
                                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -5660,7 +5660,7 @@ impl FrankenStorage {
                                 );
                                 continue;
                             }
-                            let msg_id = franken_insert_message(&tx, existing_id, msg)?;
+                            let Some(msg_id) = franken_insert_message(&tx, existing_id, msg)? else { continue; };
                             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                             if !defer_lexical_updates {
                                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -6209,10 +6209,14 @@ fn franken_insert_conversation_or_get_existing(
                 source_id = %conv.source_id,
                 agent_id,
                 external_id = ?conv.external_id,
+                source_path = %conv.source_path.display(),
                 error = %error,
                 "franken_insert_conversation failed"
             );
-            Err(error)
+            Err(error).with_context(|| format!(
+                "inserting conversation agent_id={} source_path={}",
+                agent_id, conv.source_path.display()
+            ))
         }
     }
 }
@@ -6252,12 +6256,18 @@ fn franken_insert_conversation(
     franken_last_rowid(tx)
 }
 
+
+
 /// Insert a message within a frankensqlite transaction.
+/// Returns `Ok(Some(id))` on success, `Ok(None)` when the insert was
+/// skipped due to a FOREIGN KEY violation (frankensqlite MVCC snapshot
+/// mismatch, issue 26of). Callers must skip snippet / FTS / metrics
+/// insertion when None is returned.
 fn franken_insert_message(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
     msg: &Message,
-) -> Result<i64> {
+) -> Result<Option<i64>> {
     let (extra_json_str, extra_bin): (Cow<'_, str>, Option<Vec<u8>>) =
         if let Some(raw) = historical_raw_json(&msg.extra_json) {
             (Cow::Borrowed(raw), None)
@@ -6269,7 +6279,7 @@ fn franken_insert_message(
         };
     let extra_bin_bytes = extra_bin.as_deref();
 
-    tx.execute_compat(
+    match tx.execute_compat(
         "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
         fparams![
@@ -6282,8 +6292,24 @@ fn franken_insert_message(
             extra_json_str.as_ref(),
             extra_bin_bytes
         ],
-    )?;
-    franken_last_rowid(tx)
+    ) {
+        Ok(_) => {}
+        Err(e) if matches!(e, frankensqlite::FrankenError::ForeignKeyViolation) => {
+            tracing::warn!(
+                conversation_id,
+                idx = msg.idx,
+                "FOREIGN KEY violation inserting message (26of MVCC snapshot mismatch); skipping"
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!(
+                "inserting message idx={} for conversation_id={}",
+                msg.idx, conversation_id
+            ));
+        }
+    }
+    Ok(Some(franken_last_rowid(tx)?))
 }
 
 /// Insert snippets within a frankensqlite transaction.
@@ -6305,7 +6331,7 @@ fn franken_insert_snippets(
                 snip.language.as_deref(),
                 snip.snippet_text.as_deref()
             ],
-        )?;
+        ).with_context(|| format!("inserting snippet for message_id={}", message_id))?;
     }
     Ok(())
 }
