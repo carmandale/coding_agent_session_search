@@ -2577,6 +2577,16 @@ pub fn run_index(
         // disabled indefinitely.
         restore_watch_steady_state_checkpoint_policy(&storage, opts.watch);
         if opts.watch {
+            // After a full streaming scan the WAL is fully checkpointed and
+            // the WAL file is truncated to 0 bytes.  frankensqlite requires a
+            // valid 32-byte WAL header to open new write transactions for the
+            // watch-mode incremental reindex path.  Write a no-op meta touch
+            // so the WAL file is seeded with a proper header before the first
+            // watch-scan fires.  Errors here are non-fatal — watch mode will
+            // retry on the next file-system event.
+            if let Err(e) = storage.set_last_indexed_at(FrankenStorage::now_millis()) {
+                tracing::debug!(error = %e, "wal_seed_noop_failed (non-fatal)");
+            }
             index_run_lock.set_mode(SearchMaintenanceMode::Watch)?;
         }
 
