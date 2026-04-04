@@ -39,6 +39,20 @@ use thiserror::Error;
 
 use super::provenance::SourceKind;
 
+// Re-export types from franken_agent_detection.
+pub use franken_agent_detection::{PathMapping, Platform};
+
+const BUILT_IN_LOCAL_SOURCE_NAME: &str = "local";
+const RESERVED_REMOTE_SOURCE_SUFFIX: &str = "-ssh";
+
+pub(crate) fn source_name_key(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+pub(crate) fn source_names_equal(lhs: &str, rhs: &str) -> bool {
+    source_name_key(lhs) == source_name_key(rhs)
+}
+
 /// Errors that can occur when loading or saving source configuration.
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -64,78 +78,6 @@ pub struct SourcesConfig {
     /// List of configured sources.
     #[serde(default)]
     pub sources: Vec<SourceDefinition>,
-}
-
-/// A single path mapping rule for rewriting paths.
-///
-/// Path mappings transform paths from one location to another,
-/// useful for mapping remote paths to local equivalents.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PathMapping {
-    /// Remote path prefix to match.
-    pub from: String,
-    /// Local path prefix to replace with.
-    pub to: String,
-    /// Optional: only apply this mapping for specific agents.
-    /// If None, applies to all agents.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agents: Option<Vec<String>>,
-}
-
-impl PathMapping {
-    /// Create a new path mapping.
-    pub fn new(from: impl Into<String>, to: impl Into<String>) -> Self {
-        Self {
-            from: from.into(),
-            to: to.into(),
-            agents: None,
-        }
-    }
-
-    /// Create a new path mapping with agent filter.
-    pub fn with_agents(
-        from: impl Into<String>,
-        to: impl Into<String>,
-        agents: Vec<String>,
-    ) -> Self {
-        Self {
-            from: from.into(),
-            to: to.into(),
-            agents: Some(agents),
-        }
-    }
-
-    /// Apply this mapping to a path if it matches.
-    ///
-    /// Returns `Some(rewritten_path)` if the path starts with `from` prefix,
-    /// `None` otherwise.
-    pub fn apply(&self, path: &str) -> Option<String> {
-        if path == self.from {
-            return Some(self.to.clone());
-        }
-
-        if !path.starts_with(&self.from) {
-            return None;
-        }
-
-        let rest = &path[self.from.len()..];
-        let boundary_ok =
-            self.from.ends_with('/') || self.from.ends_with('\\') || rest.starts_with(['/', '\\']);
-        if boundary_ok {
-            Some(format!("{}{}", self.to, rest))
-        } else {
-            None
-        }
-    }
-
-    /// Check if this mapping applies to a given agent.
-    pub fn applies_to_agent(&self, agent: Option<&str>) -> bool {
-        match (&self.agents, agent) {
-            (None, _) => true,       // No filter means applies to all
-            (Some(_), None) => true, // No agent specified means match all mappings
-            (Some(agents), Some(a)) => agents.iter().any(|allowed| allowed == a),
-        }
-    }
 }
 
 /// Definition of a single source (local or remote).
@@ -207,6 +149,13 @@ impl SourceDefinition {
             ));
         }
 
+        if source_names_equal(&self.name, BUILT_IN_LOCAL_SOURCE_NAME) {
+            return Err(ConfigError::Validation(format!(
+                "Source name '{}' is reserved for the built-in local source",
+                BUILT_IN_LOCAL_SOURCE_NAME
+            )));
+        }
+
         if self.name.contains('/') || self.name.contains('\\') {
             return Err(ConfigError::Validation(
                 "Source name cannot contain path separators".into(),
@@ -227,6 +176,28 @@ impl SourceDefinition {
             && let Some(host) = self.host.as_deref()
         {
             validate_ssh_host(host)?;
+        }
+
+        for (idx, mapping) in self.path_mappings.iter().enumerate() {
+            if mapping.from.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "path_mappings[{idx}].from cannot be empty"
+                )));
+            }
+
+            if mapping.to.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "path_mappings[{idx}].to cannot be empty"
+                )));
+            }
+
+            if let Some(agents) = mapping.agents.as_ref()
+                && agents.iter().any(|agent| agent.trim().is_empty())
+            {
+                return Err(ConfigError::Validation(format!(
+                    "path_mappings[{idx}].agents cannot contain empty agent names"
+                )));
+            }
         }
 
         Ok(())
@@ -250,7 +221,7 @@ impl SourceDefinition {
             .iter()
             .filter(|m| m.applies_to_agent(agent))
             .collect();
-        mappings.sort_by(|a, b| b.from.len().cmp(&a.from.len()));
+        mappings.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
 
         for mapping in mappings {
             if let Some(rewritten) = mapping.apply(path) {
@@ -259,6 +230,15 @@ impl SourceDefinition {
         }
 
         path.to_string()
+    }
+}
+
+/// Adjust an auto-generated remote source name to avoid reserved built-in IDs.
+pub(crate) fn normalize_generated_remote_source_name(name: &str) -> String {
+    if source_names_equal(name, BUILT_IN_LOCAL_SOURCE_NAME) {
+        format!("{name}{RESERVED_REMOTE_SOURCE_SUFFIX}")
+    } else {
+        name.to_string()
     }
 }
 
@@ -312,25 +292,6 @@ impl std::fmt::Display for SyncSchedule {
     }
 }
 
-/// Platform hint for choosing default paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Platform {
-    Macos,
-    Linux,
-    Windows,
-}
-
-impl std::fmt::Display for Platform {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Macos => write!(f, "macos"),
-            Self::Linux => write!(f, "linux"),
-            Self::Windows => write!(f, "windows"),
-        }
-    }
-}
-
 impl SourcesConfig {
     /// Load configuration from the default location.
     ///
@@ -373,20 +334,28 @@ impl SourcesConfig {
             std::fs::create_dir_all(parent)?;
         }
 
+        self.validate()?;
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(&config_path, content)?;
+        let _: SourcesConfig = toml::from_str(&content)?;
+        let temp_path = unique_atomic_temp_path(&config_path);
+        std::fs::write(&temp_path, content)?;
+        replace_file_from_temp(&temp_path, &config_path)?;
 
         Ok(())
     }
 
     /// Save configuration to a specific path.
-    pub fn save_to(&self, path: &PathBuf) -> Result<(), ConfigError> {
+    pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
+        self.validate()?;
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
+        let _: SourcesConfig = toml::from_str(&content)?;
+        let temp_path = unique_atomic_temp_path(path);
+        std::fs::write(&temp_path, content)?;
+        replace_file_from_temp(&temp_path, path)?;
 
         Ok(())
     }
@@ -414,7 +383,7 @@ impl SourcesConfig {
         for source in &self.sources {
             source.validate()?;
 
-            if !seen_names.insert(&source.name) {
+            if !seen_names.insert(source_name_key(&source.name)) {
                 return Err(ConfigError::Validation(format!(
                     "Duplicate source name: {}",
                     source.name
@@ -427,19 +396,27 @@ impl SourcesConfig {
 
     /// Find a source by name.
     pub fn find_source(&self, name: &str) -> Option<&SourceDefinition> {
-        self.sources.iter().find(|s| s.name == name)
+        self.sources
+            .iter()
+            .find(|s| source_names_equal(&s.name, name))
     }
 
     /// Find a source by name (mutable).
     pub fn find_source_mut(&mut self, name: &str) -> Option<&mut SourceDefinition> {
-        self.sources.iter_mut().find(|s| s.name == name)
+        self.sources
+            .iter_mut()
+            .find(|s| source_names_equal(&s.name, name))
     }
 
     /// Add a new source. Returns error if name already exists.
     pub fn add_source(&mut self, source: SourceDefinition) -> Result<(), ConfigError> {
         source.validate()?;
 
-        if self.sources.iter().any(|s| s.name == source.name) {
+        if self
+            .sources
+            .iter()
+            .any(|s| source_names_equal(&s.name, &source.name))
+        {
             return Err(ConfigError::Validation(format!(
                 "Source '{}' already exists",
                 source.name
@@ -453,7 +430,7 @@ impl SourcesConfig {
     /// Remove a source by name. Returns true if found and removed.
     pub fn remove_source(&mut self, name: &str) -> bool {
         let initial_len = self.sources.len();
-        self.sources.retain(|s| s.name != name);
+        self.sources.retain(|s| !source_names_equal(&s.name, name));
         self.sources.len() < initial_len
     }
 
@@ -641,7 +618,6 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
 
 use std::collections::HashSet;
 
-use chrono::Utc;
 use colored::Colorize;
 
 use super::probe::HostProbeResult;
@@ -660,6 +636,8 @@ pub enum MergeResult {
 pub enum SkipReason {
     /// Already configured in sources.toml.
     AlreadyConfigured,
+    /// Another selected host generates the same source name.
+    GeneratedNameConflict(String),
     /// Probe failed (unreachable, timeout, etc.).
     ProbeFailure(String),
     /// User deselected this host.
@@ -724,6 +702,15 @@ impl ConfigPreview {
             for (name, reason) in &self.sources_skipped {
                 let reason_str = match reason {
                     SkipReason::AlreadyConfigured => "already configured",
+                    SkipReason::GeneratedNameConflict(source_name) => {
+                        println!(
+                            "    {} - {}",
+                            name.dimmed(),
+                            format!("conflicts with generated source name '{source_name}'")
+                                .dimmed()
+                        );
+                        continue;
+                    }
                     SkipReason::ProbeFailure(e) => e.as_str(),
                     SkipReason::UserDeselected => "not selected",
                 };
@@ -775,9 +762,10 @@ impl SourceConfigGenerator {
         let paths = self.generate_paths(probe);
         let path_mappings = self.generate_mappings(probe);
         let platform = self.detect_platform(probe);
+        let name = normalize_generated_remote_source_name(host_name);
 
         SourceDefinition {
-            name: host_name.to_string(),
+            name,
             source_type: SourceKind::Ssh,
             host: Some(host_name.to_string()), // Use SSH alias
             paths,
@@ -872,23 +860,20 @@ impl SourceConfigGenerator {
     ///
     /// # Arguments
     /// * `probes` - List of (host_name, probe_result) tuples for selected hosts
-    /// * `already_configured` - Set of host names already in sources.toml
+    /// * `already_configured` - Set of normalized source-name keys already configured
     pub fn generate_preview(
         &self,
         probes: &[(&str, &HostProbeResult)],
         already_configured: &HashSet<String>,
     ) -> ConfigPreview {
         let mut preview = ConfigPreview::new();
+        let configured_name_keys: HashSet<_> = already_configured
+            .iter()
+            .map(|name| source_name_key(name))
+            .collect();
+        let mut preview_name_keys = configured_name_keys.clone();
 
         for (host_name, probe) in probes {
-            // Skip if already configured
-            if already_configured.contains(*host_name) {
-                preview
-                    .sources_skipped
-                    .push((host_name.to_string(), SkipReason::AlreadyConfigured));
-                continue;
-            }
-
             // Skip if probe failed
             if !probe.reachable {
                 let reason = probe
@@ -901,8 +886,23 @@ impl SourceConfigGenerator {
                 continue;
             }
 
-            // Generate source definition
+            // Generate source definition before duplicate checks so we compare
+            // using the same canonical naming rules as the saved config.
             let source = self.generate_source(host_name, probe);
+            let source_name_key = source_name_key(&source.name);
+            if configured_name_keys.contains(&source_name_key) {
+                preview
+                    .sources_skipped
+                    .push((source.name.clone(), SkipReason::AlreadyConfigured));
+                continue;
+            }
+            if !preview_name_keys.insert(source_name_key) {
+                preview.sources_skipped.push((
+                    host_name.to_string(),
+                    SkipReason::GeneratedNameConflict(source.name.clone()),
+                ));
+                continue;
+            }
             preview.sources_to_add.push(source);
         }
 
@@ -919,7 +919,7 @@ impl Default for SourceConfigGenerator {
 impl SourcesConfig {
     /// Write configuration with backup.
     ///
-    /// Creates a timestamped backup of the existing config (if any)
+    /// Creates a uniquely named backup of the existing config (if any)
     /// before writing the new configuration atomically.
     pub fn write_with_backup(&self) -> Result<BackupInfo, ConfigError> {
         let config_path = Self::config_path()?;
@@ -931,22 +931,23 @@ impl SourcesConfig {
 
         // Create backup if file exists
         let backup_path = if config_path.exists() {
-            let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-            let backup = config_path.with_extension(format!("toml.backup.{}", timestamp));
+            let backup = unique_backup_path(&config_path);
             std::fs::copy(&config_path, &backup)?;
             Some(backup)
         } else {
             None
         };
 
-        // Validate TOML before writing (round-trip check)
+        // Validate config before writing (round-trip check included below)
+        self.validate()?;
         let toml_str = toml::to_string_pretty(self)?;
-        let _: SourcesConfig = toml::from_str(&toml_str)?; // Round-trip validation
+        let parsed: SourcesConfig = toml::from_str(&toml_str)?;
+        parsed.validate()?;
 
         // Write atomically (temp file + rename)
-        let temp_path = config_path.with_extension("toml.tmp");
+        let temp_path = unique_atomic_temp_path(&config_path);
         std::fs::write(&temp_path, &toml_str)?;
-        std::fs::rename(&temp_path, &config_path)?;
+        replace_file_from_temp(&temp_path, &config_path)?;
 
         Ok(BackupInfo {
             backup_path,
@@ -963,7 +964,11 @@ impl SourcesConfig {
         source.validate()?;
 
         // Check if already exists
-        if self.sources.iter().any(|s| s.name == source.name) {
+        if self
+            .sources
+            .iter()
+            .any(|s| source_names_equal(&s.name, &source.name))
+        {
             return Ok(MergeResult::AlreadyExists(source.name));
         }
 
@@ -996,6 +1001,132 @@ impl SourcesConfig {
     pub fn configured_names(&self) -> HashSet<String> {
         self.sources.iter().map(|s| s.name.clone()).collect()
     }
+
+    /// Get normalized source-name keys for duplicate detection and lookups.
+    pub fn configured_name_keys(&self) -> HashSet<String> {
+        self.sources
+            .iter()
+            .map(|s| source_name_key(&s.name))
+            .collect()
+    }
+}
+
+fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(windows)]
+    {
+        match std::fs::rename(temp_path, final_path) {
+            Ok(()) => Ok(()),
+            Err(first_err)
+                if final_path.exists()
+                    && matches!(
+                        first_err.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                let backup_path = unique_replace_backup_path(final_path);
+                std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    let _ = std::fs::remove_file(temp_path);
+                    std::io::Error::other(format!(
+                        "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
+                        backup_path.display(),
+                        final_path.display(),
+                        first_err,
+                        backup_err
+                    ))
+                })?;
+                match std::fs::rename(temp_path, final_path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&backup_path);
+                        Ok(())
+                    }
+                    Err(second_err) => {
+                        let restore_result = std::fs::rename(&backup_path, final_path);
+                        match restore_result {
+                            Ok(()) => {
+                                let _ = std::fs::remove_file(temp_path);
+                                Err(std::io::Error::new(
+                                    second_err.kind(),
+                                    format!(
+                                        "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
+                                        final_path.display(),
+                                        temp_path.display(),
+                                        first_err,
+                                        second_err
+                                    ),
+                                ))
+                            }
+                            Err(restore_err) => Err(std::io::Error::other(format!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err,
+                                restore_err,
+                                temp_path.display()
+                            ))),
+                        }
+                    }
+                }
+            }
+            Err(rename_err) => Err(rename_err),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temp_path, final_path)
+    }
+}
+
+fn unique_atomic_temp_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "tmp", "sources.toml")
+}
+
+fn unique_backup_path(path: &Path) -> PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sources.toml");
+
+    path.with_file_name(format!(
+        "{file_name}.backup.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
+}
+
+#[cfg(windows)]
+fn unique_replace_backup_path(path: &Path) -> PathBuf {
+    unique_atomic_sidecar_path(path, "bak", "sources.toml")
+}
+
+fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+
+    path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
 }
 
 #[cfg(test)]
@@ -1006,6 +1137,50 @@ mod tests {
     fn test_empty_config_default() {
         let config = SourcesConfig::default();
         assert!(config.sources.is_empty());
+    }
+
+    #[test]
+    fn test_replace_file_from_temp_overwrites_existing_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let final_path = temp.path().join("sources.toml");
+        let first_tmp = temp.path().join("first.tmp");
+        let second_tmp = temp.path().join("second.tmp");
+
+        std::fs::write(&first_tmp, "first = true\n").expect("write first temp");
+        replace_file_from_temp(&first_tmp, &final_path).expect("initial replace");
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("read first final"),
+            "first = true\n"
+        );
+
+        std::fs::write(&second_tmp, "second = true\n").expect("write second temp");
+        replace_file_from_temp(&second_tmp, &final_path).expect("overwrite replace");
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("read second final"),
+            "second = true\n"
+        );
+    }
+
+    #[test]
+    fn test_unique_atomic_temp_path_changes_each_call() {
+        let final_path = Path::new("/tmp/sources.toml");
+        let first = unique_atomic_temp_path(final_path);
+        let second = unique_atomic_temp_path(final_path);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), final_path.parent());
+        assert_eq!(second.parent(), final_path.parent());
+    }
+
+    #[test]
+    fn test_unique_backup_path_changes_each_call() {
+        let final_path = Path::new("/tmp/sources.toml");
+        let first = unique_backup_path(final_path);
+        let second = unique_backup_path(final_path);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), final_path.parent());
+        assert_eq!(second.parent(), final_path.parent());
     }
 
     #[test]
@@ -1041,6 +1216,22 @@ mod tests {
     }
 
     #[test]
+    fn test_source_validation_reserved_local_name() {
+        let source = SourceDefinition::ssh("local", "user@host");
+        assert!(source.validate().is_err());
+
+        let source = SourceDefinition::ssh("LOCAL", "user@host");
+        assert!(source.validate().is_err());
+    }
+
+    #[test]
+    fn test_normalize_generated_remote_source_name_disambiguates_local() {
+        assert_eq!(normalize_generated_remote_source_name("local"), "local-ssh");
+        assert_eq!(normalize_generated_remote_source_name("LOCAL"), "LOCAL-ssh");
+        assert_eq!(normalize_generated_remote_source_name("laptop"), "laptop");
+    }
+
+    #[test]
     fn test_source_validation_ssh_without_host() {
         let mut source = SourceDefinition::ssh("test", "host");
         source.host = None;
@@ -1053,6 +1244,45 @@ mod tests {
         assert!(source.validate().is_err());
 
         let source = SourceDefinition::ssh("test", "user@host withspace");
+        assert!(source.validate().is_err());
+    }
+
+    #[test]
+    fn test_source_validation_path_mapping_empty_from() {
+        let mut source = SourceDefinition::local("test");
+        source.path_mappings.push(PathMapping::new("", "/Users/me"));
+        assert!(source.validate().is_err());
+
+        source.path_mappings.clear();
+        source
+            .path_mappings
+            .push(PathMapping::new("   ", "/Users/me"));
+        assert!(source.validate().is_err());
+    }
+
+    #[test]
+    fn test_source_validation_path_mapping_empty_to() {
+        let mut source = SourceDefinition::local("test");
+        source
+            .path_mappings
+            .push(PathMapping::new("/home/user", ""));
+        assert!(source.validate().is_err());
+
+        source.path_mappings.clear();
+        source
+            .path_mappings
+            .push(PathMapping::new("/home/user", "   "));
+        assert!(source.validate().is_err());
+    }
+
+    #[test]
+    fn test_source_validation_path_mapping_empty_agent_names() {
+        let mut source = SourceDefinition::local("test");
+        source.path_mappings.push(PathMapping::with_agents(
+            "/home/user",
+            "/Users/me",
+            vec!["claude-code".into(), "   ".into()],
+        ));
         assert!(source.validate().is_err());
     }
 
@@ -1184,6 +1414,19 @@ mod tests {
     }
 
     #[test]
+    fn test_config_duplicate_names_case_insensitive() {
+        let mut config = SourcesConfig::default();
+        config
+            .sources
+            .push(SourceDefinition::ssh("Laptop", "user@laptop"));
+        config
+            .sources
+            .push(SourceDefinition::ssh("laptop", "user@other-host"));
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn test_config_add_source() {
         let mut config = SourcesConfig::default();
         config.add_source(SourceDefinition::local("test")).unwrap();
@@ -1195,6 +1438,20 @@ mod tests {
     }
 
     #[test]
+    fn test_config_add_source_case_insensitive_duplicate() {
+        let mut config = SourcesConfig::default();
+        config
+            .add_source(SourceDefinition::ssh("Laptop", "user@laptop"))
+            .unwrap();
+
+        assert!(
+            config
+                .add_source(SourceDefinition::ssh("laptop", "user@other-host"))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_config_remove_source() {
         let mut config = SourcesConfig::default();
         config.sources.push(SourceDefinition::local("test"));
@@ -1202,6 +1459,29 @@ mod tests {
         assert!(config.remove_source("test"));
         assert!(!config.remove_source("nonexistent"));
         assert!(config.sources.is_empty());
+    }
+
+    #[test]
+    fn test_config_remove_source_case_insensitive() {
+        let mut config = SourcesConfig::default();
+        config
+            .sources
+            .push(SourceDefinition::ssh("Laptop", "user@laptop"));
+
+        assert!(config.remove_source("laptop"));
+        assert!(config.sources.is_empty());
+    }
+
+    #[test]
+    fn test_find_source_case_insensitive() {
+        let mut config = SourcesConfig::default();
+        config
+            .sources
+            .push(SourceDefinition::ssh("Laptop", "user@laptop"));
+
+        assert!(config.find_source("laptop").is_some());
+        assert!(config.find_source("LAPTOP").is_some());
+        assert!(config.find_source_mut("laptop").is_some());
     }
 
     #[test]
@@ -1332,6 +1612,7 @@ mod tests {
             has_curl: true,
             has_wget: true,
             remote_home: remote_home.into(),
+            machine_id: None,
         }
     }
 
@@ -1358,6 +1639,21 @@ mod tests {
         assert_eq!(source.sync_schedule, SyncSchedule::Manual);
         assert!(!source.paths.is_empty());
         assert!(source.paths.contains(&"~/.claude/projects".to_string()));
+    }
+
+    #[test]
+    fn test_generate_source_disambiguates_reserved_local_name() {
+        let generator = SourceConfigGenerator::new();
+        let probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(make_test_sys_info("linux", "/home/ubuntu")),
+        );
+
+        let source = generator.generate_source("local", &probe);
+
+        assert_eq!(source.name, "local-ssh");
+        assert_eq!(source.host, Some("local".into()));
     }
 
     #[test]
@@ -1443,6 +1739,69 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_preview_skips_already_configured_case_insensitive() {
+        let generator = SourceConfigGenerator::new();
+        let probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+
+        let probes: Vec<(&str, &HostProbeResult)> = vec![("Laptop", &probe)];
+        let mut configured = HashSet::new();
+        configured.insert(source_name_key("laptop"));
+
+        let preview = generator.generate_preview(&probes, &configured);
+        assert!(preview.sources_to_add.is_empty());
+        assert_eq!(preview.sources_skipped.len(), 1);
+    }
+
+    #[test]
+    fn test_generate_preview_skips_already_configured_case_insensitively_with_raw_names() {
+        let generator = SourceConfigGenerator::new();
+        let probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+
+        let probes: Vec<(&str, &HostProbeResult)> = vec![("laptop", &probe)];
+        let mut configured = HashSet::new();
+        configured.insert("Laptop".to_string());
+
+        let preview = generator.generate_preview(&probes, &configured);
+
+        assert!(preview.sources_to_add.is_empty());
+        assert_eq!(preview.sources_skipped.len(), 1);
+        assert!(matches!(
+            preview.sources_skipped[0].1,
+            SkipReason::AlreadyConfigured
+        ));
+    }
+
+    #[test]
+    fn test_generate_preview_skips_conflicting_generated_names_case_insensitive() {
+        let generator = SourceConfigGenerator::new();
+        let probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+
+        let probes: Vec<(&str, &HostProbeResult)> = vec![("Laptop", &probe), ("laptop", &probe)];
+        let preview = generator.generate_preview(&probes, &HashSet::new());
+
+        assert_eq!(preview.sources_to_add.len(), 1);
+        assert_eq!(preview.sources_to_add[0].name, "Laptop");
+        assert_eq!(preview.sources_skipped.len(), 1);
+        assert_eq!(preview.sources_skipped[0].0, "laptop");
+        assert!(matches!(
+            &preview.sources_skipped[0].1,
+            SkipReason::GeneratedNameConflict(name) if name == "laptop"
+        ));
+    }
+
+    #[test]
     fn test_merge_source() {
         let mut config = SourcesConfig::default();
         let source = SourceDefinition::ssh("new-server", "user@server");
@@ -1464,6 +1823,17 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_source_already_exists_case_insensitive() {
+        let mut config = SourcesConfig::default();
+        config.sources.push(SourceDefinition::ssh("Server", "host"));
+
+        let source = SourceDefinition::ssh("server", "other-host");
+        let result = config.merge_source(source).unwrap();
+        assert!(matches!(result, MergeResult::AlreadyExists(_)));
+        assert_eq!(config.sources.len(), 1);
+    }
+
+    #[test]
     fn test_configured_names() {
         let mut config = SourcesConfig::default();
         config.sources.push(SourceDefinition::ssh("server1", "h1"));
@@ -1473,6 +1843,35 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains("server1"));
         assert!(names.contains("server2"));
+    }
+
+    #[test]
+    fn test_configured_name_keys_normalize_case() {
+        let mut config = SourcesConfig::default();
+        config.sources.push(SourceDefinition::ssh("Server1", "h1"));
+        config.sources.push(SourceDefinition::ssh("server2", "h2"));
+
+        let names = config.configured_name_keys();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("server1"));
+        assert!(names.contains("server2"));
+    }
+
+    #[test]
+    fn test_save_to_rejects_invalid_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("sources.toml");
+
+        let mut config = SourcesConfig::default();
+        config
+            .sources
+            .push(SourceDefinition::ssh("local", "user@host"));
+
+        let err = config
+            .save_to(&path)
+            .expect_err("save_to should reject invalid config");
+        assert!(matches!(err, ConfigError::Validation(_)));
+        assert!(!path.exists(), "invalid config should not be written");
     }
 
     #[test]

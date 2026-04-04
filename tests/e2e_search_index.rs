@@ -10,11 +10,22 @@
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::storage::sqlite::SqliteStorage;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use std::fs;
 use std::path::Path;
 
+#[macro_use]
 mod util;
 use util::EnvGuard;
+use util::e2e_log::{E2ePerformanceMetrics, PhaseTracker};
+
+// =============================================================================
+// E2E Logger Support
+// =============================================================================
+
+fn tracker_for(test_name: &str) -> PhaseTracker {
+    PhaseTracker::new("e2e_search_index", test_name)
+}
 
 /// Helper to create Codex session with modern envelope format.
 fn make_codex_session(root: &Path, date_path: &str, filename: &str, content: &str, ts: u64) {
@@ -62,23 +73,29 @@ fn count_messages(db_path: &Path) -> i64 {
     let storage = SqliteStorage::open(db_path).expect("open sqlite");
     storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
         .expect("count messages")
 }
 
 /// Test: Full index pipeline - index --full creates DB and index
 #[test]
 fn index_full_creates_artifacts() {
+    verbose!("Starting index_full_creates_artifacts test");
+    let tracker = tracker_for("index_full_creates_artifacts");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
+    verbose!("Created temp directory at {:?}", home);
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
+    verbose!("Data directory: {:?}", data_dir);
 
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Create fixture data
+    let phase_start = tracker.start("create_fixtures", Some("Create Codex session fixture"));
     make_codex_session(
         &codex_home,
         "2024/11/20",
@@ -86,17 +103,42 @@ fn index_full_creates_artifacts() {
         "hello world",
         1732118400000,
     );
+    tracker.end(
+        "create_fixtures",
+        Some("Create Codex session fixture"),
+        phase_start,
+    );
+
+    // Capture memory/IO before indexing (for delta calculation)
+    let mem_before = E2ePerformanceMetrics::capture_memory();
+    let io_before = E2ePerformanceMetrics::capture_io();
 
     // Run index --full
+    let phase_start = tracker.start("index_full", Some("Execute full index command"));
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .assert()
         .success();
+    let index_duration_ms = phase_start.elapsed().as_millis() as u64;
+    tracker.end(
+        "index_full",
+        Some("Execute full index command"),
+        phase_start,
+    );
+
+    // Capture memory/IO after indexing
+    let mem_after = E2ePerformanceMetrics::capture_memory();
+    let io_after = E2ePerformanceMetrics::capture_io();
+    verbose!("Index completed in {}ms", index_duration_ms);
 
     // Verify artifacts created
+    let phase_start = tracker.start("verify_artifacts", Some("Verify database and index exist"));
+    verbose!("Verifying artifacts at {:?}", data_dir);
     assert!(
         data_dir.join("agent_search.db").exists(),
         "SQLite DB should be created"
@@ -105,11 +147,39 @@ fn index_full_creates_artifacts() {
         data_dir.join("index").exists(),
         "Tantivy index directory should exist"
     );
+    tracker.end(
+        "verify_artifacts",
+        Some("Verify database and index exist"),
+        phase_start,
+    );
+
+    // Count messages and emit performance metrics
+    let msg_count = count_messages(&data_dir.join("agent_search.db")) as u64;
+    verbose!("Indexed {} messages", msg_count);
+    let mut metrics = E2ePerformanceMetrics::new()
+        .with_duration(index_duration_ms)
+        .with_throughput(msg_count, index_duration_ms);
+
+    // Add memory delta if available
+    if let (Some(before), Some(after)) = (mem_before, mem_after) {
+        metrics = metrics.with_memory(after.saturating_sub(before));
+    }
+
+    // Add I/O delta if available
+    if let (Some((rb, wb)), Some((ra, wa))) = (io_before, io_after) {
+        metrics = metrics.with_io(0, 0, ra.saturating_sub(rb), wa.saturating_sub(wb));
+    }
+
+    tracker.metrics("index_full", &metrics);
+    tracker.flush();
+    verbose!("Test index_full_creates_artifacts completed successfully");
 }
 
 /// Incremental re-index must preserve existing messages and ingest new ones from the same file.
 #[test]
 fn incremental_reindex_preserves_and_appends_messages() {
+    let tracker = tracker_for("incremental_reindex_preserves_and_appends_messages");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -120,6 +190,10 @@ fn incremental_reindex_preserves_and_appends_messages() {
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Initial session
+    let phase_start = tracker.start(
+        "create_initial_fixture",
+        Some("Create initial session with test content"),
+    );
     let ts = 1_732_118_400_000u64; // stable timestamp
     make_codex_session(
         &codex_home,
@@ -129,23 +203,38 @@ fn incremental_reindex_preserves_and_appends_messages() {
         ts,
     );
     let session_file = codex_home.join("sessions/2024/11/20/rollout-incremental.jsonl");
+    tracker.end(
+        "create_initial_fixture",
+        Some("Create initial session with test content"),
+        phase_start,
+    );
 
     // Full index
+    let phase_start = tracker.start("index_full", Some("Run initial full index"));
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .assert()
         .success();
+    tracker.end("index_full", Some("Run initial full index"), phase_start);
 
     // Ensure subsequent writes get a later mtime than the recorded scan start
     std::thread::sleep(std::time::Duration::from_millis(1200));
 
     // Baseline search should find the initial content
+    let phase_start = tracker.start(
+        "search_baseline",
+        Some("Verify initial content is searchable"),
+    );
     let baseline = cargo_bin_cmd!("cass")
         .args(["search", "initial_keep_token", "--robot", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("HOME", home)
         .output()
         .expect("baseline search");
@@ -158,26 +247,54 @@ fn incremental_reindex_preserves_and_appends_messages() {
         .map(|v| v.len())
         .unwrap_or(0);
     assert!(baseline_hits >= 1, "initial content should be indexed");
+    tracker.end(
+        "search_baseline",
+        Some("Verify initial content is searchable"),
+        phase_start,
+    );
 
     // Append new content to the same file (simulates conversation growth)
+    let phase_start = tracker.start(
+        "append_content",
+        Some("Append new messages to session file"),
+    );
     append_codex_session(&session_file, "appended_token_beta", ts + 10_000);
+    tracker.end(
+        "append_content",
+        Some("Append new messages to session file"),
+        phase_start,
+    );
 
     // On some filesystems, mtime resolution is 1s; give a small buffer before reindex
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Incremental re-index (no --full)
+    let phase_start = tracker.start("index_incremental", Some("Run incremental reindex"));
     cargo_bin_cmd!("cass")
         .args(["index", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .assert()
         .success();
+    tracker.end(
+        "index_incremental",
+        Some("Run incremental reindex"),
+        phase_start,
+    );
 
     // Original content must still be present
+    let phase_start = tracker.start(
+        "search_preserved",
+        Some("Verify original content preserved"),
+    );
     let preserved = cargo_bin_cmd!("cass")
         .args(["search", "initial_keep_token", "--robot", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("HOME", home)
         .output()
         .expect("preserved search");
@@ -192,11 +309,19 @@ fn incremental_reindex_preserves_and_appends_messages() {
         preserved_hits >= baseline_hits,
         "existing messages should not be dropped on reindex"
     );
+    tracker.end(
+        "search_preserved",
+        Some("Verify original content preserved"),
+        phase_start,
+    );
 
     // New content must be discoverable
+    let phase_start = tracker.start("search_appended", Some("Verify appended content indexed"));
     let appended = cargo_bin_cmd!("cass")
         .args(["search", "appended_token_beta", "--robot", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("HOME", home)
         .output()
         .expect("appended search");
@@ -211,16 +336,29 @@ fn incremental_reindex_preserves_and_appends_messages() {
         appended_hits >= 1,
         "appended content should be indexed during incremental run"
     );
+    tracker.end(
+        "search_appended",
+        Some("Verify appended content indexed"),
+        phase_start,
+    );
+
+    tracker.flush();
 }
 
 /// Reindexing must never drop previously ingested messages in SQLite or Tantivy.
 #[test]
 fn reindex_does_not_drop_messages_in_db_or_search() {
+    let tracker = tracker_for("reindex_does_not_drop_messages_in_db_or_search");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
+    let xdg_data = home.join(".local/share");
+    let xdg_config = home.join(".config");
+    fs::create_dir_all(&xdg_data).unwrap();
+    fs::create_dir_all(&xdg_config).unwrap();
 
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
@@ -239,8 +377,12 @@ fn reindex_does_not_drop_messages_in_db_or_search() {
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
         .assert()
         .success();
 
@@ -257,8 +399,12 @@ fn reindex_does_not_drop_messages_in_db_or_search() {
     cargo_bin_cmd!("cass")
         .args(["index", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
         .assert()
         .success();
 
@@ -274,7 +420,11 @@ fn reindex_does_not_drop_messages_in_db_or_search() {
         let out = cargo_bin_cmd!("cass")
             .args(["search", term, "--robot", "--data-dir"])
             .arg(&data_dir)
+            // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+            .current_dir(home)
             .env("HOME", home)
+            .env("XDG_DATA_HOME", &xdg_data)
+            .env("XDG_CONFIG_HOME", &xdg_config)
             .output()
             .expect("search");
         assert!(out.status.success(), "search should succeed for {term}");
@@ -291,6 +441,8 @@ fn reindex_does_not_drop_messages_in_db_or_search() {
 /// Test: Search returns hits with correct match_type
 #[test]
 fn search_returns_hits_with_match_type() {
+    let tracker = tracker_for("search_returns_hits_with_match_type");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -367,6 +519,8 @@ fn search_returns_hits_with_match_type() {
 /// Test: Search aggregations include agent buckets
 #[test]
 fn search_aggregations_include_agents() {
+    let tracker = tracker_for("search_aggregations_include_agents");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -448,6 +602,8 @@ fn search_aggregations_include_agents() {
 /// Test: Watch-once mode indexes specific paths
 #[test]
 fn watch_once_indexes_specified_path() {
+    let tracker = tracker_for("watch_once_indexes_specified_path");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -523,6 +679,8 @@ fn watch_once_indexes_specified_path() {
 /// Test: Search with filters (agent, time range)
 #[test]
 fn search_with_filters() {
+    let tracker = tracker_for("search_with_filters");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -589,6 +747,8 @@ fn search_with_filters() {
 /// Test: Search returns total_matches and pagination info
 #[test]
 fn search_returns_pagination_info() {
+    let tracker = tracker_for("search_returns_pagination_info");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -662,6 +822,8 @@ fn search_returns_pagination_info() {
 /// Test: Force rebuild recreates index
 #[test]
 fn force_rebuild_recreates_index() {
+    let tracker = tracker_for("force_rebuild_recreates_index");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -730,6 +892,8 @@ fn force_rebuild_recreates_index() {
 /// Test: JSON output mode (--json) for index command
 #[test]
 fn index_json_output_mode() {
+    let tracker = tracker_for("index_json_output_mode");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -780,6 +944,8 @@ fn index_json_output_mode() {
 /// Test: Help text includes expected options
 #[test]
 fn index_help_includes_options() {
+    let tracker = tracker_for("index_help_includes_options");
+    let _trace_guard = tracker.trace_env_guard();
     let output = cargo_bin_cmd!("cass")
         .args(["index", "--help"])
         .output()
@@ -795,6 +961,14 @@ fn index_help_includes_options() {
         "Help should mention --force-rebuild"
     );
     assert!(
+        stdout.contains("--semantic"),
+        "Help should mention --semantic"
+    );
+    assert!(
+        stdout.contains("--embedder"),
+        "Help should mention --embedder"
+    );
+    assert!(
         stdout.contains("--data-dir"),
         "Help should mention --data-dir"
     );
@@ -803,6 +977,8 @@ fn index_help_includes_options() {
 /// Test: Search help includes expected options
 #[test]
 fn search_help_includes_options() {
+    let tracker = tracker_for("search_help_includes_options");
+    let _trace_guard = tracker.trace_env_guard();
     let output = cargo_bin_cmd!("cass")
         .args(["search", "--help"])
         .output()
@@ -823,6 +999,8 @@ fn search_help_includes_options() {
 /// Test: Search with wildcard query
 #[test]
 fn search_wildcard_query() {
+    let tracker = tracker_for("search_wildcard_query");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -871,6 +1049,8 @@ fn search_wildcard_query() {
 /// Test: Trace logging works when enabled
 #[test]
 fn trace_logging_to_file() {
+    let tracker = tracker_for("trace_logging_to_file");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -909,6 +1089,8 @@ fn trace_logging_to_file() {
 /// Test: Empty query returns recent results
 #[test]
 fn empty_query_returns_recent() {
+    let tracker = tracker_for("empty_query_returns_recent");
+    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");

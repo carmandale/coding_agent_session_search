@@ -15,7 +15,18 @@ use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters}
 use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
+
+/// These tests use RSS-based assertions and should not run concurrently.
+static MEMORY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn memory_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    MEMORY_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("memory test mutex poisoned")
+}
 
 /// Generate a sample conversation for testing.
 fn sample_conv(i: i64, msgs: i64) -> NormalizedConversation {
@@ -32,6 +43,7 @@ fn sample_conv(i: i64, msgs: i64) -> NormalizedConversation {
             ),
             extra: serde_json::json!({}),
             snippets: Vec::new(),
+            invocations: Vec::new(),
         });
     }
     NormalizedConversation {
@@ -54,12 +66,12 @@ fn setup_test_index(conv_count: i64, msgs_per_conv: i64) -> (TempDir, SearchClie
     let db_path = data_dir.join("memory_test.db");
     let index_path = index_dir(&data_dir).expect("index path");
 
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
     let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     for i in 0..conv_count {
         let conv = sample_conv(i, msgs_per_conv);
-        persist_conversation(&mut storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
     }
     t_index.commit().unwrap();
 
@@ -116,6 +128,7 @@ fn get_process_memory_bytes() -> usize {
 /// grow unboundedly. Some growth is acceptable due to caching.
 #[test]
 fn test_search_memory_no_leak() {
+    let _guard = memory_test_guard();
     // Create index with 100 conversations
     let (_tmp, client) = setup_test_index(100, 10);
     let filters = SearchFilters::default();
@@ -172,18 +185,19 @@ fn test_search_memory_no_leak() {
 /// Test that repeated indexing operations don't leak memory.
 #[test]
 fn test_indexing_memory_no_leak() {
+    let _guard = memory_test_guard();
     let temp = TempDir::new().expect("tempdir");
     let data_dir = temp.path().to_path_buf();
     let db_path = data_dir.join("memory_index_test.db");
     let index_path = index_dir(&data_dir).expect("index path");
 
-    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    let storage = SqliteStorage::open(&db_path).expect("open db");
     let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     // Warm up
     for i in 0..5 {
         let conv = sample_conv(i, 5);
-        persist_conversation(&mut storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
     }
     t_index.commit().unwrap();
 
@@ -197,7 +211,7 @@ fn test_indexing_memory_no_leak() {
     // Index many conversations
     for i in 5..105 {
         let conv = sample_conv(i, 10);
-        persist_conversation(&mut storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
 
         // Commit periodically
         if i % 20 == 0 {
@@ -231,44 +245,62 @@ fn test_indexing_memory_no_leak() {
 /// Test that vector search operations don't leak memory.
 #[test]
 fn test_vector_search_memory_no_leak() {
-    use coding_agent_search::search::vector_index::{Quantization, VectorEntry, VectorIndex};
+    let _guard = memory_test_guard();
+    use coding_agent_search::search::vector_index::{Quantization, SemanticDocId, VectorIndex};
 
     let dimension = 384;
     let count = 10_000;
 
-    // Build index
-    let entries: Vec<VectorEntry> = (0..count)
-        .map(|idx| {
-            let mut vector = Vec::with_capacity(dimension);
-            for d in 0..dimension {
-                let value = ((idx + d * 31) % 997) as f32 / 997.0;
-                vector.push(value);
+    fn normalize_in_place(vec: &mut [f32]) {
+        let norm_sq: f32 = vec.iter().map(|v| v * v).sum();
+        let norm = norm_sq.sqrt();
+        if norm > 0.0 {
+            for v in vec {
+                *v /= norm;
             }
-            VectorEntry {
-                message_id: idx as u64,
-                created_at_ms: idx as i64,
-                agent_id: (idx % 8) as u32,
-                workspace_id: 1,
-                source_id: 1,
-                role: 1,
-                chunk_idx: 0,
-                content_hash: [0u8; 32],
-                vector,
-            }
-        })
-        .collect();
+        }
+    }
 
-    let index = VectorIndex::build(
+    // Build on-disk index (FSVI) so memory measurements reflect real behavior.
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("mem.fsvi");
+    let mut writer = VectorIndex::create_with_revision(
+        &path,
         "test-embedder",
         "rev1",
         dimension,
         Quantization::F16,
-        entries,
     )
-    .expect("build index");
+    .expect("create writer");
+
+    let mut vec_buf = vec![0.0f32; dimension];
+    for idx in 0..count {
+        for (d, slot) in vec_buf.iter_mut().enumerate() {
+            *slot = ((idx + d * 31) % 997) as f32 / 997.0;
+        }
+        normalize_in_place(&mut vec_buf);
+        let doc_id = SemanticDocId {
+            message_id: idx as u64,
+            chunk_idx: 0,
+            agent_id: (idx % 8) as u32,
+            workspace_id: 1,
+            source_id: 1,
+            role: 1,
+            created_at_ms: idx as i64,
+            content_hash: None,
+        }
+        .to_doc_id_string();
+        writer
+            .write_record(&doc_id, &vec_buf)
+            .expect("write_record");
+    }
+    writer.finish().expect("finish");
+
+    let index = VectorIndex::open(&path).expect("open");
 
     // Generate query vector
-    let query: Vec<f32> = (0..dimension).map(|d| (d % 17) as f32 / 17.0).collect();
+    let mut query: Vec<f32> = (0..dimension).map(|d| (d % 17) as f32 / 17.0).collect();
+    normalize_in_place(&mut query);
 
     // Warm up
     for _ in 0..10 {

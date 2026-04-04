@@ -18,30 +18,35 @@ fn cline_parses_fixture_task() {
         since_ts: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
-    assert_eq!(convs.len(), 1);
+    assert_eq!(
+        convs.len(),
+        1,
+        "expected exactly 1 conversation from fixture"
+    );
     let c = &convs[0];
-    assert_eq!(c.title.as_deref(), Some("Cline fixture task"));
+    assert_eq!(
+        c.title.as_deref(),
+        Some("Cline fixture task"),
+        "title should match fixture's task metadata"
+    );
     // We now prefer ui_messages.json (2 msgs) over api_conversation_history.json (1 msg)
     // to avoid duplicates and prefer user-facing content.
-    assert_eq!(c.messages.len(), 2);
-    assert!(c.messages.iter().any(|m| m.content.contains("Hello Cline")));
+    assert_eq!(
+        c.messages.len(),
+        2,
+        "expected 2 messages from ui_messages.json"
+    );
+    assert!(
+        c.messages.iter().any(|m| m.content.contains("Hello Cline")),
+        "should contain 'Hello Cline' message from fixture"
+    );
 }
 
 #[test]
-#[ignore = "flaky in CI: HOME env override doesn't propagate to all storage_root checks"]
 fn cline_respects_since_ts_and_resequences_indices() {
     let dir = tempfile::TempDir::new().unwrap();
-
-    // Point HOME to temp so storage_root resolves inside the sandbox.
-    // Note: This can be flaky in CI environments where the connector may
-    // resolve paths before the environment variable is set.
-    unsafe {
-        std::env::set_var("HOME", dir.path());
-    }
-
-    let root = dir
-        .path()
-        .join(".config/Code/User/globalStorage/saoudrizwan.claude-dev/task-123");
+    let storage_root = dir.path().join("saoudrizwan.claude-dev");
+    let root = storage_root.join("task-123");
     std::fs::create_dir_all(&root).unwrap();
 
     let ui_messages_path = root.join("ui_messages.json");
@@ -63,25 +68,84 @@ fn cline_respects_since_ts_and_resequences_indices() {
 
     let connector = ClineConnector::new();
     let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
+        data_dir: storage_root,
         scan_roots: Vec::new(),
         since_ts: Some(1_500),
     };
 
     let convs = connector.scan(&ctx).unwrap();
-    assert_eq!(convs.len(), 1);
+    assert_eq!(
+        convs.len(),
+        1,
+        "expected exactly 1 conversation after since_ts filtering"
+    );
     let c = &convs[0];
 
-    // Should keep only the newer message
+    // Incremental filtering for Cline is file-level, not per-message.
+    // Since the file is newer than since_ts, we ingest all messages and resequence.
     assert_eq!(
         c.messages.len(),
-        1,
-        "expected since_ts to drop older messages"
+        2,
+        "expected file-level since_ts filtering to keep full conversation payload"
     );
-    let msg = &c.messages[0];
-    assert_eq!(msg.idx, 0, "idx should be re-sequenced after filtering");
-    assert_eq!(msg.role, "assistant");
-    assert!(msg.content.contains("new msg"));
+    assert_eq!(
+        c.messages[0].idx, 0,
+        "first message idx should be 0 after re-sequencing"
+    );
+    assert!(
+        c.messages[0].content.contains("old msg"),
+        "first message should contain 'old msg'"
+    );
+    assert_eq!(
+        c.messages[1].idx, 1,
+        "second message idx should be 1 after re-sequencing"
+    );
+    assert_eq!(
+        c.messages[1].role, "assistant",
+        "second message should be assistant role"
+    );
+    assert!(
+        c.messages[1].content.contains("new msg"),
+        "second message should contain 'new msg'"
+    );
+}
+
+#[test]
+fn cline_skips_unmodified_files_for_since_ts() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage_root = dir.path().join("saoudrizwan.claude-dev");
+    let root = storage_root.join("task-older");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let ui_messages_path = root.join("ui_messages.json");
+    let msgs = serde_json::json!([
+        {
+            "timestamp": 1_000,
+            "role": "user",
+            "content": "persisted msg"
+        }
+    ]);
+    std::fs::write(&ui_messages_path, serde_json::to_string(&msgs).unwrap()).unwrap();
+
+    let modified_ms = std::fs::metadata(&ui_messages_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+
+    let connector = ClineConnector::new();
+    let ctx = ScanContext {
+        data_dir: storage_root,
+        scan_roots: Vec::new(),
+        since_ts: Some(modified_ms.saturating_add(2_000)),
+    };
+
+    let convs = connector.scan(&ctx).unwrap();
+    assert!(
+        convs.is_empty(),
+        "expected conversation to be skipped when file mtime is older than since_ts threshold"
+    );
 }
 
 // ============================================================================
@@ -122,8 +186,15 @@ fn cline_prefers_ui_messages() {
         since_ts: None,
     };
     let convs = conn.scan(&ctx).unwrap();
-    assert_eq!(convs.len(), 1);
-    assert!(convs[0].messages[0].content.contains("UI message"));
+    assert_eq!(
+        convs.len(),
+        1,
+        "expected exactly 1 conversation when ui_messages.json exists"
+    );
+    assert!(
+        convs[0].messages[0].content.contains("UI message"),
+        "should prefer ui_messages.json content over api_conversation_history.json"
+    );
 }
 
 /// Test fallback to api_conversation_history.json when ui_messages.json is missing
@@ -149,8 +220,15 @@ fn cline_fallback_to_api_history() {
         since_ts: None,
     };
     let convs = conn.scan(&ctx).unwrap();
-    assert_eq!(convs.len(), 1);
-    assert!(convs[0].messages[0].content.contains("API only message"));
+    assert_eq!(
+        convs.len(),
+        1,
+        "expected exactly 1 conversation from api_conversation_history fallback"
+    );
+    assert!(
+        convs[0].messages[0].content.contains("API only message"),
+        "should fallback to api_conversation_history.json when ui_messages.json is missing"
+    );
 }
 
 /// Test multiple task directories
@@ -173,7 +251,11 @@ fn cline_handles_multiple_tasks() {
         since_ts: None,
     };
     let convs = conn.scan(&ctx).unwrap();
-    assert_eq!(convs.len(), 3);
+    assert_eq!(
+        convs.len(),
+        3,
+        "expected 3 conversations from 3 task directories"
+    );
 }
 
 /// Test taskHistory.json is skipped
@@ -198,8 +280,15 @@ fn cline_skips_task_history_json() {
         since_ts: None,
     };
     let convs = conn.scan(&ctx).unwrap();
-    assert_eq!(convs.len(), 1);
-    assert!(convs[0].messages[0].content.contains("Real task"));
+    assert_eq!(
+        convs.len(),
+        1,
+        "expected 1 conversation - taskHistory.json dir should be skipped"
+    );
+    assert!(
+        convs[0].messages[0].content.contains("Real task"),
+        "should only contain real task, not taskHistory.json"
+    );
 }
 
 /// Test title extraction from metadata
@@ -221,8 +310,16 @@ fn cline_extracts_title_from_metadata() {
         since_ts: None,
     };
     let convs = conn.scan(&ctx).unwrap();
-    assert_eq!(convs.len(), 1);
-    assert_eq!(convs[0].title, Some("Custom Task Title".to_string()));
+    assert_eq!(
+        convs.len(),
+        1,
+        "expected 1 conversation for title metadata test"
+    );
+    assert_eq!(
+        convs[0].title,
+        Some("Custom Task Title".to_string()),
+        "title should be extracted from task_metadata.json"
+    );
 }
 
 /// Test title fallback to first message
@@ -244,8 +341,16 @@ fn cline_title_fallback_to_first_message() {
         since_ts: None,
     };
     let convs = conn.scan(&ctx).unwrap();
-    assert_eq!(convs.len(), 1);
-    assert_eq!(convs[0].title, Some("First line for title".to_string()));
+    assert_eq!(
+        convs.len(),
+        1,
+        "expected 1 conversation for title fallback test"
+    );
+    assert_eq!(
+        convs[0].title,
+        Some("First line for title".to_string()),
+        "title should fallback to first line of first user message"
+    );
 }
 
 /// Test workspace extraction from metadata (rootPath)
@@ -267,10 +372,15 @@ fn cline_extracts_workspace_from_rootpath() {
         since_ts: None,
     };
     let convs = conn.scan(&ctx).unwrap();
-    assert_eq!(convs.len(), 1);
+    assert_eq!(
+        convs.len(),
+        1,
+        "expected 1 conversation for rootPath workspace test"
+    );
     assert_eq!(
         convs[0].workspace,
-        Some(PathBuf::from("/home/user/project"))
+        Some(PathBuf::from("/home/user/project")),
+        "workspace should be extracted from rootPath in task_metadata.json"
     );
 }
 
@@ -452,8 +562,8 @@ fn cline_sets_started_and_ended_at() {
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
-    assert_eq!(convs[0].started_at, Some(1000));
-    assert_eq!(convs[0].ended_at, Some(5000));
+    assert_eq!(convs[0].started_at, Some(1000000)); // 1000 seconds -> 1000000 ms
+    assert_eq!(convs[0].ended_at, Some(5000000)); // 5000 seconds -> 5000000 ms
 }
 
 /// Test agent_slug is "cline"
@@ -525,8 +635,8 @@ fn cline_parses_alternate_timestamp_fields() {
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
-    assert_eq!(convs[0].messages[0].created_at, Some(1000));
-    assert_eq!(convs[0].messages[1].created_at, Some(2000));
+    assert_eq!(convs[0].messages[0].created_at, Some(1000000)); // 1000 seconds -> 1000000 ms
+    assert_eq!(convs[0].messages[1].created_at, Some(2000000)); // 2000 seconds -> 2000000 ms
 }
 
 /// Test type field used as role when role is missing

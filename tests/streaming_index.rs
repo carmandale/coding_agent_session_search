@@ -11,6 +11,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::indexer::streaming_index_enabled;
 use coding_agent_search::storage::sqlite::SqliteStorage;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use std::fs;
 use std::path::Path;
 
@@ -46,7 +47,7 @@ fn count_messages(db_path: &Path) -> i64 {
     let storage = SqliteStorage::open(db_path).expect("open sqlite");
     storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
         .expect("count messages")
 }
 
@@ -54,7 +55,9 @@ fn count_conversations(db_path: &Path) -> i64 {
     let storage = SqliteStorage::open(db_path).expect("open sqlite");
     storage
         .raw()
-        .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+        .query_row_map("SELECT COUNT(*) FROM conversations", &[], |r| {
+            r.get_typed(0)
+        })
         .expect("count conversations")
 }
 
@@ -113,6 +116,8 @@ fn test_streaming_batch_equivalence_message_count() {
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir_streaming)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .env("CASS_STREAMING_INDEX", "1")
@@ -129,6 +134,8 @@ fn test_streaming_batch_equivalence_message_count() {
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir_batch)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .env("CASS_STREAMING_INDEX", "0")
@@ -188,6 +195,8 @@ fn test_streaming_batch_equivalence_search_results() {
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir_streaming)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .env("CASS_STREAMING_INDEX", "1")
@@ -201,6 +210,8 @@ fn test_streaming_batch_equivalence_search_results() {
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir_batch)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .env("CASS_STREAMING_INDEX", "0")
@@ -211,6 +222,7 @@ fn test_streaming_batch_equivalence_search_results() {
     let streaming_result = cargo_bin_cmd!("cass")
         .args(["search", "handler", "--json", "--data-dir"])
         .arg(&data_dir_streaming)
+        .current_dir(home)
         .env("HOME", home)
         .output()
         .expect("search command");
@@ -219,6 +231,7 @@ fn test_streaming_batch_equivalence_search_results() {
     let batch_result = cargo_bin_cmd!("cass")
         .args(["search", "handler", "--json", "--data-dir"])
         .arg(&data_dir_batch)
+        .current_dir(home)
         .env("HOME", home)
         .output()
         .expect("search command");
@@ -269,6 +282,8 @@ fn test_streaming_indexing_deterministic() {
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir1)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .env("CASS_STREAMING_INDEX", "1")
@@ -282,6 +297,8 @@ fn test_streaming_indexing_deterministic() {
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir2)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .env("CASS_STREAMING_INDEX", "1")
@@ -327,6 +344,8 @@ fn test_streaming_larger_corpus() {
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .env("CASS_STREAMING_INDEX", "1")
@@ -367,6 +386,8 @@ fn test_streaming_incremental_indexing() {
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .env("CASS_STREAMING_INDEX", "1")
@@ -392,6 +413,8 @@ fn test_streaming_incremental_indexing() {
     cargo_bin_cmd!("cass")
         .args(["index", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .env("CASS_STREAMING_INDEX", "1")
@@ -425,6 +448,8 @@ fn test_streaming_empty_corpus() {
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .env("CASS_STREAMING_INDEX", "1")
@@ -457,6 +482,8 @@ fn test_switch_from_batch_to_streaming() {
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .env("CASS_STREAMING_INDEX", "0")
@@ -479,6 +506,8 @@ fn test_switch_from_batch_to_streaming() {
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
+        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
+        .current_dir(home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
         .env("CASS_STREAMING_INDEX", "1")

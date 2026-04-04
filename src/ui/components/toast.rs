@@ -3,13 +3,8 @@
 //! Provides non-blocking notifications that auto-dismiss after a configurable duration.
 //! Supports coalescing of similar messages to prevent notification spam.
 
-use ratatui::{
-    Frame,
-    layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
-};
+use ftui::core::geometry::Rect;
+use ftui::render::cell::PackedRgba;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -39,13 +34,13 @@ impl ToastType {
         }
     }
 
-    /// Get the color for this toast type
-    pub fn color(self, palette: &ThemePalette) -> Color {
+    /// Get the color for this toast type as a PackedRgba.
+    pub fn color(self, palette: &ThemePalette) -> PackedRgba {
         match self {
             Self::Info => palette.accent,
-            Self::Success => palette.user,            // Green-ish
-            Self::Warning => palette.system,          // Yellow/amber
-            Self::Error => Color::Rgb(247, 118, 142), // Red
+            Self::Success => palette.user,
+            Self::Warning => palette.system,
+            Self::Error => PackedRgba::rgb(247, 118, 142),
         }
     }
 
@@ -156,7 +151,7 @@ impl Toast {
 }
 
 /// Manages a collection of toast notifications
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ToastManager {
     /// Active toasts (newest first for top-down rendering)
     toasts: VecDeque<Toast>,
@@ -166,6 +161,12 @@ pub struct ToastManager {
     position: ToastPosition,
     /// Whether to coalesce similar toasts
     coalesce: bool,
+}
+
+impl Default for ToastManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToastManager {
@@ -260,7 +261,8 @@ impl ToastManager {
     /// Calculate the render area for toasts given the full terminal area
     pub fn render_area(&self, full_area: Rect) -> Rect {
         let toast_width = 40.min(full_area.width.saturating_sub(4));
-        let toast_height = (self.max_visible as u16 * 3).min(full_area.height.saturating_sub(2));
+        let visible_count = self.visible().count();
+        let toast_height = (visible_count as u16 * 3).min(full_area.height.saturating_sub(2));
 
         let x = match self.position {
             ToastPosition::TopLeft | ToastPosition::BottomLeft => 2,
@@ -280,59 +282,6 @@ impl ToastManager {
         };
 
         Rect::new(x, y, toast_width, toast_height)
-    }
-}
-
-/// Render toasts to a frame
-pub fn render_toasts(frame: &mut Frame, manager: &ToastManager, palette: &ThemePalette) {
-    if manager.is_empty() {
-        return;
-    }
-
-    let area = manager.render_area(frame.area());
-    let toast_height = 3u16; // Each toast is 3 lines (border + content + border)
-
-    for (i, toast) in manager.visible().enumerate() {
-        let y_offset = i as u16 * toast_height;
-        if y_offset + toast_height > area.height {
-            break;
-        }
-
-        let toast_area = Rect::new(area.x, area.y + y_offset, area.width, toast_height);
-
-        // Clear the area first
-        frame.render_widget(Clear, toast_area);
-
-        // Build the toast content
-        let color = toast.toast_type.color(palette);
-        let icon = toast.toast_type.icon();
-
-        let count_suffix = if toast.count > 1 {
-            format!(" (x{})", toast.count)
-        } else {
-            String::new()
-        };
-
-        let content = Line::from(vec![
-            Span::styled(
-                format!("[{icon}] "),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(&toast.message, Style::default().fg(palette.fg)),
-            Span::styled(count_suffix, Style::default().fg(palette.hint)),
-        ]);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(color))
-            .style(Style::default().bg(palette.surface));
-
-        let paragraph = Paragraph::new(content)
-            .block(block)
-            .wrap(Wrap { trim: true })
-            .alignment(Alignment::Left);
-
-        frame.render_widget(paragraph, toast_area);
     }
 }
 

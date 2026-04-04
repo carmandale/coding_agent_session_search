@@ -133,6 +133,15 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ---
 
+## Code-Verify Scope Discipline
+
+<!-- Heuristic from compound-learnings: 3 sessions, verification -->
+- For spec verification, treat `baseline_sha..end_sha` in `implement-receipt.md` as the blocking scope.
+- Evidence outside that range (runtime soak/provenance artifacts) is informational unless explicitly included in scope.
+- Label out-of-window evidence as provenance-only/deferred in receipts to avoid review ambiguity.
+
+---
+
 ## Third-Party Library Usage
 
 If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to find the latest documentation and mid-2025 best practices.

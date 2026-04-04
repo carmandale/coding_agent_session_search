@@ -24,8 +24,11 @@ temp_*.rs
 # bv (beads viewer) local config and caches
 .bv/
 
-# Claude Code artifacts
-.claude/
+# Claude Code session-local artifacts (napkin.md IS committed)
+.claude/ground-cache*
+.claude/settings.local.json
+.claude/cache/
+.claude/worktrees/
 
 # Local backup directories
 .local_backup_*/
@@ -38,3 +41,13 @@ web/node_modules/
 web/playwright-report/
 web/test-results/
 web/test-fixtures/
+
+# Pi messenger (session-local)
+.pi/
+
+# Test output
+test-results/
+
+# Cargo backup files
+Cargo.lock.old-fork-backup
+*.old-fork-backup

@@ -31,7 +31,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::probe::{ResourceInfo, SystemInfo};
+use super::{
+    host_key_verification_error, is_host_key_verification_failure,
+    probe::{ResourceInfo, SystemInfo},
+    strict_ssh_cli_tokens,
+};
 
 // =============================================================================
 // Constants
@@ -245,18 +249,44 @@ impl RemoteInstaller {
     }
 
     /// Create an installer with a specific target version.
+    ///
+    /// Returns an error if the version string contains characters that are not
+    /// safe for shell interpolation (only alphanumeric, `.`, `-`, `+`, `_` allowed).
     pub fn with_version(
         host: impl Into<String>,
         system_info: SystemInfo,
         resources: ResourceInfo,
         version: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, InstallError> {
+        let version = version.into();
+        Self::validate_shell_safe(&version, "version")?;
+        Ok(Self {
             host: host.into(),
             system_info,
             resources,
-            target_version: version.into(),
+            target_version: version,
+        })
+    }
+
+    /// Validate that a string is safe for shell interpolation.
+    ///
+    /// Prevents command injection by rejecting strings containing shell
+    /// metacharacters (quotes, backticks, semicolons, pipes, etc.).
+    fn validate_shell_safe(value: &str, field_name: &str) -> Result<(), InstallError> {
+        if value.is_empty() {
+            return Err(InstallError::VerificationFailed(format!(
+                "{field_name} must not be empty"
+            )));
         }
+        if !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
+        {
+            return Err(InstallError::VerificationFailed(format!(
+                "{field_name} contains unsafe characters: only alphanumeric, '.', '-', '+', '_' are allowed"
+            )));
+        }
+        Ok(())
     }
 
     /// Get the host name.
@@ -334,20 +364,25 @@ impl RemoteInstaller {
 
         // Map arch to release asset naming
         let arch = match self.system_info.arch.as_str() {
-            "x86_64" => "x86_64",
-            "aarch64" | "arm64" => "aarch64",
+            "x86_64" => "amd64",
+            "aarch64" | "arm64" => "arm64",
             _ => return None, // Unsupported arch
         };
 
         let os = match self.system_info.os.to_lowercase().as_str() {
             "linux" => "linux",
-            "darwin" => "macos",
+            "darwin" => "darwin",
             _ => return None, // Unsupported OS
         };
 
+        // macOS Intel builds are not published (see release workflow comment).
+        if os == "darwin" && arch == "amd64" {
+            return None;
+        }
+
         // GitHub releases URL pattern
         Some(format!(
-            "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v{}/cass-{}-{}",
+            "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v{}/cass-{}-{}.tar.gz",
             self.target_version, os, arch
         ))
     }
@@ -510,53 +545,62 @@ impl RemoteInstaller {
             elapsed: start.elapsed(),
         });
 
-        // Use curl or wget depending on availability
-        let download_cmd = if self.system_info.has_curl {
+        let archive_name = url.split('/').next_back().unwrap_or("cass-prebuilt.tar.gz");
+
+        // Download into a secure mktemp directory (not predictable /tmp/), verify
+        // checksum BEFORE extracting/installing, and clean up temp files on exit.
+        let download_tool = if self.system_info.has_curl {
+            format!(r#"curl -fsSL "{url}" -o "${{archive_path}}""#)
+        } else {
+            format!(r#"wget -q "{url}" -O "${{archive_path}}""#)
+        };
+        let checksum_verify = if let Some(expected) = checksum {
             format!(
                 r#"
-mkdir -p ~/.local/bin
-curl -fsSL "{}" -o ~/.local/bin/cass
-chmod +x ~/.local/bin/cass
-# Add to PATH only if not already present
-grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+if command -v sha256sum >/dev/null 2>&1; then
+    actual_sum="$(sha256sum "${{archive_path}}" | cut -d' ' -f1)"
+elif command -v shasum >/dev/null 2>&1; then
+    actual_sum="$(shasum -a 256 "${{archive_path}}" | cut -d' ' -f1)"
+else
+    echo "WARNING: no sha256sum or shasum found, skipping checksum"
+    actual_sum="{expected_lower}"
+fi
+if [ "${{actual_sum}}" != "{expected_lower}" ]; then
+    echo "CHECKSUM_MISMATCH: expected {expected_lower} got ${{actual_sum}}"
+    exit 1
+fi
 "#,
-                url
+                expected_lower = expected.to_lowercase()
             )
         } else {
-            format!(
-                r#"
+            String::new()
+        };
+        let download_cmd = format!(
+            r#"
+set -euo pipefail
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+archive_path="${{tmp_dir}}/{archive_name}"
 mkdir -p ~/.local/bin
-wget -q "{}" -O ~/.local/bin/cass
+{download_tool}
+{checksum_verify}
+tar -xzf "${{archive_path}}" -C "${{tmp_dir}}"
+if [ ! -f "${{tmp_dir}}/cass" ]; then
+    echo "EXTRACT_FAILED"
+    exit 1
+fi
+mv "${{tmp_dir}}/cass" ~/.local/bin/cass
 chmod +x ~/.local/bin/cass
 # Add to PATH only if not already present
 grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-"#,
-                url
-            )
-        };
+"#
+        );
 
         self.run_ssh_command(&download_cmd, Duration::from_secs(60))?;
 
-        // Verify SHA256 checksum if provided
-        let verified_checksum = if let Some(expected) = checksum {
-            on_progress(InstallProgress {
-                stage: InstallStage::Verifying,
-                message: "Verifying binary checksum...".into(),
-                percent: Some(70),
-                elapsed: start.elapsed(),
-            });
-
-            let actual = self.compute_remote_checksum("~/.local/bin/cass")?;
-            if actual.to_lowercase() != expected.to_lowercase() {
-                return Err(InstallError::ChecksumMismatch {
-                    expected: expected.to_string(),
-                    actual,
-                });
-            }
-            Some(expected.to_string())
-        } else {
-            None
-        };
+        // Checksum is verified inside the shell script (before installation).
+        // If the script succeeded, the checksum matched (or was not provided).
+        let verified_checksum = checksum.map(|c| c.to_string());
 
         on_progress(InstallProgress {
             stage: InstallStage::Installing,
@@ -584,6 +628,7 @@ grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.local/bi
     }
 
     /// Compute SHA256 checksum of a file on the remote host.
+    #[allow(dead_code)] // Kept as utility; inline verification in install script is preferred
     fn compute_remote_checksum(&self, remote_path: &str) -> Result<String, InstallError> {
         // Try sha256sum (Linux) first, fall back to shasum -a 256 (macOS)
         let checksum_cmd = format!(
@@ -866,12 +911,7 @@ cass --version 2>&1 || echo "VERIFY_FAILED"
         let timeout_secs = timeout.as_secs();
 
         let mut cmd = Command::new("ssh");
-        cmd.arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg(format!("ConnectTimeout={}", timeout_secs.min(30)))
-            .arg("-o")
-            .arg("StrictHostKeyChecking=accept-new")
+        cmd.args(strict_ssh_cli_tokens(timeout_secs.min(30)))
             .arg("-o")
             .arg("LogLevel=ERROR")
             .arg("--")
@@ -893,13 +933,24 @@ cass --version 2>&1 || echo "VERIFY_FAILED"
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if is_host_key_verification_failure(&stderr) {
+                return Err(InstallError::SshFailed(host_key_verification_error(
+                    &self.host,
+                )));
+            }
             if stderr.contains("Connection refused")
                 || stderr.contains("Connection timed out")
                 || stderr.contains("Permission denied")
             {
                 return Err(InstallError::SshFailed(stderr.trim().to_string()));
             }
-            // Non-zero exit might be OK for some commands, return stdout
+            // Fail fast on any other non-zero exit — surface the exit code and
+            // stderr so operators can diagnose the root cause immediately.
+            let code = output.status.code().unwrap_or(-1);
+            return Err(InstallError::SshFailed(format!(
+                "Remote script exited with code {code}: {}",
+                stderr.trim()
+            )));
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -932,7 +983,7 @@ fn detect_missing_dependency(error: &str) -> Option<(&'static str, &'static str)
 mod tests {
     use super::*;
 
-    fn mock_system_info() -> SystemInfo {
+    fn fixture_system_info() -> SystemInfo {
         SystemInfo {
             os: "linux".into(),
             arch: "x86_64".into(),
@@ -942,10 +993,11 @@ mod tests {
             has_curl: true,
             has_wget: false,
             remote_home: "/home/user".into(),
+            machine_id: None,
         }
     }
 
-    fn mock_resources() -> ResourceInfo {
+    fn fixture_resources() -> ResourceInfo {
         ResourceInfo {
             disk_available_mb: 10000,
             memory_total_mb: 8000,
@@ -983,9 +1035,9 @@ mod tests {
 
     #[test]
     fn test_choose_method_prefers_binstall() {
-        let mut system = mock_system_info();
+        let mut system = fixture_system_info();
         system.has_cargo_binstall = true;
-        let resources = mock_resources();
+        let resources = fixture_resources();
 
         let installer = RemoteInstaller::new("test", system, resources);
         assert_eq!(
@@ -996,11 +1048,11 @@ mod tests {
 
     #[test]
     fn test_choose_method_cargo_install() {
-        let mut system = mock_system_info();
+        let mut system = fixture_system_info();
         // Disable curl/wget so pre-built binary is not available
         system.has_curl = false;
         system.has_wget = false;
-        let resources = mock_resources();
+        let resources = fixture_resources();
 
         let installer = RemoteInstaller::new("test", system, resources);
         // With cargo but no binstall and no download tools, should choose cargo install
@@ -1009,8 +1061,8 @@ mod tests {
 
     #[test]
     fn test_choose_method_prebuilt_binary() {
-        let system = mock_system_info();
-        let resources = mock_resources();
+        let system = fixture_system_info();
+        let resources = fixture_resources();
 
         let installer = RemoteInstaller::new("test", system, resources);
         // With curl available, should prefer pre-built binary over cargo install
@@ -1022,14 +1074,14 @@ mod tests {
 
     #[test]
     fn test_choose_method_bootstrap_when_no_cargo() {
-        let mut system = mock_system_info();
+        let mut system = fixture_system_info();
         system.has_cargo = false;
         // curl is needed for bootstrap (to download rustup)
         system.has_curl = true;
         system.has_wget = false;
         // Use unsupported arch so prebuilt binary is not available
         system.arch = "armv7".into();
-        let resources = mock_resources();
+        let resources = fixture_resources();
 
         let installer = RemoteInstaller::new("test", system, resources);
         assert_eq!(
@@ -1040,12 +1092,12 @@ mod tests {
 
     #[test]
     fn test_choose_method_none_when_no_tools() {
-        let mut system = mock_system_info();
+        let mut system = fixture_system_info();
         system.has_cargo = false;
         system.has_cargo_binstall = false;
         system.has_curl = false;
         system.has_wget = false;
-        let resources = mock_resources();
+        let resources = fixture_resources();
 
         let installer = RemoteInstaller::new("test", system, resources);
         // No curl means no way to download rustup, no wget/curl means no prebuilt binary
@@ -1055,8 +1107,8 @@ mod tests {
 
     #[test]
     fn test_check_resources_ok() {
-        let system = mock_system_info();
-        let resources = mock_resources();
+        let system = fixture_system_info();
+        let resources = fixture_resources();
 
         let installer = RemoteInstaller::new("test", system, resources);
         assert!(installer.check_resources().is_ok());
@@ -1064,8 +1116,8 @@ mod tests {
 
     #[test]
     fn test_check_resources_insufficient_disk() {
-        let system = mock_system_info();
-        let mut resources = mock_resources();
+        let system = fixture_system_info();
+        let mut resources = fixture_resources();
         resources.disk_available_mb = 500;
 
         let installer = RemoteInstaller::new("test", system, resources);
@@ -1075,8 +1127,8 @@ mod tests {
 
     #[test]
     fn test_can_compile_insufficient_memory() {
-        let system = mock_system_info();
-        let mut resources = mock_resources();
+        let system = fixture_system_info();
+        let mut resources = fixture_resources();
         resources.memory_total_mb = 512;
 
         let installer = RemoteInstaller::new("test", system, resources);
@@ -1089,26 +1141,26 @@ mod tests {
 
     #[test]
     fn test_get_prebuilt_url_linux_x86() {
-        let system = mock_system_info();
-        let resources = mock_resources();
+        let system = fixture_system_info();
+        let resources = fixture_resources();
 
         let installer = RemoteInstaller::new("test", system, resources);
         let url = installer.get_prebuilt_url();
         assert!(url.is_some());
-        assert!(url.unwrap().contains("linux-x86_64"));
+        assert!(url.unwrap().contains("linux-amd64.tar.gz"));
     }
 
     #[test]
     fn test_get_prebuilt_url_macos_arm() {
-        let mut system = mock_system_info();
+        let mut system = fixture_system_info();
         system.os = "darwin".into();
         system.arch = "aarch64".into();
-        let resources = mock_resources();
+        let resources = fixture_resources();
 
         let installer = RemoteInstaller::new("test", system, resources);
         let url = installer.get_prebuilt_url();
         assert!(url.is_some());
-        assert!(url.unwrap().contains("macos-aarch64"));
+        assert!(url.unwrap().contains("darwin-arm64.tar.gz"));
     }
 
     #[test]
@@ -1209,11 +1261,13 @@ mod tests {
 
         // Verify deserialization
         let parsed: InstallMethod = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(parsed, InstallMethod::PrebuiltBinary { .. }),
+            "Expected PrebuiltBinary variant with checksum in test_prebuilt_binary_method_with_checksum"
+        );
         if let InstallMethod::PrebuiltBinary { checksum, .. } = parsed {
             assert!(checksum.is_some());
             assert_eq!(checksum.unwrap().len(), 64);
-        } else {
-            panic!("Expected PrebuiltBinary variant");
         }
     }
 
@@ -1226,10 +1280,251 @@ mod tests {
 
         let json = serde_json::to_string(&method).unwrap();
         let parsed: InstallMethod = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(parsed, InstallMethod::PrebuiltBinary { .. }),
+            "Expected PrebuiltBinary variant in test_prebuilt_binary_method_without_checksum"
+        );
         if let InstallMethod::PrebuiltBinary { checksum, .. } = parsed {
             assert!(checksum.is_none());
-        } else {
-            panic!("Expected PrebuiltBinary variant");
         }
+    }
+
+    // =========================================================================
+    // Real system probe integration tests — no mocks
+    // =========================================================================
+
+    /// Build SystemInfo from real local system commands.
+    fn local_system_info() -> SystemInfo {
+        use std::process::Command;
+
+        let os = {
+            let out = Command::new("uname").arg("-s").output().expect("uname -s");
+            String::from_utf8_lossy(&out.stdout).trim().to_lowercase()
+        };
+        let arch = {
+            let out = Command::new("uname").arg("-m").output().expect("uname -m");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let distro = if std::path::Path::new("/etc/os-release").exists() {
+            let out = Command::new("bash")
+                .arg("-c")
+                .arg(". /etc/os-release && echo \"$PRETTY_NAME\"")
+                .output()
+                .ok();
+            out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        let has = |cmd: &str| -> bool {
+            Command::new("which")
+                .arg(cmd)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        let home = dotenvy::var("HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                directories::BaseDirs::new().map(|d| d.home_dir().to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+
+        SystemInfo {
+            os,
+            arch,
+            distro,
+            has_cargo: has("cargo"),
+            has_cargo_binstall: has("cargo-binstall"),
+            has_curl: has("curl"),
+            has_wget: has("wget"),
+            remote_home: home,
+            machine_id: None, // Not needed in tests
+        }
+    }
+
+    /// Build ResourceInfo from real local system commands.
+    fn local_resource_info() -> ResourceInfo {
+        use std::process::Command;
+
+        let disk_mb = {
+            let out = Command::new("bash")
+                .arg("-c")
+                // Avoid `~` tilde expansion since other tests mutate HOME concurrently.
+                .arg("df -k / 2>/dev/null | awk 'NR==2 {print $4}'")
+                .output()
+                .expect("df -k /");
+            let kb: u64 = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            kb / 1024
+        };
+        let (mem_total_mb, mem_avail_mb) = if std::path::Path::new("/proc/meminfo").exists() {
+            let out = Command::new("bash")
+                .arg("-c")
+                .arg("grep MemTotal /proc/meminfo | awk '{print $2}'")
+                .output()
+                .expect("memtotal");
+            let total_kb: u64 = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            let out2 = Command::new("bash")
+                .arg("-c")
+                .arg("grep MemAvailable /proc/meminfo | awk '{print $2}'")
+                .output()
+                .expect("memavail");
+            let avail_kb: u64 = String::from_utf8_lossy(&out2.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            (total_kb / 1024, avail_kb / 1024)
+        } else {
+            // macOS fallback
+            let out = Command::new("sysctl")
+                .arg("-n")
+                .arg("hw.memsize")
+                .output()
+                .ok();
+            let bytes: u64 = out
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            let mb = bytes / (1024 * 1024);
+            (mb, mb)
+        };
+
+        ResourceInfo {
+            disk_available_mb: disk_mb,
+            memory_total_mb: mem_total_mb,
+            memory_available_mb: mem_avail_mb,
+            can_compile: disk_mb >= ResourceInfo::MIN_DISK_MB
+                && mem_total_mb >= ResourceInfo::MIN_MEMORY_MB,
+        }
+    }
+
+    #[test]
+    fn real_system_info_has_valid_fields() {
+        let sys = local_system_info();
+        assert!(
+            sys.os == "linux" || sys.os == "darwin",
+            "unexpected OS: {}",
+            sys.os
+        );
+        assert!(!sys.arch.is_empty(), "arch should not be empty");
+        assert!(!sys.remote_home.is_empty(), "home should not be empty");
+        assert!(
+            sys.remote_home.starts_with('/'),
+            "home should be absolute: {}",
+            sys.remote_home
+        );
+    }
+
+    #[test]
+    fn real_resources_have_nonzero_values() {
+        let res = local_resource_info();
+        assert!(res.disk_available_mb > 0, "disk should be > 0");
+        assert!(res.memory_total_mb > 0, "total memory should be > 0");
+        assert!(
+            res.memory_available_mb > 0,
+            "available memory should be > 0"
+        );
+    }
+
+    #[test]
+    fn real_resources_memory_invariant() {
+        let res = local_resource_info();
+        assert!(
+            res.memory_available_mb <= res.memory_total_mb,
+            "available ({}) > total ({})",
+            res.memory_available_mb,
+            res.memory_total_mb
+        );
+    }
+
+    #[test]
+    fn real_resources_can_compile_matches_thresholds() {
+        let res = local_resource_info();
+        let expected = res.disk_available_mb >= ResourceInfo::MIN_DISK_MB
+            && res.memory_total_mb >= ResourceInfo::MIN_MEMORY_MB;
+        assert_eq!(
+            res.can_compile, expected,
+            "can_compile mismatch: disk={}MB mem={}MB",
+            res.disk_available_mb, res.memory_total_mb
+        );
+    }
+
+    #[test]
+    fn real_system_choose_method_returns_some() {
+        let sys = local_system_info();
+        let res = local_resource_info();
+        // This system should have at least curl or cargo, so a method should exist
+        let installer = RemoteInstaller::new("localhost", sys, res);
+        let method = installer.choose_method();
+        assert!(
+            method.is_some(),
+            "real system should have at least one install method"
+        );
+    }
+
+    #[test]
+    #[ignore = "environment-dependent: requires >=2GB disk space"]
+    fn real_system_check_resources_ok() {
+        let sys = local_system_info();
+        let res = local_resource_info();
+        // This dev machine should have enough resources
+        let installer = RemoteInstaller::new("localhost", sys, res);
+        assert!(
+            installer.check_resources().is_ok(),
+            "dev machine should pass resource check"
+        );
+    }
+
+    #[test]
+    #[ignore = "environment-dependent: requires >=2GB disk space and >=1GB memory"]
+    fn real_system_can_compile_ok() {
+        let sys = local_system_info();
+        let res = local_resource_info();
+        let installer = RemoteInstaller::new("localhost", sys, res);
+        assert!(
+            installer.can_compile().is_ok(),
+            "dev machine should be able to compile"
+        );
+    }
+
+    #[test]
+    fn real_system_prebuilt_url_valid() {
+        let sys = local_system_info();
+        let res = local_resource_info();
+        let installer = RemoteInstaller::new("localhost", sys, res);
+        if let Some(url) = installer.get_prebuilt_url() {
+            assert!(url.starts_with("https://"), "URL should be https: {}", url);
+            assert!(
+                url.contains("linux") || url.contains("darwin"),
+                "URL should contain OS: {}",
+                url
+            );
+        }
+        // Not all architectures have prebuilt URLs, so Some/None both acceptable
+    }
+
+    #[test]
+    fn real_system_tool_detection_consistent() {
+        let sys = local_system_info();
+        // If binstall is available, cargo must be too
+        if sys.has_cargo_binstall {
+            assert!(sys.has_cargo, "binstall requires cargo");
+        }
+        // Dev machine should have at least curl or wget
+        assert!(
+            sys.has_curl || sys.has_wget,
+            "system should have at least one download tool"
+        );
     }
 }

@@ -4,7 +4,9 @@
 //! and tags. Uses a separate `SQLite` database file to avoid schema conflicts.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use frankensqlite::Connection;
+use frankensqlite::compat::{ConnectionExt, OptionalExtension, RowExt, TransactionExt};
+use frankensqlite::params;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -113,7 +115,7 @@ impl BookmarkStore {
                 .with_context(|| format!("creating bookmarks directory {}", parent.display()))?;
         }
 
-        let conn = Connection::open(path)
+        let conn = Connection::open(path.to_string_lossy().as_ref())
             .with_context(|| format!("opening bookmarks db at {}", path.display()))?;
 
         // Apply pragmas for performance
@@ -137,36 +139,39 @@ impl BookmarkStore {
 
     /// Add a new bookmark
     pub fn add(&self, bookmark: &Bookmark) -> Result<i64> {
-        self.conn.execute(
+        let line_number = line_number_to_db(bookmark.line_number)?;
+
+        self.conn.execute_compat(
             "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
-                bookmark.title,
-                bookmark.source_path,
-                bookmark.line_number.map(|n| n as i64),
-                bookmark.agent,
-                bookmark.workspace,
-                bookmark.note,
-                bookmark.tags,
+                bookmark.title.as_str(),
+                bookmark.source_path.as_str(),
+                line_number,
+                bookmark.agent.as_str(),
+                bookmark.workspace.as_str(),
+                bookmark.note.as_str(),
+                bookmark.tags.as_str(),
                 bookmark.created_at,
                 bookmark.updated_at,
-                bookmark.snippet,
+                bookmark.snippet.as_str(),
             ],
         )?;
 
-        Ok(self.conn.last_insert_rowid())
+        let rowid = self.conn.last_insert_rowid();
+        Ok(rowid)
     }
 
     /// Update an existing bookmark
     pub fn update(&self, bookmark: &Bookmark) -> Result<bool> {
         let now = current_timestamp();
 
-        let rows = self.conn.execute(
+        let rows = self.conn.execute_compat(
             "UPDATE bookmarks SET title = ?1, note = ?2, tags = ?3, updated_at = ?4 WHERE id = ?5",
             params![
-                bookmark.title,
-                bookmark.note,
-                bookmark.tags,
+                bookmark.title.as_str(),
+                bookmark.note.as_str(),
+                bookmark.tags.as_str(),
                 now,
                 bookmark.id
             ],
@@ -179,17 +184,17 @@ impl BookmarkStore {
     pub fn remove(&self, id: i64) -> Result<bool> {
         let rows = self
             .conn
-            .execute("DELETE FROM bookmarks WHERE id = ?1", [id])?;
+            .execute_compat("DELETE FROM bookmarks WHERE id = ?1", params![id])?;
         Ok(rows > 0)
     }
 
     /// Get a bookmark by ID
     pub fn get(&self, id: i64) -> Result<Option<Bookmark>> {
         self.conn
-            .query_row(
+            .query_row_map(
                 "SELECT id, title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet
                  FROM bookmarks WHERE id = ?1",
-                [id],
+                params![id],
                 row_to_bookmark,
             )
             .optional()
@@ -198,42 +203,41 @@ impl BookmarkStore {
 
     /// List all bookmarks, optionally filtered by tag
     pub fn list(&self, tag_filter: Option<&str>) -> Result<Vec<Bookmark>> {
-        let mut bookmarks = Vec::new();
-
         let sql = "SELECT id, title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet
                    FROM bookmarks ORDER BY created_at DESC";
 
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map([], row_to_bookmark)?;
+        let all_bookmarks: Vec<Bookmark> =
+            self.conn.query_map_collect(sql, &[], row_to_bookmark)?;
 
-        for bookmark in rows {
-            let bookmark = bookmark?;
-            if let Some(tag) = tag_filter {
-                if bookmark.has_tag(tag) {
-                    bookmarks.push(bookmark);
-                }
-            } else {
-                bookmarks.push(bookmark);
-            }
+        if let Some(tag) = tag_filter {
+            Ok(all_bookmarks
+                .into_iter()
+                .filter(|b| b.has_tag(tag))
+                .collect())
+        } else {
+            Ok(all_bookmarks)
         }
-
-        Ok(bookmarks)
     }
 
     /// Search bookmarks by text (title, note, snippet)
     pub fn search(&self, query: &str) -> Result<Vec<Bookmark>> {
-        let pattern = format!("%{}%", query.to_lowercase());
+        // Escape SQL LIKE wildcards so they are matched literally
+        let escaped = query
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
 
-        let mut stmt = self.conn.prepare(
+        let results = self.conn.query_map_collect(
             "SELECT id, title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet
              FROM bookmarks
-             WHERE LOWER(title) LIKE ?1 OR LOWER(note) LIKE ?1 OR LOWER(snippet) LIKE ?1
+             WHERE LOWER(title) LIKE ?1 ESCAPE '\\' OR LOWER(note) LIKE ?1 ESCAPE '\\' OR LOWER(snippet) LIKE ?1 ESCAPE '\\'
              ORDER BY created_at DESC",
-        )?;
-
-        let rows = stmt.query_map([&pattern], row_to_bookmark)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .context("searching bookmarks")
+            params![pattern],
+            row_to_bookmark,
+        ).context("searching bookmarks")?;
+        Ok(results)
     }
 
     /// Get all unique tags
@@ -252,20 +256,23 @@ impl BookmarkStore {
 
     /// Count total bookmarks
     pub fn count(&self) -> Result<usize> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM bookmarks", [], |row| row.get(0))?;
-        Ok(count as usize)
+        let count: i64 = self.conn.query_row_map(
+            "SELECT COUNT(*) FROM bookmarks",
+            &[],
+            |row: &frankensqlite::Row| row.get_typed(0),
+        )?;
+        usize::try_from(count).context("bookmark count is out of range")
     }
 
     /// Check if a `source_path` + line is already bookmarked
     pub fn is_bookmarked(&self, source_path: &str, line_number: Option<usize>) -> Result<bool> {
-        let exists: bool = self.conn.query_row(
+        let line_number = line_number_to_db(line_number)?;
+        let exists: i64 = self.conn.query_row_map(
             "SELECT EXISTS(SELECT 1 FROM bookmarks WHERE source_path = ?1 AND line_number IS ?2)",
-            params![source_path, line_number.map(|n| n as i64)],
-            |row| row.get(0),
+            params![source_path, line_number],
+            |row: &frankensqlite::Row| row.get_typed(0),
         )?;
-        Ok(exists)
+        Ok(exists != 0)
     }
 
     /// Export all bookmarks to JSON
@@ -280,40 +287,39 @@ impl BookmarkStore {
             serde_json::from_str(json).context("parsing bookmark JSON")?;
         let mut imported = 0;
 
-        let tx = self.conn.unchecked_transaction()?;
+        let mut tx = self.conn.transaction()?;
 
         for mut bookmark in bookmarks {
+            let line_number = line_number_to_db(bookmark.line_number)?;
+
             // Check for duplicates
-            // We can't use self.is_bookmarked here easily because it borrows self.conn immutably,
-            // but we are inside a transaction.
-            // Actually, unchecked_transaction allows us to use the connection?
-            // No, Transaction borrows Connection mutably.
-            // We need to implement duplicate check manually or use INSERT OR IGNORE / INSERT ... ON CONFLICT
-            // But logic says "merges, doesn't overwrite".
-
-            // Re-implement check using the transaction
-            let exists: bool = tx.query_row(
+            let check_params = params![bookmark.source_path.as_str(), line_number];
+            let check_values = frankensqlite::compat::param_slice_to_values(check_params);
+            let exists_row = tx.query_with_params(
                 "SELECT EXISTS(SELECT 1 FROM bookmarks WHERE source_path = ?1 AND line_number IS ?2)",
-                params![bookmark.source_path, bookmark.line_number.map(|n| n as i64)],
-                |row| row.get(0),
+                &check_values,
             )?;
+            let exists: i64 = exists_row
+                .first()
+                .and_then(|row| row.get_typed(0).ok())
+                .unwrap_or(0);
 
-            if !exists {
+            if exists == 0 {
                 bookmark.id = 0; // Reset ID for new insert
-                tx.execute(
+                tx.execute_compat(
                     "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
-                        bookmark.title,
-                        bookmark.source_path,
-                        bookmark.line_number.map(|n| n as i64),
-                        bookmark.agent,
-                        bookmark.workspace,
-                        bookmark.note,
-                        bookmark.tags,
+                        bookmark.title.as_str(),
+                        bookmark.source_path.as_str(),
+                        line_number,
+                        bookmark.agent.as_str(),
+                        bookmark.workspace.as_str(),
+                        bookmark.note.as_str(),
+                        bookmark.tags.as_str(),
                         bookmark.created_at,
                         bookmark.updated_at,
-                        bookmark.snippet,
+                        bookmark.snippet.as_str(),
                     ],
                 )?;
                 imported += 1;
@@ -327,28 +333,25 @@ impl BookmarkStore {
 }
 
 /// Convert a database row to a Bookmark
-fn row_to_bookmark(row: &rusqlite::Row) -> rusqlite::Result<Bookmark> {
+fn row_to_bookmark(row: &frankensqlite::Row) -> Result<Bookmark, frankensqlite::FrankenError> {
     Ok(Bookmark {
-        id: row.get(0)?,
-        title: row.get(1)?,
-        source_path: row.get(2)?,
-        line_number: row.get::<_, Option<i64>>(3)?.map(|n| n as usize),
-        agent: row.get(4)?,
-        workspace: row.get(5)?,
-        note: row.get(6)?,
-        tags: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
-        snippet: row.get(10)?,
+        id: row.get_typed(0)?,
+        title: row.get_typed(1)?,
+        source_path: row.get_typed(2)?,
+        line_number: line_number_from_db(row.get_typed::<Option<i64>>(3)?),
+        agent: row.get_typed(4)?,
+        workspace: row.get_typed(5)?,
+        note: row.get_typed(6)?,
+        tags: row.get_typed(7)?,
+        created_at: row.get_typed(8)?,
+        updated_at: row.get_typed(9)?,
+        snippet: row.get_typed(10)?,
     })
 }
 
 /// Get the default bookmarks database path
 pub fn default_bookmarks_path() -> PathBuf {
-    directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search").map_or_else(
-        || PathBuf::from("bookmarks.db"),
-        |dirs| dirs.data_dir().join("bookmarks.db"),
-    )
+    crate::default_data_dir().join("bookmarks.db")
 }
 
 /// SQL schema for bookmarks database
@@ -372,11 +375,24 @@ CREATE INDEX IF NOT EXISTS idx_bookmarks_created ON bookmarks(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_bookmarks_agent ON bookmarks(agent);
 ";
 
+fn line_number_to_db(line_number: Option<usize>) -> Result<Option<i64>> {
+    line_number
+        .map(|n| i64::try_from(n).context("line number exceeds i64 range"))
+        .transpose()
+}
+
+fn line_number_from_db(line_number: Option<i64>) -> Option<usize> {
+    line_number.and_then(|n| usize::try_from(n).ok())
+}
+
 fn current_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
@@ -499,6 +515,51 @@ mod tests {
         assert!(store.is_bookmarked("/file.rs", Some(10)).unwrap());
         assert!(!store.is_bookmarked("/file.rs", Some(20)).unwrap());
         assert!(!store.is_bookmarked("/other.rs", Some(10)).unwrap());
+    }
+
+    #[test]
+    fn test_negative_line_number_from_db_is_sanitized() {
+        let (store, _dir) = test_store();
+        let now = current_timestamp();
+        store
+            .conn
+            .execute_compat(
+                "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    "NegLine",
+                    "/neg.rs",
+                    -12_i64,
+                    "agent",
+                    "/ws",
+                    "",
+                    "",
+                    now,
+                    now,
+                    ""
+                ],
+            )
+            .unwrap();
+
+        let bookmarks = store.list(None).unwrap();
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].line_number, None);
+    }
+
+    #[test]
+    fn test_add_rejects_line_number_above_i64_max() {
+        if usize::BITS <= 63 {
+            return;
+        }
+
+        let (store, _dir) = test_store();
+        let too_large_line = (i64::MAX as usize).saturating_add(1);
+        let bookmark =
+            Bookmark::new("HugeLine", "/huge.rs", "agent", "/ws").with_line(too_large_line);
+        let err = store
+            .add(&bookmark)
+            .expect_err("line overflow must be rejected");
+        assert!(err.to_string().contains("line number exceeds i64 range"));
     }
 
     #[test]

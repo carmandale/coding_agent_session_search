@@ -6,7 +6,14 @@
  * Uses virtual scrolling for long conversations with 50+ messages.
  */
 
-import { getConversation, getConversationMessages } from './database.js';
+import { getConversation, getConversationMessages, checkMemoryPressure, getMemoryUsage } from './database.js';
+import {
+    createAttachmentElement,
+    getMessageAttachments,
+    initAttachments,
+    reset as resetAttachments,
+} from './attachments.js';
+import { copyTextToClipboard } from './share.js';
 import { VariableHeightVirtualList } from './virtual-list.js';
 
 // Virtual scrolling configuration
@@ -15,6 +22,17 @@ const VIRTUAL_CONFIG = {
     ESTIMATED_MESSAGE_HEIGHT: 150, // Estimated average message height
     OVERSCAN: 3, // Extra items to render above/below viewport
 };
+
+// Memory management configuration
+const MEMORY_CONFIG = {
+    MAX_LOADED_CONVERSATIONS: 5, // Maximum conversations to keep in memory
+    MEMORY_CHECK_INTERVAL: 30000, // Check memory every 30 seconds
+    MEMORY_WARNING_THRESHOLD: 80, // Warn at 80% memory usage
+};
+
+// LRU cache for loaded conversations
+const loadedConversations = new Map();
+let memoryCheckIntervalId = null;
 
 // DOMPurify configuration for XSS prevention
 const SANITIZE_CONFIG = {
@@ -28,12 +46,20 @@ const SANITIZE_CONFIG = {
     FORBID_TAGS: ['script', 'style', 'iframe', 'object', 'embed', 'form', 'input'],
     FORBID_ATTR: ['onerror', 'onclick', 'onload', 'onmouseover', 'style'],
 };
+const ALLOWED_TAGS = new Set(SANITIZE_CONFIG.ALLOWED_TAGS);
+const ALLOWED_ATTR = new Set([...SANITIZE_CONFIG.ALLOWED_ATTR, 'target', 'rel']);
+const FORBID_TAGS = new Set(SANITIZE_CONFIG.FORBID_TAGS);
+const FORBID_ATTR = new Set(SANITIZE_CONFIG.FORBID_ATTR);
 
 // Module state
 let currentConversation = null;
 let currentMessages = [];
 let onBack = null;
 let messageVirtualList = null; // Virtual list for long conversations
+let attachmentState = createAttachmentState();
+let activeConversationLoadId = 0;
+let documentKeydownHandler = null;
+let copyFeedbackTimeoutId = null;
 
 // DOM element references
 let elements = {
@@ -50,27 +76,142 @@ let elements = {
 export function initConversationViewer(container, backCallback) {
     elements.container = container;
     onBack = backCallback;
+    window.removeEventListener('cass:lock', handleArchiveLock);
+    window.addEventListener('cass:lock', handleArchiveLock);
 }
 
 /**
- * Load and display a conversation
+ * Load and display a conversation with LRU caching
  * @param {number} conversationId - Conversation ID
  * @param {number|null} highlightMessageId - Message ID to highlight/scroll to
  */
 export async function loadConversation(conversationId, highlightMessageId = null) {
-    // Load conversation metadata
-    currentConversation = getConversation(conversationId);
+    const loadId = ++activeConversationLoadId;
+    try {
+        let conversation;
+        let messages;
 
-    if (!currentConversation) {
-        showError('Conversation not found');
-        return;
+        // Check if conversation is already in cache
+        if (loadedConversations.has(conversationId)) {
+            const cached = loadedConversations.get(conversationId);
+            // Move to end of map (most recently used)
+            loadedConversations.delete(conversationId);
+            loadedConversations.set(conversationId, cached);
+            conversation = cached.conversation;
+            messages = cached.messages;
+            console.debug(`[Conversation] Using cached conversation ${conversationId}`);
+        } else {
+            // Unload oldest conversation if at limit
+            if (loadedConversations.size >= MEMORY_CONFIG.MAX_LOADED_CONVERSATIONS) {
+                unloadOldestConversation();
+            }
+
+            // Load conversation metadata
+            conversation = getConversation(conversationId);
+
+            if (!conversation) {
+                if (loadId === activeConversationLoadId) {
+                    showError('Conversation not found');
+                }
+                return;
+            }
+
+            // Load messages
+            messages = getConversationMessages(conversationId);
+
+            // Cache the loaded data
+            loadedConversations.set(conversationId, {
+                conversation,
+                messages,
+                loadedAt: Date.now(),
+            });
+            console.debug(`[Conversation] Loaded and cached conversation ${conversationId} (cache size: ${loadedConversations.size})`);
+        }
+
+        // Check memory pressure
+        if (checkMemoryPressure()) {
+            showMemoryWarning();
+        }
+
+        await ensureAttachmentsReady(loadId);
+
+        if (loadId !== activeConversationLoadId) {
+            return;
+        }
+
+        currentConversation = conversation;
+        currentMessages = messages;
+
+        // Render the view
+        render(conversation, messages, highlightMessageId);
+    } catch (error) {
+        if (loadId !== activeConversationLoadId) {
+            return;
+        }
+
+        console.error(`[Conversation] Failed to load conversation ${conversationId}:`, error);
+        teardownDocumentListeners();
+        destroyVirtualList();
+        currentConversation = null;
+        currentMessages = [];
+        showError('Failed to load conversation');
+    }
+}
+
+function createAttachmentState() {
+    return {
+        ready: false,
+        available: false,
+        dek: null,
+        exportId: null,
+    };
+}
+
+async function ensureAttachmentsReady(loadId = activeConversationLoadId) {
+    const state = attachmentState;
+
+    if (state.ready) {
+        return state.available;
     }
 
-    // Load messages
-    currentMessages = getConversationMessages(conversationId);
+    const session = window.cassSession;
+    const dekBase64 = session?.dek;
+    const exportIdBase64 = session?.config?.export_id;
 
-    // Render the view
-    render(currentConversation, currentMessages, highlightMessageId);
+    if (!dekBase64 || !exportIdBase64) {
+        if (state === attachmentState && loadId === activeConversationLoadId) {
+            state.ready = true;
+            state.available = false;
+        }
+        return false;
+    }
+
+    try {
+        const dek = base64ToBytes(dekBase64);
+        const exportId = base64ToBytes(exportIdBase64);
+        const manifest = await initAttachments(dek, exportId);
+
+        if (state !== attachmentState || loadId !== activeConversationLoadId) {
+            return false;
+        }
+
+        state.dek = dek;
+        state.exportId = exportId;
+        state.available = Boolean(manifest?.entries?.length);
+        state.ready = true;
+        return state.available;
+    } catch (error) {
+        if (state !== attachmentState || loadId !== activeConversationLoadId) {
+            return false;
+        }
+        if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {
+            return false;
+        }
+        console.warn('[Conversation] Attachment manifest unavailable:', error);
+        state.ready = false;
+        state.available = false;
+        return false;
+    }
 }
 
 /**
@@ -179,6 +320,7 @@ function renderVirtualMessages(messages, highlightId) {
 function renderDirectMessages(messages, highlightId) {
     const html = messages.map((msg, idx) => renderMessage(msg, idx, msg.id === highlightId)).join('');
     elements.messagesList.innerHTML = html;
+    hydrateDirectMessageAttachments(messages);
 
     // Apply syntax highlighting
     applySyntaxHighlighting();
@@ -213,6 +355,8 @@ function createMessageElement(message, index, isHighlighted = false) {
             ${renderedContent}
         </div>
     `;
+
+    appendAttachmentsToMessage(article, message);
 
     // Apply syntax highlighting after element is created
     requestAnimationFrame(() => {
@@ -285,10 +429,71 @@ function renderMessage(message, index, isHighlighted = false) {
     `;
 }
 
+function hydrateDirectMessageAttachments(messages) {
+    if (!attachmentState.available) {
+        return;
+    }
+
+    const byId = new Map(messages.map(message => [String(message.id), message]));
+    const renderedMessages = elements.messagesList.querySelectorAll('.message[data-message-id]');
+
+    renderedMessages.forEach(messageElement => {
+        const message = byId.get(messageElement.dataset.messageId);
+        if (message) {
+            appendAttachmentsToMessage(messageElement, message);
+        }
+    });
+}
+
+function appendAttachmentsToMessage(messageElement, message) {
+    if (!attachmentState.available) {
+        return;
+    }
+
+    const attachments = getMessageAttachments(message.id);
+    if (!attachments.length) {
+        return;
+    }
+
+    const contentElement = messageElement.querySelector('.message-content');
+    if (!contentElement || contentElement.querySelector('.message-attachments')) {
+        return;
+    }
+
+    const attachmentsContainer = document.createElement('div');
+    attachmentsContainer.className = 'message-attachments';
+
+    const label = document.createElement('div');
+    label.className = 'message-attachments-label';
+    label.textContent = attachments.length === 1 ? 'Attachment' : 'Attachments';
+    attachmentsContainer.appendChild(label);
+
+    attachments.forEach(entry => {
+        attachmentsContainer.appendChild(
+            createAttachmentElement(entry, attachmentState.dek, attachmentState.exportId)
+        );
+    });
+
+    contentElement.appendChild(attachmentsContainer);
+}
+
+function handleArchiveLock() {
+    activeConversationLoadId += 1;
+    currentConversation = null;
+    currentMessages = [];
+    teardownDocumentListeners();
+    destroyVirtualList();
+    clearAllCache();
+    attachmentState = createAttachmentState();
+    resetAttachments();
+}
+
 /**
  * Set up event listeners
  */
 function setupEventListeners() {
+    teardownDocumentListeners();
+
     // Back button
     const backBtn = document.getElementById('back-btn');
     backBtn?.addEventListener('click', () => {
@@ -304,13 +509,19 @@ function setupEventListeners() {
     });
 
     // Escape key to go back
-    const handleKeydown = (e) => {
+    documentKeydownHandler = (e) => {
         if (e.key === 'Escape' && onBack) {
             onBack();
-            document.removeEventListener('keydown', handleKeydown);
         }
     };
-    document.addEventListener('keydown', handleKeydown);
+    document.addEventListener('keydown', documentKeydownHandler);
+}
+
+function teardownDocumentListeners() {
+    if (documentKeydownHandler) {
+        document.removeEventListener('keydown', documentKeydownHandler);
+        documentKeydownHandler = null;
+    }
 }
 
 /**
@@ -332,6 +543,33 @@ function renderMarkdown(content) {
 
     // Fallback: simple markdown-like rendering
     return sanitizeHtml(simpleMarkdown(content));
+}
+
+function base64ToBytes(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+}
+
+export function sanitizeDestinationUrl(value) {
+    const url = typeof value === 'string' ? value.trim() : String(value ?? '').trim();
+    const normalized = Array.from(url)
+        .filter(ch => !/\s/.test(ch) && !/[\u0000-\u001F\u007F]/.test(ch))
+        .join('')
+        .toLowerCase();
+
+    if (
+        normalized.startsWith('javascript:')
+        || normalized.startsWith('vbscript:')
+        || normalized.startsWith('data:')
+    ) {
+        return '#';
+    }
+
+    return url;
 }
 
 /**
@@ -364,8 +602,10 @@ function simpleMarkdown(text) {
     html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
 
     // Links
-    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g,
-        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => {
+        const safeHref = escapeHtml(sanitizeDestinationUrl(href));
+        return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    });
 
     // Line breaks
     html = html.replace(/\n\n/g, '</p><p>');
@@ -394,18 +634,35 @@ function sanitizeHtml(html) {
     const template = document.createElement('template');
     template.innerHTML = html;
 
-    // Remove script tags and event handlers
-    const scripts = template.content.querySelectorAll('script, style, iframe, object, embed');
-    scripts.forEach(el => el.remove());
-
-    // Remove event handlers
-    const allElements = template.content.querySelectorAll('*');
+    const allElements = Array.from(template.content.querySelectorAll('*'));
     allElements.forEach(el => {
+        const tag = el.tagName.toLowerCase();
+        if (FORBID_TAGS.has(tag)) {
+            el.remove();
+            return;
+        }
+
+        if (!ALLOWED_TAGS.has(tag)) {
+            el.replaceWith(...Array.from(el.childNodes));
+            return;
+        }
+
         Array.from(el.attributes).forEach(attr => {
-            if (attr.name.startsWith('on') || attr.name === 'style') {
+            const name = attr.name.toLowerCase();
+            if (name.startsWith('on') || FORBID_ATTR.has(name) || !ALLOWED_ATTR.has(name)) {
                 el.removeAttribute(attr.name);
+                return;
+            }
+
+            if (name === 'href') {
+                el.setAttribute('href', sanitizeDestinationUrl(attr.value));
             }
         });
+
+        if (tag === 'a') {
+            el.setAttribute('target', '_blank');
+            el.setAttribute('rel', 'noopener noreferrer');
+        }
     });
 
     return template.innerHTML;
@@ -457,7 +714,10 @@ async function copyConversation() {
     const text = formatConversationAsText(currentConversation, currentMessages);
 
     try {
-        await navigator.clipboard.writeText(text);
+        const copied = await copyTextToClipboard(text);
+        if (!copied) {
+            throw new Error('Clipboard copy failed');
+        }
         showCopyFeedback('Copied!');
     } catch (error) {
         console.error('[Conversation] Copy failed:', error);
@@ -498,10 +758,22 @@ function formatConversationAsText(conv, messages) {
 function showCopyFeedback(message) {
     const copyBtn = document.getElementById('copy-btn');
     if (copyBtn) {
-        const originalText = copyBtn.innerHTML;
+        if (!copyBtn.dataset.defaultLabel) {
+            copyBtn.dataset.defaultLabel = copyBtn.innerHTML;
+        }
+
+        if (copyFeedbackTimeoutId !== null) {
+            clearTimeout(copyFeedbackTimeoutId);
+            copyFeedbackTimeoutId = null;
+        }
+
+        const defaultLabel = copyBtn.dataset.defaultLabel;
         copyBtn.innerHTML = message;
-        setTimeout(() => {
-            copyBtn.innerHTML = originalText;
+        copyFeedbackTimeoutId = window.setTimeout(() => {
+            if (copyBtn.isConnected) {
+                copyBtn.innerHTML = defaultLabel;
+            }
+            copyFeedbackTimeoutId = null;
         }, 2000);
     }
 }
@@ -535,8 +807,9 @@ function showError(message) {
  * Format agent name for display
  */
 function formatAgentName(agent) {
-    if (!agent) return 'Unknown';
-    return agent.charAt(0).toUpperCase() + agent.slice(1);
+    if (agent === undefined || agent === null || agent === '') return 'Unknown';
+    const value = String(agent);
+    return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 /**
@@ -613,15 +886,148 @@ export function getCurrentConversation() {
 }
 
 /**
+ * Unload the oldest (least recently used) conversation from cache
+ * @private
+ */
+function unloadOldestConversation() {
+    const oldest = loadedConversations.keys().next().value;
+    if (oldest !== undefined) {
+        loadedConversations.delete(oldest);
+        console.debug(`[Conversation] Unloaded oldest conversation ${oldest} (cache size: ${loadedConversations.size})`);
+    }
+}
+
+/**
+ * Clear old conversations from cache to free memory
+ * @param {number} [keepCount=1] - Number of recent conversations to keep
+ */
+export function clearOldConversations(keepCount = 1) {
+    const entries = Array.from(loadedConversations.entries());
+    const toRemove = entries.length - keepCount;
+
+    if (toRemove > 0) {
+        // Remove oldest entries (first ones in the Map)
+        for (let i = 0; i < toRemove; i++) {
+            loadedConversations.delete(entries[i][0]);
+        }
+        console.debug(`[Conversation] Cleared ${toRemove} old conversations (cache size: ${loadedConversations.size})`);
+    }
+}
+
+/**
+ * Show memory warning banner
+ */
+function showMemoryWarning() {
+    // Check if warning already exists
+    if (document.getElementById('memory-warning')) return;
+
+    const usage = getMemoryUsage();
+    const percent = usage ? usage.percent.toFixed(1) : 'N/A';
+
+    const banner = document.createElement('div');
+    banner.id = 'memory-warning';
+    banner.className = 'memory-warning-banner';
+    banner.setAttribute('role', 'alert');
+    banner.innerHTML = `
+        <span class="memory-warning-icon" aria-hidden="true">&#x26A0;&#xFE0F;</span>
+        <span class="memory-warning-text">Memory usage is high (${percent}%). Consider closing some conversations.</span>
+        <button id="memory-clear-btn" type="button" class="btn btn-small memory-clear-btn">
+            Clear Cache
+        </button>
+        <button class="memory-dismiss-btn" type="button" aria-label="Dismiss">&#x2715;</button>
+    `;
+
+    // Add to page
+    document.body.prepend(banner);
+
+    // Event listeners
+    const clearBtn = document.getElementById('memory-clear-btn');
+    clearBtn?.addEventListener('click', () => {
+        clearOldConversations(1);
+        hideMemoryWarning();
+    });
+
+    const dismissBtn = banner.querySelector('.memory-dismiss-btn');
+    dismissBtn?.addEventListener('click', hideMemoryWarning);
+}
+
+/**
+ * Hide memory warning banner
+ */
+function hideMemoryWarning() {
+    const banner = document.getElementById('memory-warning');
+    if (banner) {
+        banner.remove();
+    }
+}
+
+/**
+ * Start periodic memory monitoring
+ */
+export function startMemoryMonitoring() {
+    if (memoryCheckIntervalId) return; // Already running
+
+    memoryCheckIntervalId = setInterval(() => {
+        if (checkMemoryPressure()) {
+            showMemoryWarning();
+        }
+    }, MEMORY_CONFIG.MEMORY_CHECK_INTERVAL);
+
+    console.debug('[Conversation] Memory monitoring started');
+}
+
+/**
+ * Stop periodic memory monitoring
+ */
+export function stopMemoryMonitoring() {
+    if (memoryCheckIntervalId) {
+        clearInterval(memoryCheckIntervalId);
+        memoryCheckIntervalId = null;
+        console.debug('[Conversation] Memory monitoring stopped');
+    }
+}
+
+/**
+ * Get conversation cache statistics
+ * @returns {Object} Cache stats
+ */
+export function getCacheStats() {
+    const memory = getMemoryUsage();
+    return {
+        cachedCount: loadedConversations.size,
+        maxCached: MEMORY_CONFIG.MAX_LOADED_CONVERSATIONS,
+        memoryUsed: memory?.used || 0,
+        memoryLimit: memory?.limit || 0,
+        memoryPercent: memory?.percent || 0,
+    };
+}
+
+/**
  * Clear the viewer
  */
 export function clearViewer() {
+    activeConversationLoadId += 1;
     // Clean up virtual list
     destroyVirtualList();
+    teardownDocumentListeners();
 
     currentConversation = null;
     currentMessages = [];
     elements.container.innerHTML = '';
+}
+
+export function cleanupConversationViewer() {
+    window.removeEventListener('cass:lock', handleArchiveLock);
+    clearViewer();
+}
+
+/**
+ * Clear all cached conversations
+ */
+export function clearAllCache() {
+    loadedConversations.clear();
+    hideMemoryWarning();
+    console.debug('[Conversation] All cached conversations cleared');
 }
 
 // Export default
@@ -631,4 +1037,10 @@ export default {
     getCurrentConversationId,
     getCurrentConversation,
     clearViewer,
+    cleanupConversationViewer,
+    clearAllCache,
+    clearOldConversations,
+    getCacheStats,
+    startMemoryMonitoring,
+    stopMemoryMonitoring,
 };

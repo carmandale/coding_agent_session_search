@@ -1,16 +1,10 @@
 {
   "id": "ses_test1",
-  "version": "1.0.138",
-  "projectID": "proj1",
+  "title": "OpenCode JSON Session",
   "directory": "/tmp/test-project",
-  "title": "Test Session",
+  "projectID": "proj1",
   "time": {
     "created": 1700000000000,
-    "updated": 1700000010000
-  },
-  "summary": {
-    "additions": 10,
-    "deletions": 5,
-    "files": 2
+    "updated": 1700000005000
   }
 }

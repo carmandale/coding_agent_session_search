@@ -7,6 +7,79 @@
 // Registration state
 let registration = null;
 let updateAvailable = false;
+const DEFAULT_SW_MESSAGE_TIMEOUT_MS = 3000;
+const watchedRegistrations = new WeakSet();
+let controllerChangeListenerInstalled = false;
+
+function getCurrentScopeUrl() {
+    return new URL('./', window.location.href).href;
+}
+
+async function resolveRegistration() {
+    if (!('serviceWorker' in navigator)) {
+        registration = null;
+        return null;
+    }
+
+    try {
+        registration = await navigator.serviceWorker.getRegistration(getCurrentScopeUrl());
+    } catch (error) {
+        console.warn('[SW] Failed to resolve registration:', error);
+        registration = null;
+    }
+
+    return registration;
+}
+
+async function postMessageWithReply(message, { timeoutMs = DEFAULT_SW_MESSAGE_TIMEOUT_MS } = {}) {
+    const controller = navigator?.serviceWorker?.controller;
+    if (!controller) {
+        return null;
+    }
+
+    return new Promise((resolve) => {
+        const channel = new MessageChannel();
+        const timeoutId = setTimeout(() => {
+            console.warn('[SW] Timed out waiting for controller reply:', message.type);
+            resolve(null);
+        }, timeoutMs);
+
+        channel.port1.onmessage = (event) => {
+            clearTimeout(timeoutId);
+            resolve(event.data ?? null);
+        };
+
+        try {
+            controller.postMessage(message, [channel.port2]);
+        } catch (error) {
+            clearTimeout(timeoutId);
+            console.warn('[SW] Failed to post message to controller:', message.type, error);
+            resolve(null);
+        }
+    });
+}
+
+function waitForControllerChange({ timeoutMs = DEFAULT_SW_MESSAGE_TIMEOUT_MS } = {}) {
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            clearTimeout(timeoutId);
+            navigator.serviceWorker.removeEventListener('controllerchange', handleControllerChange);
+            resolve();
+        };
+        const handleControllerChange = () => finish();
+        const timeoutId = setTimeout(() => {
+            console.warn('[SW] Timed out waiting for controller change');
+            finish();
+        }, timeoutMs);
+
+        navigator.serviceWorker.addEventListener('controllerchange', handleControllerChange);
+    });
+}
 
 /**
  * Register the service worker
@@ -30,6 +103,7 @@ export async function registerServiceWorker() {
 
         // Wait for service worker to be ready
         await navigator.serviceWorker.ready;
+        await resolveRegistration();
         console.log('[SW] Ready');
 
         // Check if we already have SharedArrayBuffer support
@@ -64,6 +138,11 @@ export function hasSharedArrayBuffer() {
  * Set up listener for service worker updates
  */
 function setupUpdateListener(reg) {
+    if (watchedRegistrations.has(reg)) {
+        return;
+    }
+    watchedRegistrations.add(reg);
+
     reg.addEventListener('updatefound', () => {
         const newWorker = reg.installing;
 
@@ -85,10 +164,13 @@ function setupUpdateListener(reg) {
     });
 
     // Listen for controller change (after skipWaiting)
-    navigator.serviceWorker.addEventListener('controllerchange', () => {
-        console.log('[SW] Controller changed');
-        // Could auto-reload here, but better to let user decide
-    });
+    if (!controllerChangeListenerInstalled) {
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+            console.log('[SW] Controller changed');
+            // Could auto-reload here, but better to let user decide
+        });
+        controllerChangeListenerInstalled = true;
+    }
 }
 
 /**
@@ -147,7 +229,9 @@ function showUpdateNotification() {
 
     // Event handlers
     refreshBtn.addEventListener('click', () => {
-        applyUpdate();
+        void applyUpdate().catch((error) => {
+            console.error('[SW] Failed to apply update:', error);
+        });
     });
 
     dismissBtn.addEventListener('click', () => {
@@ -160,10 +244,13 @@ function showUpdateNotification() {
 /**
  * Apply pending update
  */
-export function applyUpdate() {
-    if (registration?.waiting) {
+export async function applyUpdate() {
+    const currentRegistration = registration ?? await resolveRegistration();
+    if (currentRegistration?.waiting) {
+        const waitForActivation = waitForControllerChange();
         // Tell waiting service worker to skip waiting
-        registration.waiting.postMessage({ type: 'SKIP_WAITING' });
+        currentRegistration.waiting.postMessage({ type: 'SKIP_WAITING' });
+        await waitForActivation;
     }
     // Reload the page
     window.location.reload();
@@ -179,59 +266,58 @@ export function isUpdateAvailable() {
 
 /**
  * Get the current service worker registration
- * @returns {ServiceWorkerRegistration|null}
+ * @returns {Promise<ServiceWorkerRegistration|null>}
  */
-export function getRegistration() {
-    return registration;
+export async function getRegistration() {
+    return registration ?? await resolveRegistration();
 }
 
 /**
  * Unregister the service worker
  */
 export async function unregisterServiceWorker() {
-    if (registration) {
-        await registration.unregister();
+    if (!('serviceWorker' in navigator)) {
+        registration = null;
+        return true;
+    }
+
+    const currentRegistration = registration ?? await resolveRegistration();
+    if (!currentRegistration) {
+        registration = null;
+        return true;
+    }
+
+    const unregistered = await currentRegistration.unregister();
+    if (unregistered) {
         registration = null;
         console.log('[SW] Unregistered');
+        return true;
     }
+    console.warn('[SW] Service Worker refused unregister request');
+    return false;
 }
 
 /**
  * Clear the service worker cache
  */
-export async function clearCache() {
-    if (navigator.serviceWorker.controller) {
-        return new Promise((resolve) => {
-            const channel = new MessageChannel();
-            channel.port1.onmessage = () => {
-                console.log('[SW] Cache cleared');
-                resolve();
-            };
-            navigator.serviceWorker.controller.postMessage(
-                { type: 'CLEAR_CACHE' },
-                [channel.port2]
-            );
-        });
+export async function clearCache(options = {}) {
+    const reply = await postMessageWithReply({ type: 'CLEAR_CACHE' }, options);
+    if (reply?.type === 'CACHE_CLEARED') {
+        console.log('[SW] Cache cleared');
+        return true;
     }
+    if (reply?.type === 'CACHE_CLEAR_FAILED') {
+        console.warn('[SW] Cache clear failed:', reply.error);
+    }
+    return false;
 }
 
 /**
  * Get service worker version
  */
-export async function getVersion() {
-    if (navigator.serviceWorker.controller) {
-        return new Promise((resolve) => {
-            const channel = new MessageChannel();
-            channel.port1.onmessage = (event) => {
-                resolve(event.data.version);
-            };
-            navigator.serviceWorker.controller.postMessage(
-                { type: 'GET_VERSION' },
-                [channel.port2]
-            );
-        });
-    }
-    return null;
+export async function getVersion(options = {}) {
+    const reply = await postMessageWithReply({ type: 'GET_VERSION' }, options);
+    return reply?.version ?? null;
 }
 
 // Export status checker
@@ -240,10 +326,12 @@ export const swStatus = {
         return 'serviceWorker' in navigator;
     },
     get isRegistered() {
-        return registration !== null;
+        return 'serviceWorker' in navigator
+            && (registration !== null || navigator.serviceWorker.controller !== null);
     },
     get isActive() {
-        return navigator.serviceWorker.controller !== null;
+        return 'serviceWorker' in navigator
+            && navigator.serviceWorker.controller !== null;
     },
     get hasSharedArrayBuffer() {
         return hasSharedArrayBuffer();

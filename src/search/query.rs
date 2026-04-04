@@ -1,4 +1,36 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use crossbeam_channel as mpsc;
+use frankensearch::lexical::{
+    BooleanQuery, CASS_SCHEMA_HASH as FS_CASS_SCHEMA_HASH, CassFields as FsCassFields,
+    CassQueryFilters as FsCassQueryFilters, CassQueryToken as FsCassQueryToken,
+    CassSourceFilter as FsCassSourceFilter, CassWildcardPattern as FsCassWildcardPattern,
+    IndexReader, IndexRecordOption, Occur, Query, ReloadPolicy, Searcher,
+    SnippetConfig as FsSnippetConfig, TantivyDocument, Term, TermQuery, TopDocs, Value,
+    cass_build_tantivy_query as fs_cass_build_tantivy_query,
+    cass_has_boolean_operators as fs_cass_has_boolean_operators,
+    cass_open_search_reader as fs_cass_open_search_reader,
+    cass_parse_boolean_query as fs_cass_parse_boolean_query,
+    cass_sanitize_query as fs_cass_sanitize_query,
+    execute_query_with_offset as fs_execute_query_with_offset, load_doc as fs_load_doc,
+    render_snippet_html as fs_render_snippet_html,
+    try_build_snippet_generator as fs_try_build_snippet_generator,
+};
+use frankensearch::{
+    Cx as FsCx, InMemoryTwoTierIndex as FsInMemoryTwoTierIndex,
+    InMemoryVectorIndex as FsInMemoryVectorIndex, LexicalSearch as FsLexicalSearch,
+    QueryClass as FsQueryClass, RrfConfig as FsRrfConfig, ScoreSource as FsScoreSource,
+    ScoredResult as FsScoredResult, SearchError as FsSearchError, SearchFuture as FsSearchFuture,
+    SearchPhase as FsSearchPhase, SyncEmbedderAdapter as FsSyncEmbedderAdapter,
+    SyncTwoTierSearcher as FsSyncTwoTierSearcher, TwoTierConfig as FsTwoTierConfig,
+    TwoTierIndex as FsTwoTierIndex, TwoTierSearcher as FsTwoTierSearcher, VectorHit as FsVectorHit,
+    candidate_count as fs_candidate_count,
+    core::filter::SearchFilter as FsSearchFilter,
+    index::{
+        HNSW_DEFAULT_EF_SEARCH as FS_HNSW_DEFAULT_EF_SEARCH, HnswIndex as FsHnswIndex,
+        VectorIndex as FsVectorIndex,
+    },
+    rrf_fuse as fs_rrf_fuse,
+};
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -6,28 +38,41 @@ use std::cell::RefCell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tantivy::collector::TopDocs;
-use tantivy::query::{
-    AllQuery, BooleanQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
-};
-use tantivy::schema::{Field, IndexRecordOption, Term, Value};
-use tantivy::snippet::SnippetGenerator;
-use tantivy::{Index, IndexReader, Searcher, TantivyDocument};
-use tokio::runtime::Handle;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
-use rusqlite::Connection;
+use frankensqlite::Connection;
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+#[cfg(test)]
+use frankensqlite::params;
 
-use crate::search::canonicalize::canonicalize_for_embedding;
+/// Wrapper around `frankensqlite::Connection` that implements `Send`.
+///
+/// `frankensqlite::Connection` is `!Send` because it uses `Rc` internally.
+/// However, the `Rc` values are entirely self-contained within the Connection
+/// and are not shared with any external references.  When wrapped in a `Mutex`
+/// (as in `SearchClient`), exclusive access is guaranteed, making cross-thread
+/// transfer safe.
+struct SendConnection(Connection);
+
+// Safety: Rc fields inside Connection are not cloned or shared externally.
+// The Mutex<Option<SendConnection>> in SearchClient ensures exclusive access.
+unsafe impl Send for SendConnection {}
+
+impl std::ops::Deref for SendConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+
+use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::embedder::Embedder;
-use crate::search::tantivy::fields_from_schema;
 use crate::search::vector_index::{
-    SemanticFilter, SemanticFilterMaps, VectorIndex, VectorSearchResult,
+    ROLE_USER, SemanticDocId, SemanticFilter, SemanticFilterMaps, VectorIndex, VectorSearchResult,
+    parse_semantic_doc_id, role_code_from_str,
 };
 
 use crate::sources::provenance::SourceFilter;
@@ -110,7 +155,39 @@ fn intern_cache_key(s: &str) -> Arc<str> {
     CACHE_KEY_INTERNER.intern(s)
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize)]
+// ============================================================================
+// SQL Placeholder Builder (Opt 4.5: Pre-sized String Buffers)
+// ============================================================================
+
+/// Build a comma-separated list of SQL placeholders with pre-allocated capacity.
+///
+/// For `n` items, produces "?,?,?..." (n "?" with n-1 ",").
+/// Uses pre-sized String to avoid reallocations.
+///
+/// # Examples
+/// ```ignore
+/// assert_eq!(sql_placeholders(0), "");
+/// assert_eq!(sql_placeholders(1), "?");
+/// assert_eq!(sql_placeholders(3), "?,?,?");
+/// ```
+#[inline]
+pub fn sql_placeholders(count: usize) -> String {
+    if count == 0 {
+        return String::new();
+    }
+    // Capacity: n "?" + (n-1) "," = 2n - 1
+    let capacity = count.saturating_mul(2).saturating_sub(1);
+    let mut result = String::with_capacity(capacity);
+    for i in 0..count {
+        if i > 0 {
+            result.push(',');
+        }
+        result.push('?');
+    }
+    result
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SearchFilters {
     pub agents: HashSet<String>,
     pub workspaces: HashSet<String>,
@@ -146,8 +223,119 @@ impl SearchMode {
     }
 }
 
-const RRF_K: f32 = 60.0;
-const HYBRID_CANDIDATE_MULTIPLIER: usize = 3;
+/// Execution strategy for semantic search.
+///
+/// `Single` preserves existing exact vector behavior.
+/// Other modes attempt to use frankensearch's sync two-tier searcher when a
+/// compatible in-memory two-tier index is available; otherwise they fall back
+/// to `Single`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticTierMode {
+    #[default]
+    Single,
+    Progressive,
+    FastOnly,
+    QualityOnly,
+}
+
+impl SemanticTierMode {
+    const fn wants_two_tier(self) -> bool {
+        !matches!(self, Self::Single)
+    }
+
+    fn to_frankensearch_config(self) -> FsTwoTierConfig {
+        let mut config = frankensearch_two_tier_config();
+        match self {
+            Self::Single | Self::Progressive => {}
+            Self::FastOnly => {
+                config.fast_only = true;
+            }
+            Self::QualityOnly => {
+                config.fast_only = false;
+                config.quality_weight = 1.0;
+            }
+        }
+        config
+    }
+}
+
+const PROGRESSIVE_EMBEDDING_CACHE_CAPACITY: usize = 64;
+const ANN_CANDIDATE_MULTIPLIER: usize = 4;
+const HYBRID_NO_LIMIT_PLANNING_WINDOW: usize = 64;
+const HYBRID_NO_LIMIT_SEMANTIC_CAP: usize = 2048;
+
+static FRANKENSEARCH_TWO_TIER_CONFIG: Lazy<FsTwoTierConfig> =
+    Lazy::new(|| FsTwoTierConfig::optimized().with_env_overrides());
+
+fn frankensearch_two_tier_config() -> FsTwoTierConfig {
+    FRANKENSEARCH_TWO_TIER_CONFIG.clone()
+}
+
+#[inline]
+const fn progressive_phase_fetch_limit(limit: usize) -> usize {
+    let limit = if limit == 0 { 1 } else { limit };
+    limit.saturating_mul(3)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HybridCandidateBudget {
+    lexical_candidates: usize,
+    semantic_candidates: usize,
+}
+
+#[inline]
+const fn hybrid_stage_multipliers(query_class: FsQueryClass) -> (usize, usize) {
+    match query_class {
+        // Identifier-heavy queries: prioritize lexical precision.
+        FsQueryClass::Identifier => (6, 2),
+        // Keyword queries: balanced lexical/semantic retrieval.
+        FsQueryClass::ShortKeyword => (4, 4),
+        // Natural language queries: prioritize semantic retrieval.
+        FsQueryClass::NaturalLanguage => (2, 8),
+        // Empty query should short-circuit before budgeting.
+        FsQueryClass::Empty => (0, 0),
+    }
+}
+
+#[inline]
+fn hybrid_candidate_budget(
+    query: &str,
+    requested_limit: usize,
+    effective_limit: usize,
+    offset: usize,
+    total_docs: usize,
+) -> HybridCandidateBudget {
+    let query_class = FsQueryClass::classify(query);
+    let (lex_mult, sem_mult) = hybrid_stage_multipliers(query_class);
+    let total_docs = total_docs.max(1);
+
+    // When no explicit limit is requested, keep "no limit" output semantics,
+    // but bound semantic fanout so hybrid doesn't try to score the entire corpus.
+    if requested_limit == 0 {
+        let planning_window = HYBRID_NO_LIMIT_PLANNING_WINDOW.max(offset.saturating_add(1));
+        let semantic = fs_candidate_count(planning_window, 0, sem_mult)
+            .max(planning_window)
+            .min(HYBRID_NO_LIMIT_SEMANTIC_CAP.max(offset.saturating_add(planning_window)))
+            .min(total_docs);
+        return HybridCandidateBudget {
+            lexical_candidates: effective_limit.min(total_docs),
+            semantic_candidates: semantic,
+        };
+    }
+
+    let lexical = fs_candidate_count(requested_limit, offset, lex_mult.max(1))
+        .max(requested_limit.saturating_add(offset))
+        .min(total_docs);
+    let semantic = fs_candidate_count(requested_limit, offset, sem_mult.max(1))
+        .max(requested_limit.saturating_add(offset))
+        .min(total_docs);
+
+    HybridCandidateBudget {
+        lexical_candidates: lexical,
+        semantic_candidates: semantic,
+    }
+}
 
 // ============================================================================
 // Query Explanation types (--explain flag support)
@@ -199,15 +387,22 @@ pub enum QueryCost {
     High,
 }
 
+/// Sub-component of a parsed term
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParsedSubTerm {
+    pub text: String,
+    pub pattern: String,
+}
+
 /// Parsed term from the query
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ParsedTerm {
     /// Original term text
     pub text: String,
-    /// Wildcard pattern applied
-    pub pattern: String,
     /// Whether this is negated (NOT/-)
     pub negated: bool,
+    /// Sub-terms if split (implicit AND)
+    pub subterms: Vec<ParsedSubTerm>,
 }
 
 /// Parsed structure of the query
@@ -262,9 +457,9 @@ pub struct FiltersSummary {
 impl QueryExplanation {
     /// Build explanation from query string and filters
     pub fn analyze(query: &str, filters: &SearchFilters) -> Self {
-        let sanitized = sanitize_query(query);
+        let sanitized = fs_cass_sanitize_query(query);
         // Parse original query to preserve quotes for phrases
-        let tokens = parse_boolean_query(query);
+        let tokens = fs_cass_parse_boolean_query(query);
 
         // Extract terms, phrases, and operators
         let mut parsed = ParsedQuery::default();
@@ -273,44 +468,57 @@ impl QueryExplanation {
 
         for token in &tokens {
             match token {
-                QueryToken::Term(t) => {
-                    let parts = normalize_term_parts(t);
+                FsCassQueryToken::Term(t) => {
+                    let parts: Vec<String> = fs_cass_sanitize_query(t)
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect();
                     if parts.is_empty() {
                         next_negated = false;
                         continue;
                     }
+                    let mut subterms = Vec::new();
                     for part in parts {
-                        let pattern = WildcardPattern::parse(&part);
+                        let pattern = FsCassWildcardPattern::parse(&part);
                         let pattern_str = match &pattern {
-                            WildcardPattern::Exact(_) => "exact",
-                            WildcardPattern::Prefix(_) => "prefix (*)",
-                            WildcardPattern::Suffix(_) => "suffix (*)",
-                            WildcardPattern::Substring(_) => "substring (*)",
+                            FsCassWildcardPattern::Exact(_) => "exact",
+                            FsCassWildcardPattern::Prefix(_) => "prefix (*)",
+                            FsCassWildcardPattern::Suffix(_) => "suffix (*)",
+                            FsCassWildcardPattern::Substring(_) => "substring (*)",
+                            FsCassWildcardPattern::Complex(_) => "complex (*)",
                         };
-                        parsed.terms.push(ParsedTerm {
+                        subterms.push(ParsedSubTerm {
                             text: part,
                             pattern: pattern_str.to_string(),
-                            negated: next_negated,
                         });
                     }
+                    parsed.terms.push(ParsedTerm {
+                        text: t.clone(),
+                        negated: next_negated,
+                        subterms,
+                    });
                     next_negated = false;
                 }
-                QueryToken::Phrase(p) => {
-                    let parts = normalize_phrase_terms(p);
+                FsCassQueryToken::Phrase(p) => {
+                    let parts: Vec<String> = fs_cass_sanitize_query(p)
+                        .split_whitespace()
+                        .map(|s| s.trim_matches('*').to_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect();
                     if !parts.is_empty() {
                         parsed.phrases.push(parts.join(" "));
                     }
                     next_negated = false;
                 }
-                QueryToken::And => {
+                FsCassQueryToken::And => {
                     parsed.operators.push("AND".to_string());
                     has_explicit_operator = true;
                 }
-                QueryToken::Or => {
+                FsCassQueryToken::Or => {
                     parsed.operators.push("OR".to_string());
                     has_explicit_operator = true;
                 }
-                QueryToken::Not => {
+                FsCassQueryToken::Not => {
                     parsed.operators.push("NOT".to_string());
                     has_explicit_operator = true;
                     next_negated = true;
@@ -376,7 +584,11 @@ impl QueryExplanation {
         }
 
         // Check for wildcards
-        let has_wildcards = parsed.terms.iter().any(|t| t.pattern != "exact");
+        let has_wildcards = parsed
+            .terms
+            .iter()
+            .flat_map(|t| &t.subterms)
+            .any(|t| t.pattern != "exact");
         if has_wildcards {
             return QueryType::Wildcard;
         }
@@ -393,6 +605,7 @@ impl QueryExplanation {
         let has_leading_wildcard = parsed
             .terms
             .iter()
+            .flat_map(|t| &t.subterms)
             .any(|t| t.pattern == "suffix (*)" || t.pattern == "substring (*)");
 
         if has_leading_wildcard {
@@ -400,7 +613,14 @@ impl QueryExplanation {
         }
 
         // Boolean queries use combination strategy
-        if !parsed.operators.is_empty() || parsed.terms.len() > 1 || !parsed.phrases.is_empty() {
+        // Also if any single term is split into multiple subterms (e.g. "foo.bar" -> "foo", "bar")
+        let has_compound_terms = parsed.terms.iter().any(|t| t.subterms.len() > 1);
+
+        if !parsed.operators.is_empty()
+            || parsed.terms.len() > 1
+            || !parsed.phrases.is_empty()
+            || has_compound_terms
+        {
             return IndexStrategy::BooleanCombination;
         }
 
@@ -427,7 +647,7 @@ impl QueryExplanation {
         let has_time_filter = filters.created_from.is_some() || filters.created_to.is_some();
 
         // Count complexity factors
-        let term_count = parsed.terms.len();
+        let term_count: usize = parsed.terms.iter().map(|t| t.subterms.len()).sum();
         let operator_count = parsed.operators.len();
         let phrase_count = parsed.phrases.len();
 
@@ -491,6 +711,7 @@ impl QueryExplanation {
         let has_leading_wildcard = parsed
             .terms
             .iter()
+            .flat_map(|t| &t.subterms)
             .any(|t| t.pattern == "suffix (*)" || t.pattern == "substring (*)");
         if has_leading_wildcard {
             warnings.push(
@@ -501,11 +722,13 @@ impl QueryExplanation {
 
         // Warn about very short terms
         for term in &parsed.terms {
-            if term.text.trim_matches('*').len() < 2 {
-                warnings.push(format!(
-                    "Very short term '{}' may match many documents",
-                    term.text
-                ));
+            for sub in &term.subterms {
+                if sub.text.trim_matches('*').len() < 2 {
+                    warnings.push(format!(
+                        "Very short term '{}' may match many documents",
+                        sub.text
+                    ));
+                }
             }
         }
 
@@ -565,6 +788,8 @@ pub enum MatchType {
     Suffix,
     /// Matched via both wildcards (*foo*) - uses regex
     Substring,
+    /// Matched via complex wildcard (e.g. f*o) - uses regex
+    Wildcard,
     /// Matched via automatic wildcard fallback when exact search was sparse
     ImplicitWildcard,
 }
@@ -577,6 +802,7 @@ impl MatchType {
             MatchType::Prefix => 0.9,
             MatchType::Suffix => 0.8,
             MatchType::Substring => 0.7,
+            MatchType::Wildcard => 0.65,
             MatchType::ImplicitWildcard => 0.6,
         }
     }
@@ -787,6 +1013,38 @@ pub struct SearchResult {
     pub cache_stats: CacheStats,
     /// Did-you-mean suggestions when hits are empty or sparse
     pub suggestions: Vec<QuerySuggestion>,
+    /// ANN search statistics (present when --approximate was used)
+    pub ann_stats: Option<crate::search::ann_index::AnnSearchStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressivePhaseKind {
+    Initial,
+    Refined,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProgressiveSearchEvent {
+    Phase {
+        kind: ProgressivePhaseKind,
+        result: SearchResult,
+        elapsed_ms: u128,
+    },
+    RefinementFailed {
+        latency_ms: u128,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProgressiveSearchRequest<'a> {
+    pub(crate) cx: &'a FsCx,
+    pub(crate) query: &'a str,
+    pub(crate) filters: SearchFilters,
+    pub(crate) limit: usize,
+    pub(crate) sparse_threshold: usize,
+    pub(crate) field_mask: FieldMask,
+    pub(crate) mode: SearchMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -827,6 +1085,8 @@ impl PartialOrd for SearchHitKey {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 struct HybridScore {
     rrf: f32,
@@ -836,6 +1096,8 @@ struct HybridScore {
     semantic_score: Option<f32>,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct FusedHit {
     key: SearchHitKey,
@@ -855,6 +1117,8 @@ fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
 pub(crate) fn stable_content_hash(content: &str) -> u64 {
     const FNV_OFFSET: u64 = 14695981039346656037;
     let mut hash = FNV_OFFSET;
+    // Fast path: hash bytes directly. We still split by whitespace to keep it
+    // whitespace-invariant for deduplication, but we avoid many tiny FNV updates.
     let mut first = true;
     for token in content.split_whitespace() {
         if !first {
@@ -872,11 +1136,14 @@ fn stable_hit_hash(
     line_number: Option<usize>,
     created_at: Option<i64>,
 ) -> u64 {
-    if !content.is_empty() {
-        return stable_content_hash(content);
-    }
     const FNV_OFFSET: u64 = 14695981039346656037;
-    let mut hash = FNV_OFFSET;
+    let mut hash = if !content.is_empty() {
+        stable_content_hash(content)
+    } else {
+        FNV_OFFSET
+    };
+
+    hash = hash_bytes(hash, b"|");
     hash = hash_bytes(hash, source_path.as_bytes());
     hash = hash_bytes(hash, b"|");
     if let Some(line) = line_number {
@@ -889,7 +1156,25 @@ fn stable_hit_hash(
     hash
 }
 
+fn search_hit_key_doc_id(key: &SearchHitKey) -> String {
+    // Unit Separator (0x1F) is extremely unlikely in filesystem paths/ids.
+    let sep = '\u{1f}';
+    format!(
+        "{}{sep}{}{sep}{}{sep}{}{sep}{}",
+        key.source_id,
+        key.source_path,
+        key.line_number.map(|v| v.to_string()).unwrap_or_default(),
+        key.created_at.map(|v| v.to_string()).unwrap_or_default(),
+        key.content_hash,
+    )
+}
+
+fn search_hit_doc_id(hit: &SearchHit) -> String {
+    search_hit_key_doc_id(&SearchHitKey::from_hit(hit))
+}
+
 /// Comparator for FusedHit: descending RRF score, prefer dual-source, then key for determinism.
+#[cfg(test)]
 fn cmp_fused_hit_desc(a: &FusedHit, b: &FusedHit) -> CmpOrdering {
     b.score
         .rrf
@@ -907,6 +1192,8 @@ fn cmp_fused_hit_desc(a: &FusedHit, b: &FusedHit) -> CmpOrdering {
 }
 
 /// Threshold below which full sort is faster than quickselect + partial sort.
+#[cfg(test)]
+#[allow(dead_code)]
 const QUICKSELECT_THRESHOLD: usize = 64;
 
 /// Partition fused hits to get top-k in O(N + k log k) instead of O(N log N).
@@ -914,6 +1201,11 @@ const QUICKSELECT_THRESHOLD: usize = 64;
 /// For k << N, this is significantly faster than sorting all N elements.
 /// Uses `select_nth_unstable_by` for O(N) average-case partitioning,
 /// then sorts only the top-k elements.
+///
+/// Note: Currently only used for tests. Production code uses full sort for
+/// content deduplication which requires seeing all elements.
+#[cfg(test)]
+#[allow(dead_code)]
 fn top_k_fused(mut hits: Vec<FusedHit>, k: usize) -> Vec<FusedHit> {
     let n = hits.len();
 
@@ -956,49 +1248,107 @@ pub fn rrf_fuse_hits(
     if limit == 0 {
         return Vec::new();
     }
+    let total_candidates = lexical.len().saturating_add(semantic.len());
+    if total_candidates == 0 {
+        return Vec::new();
+    }
 
-    let mut scores: HashMap<SearchHitKey, HybridScore> = HashMap::new();
-    let mut hits: HashMap<SearchHitKey, SearchHit> = HashMap::new();
+    let mut lexical_scored = Vec::with_capacity(lexical.len());
+    let mut semantic_scored = Vec::with_capacity(semantic.len());
+    let mut hit_by_doc_id: HashMap<String, SearchHit> = HashMap::with_capacity(total_candidates);
 
-    for (rank, hit) in lexical.iter().enumerate() {
-        let key = SearchHitKey::from_hit(hit);
-        let entry = scores.entry(key.clone()).or_default();
-        entry.rrf += 1.0 / (RRF_K + rank as f32 + 1.0);
-        entry.lexical_rank = Some(rank);
-        entry.lexical_score = Some(hit.score);
+    for hit in lexical {
+        let doc_id = search_hit_doc_id(hit);
         // Prefer lexical hit details (snippets highlight query terms).
-        hits.insert(key, hit.clone());
+        hit_by_doc_id.insert(doc_id.clone(), hit.clone());
+        lexical_scored.push(FsScoredResult {
+            doc_id,
+            score: hit.score,
+            source: FsScoreSource::Lexical,
+            index: None,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: Some(hit.score),
+            rerank_score: None,
+            explanation: None,
+            metadata: None,
+        });
     }
 
-    for (rank, hit) in semantic.iter().enumerate() {
-        let key = SearchHitKey::from_hit(hit);
-        let entry = scores.entry(key.clone()).or_default();
-        entry.rrf += 1.0 / (RRF_K + rank as f32 + 1.0);
-        entry.semantic_rank = Some(rank);
-        entry.semantic_score = Some(hit.score);
-        hits.entry(key).or_insert_with(|| hit.clone());
+    for (idx, hit) in semantic.iter().enumerate() {
+        let doc_id = search_hit_doc_id(hit);
+        hit_by_doc_id
+            .entry(doc_id.clone())
+            .or_insert_with(|| hit.clone());
+        semantic_scored.push(FsVectorHit {
+            index: u32::try_from(idx).unwrap_or(u32::MAX),
+            score: hit.score,
+            doc_id,
+        });
     }
 
-    let mut fused: Vec<FusedHit> = Vec::with_capacity(scores.len());
-    for (key, score) in scores {
-        if let Some(hit) = hits.remove(&key) {
-            fused.push(FusedHit { key, score, hit });
+    // Ask frankensearch for full fused ordering so we can preserve cass's
+    // content-level deduplication/pagination semantics afterward.
+    let fused = fs_rrf_fuse(
+        &lexical_scored,
+        &semantic_scored,
+        total_candidates,
+        0,
+        &FsRrfConfig::default(),
+    );
+
+    // Dedup by (source_id, source_path, content_hash) while preserving RRF order.
+    let mut source_ids: HashMap<String, u32> = HashMap::new();
+    let mut path_ids: HashMap<String, u32> = HashMap::new();
+    let mut next_source_id: u32 = 0;
+    let mut next_path_id: u32 = 0;
+    let mut seen_content: HashSet<(u32, u32, u64)> = HashSet::with_capacity(fused.len());
+    let mut unique_hits = Vec::with_capacity(fused.len());
+
+    for fused_hit in fused {
+        let mut hit = match hit_by_doc_id.remove(&fused_hit.doc_id) {
+            Some(hit) => hit,
+            None => continue,
+        };
+        // Skip tool noise if present (though inputs should be clean)
+        let content_to_check = if hit.content.is_empty() {
+            &hit.snippet
+        } else {
+            &hit.content
+        };
+        if !content_to_check.is_empty() && is_tool_invocation_noise(content_to_check) {
+            continue;
+        }
+
+        // Intern IDs for the seen set key to avoid String clones.
+        let source_key = if let Some(id) = source_ids.get(hit.source_id.as_str()) {
+            *id
+        } else {
+            let id = next_source_id;
+            next_source_id = next_source_id.saturating_add(1);
+            source_ids.insert(hit.source_id.clone(), id);
+            id
+        };
+        let path_key = if let Some(id) = path_ids.get(hit.source_path.as_str()) {
+            *id
+        } else {
+            let id = next_path_id;
+            next_path_id = next_path_id.saturating_add(1);
+            path_ids.insert(hit.source_path.clone(), id);
+            id
+        };
+        let key = (source_key, path_key, hit.content_hash);
+
+        if seen_content.insert(key) {
+            // Update hit score to the fused RRF score
+            hit.score = fused_hit.rrf_score as f32;
+            unique_hits.push(hit);
         }
     }
 
-    // Use quickselect to get top-(offset+limit) elements in O(N + k log k)
-    // instead of sorting all N elements in O(N log N)
-    let k = offset.saturating_add(limit);
-    let fused = top_k_fused(fused, k);
-
     // Take the slice from offset to offset+limit
-    let start = offset.min(fused.len());
-    let mut results = Vec::with_capacity(limit.min(fused.len().saturating_sub(start)));
-    for mut entry in fused.into_iter().skip(start).take(limit) {
-        entry.hit.score = entry.score.rrf;
-        results.push(entry.hit);
-    }
-    results
+    let start = offset.min(unique_hits.len());
+    unique_hits.into_iter().skip(start).take(limit).collect()
 }
 
 struct QueryCache {
@@ -1025,7 +1375,7 @@ impl QueryCache {
         }
 
         let embedding = embedder
-            .embed(canonical)
+            .embed_sync(canonical)
             .map_err(|e| anyhow!("embedding failed: {e}"))?;
         self.embeddings
             .put(canonical.to_string(), embedding.clone());
@@ -1033,28 +1383,440 @@ impl QueryCache {
     }
 }
 
+/// Returns `Some(&filter)` when the filter has at least one active constraint,
+/// `None` when unrestricted (skip filtering for performance).
+fn semantic_filter_as_search_filter(filter: &SemanticFilter) -> Option<&dyn FsSearchFilter> {
+    let unrestricted = filter.agents.is_none()
+        && filter.workspaces.is_none()
+        && filter.sources.is_none()
+        && filter.roles.is_none()
+        && filter.created_from.is_none()
+        && filter.created_to.is_none();
+    if unrestricted { None } else { Some(filter) }
+}
+
+fn open_fs_semantic_ann_index(fs_index: &FsVectorIndex, ann_path: &Path) -> Result<FsHnswIndex> {
+    if !ann_path.is_file() {
+        bail!(
+            "approximate search unavailable: HNSW index not found at {}",
+            ann_path.display()
+        );
+    }
+
+    let ann = FsHnswIndex::load(ann_path, fs_index)
+        .map_err(|err| anyhow!("open HNSW index failed: {err}"))?;
+    let matches = ann
+        .matches_vector_index(fs_index)
+        .map_err(|err| anyhow!("validate HNSW index failed: {err}"))?;
+    if !matches {
+        bail!(
+            "approximate search unavailable: HNSW index at {} is stale for current semantic index (run 'cass index --semantic --build-hnsw')",
+            ann_path.display()
+        );
+    }
+
+    Ok(ann)
+}
+
 struct SemanticSearchState {
     embedder: Arc<dyn Embedder>,
-    index: VectorIndex,
+    fs_semantic_index: FsVectorIndex,
+    fs_ann_index: Option<FsHnswIndex>,
+    ann_path: Option<PathBuf>,
+    fs_in_memory_two_tier_index: Option<Arc<FsInMemoryTwoTierIndex>>,
+    in_memory_two_tier_init_attempted: bool,
+    progressive_context: Option<Arc<ProgressiveTwoTierContext>>,
+    progressive_context_init_attempted: bool,
     filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
     query_cache: QueryCache,
 }
 
+struct ProgressiveTwoTierContext {
+    index: Arc<FsTwoTierIndex>,
+    fast_embedder: Arc<dyn frankensearch::Embedder>,
+    quality_embedder: Option<Arc<dyn frankensearch::Embedder>>,
+}
+
+struct SharedCassSyncEmbedder {
+    inner: Arc<dyn Embedder>,
+    cache: Mutex<LruCache<String, Vec<f32>>>,
+}
+
+impl SharedCassSyncEmbedder {
+    fn new(inner: Arc<dyn Embedder>) -> Self {
+        let cache_capacity =
+            NonZeroUsize::new(PROGRESSIVE_EMBEDDING_CACHE_CAPACITY).expect("cache capacity > 0");
+        Self {
+            inner,
+            cache: Mutex::new(LruCache::new(cache_capacity)),
+        }
+    }
+}
+
+impl Embedder for SharedCassSyncEmbedder {
+    fn embed_sync(&self, text: &str) -> crate::search::embedder::EmbedderResult<Vec<f32>> {
+        if let Ok(mut cache) = self.cache.lock()
+            && let Some(embedding) = cache.get(text).cloned()
+        {
+            return Ok(embedding);
+        }
+
+        let embedding = self.inner.embed_sync(text)?;
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.put(text.to_owned(), embedding.clone());
+        }
+        Ok(embedding)
+    }
+
+    fn embed_batch_sync(
+        &self,
+        texts: &[&str],
+    ) -> crate::search::embedder::EmbedderResult<Vec<Vec<f32>>> {
+        self.inner.embed_batch_sync(texts)
+    }
+
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+
+    fn is_semantic(&self) -> bool {
+        self.inner.is_semantic()
+    }
+
+    fn category(&self) -> frankensearch::ModelCategory {
+        self.inner.category()
+    }
+
+    fn tier(&self) -> frankensearch::ModelTier {
+        self.inner.tier()
+    }
+
+    fn supports_mrl(&self) -> bool {
+        self.inner.supports_mrl()
+    }
+}
+
+impl SemanticSearchState {
+    fn load_in_memory_two_tier_index(
+        &mut self,
+        tier_mode: SemanticTierMode,
+    ) -> Option<Arc<FsInMemoryTwoTierIndex>> {
+        if let Some(index) = self.fs_in_memory_two_tier_index.as_ref() {
+            return Some(Arc::clone(index));
+        }
+        if self.in_memory_two_tier_init_attempted {
+            return None;
+        }
+        self.in_memory_two_tier_init_attempted = true;
+
+        let index_dir = self
+            .ann_path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        let Some(index_dir) = index_dir else {
+            tracing::debug!("two-tier semantic unavailable: ann/index directory path missing");
+            return None;
+        };
+
+        match FsInMemoryTwoTierIndex::from_dir(&index_dir) {
+            Ok(index) => {
+                let index = Arc::new(index);
+                self.fs_in_memory_two_tier_index = Some(Arc::clone(&index));
+                return Some(index);
+            }
+            Err(err) => {
+                tracing::debug!(
+                    dir = %index_dir.display(),
+                    error = %err,
+                    "two-tier semantic index load failed; considering fallback"
+                );
+            }
+        }
+
+        if !matches!(tier_mode, SemanticTierMode::FastOnly) {
+            return None;
+        }
+
+        let fallback_fast = index_dir.join(format!("index-{}.fsvi", self.embedder.id()));
+        if !fallback_fast.is_file() {
+            return None;
+        }
+
+        match FsInMemoryVectorIndex::from_fsvi(&fallback_fast) {
+            Ok(fast) => {
+                let index = Arc::new(FsInMemoryTwoTierIndex::new(fast, None));
+                self.fs_in_memory_two_tier_index = Some(Arc::clone(&index));
+                Some(index)
+            }
+            Err(err) => {
+                tracing::debug!(
+                    path = %fallback_fast.display(),
+                    error = %err,
+                    "fast-only semantic fallback index load failed"
+                );
+                None
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedSemanticDocId {
+    message_id: u64,
+    doc_id: String,
+}
+
+type ProgressiveLookupKey = (String, String, i64);
+type ResolvedSemanticLookupRow = Option<(ProgressiveLookupKey, ResolvedSemanticDocId)>;
+
+#[derive(Debug, Clone)]
+struct ProgressiveLexicalHit {
+    title: String,
+    snippet: String,
+    content: String,
+    content_hash: u64,
+    source_path: String,
+    agent: String,
+    workspace: String,
+    workspace_original: Option<String>,
+    created_at: Option<i64>,
+    match_type: MatchType,
+    line_number: Option<usize>,
+    source_id: String,
+    origin_kind: String,
+    origin_host: Option<String>,
+}
+
+impl ProgressiveLexicalHit {
+    fn from_search_hit(hit: &SearchHit, field_mask: FieldMask) -> Self {
+        Self {
+            title: if field_mask.wants_title() {
+                hit.title.clone()
+            } else {
+                String::new()
+            },
+            snippet: if field_mask.wants_snippet() {
+                hit.snippet.clone()
+            } else {
+                String::new()
+            },
+            content: if field_mask.needs_content() {
+                hit.content.clone()
+            } else {
+                String::new()
+            },
+            content_hash: hit.content_hash,
+            source_path: hit.source_path.clone(),
+            agent: hit.agent.clone(),
+            workspace: hit.workspace.clone(),
+            workspace_original: hit.workspace_original.clone(),
+            created_at: hit.created_at,
+            match_type: hit.match_type,
+            line_number: hit.line_number,
+            source_id: hit.source_id.clone(),
+            origin_kind: hit.origin_kind.clone(),
+            origin_host: hit.origin_host.clone(),
+        }
+    }
+
+    fn to_search_hit(&self, score: f32) -> SearchHit {
+        SearchHit {
+            title: self.title.clone(),
+            snippet: self.snippet.clone(),
+            content: self.content.clone(),
+            content_hash: self.content_hash,
+            score,
+            source_path: self.source_path.clone(),
+            agent: self.agent.clone(),
+            workspace: self.workspace.clone(),
+            workspace_original: self.workspace_original.clone(),
+            created_at: self.created_at,
+            line_number: self.line_number,
+            match_type: self.match_type,
+            source_id: self.source_id.clone(),
+            origin_kind: self.origin_kind.clone(),
+            origin_host: self.origin_host.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProgressiveLexicalCache {
+    hits_by_message: HashMap<u64, ProgressiveLexicalHit>,
+    wildcard_fallback: bool,
+    suggestions: Vec<QuerySuggestion>,
+}
+
+type ProgressiveLexicalSnapshot = Arc<ProgressiveLexicalCache>;
+
+struct CassProgressiveLexicalAdapter {
+    client: Arc<SearchClient>,
+    filters: SearchFilters,
+    field_mask: FieldMask,
+    sparse_threshold: usize,
+    shared: Arc<Mutex<ProgressiveLexicalSnapshot>>,
+}
+
+impl CassProgressiveLexicalAdapter {
+    fn new(
+        client: Arc<SearchClient>,
+        filters: SearchFilters,
+        field_mask: FieldMask,
+        sparse_threshold: usize,
+        shared: Arc<Mutex<ProgressiveLexicalSnapshot>>,
+    ) -> Self {
+        Self {
+            client,
+            filters,
+            field_mask,
+            sparse_threshold,
+            shared,
+        }
+    }
+}
+
+impl FsLexicalSearch for CassProgressiveLexicalAdapter {
+    fn search<'a>(
+        &'a self,
+        cx: &'a FsCx,
+        query: &'a str,
+        limit: usize,
+    ) -> FsSearchFuture<'a, Vec<FsScoredResult>> {
+        Box::pin(async move {
+            if cx.is_cancel_requested() {
+                return Err(FsSearchError::Cancelled {
+                    phase: "lexical".to_string(),
+                    reason: "cancel requested".to_string(),
+                });
+            }
+
+            let result = self
+                .client
+                .search_with_fallback(
+                    query,
+                    self.filters.clone(),
+                    limit,
+                    0,
+                    self.sparse_threshold,
+                    self.field_mask,
+                )
+                .map_err(|err| FsSearchError::SubsystemError {
+                    subsystem: "cass_lexical_adapter",
+                    source: Box::new(std::io::Error::other(err.to_string())),
+                })?;
+
+            let resolved = self
+                .client
+                .resolve_semantic_doc_ids_for_hits(&result.hits)
+                .map_err(|err| FsSearchError::SubsystemError {
+                    subsystem: "cass_lexical_adapter",
+                    source: Box::new(std::io::Error::other(err.to_string())),
+                })?;
+
+            let mut scored = Vec::with_capacity(result.hits.len());
+            let mut hits_by_message = HashMap::with_capacity(result.hits.len());
+
+            for (hit, resolved_doc) in result.hits.iter().zip(resolved.into_iter()) {
+                let Some(resolved_doc) = resolved_doc else {
+                    continue;
+                };
+                hits_by_message
+                    .entry(resolved_doc.message_id)
+                    .or_insert_with(|| {
+                        ProgressiveLexicalHit::from_search_hit(hit, self.field_mask)
+                    });
+                scored.push(FsScoredResult {
+                    doc_id: resolved_doc.doc_id,
+                    score: hit.score,
+                    source: FsScoreSource::Lexical,
+                    index: None,
+                    fast_score: None,
+                    quality_score: None,
+                    lexical_score: Some(hit.score),
+                    rerank_score: None,
+                    explanation: None,
+                    metadata: None,
+                });
+            }
+
+            if let Ok(mut guard) = self.shared.lock() {
+                *guard = Arc::new(ProgressiveLexicalCache {
+                    hits_by_message,
+                    wildcard_fallback: result.wildcard_fallback,
+                    suggestions: result.suggestions,
+                });
+            }
+
+            Ok(scored)
+        })
+    }
+
+    fn index_document<'a>(
+        &'a self,
+        _cx: &'a FsCx,
+        _doc: &'a frankensearch::IndexableDocument,
+    ) -> FsSearchFuture<'a, ()> {
+        Box::pin(async move {
+            Err(FsSearchError::SubsystemError {
+                subsystem: "cass_lexical_adapter",
+                source: Box::new(std::io::Error::other("cass lexical adapter is read-only")),
+            })
+        })
+    }
+
+    fn commit<'a>(&'a self, _cx: &'a FsCx) -> FsSearchFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn doc_count(&self) -> usize {
+        self.client.total_docs()
+    }
+}
+
 pub struct SearchClient {
-    reader: Option<(IndexReader, crate::search::tantivy::Fields)>,
-    sqlite: Option<Connection>,
+    reader: Option<(IndexReader, FsCassFields)>,
+    sqlite: Mutex<Option<SendConnection>>,
+    sqlite_path: Option<PathBuf>,
     prefix_cache: Mutex<CacheShards>,
+    reload_on_search: bool,
     last_reload: Mutex<Option<Instant>>,
     last_generation: Mutex<Option<u64>>,
     reload_epoch: Arc<AtomicU64>,
-    warm_tx: Option<mpsc::UnboundedSender<WarmJob>>,
-    _warm_handle: Option<JoinHandle<()>>,
+    warm_tx: Option<mpsc::Sender<WarmJob>>,
+    _warm_handle: Option<std::thread::JoinHandle<()>>,
     // Shared for warm worker to read cache/filter logic; keep Arc to avoid clones of big data
     _shared_filters: Arc<Mutex<()>>, // placeholder lock to ensure Send/Sync; future warm prefill state
     metrics: Metrics,
     cache_namespace: String,
     semantic: Mutex<Option<SemanticSearchState>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SearchClientOptions {
+    pub enable_reload: bool,
+    pub enable_warm: bool,
+}
+
+impl Default for SearchClientOptions {
+    fn default() -> Self {
+        Self {
+            enable_reload: true,
+            enable_warm: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1120,50 +1882,6 @@ static WARM_DEBOUNCE_MS: Lazy<u64> = Lazy::new(|| {
         .unwrap_or(120)
 });
 
-const DEFAULT_REGEX_CACHE_SIZE: usize = 100;
-
-static REGEX_CACHE_ENABLED: Lazy<bool> = Lazy::new(|| {
-    dotenvy::var("CASS_REGEX_CACHE")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
-});
-
-static REGEX_CACHE_SIZE: Lazy<NonZeroUsize> = Lazy::new(|| {
-    let parsed = dotenvy::var("CASS_REGEX_CACHE_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .and_then(NonZeroUsize::new);
-    parsed.unwrap_or_else(|| NonZeroUsize::new(DEFAULT_REGEX_CACHE_SIZE).unwrap())
-});
-
-type RegexCacheKey = (Field, String);
-
-struct RegexCache {
-    cache: RwLock<LruCache<RegexCacheKey, RegexQuery>>,
-}
-
-impl RegexCache {
-    fn new(capacity: NonZeroUsize) -> Self {
-        Self {
-            cache: RwLock::new(LruCache::new(capacity)),
-        }
-    }
-
-    fn get_or_insert(&self, field: Field, pattern: &str) -> Result<RegexQuery> {
-        let key = (field, pattern.to_string());
-        if let Some(cached) = self.cache.read().peek(&key) {
-            return Ok(cached.clone());
-        }
-        let query = RegexQuery::from_pattern(pattern, field)
-            .map_err(|e| anyhow!("regex query build failed: {e}"))?;
-        self.cache.write().put(key, query.clone());
-        Ok(query)
-    }
-}
-
-static REGEX_CACHE: Lazy<RegexCache> = Lazy::new(|| RegexCache::new(*REGEX_CACHE_SIZE));
-
 #[derive(Clone)]
 struct CachedHit {
     hit: SearchHit,
@@ -1184,7 +1902,19 @@ impl CachedHit {
             + self.hit.content.len()
             + self.hit.source_path.len()
             + self.hit.agent.len()
-            + self.hit.workspace.len();
+            + self.hit.workspace.len()
+            + self
+                .hit
+                .workspace_original
+                .as_ref()
+                .map_or(0, std::string::String::len)
+            + self.hit.source_id.len()
+            + self.hit.origin_kind.len()
+            + self
+                .hit
+                .origin_host
+                .as_ref()
+                .map_or(0, std::string::String::len);
         // Lowercase cache copies
         let lc_strings =
             self.lc_content.len() + self.lc_title.as_ref().map_or(0, std::string::String::len);
@@ -1234,14 +1964,19 @@ impl CacheShards {
         let shard = self.shard_mut(shard_name);
         let new_cost = value.len();
         let new_bytes: usize = value.iter().map(CachedHit::approx_bytes).sum();
-        // Subtract old entry's cost/bytes if replacing
-        // Note: LruCache.get() with Arc<str> key works via Borrow<str>
-        let (old_cost, old_bytes) = shard.get(&key).map_or((0, 0), |v| {
+        let old_val = shard.put(key, value);
+        let (old_cost, old_bytes) = old_val.as_ref().map_or((0, 0), |v| {
             (v.len(), v.iter().map(CachedHit::approx_bytes).sum())
         });
-        shard.put(key, value);
-        self.total_cost += new_cost.saturating_sub(old_cost);
-        self.total_bytes += new_bytes.saturating_sub(old_bytes);
+
+        self.total_cost = self
+            .total_cost
+            .saturating_add(new_cost)
+            .saturating_sub(old_cost);
+        self.total_bytes = self
+            .total_bytes
+            .saturating_add(new_bytes)
+            .saturating_sub(old_bytes);
         self.evict_until_within_cap();
     }
 
@@ -1250,24 +1985,29 @@ impl CacheShards {
         while self.total_cost > self.total_cap
             || (self.byte_cap > 0 && self.total_bytes > self.byte_cap)
         {
-            let mut evicted = false;
-            for shard in self.shards.values_mut() {
-                if let Some((_k, v)) = shard.pop_lru() {
+            // Find the shard with the most cached items. This distributes
+            // evictions fairly and prevents the first shard in HashMap
+            // iteration order from absorbing all evictions.
+            let mut largest_shard_key = None;
+            let mut max_len = 0;
+            for (k, v) in self.shards.iter() {
+                if v.len() > max_len {
+                    max_len = v.len();
+                    largest_shard_key = Some(k.clone());
+                }
+            }
+
+            if let Some(key) = largest_shard_key {
+                if let Some(shard) = self.shards.get_mut(&key)
+                    && let Some((_k, v)) = shard.pop_lru()
+                {
                     let evicted_bytes: usize = v.iter().map(CachedHit::approx_bytes).sum();
                     self.total_cost = self.total_cost.saturating_sub(v.len());
                     self.total_bytes = self.total_bytes.saturating_sub(evicted_bytes);
                     self.eviction_count += 1;
-                    evicted = true;
-                    // Check if we're back within both caps
-                    let within_cost = self.total_cost <= self.total_cap;
-                    let within_bytes = self.byte_cap == 0 || self.total_bytes <= self.byte_cap;
-                    if within_cost && within_bytes {
-                        break;
-                    }
                 }
-            }
-            if !evicted {
-                break;
+            } else {
+                break; // All shards are empty
             }
         }
     }
@@ -1316,23 +2056,6 @@ thread_local! {
     static THREAD_SEARCHER: RefCell<Option<SearcherCacheEntry>> = const { RefCell::new(None) };
 }
 
-fn sanitize_query(raw: &str) -> String {
-    // Replace any character that is not alphanumeric, asterisk, or double quote with a space.
-    // Asterisks are preserved for wildcard query support (*foo, foo*, *bar*).
-    // Double quotes are preserved for phrase query support ("exact phrase").
-    // This ensures that the input tokens match how SimpleTokenizer splits content.
-    // e.g. "c++" -> "c  ", "foo.bar" -> "foo bar", "*config*" -> "*config*"
-    raw.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '*' || c == '"' {
-                c
-            } else {
-                ' '
-            }
-        })
-        .collect()
-}
-
 /// Calculate Levenshtein edit distance between two strings.
 /// Used for typo detection in did-you-mean suggestions.
 fn levenshtein_distance(a: &str, b: &str) -> usize {
@@ -1366,175 +2089,12 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
     prev_row[b_len]
 }
 
-/// Escape special regex characters in a string
-fn escape_regex(s: &str) -> String {
-    let mut escaped = String::with_capacity(s.len() * 2);
-    for c in s.chars() {
-        match c {
-            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => {
-                escaped.push('\\');
-                escaped.push(c);
-            }
-            _ => escaped.push(c),
-        }
-    }
-    escaped
-}
-
-/// Represents different wildcard patterns for a search term
-#[derive(Debug, Clone, PartialEq)]
-enum WildcardPattern {
-    /// No wildcards - exact term match (through edge n-grams)
-    Exact(String),
-    /// Trailing wildcard: foo* (prefix match)
-    Prefix(String),
-    /// Leading wildcard: *foo (suffix match - requires regex)
-    Suffix(String),
-    /// Both wildcards: *foo* (substring match - requires regex)
-    Substring(String),
-}
-
-impl WildcardPattern {
-    fn parse(term: &str) -> Self {
-        let starts_with_star = term.starts_with('*');
-        let ends_with_star = term.ends_with('*');
-
-        let core = term.trim_matches('*').to_lowercase();
-        if core.is_empty() {
-            return WildcardPattern::Exact(String::new());
-        }
-
-        match (starts_with_star, ends_with_star) {
-            (true, true) => WildcardPattern::Substring(core),
-            (true, false) => WildcardPattern::Suffix(core),
-            (false, true) => WildcardPattern::Prefix(core),
-            (false, false) => WildcardPattern::Exact(core),
-        }
-    }
-
-    /// Convert to regex pattern for Tantivy `RegexQuery`
-    fn to_regex(&self) -> Option<String> {
-        match self {
-            WildcardPattern::Suffix(core) => Some(format!(".*{}", escape_regex(core))),
-            WildcardPattern::Substring(core) => Some(format!(".*{}.*", escape_regex(core))),
-            _ => None,
-        }
-    }
-
-    /// Convert to the corresponding public `MatchType`
-    fn to_match_type(&self) -> MatchType {
-        match self {
-            WildcardPattern::Exact(_) => MatchType::Exact,
-            WildcardPattern::Prefix(_) => MatchType::Prefix,
-            WildcardPattern::Suffix(_) => MatchType::Suffix,
-            WildcardPattern::Substring(_) => MatchType::Substring,
-        }
-    }
-}
-
-/// Token types for boolean query parsing
-#[derive(Debug, Clone, PartialEq)]
-enum QueryToken {
-    /// A search term (may include wildcards)
-    Term(String),
-    /// Quoted phrase for exact matching
-    Phrase(String),
-    /// AND operator (explicit)
-    And,
-    /// OR operator
-    Or,
-    /// NOT operator (next term is excluded)
-    Not,
-}
-
-/// Parse a query string into boolean tokens.
-/// Supports:
-/// - AND, && for explicit AND (implicit between terms)
-/// - OR, || for OR
-/// - NOT, - prefix for exclusion
-/// - "quoted phrases" for exact matching
-fn parse_boolean_query(query: &str) -> Vec<QueryToken> {
-    let mut tokens = Vec::new();
-    let mut chars = query.chars().peekable();
-    let mut current_word = String::new();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                // Flush any pending word
-                if !current_word.is_empty() {
-                    tokens.push(QueryToken::Term(std::mem::take(&mut current_word)));
-                }
-                // Collect quoted phrase
-                let mut phrase = String::new();
-                while let Some(&next) = chars.peek() {
-                    if next == '"' {
-                        chars.next();
-                        break;
-                    }
-                    if let Some(c) = chars.next() {
-                        phrase.push(c);
-                    }
-                }
-                if !phrase.is_empty() {
-                    tokens.push(QueryToken::Phrase(phrase));
-                }
-            }
-            '&' if chars.peek() == Some(&'&') => {
-                chars.next(); // consume second &
-                if !current_word.is_empty() {
-                    tokens.push(QueryToken::Term(std::mem::take(&mut current_word)));
-                }
-                tokens.push(QueryToken::And);
-            }
-            '|' if chars.peek() == Some(&'|') => {
-                chars.next(); // consume second |
-                if !current_word.is_empty() {
-                    tokens.push(QueryToken::Term(std::mem::take(&mut current_word)));
-                }
-                tokens.push(QueryToken::Or);
-            }
-            '-' if current_word.is_empty() => {
-                // Prefix minus for NOT (at start of a term)
-                // Works at query start: "-foo" or mid-query: "bar -foo"
-                tokens.push(QueryToken::Not);
-            }
-            ' ' | '\t' | '\n' => {
-                if !current_word.is_empty() {
-                    let word = std::mem::take(&mut current_word);
-                    let upper = word.to_uppercase();
-                    match upper.as_str() {
-                        "AND" => tokens.push(QueryToken::And),
-                        "OR" => tokens.push(QueryToken::Or),
-                        "NOT" => tokens.push(QueryToken::Not),
-                        _ => tokens.push(QueryToken::Term(word)),
-                    }
-                }
-            }
-            _ => {
-                current_word.push(c);
-            }
-        }
-    }
-
-    // Flush final word
-    if !current_word.is_empty() {
-        let upper = current_word.to_uppercase();
-        match upper.as_str() {
-            "AND" => tokens.push(QueryToken::And),
-            "OR" => tokens.push(QueryToken::Or),
-            "NOT" => tokens.push(QueryToken::Not),
-            _ => tokens.push(QueryToken::Term(current_word)),
-        }
-    }
-
-    tokens
-}
-
 /// Normalize a term into tokenizer-aligned parts.
-/// Splits on punctuation to match SimpleTokenizer behavior, preserving `*` for wildcards.
+/// Splits on non-word punctuation (hyphens preserved) to match `hyphen_normalize` tokenizer,
+/// preserving `*` for wildcards. The FTS5 transpiler quotes hyphenated terms later so
+/// stock SQLite parses them correctly.
 fn normalize_term_parts(raw: &str) -> Vec<String> {
-    sanitize_query(raw)
+    fs_cass_sanitize_query(raw)
         .split_whitespace()
         .map(|s| s.to_string())
         .collect()
@@ -1542,168 +2102,34 @@ fn normalize_term_parts(raw: &str) -> Vec<String> {
 
 /// Normalize phrase text into tokenizer-aligned terms (lowercased, no wildcards).
 fn normalize_phrase_terms(raw: &str) -> Vec<String> {
-    sanitize_query(raw)
+    fs_cass_sanitize_query(raw)
         .split_whitespace()
         .map(|s| s.trim_matches('*').to_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
 }
 
-/// Build a compound query that requires all term parts to match (implicit AND).
-fn build_compound_term_query(
-    parts: &[String],
-    fields: &crate::search::tantivy::Fields,
-) -> Option<Box<dyn Query>> {
-    let mut subqueries: Vec<Box<dyn Query>> = Vec::new();
-    for part in parts {
-        let pattern = WildcardPattern::parse(part);
-        let term_shoulds = build_term_query_clauses(&pattern, fields);
-        if !term_shoulds.is_empty() {
-            subqueries.push(Box::new(BooleanQuery::new(term_shoulds)));
-        }
-    }
-
-    match subqueries.len() {
-        0 => None,
-        1 => subqueries.pop(),
-        _ => {
-            let musts = subqueries.into_iter().map(|q| (Occur::Must, q)).collect();
-            Some(Box::new(BooleanQuery::new(musts)))
-        }
-    }
-}
-
-/// Build a phrase query (exact order) across title/content fields.
-fn build_phrase_query(
-    terms: &[String],
-    fields: &crate::search::tantivy::Fields,
-) -> Option<Box<dyn Query>> {
-    if terms.is_empty() {
+fn render_fts5_term_part(part: &str) -> Option<String> {
+    let pattern = FsCassWildcardPattern::parse(part);
+    if matches!(
+        pattern,
+        FsCassWildcardPattern::Suffix(_)
+            | FsCassWildcardPattern::Substring(_)
+            | FsCassWildcardPattern::Complex(_)
+    ) {
         return None;
     }
-    if terms.len() == 1 {
-        return build_compound_term_query(terms, fields);
+
+    if part.contains('-') {
+        return Some(match pattern {
+            FsCassWildcardPattern::Prefix(_) => {
+                format!("\"{}\"*", part.trim_end_matches('*'))
+            }
+            _ => format!("\"{}\"", part),
+        });
     }
 
-    let mut shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-    for field in [fields.title, fields.content] {
-        let phrase_terms = terms
-            .iter()
-            .map(|t| Term::from_field_text(field, t))
-            .collect::<Vec<_>>();
-        shoulds.push((Occur::Should, Box::new(PhraseQuery::new(phrase_terms))));
-    }
-    Some(Box::new(BooleanQuery::new(shoulds)))
-}
-
-/// Check if a query string contains boolean operators
-fn has_boolean_operators(query: &str) -> bool {
-    let tokens = parse_boolean_query(query);
-    tokens.iter().any(|t| {
-        matches!(
-            t,
-            QueryToken::And | QueryToken::Or | QueryToken::Not | QueryToken::Phrase(_)
-        )
-    })
-}
-
-/// Build Tantivy query clauses from boolean tokens.
-/// Returns clauses for use in a `BooleanQuery`.
-fn build_boolean_query_clauses(
-    tokens: &[QueryToken],
-    fields: &crate::search::tantivy::Fields,
-) -> Vec<(Occur, Box<dyn Query>)> {
-    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-    let mut pending_or_group: Vec<Box<dyn Query>> = Vec::new();
-    let mut next_occur = Occur::Must;
-    let mut in_or_sequence = false;
-
-    for token in tokens {
-        match token {
-            QueryToken::And => {
-                // Flush any OR group
-                if !pending_or_group.is_empty() {
-                    let or_clauses: Vec<_> = pending_or_group
-                        .drain(..)
-                        .map(|q| (Occur::Should, q))
-                        .collect();
-                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(or_clauses))));
-                }
-                in_or_sequence = false;
-                next_occur = Occur::Must;
-            }
-            QueryToken::Or => {
-                in_or_sequence = true;
-                // Don't change next_occur; OR will group with previous term
-            }
-            QueryToken::Not => {
-                // Flush any OR group
-                if !pending_or_group.is_empty() {
-                    let or_clauses: Vec<_> = pending_or_group
-                        .drain(..)
-                        .map(|q| (Occur::Should, q))
-                        .collect();
-                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(or_clauses))));
-                }
-                in_or_sequence = false;
-                next_occur = Occur::MustNot;
-            }
-            QueryToken::Term(term) => {
-                let parts = normalize_term_parts(term);
-                let term_query = build_compound_term_query(&parts, fields);
-                if term_query.is_none() {
-                    continue;
-                }
-                let term_query = term_query.unwrap();
-
-                if in_or_sequence || next_occur == Occur::Should {
-                    // Add to OR group
-                    if pending_or_group.is_empty() {
-                        // Pull last Must clause into OR group if exists
-                        if let Some((Occur::Must, last_q)) = clauses.pop() {
-                            pending_or_group.push(last_q);
-                        }
-                    }
-                    pending_or_group.push(term_query);
-                    in_or_sequence = true; // Continue OR sequence
-                } else {
-                    clauses.push((next_occur, term_query));
-                }
-                next_occur = Occur::Must; // Reset for next term
-            }
-            QueryToken::Phrase(phrase) => {
-                let terms = normalize_phrase_terms(phrase);
-                let phrase_query = build_phrase_query(&terms, fields);
-                if phrase_query.is_none() {
-                    continue;
-                }
-                let phrase_query = phrase_query.unwrap();
-
-                if in_or_sequence {
-                    if pending_or_group.is_empty()
-                        && let Some((Occur::Must, last_q)) = clauses.pop()
-                    {
-                        pending_or_group.push(last_q);
-                    }
-                    pending_or_group.push(phrase_query);
-                } else {
-                    clauses.push((next_occur, phrase_query));
-                }
-                next_occur = Occur::Must;
-            }
-        }
-    }
-
-    // Flush any remaining OR group
-    if !pending_or_group.is_empty() {
-        let or_clauses: Vec<_> = pending_or_group
-            .drain(..)
-            .map(|q| (Occur::Should, q))
-            .collect();
-        clauses.push((Occur::Must, Box::new(BooleanQuery::new(or_clauses))));
-    }
-
-    clauses
+    Some(part.to_string())
 }
 
 /// Determine the dominant match type from a query string.
@@ -1711,8 +2137,14 @@ fn build_boolean_query_clauses(
 fn dominant_match_type(query: &str) -> MatchType {
     let mut worst = MatchType::Exact;
     for term in query.split_whitespace() {
-        let pattern = WildcardPattern::parse(term);
-        let mt = pattern.to_match_type();
+        let pattern = FsCassWildcardPattern::parse(term);
+        let mt = match pattern {
+            FsCassWildcardPattern::Exact(_) => MatchType::Exact,
+            FsCassWildcardPattern::Prefix(_) => MatchType::Prefix,
+            FsCassWildcardPattern::Suffix(_) => MatchType::Suffix,
+            FsCassWildcardPattern::Substring(_) => MatchType::Substring,
+            FsCassWildcardPattern::Complex(_) => MatchType::Wildcard,
+        };
         // Lower quality factor = "looser" match = dominant
         if mt.quality_factor() < worst.quality_factor() {
             worst = mt;
@@ -1721,92 +2153,30 @@ fn dominant_match_type(query: &str) -> MatchType {
     worst
 }
 
-fn regex_query_for_pattern(field: Field, pattern: &str) -> Result<RegexQuery> {
-    if !*REGEX_CACHE_ENABLED {
-        return RegexQuery::from_pattern(pattern, field)
-            .map_err(|e| anyhow!("regex query build failed: {e}"));
-    }
-    REGEX_CACHE.get_or_insert(field, pattern)
-}
-
-/// Build query clauses for a single term based on its wildcard pattern.
-/// Returns a Vec of (`Occur::Should`, Query) for use in a `BooleanQuery`.
-fn build_term_query_clauses(
-    pattern: &WildcardPattern,
-    fields: &crate::search::tantivy::Fields,
-) -> Vec<(Occur, Box<dyn Query>)> {
-    let mut shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-
-    match pattern {
-        WildcardPattern::Exact(term) | WildcardPattern::Prefix(term) => {
-            // For exact and prefix patterns, use TermQuery on all fields
-            // (edge n-grams already handle prefix matching)
-            if term.is_empty() {
-                return shoulds;
-            }
-            shoulds.push((
-                Occur::Should,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(fields.title, term),
-                    IndexRecordOption::WithFreqsAndPositions,
-                )),
-            ));
-            shoulds.push((
-                Occur::Should,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(fields.content, term),
-                    IndexRecordOption::WithFreqsAndPositions,
-                )),
-            ));
-            shoulds.push((
-                Occur::Should,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(fields.title_prefix, term),
-                    IndexRecordOption::WithFreqsAndPositions,
-                )),
-            ));
-            shoulds.push((
-                Occur::Should,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(fields.content_prefix, term),
-                    IndexRecordOption::WithFreqsAndPositions,
-                )),
-            ));
-        }
-        WildcardPattern::Suffix(term) | WildcardPattern::Substring(term) => {
-            // For suffix and substring patterns, use RegexQuery
-            if term.is_empty() {
-                return shoulds;
-            }
-            if let Some(regex_pattern) = pattern.to_regex() {
-                // Try to create RegexQuery for content field
-                if let Ok(rq) = regex_query_for_pattern(fields.content, &regex_pattern) {
-                    shoulds.push((Occur::Should, Box::new(rq)));
-                }
-                // Also try for title field
-                if let Ok(rq) = regex_query_for_pattern(fields.title, &regex_pattern) {
-                    shoulds.push((Occur::Should, Box::new(rq)));
-                }
-            }
-        }
-    }
-
-    shoulds
-}
-
 /// Check if content is primarily a tool invocation (noise that shouldn't appear in search results).
 /// Tool invocations like "[Tool: Bash - Check status]" are not informative search results.
-fn is_tool_invocation_noise(content: &str) -> bool {
+pub(crate) fn is_tool_invocation_noise(content: &str) -> bool {
     let trimmed = content.trim();
 
-    // Direct tool invocations that are just "[Tool: X - description]"
+    // Direct tool invocations that are just "[Tool: X - description]" or "[Tool: X] args"
     if trimmed.starts_with("[Tool:") {
-        // Only filter if it's very short (likely just the tool name without args)
-        // e.g. "[Tool: Bash]" (12 chars) vs "[Tool: Bash - ls]" (17 chars)
-        if trimmed.len() < 15 {
-            return true;
+        // Find closing bracket
+        if let Some(close_idx) = trimmed.find(']') {
+            // Check for content after closing bracket (Pi-Agent style: "[Tool: name] args")
+            let after = &trimmed[close_idx + 1..];
+            if !after.trim().is_empty() {
+                return false; // Has args/content after -> Keep
+            }
+
+            // No content after bracket. Check for description inside.
+            // Format: "[Tool: Name - Desc]" (useful) vs "[Tool: Name]" (previously noise, now kept)
+            // We now keep "[Tool: Name]" because users might search for "Tool: Bash" to find usage.
+            // Only "[Tool:]" or "[Tool: ]" (empty name) is considered noise.
+            let inner = &trimmed[6..close_idx]; // Skip "[Tool:"
+            return inner.trim().is_empty();
         }
-        return false;
+        // No closing bracket? Malformed, treat as noise
+        return true;
     }
 
     // Also filter very short content that's just tool names or markers
@@ -1822,11 +2192,13 @@ fn is_tool_invocation_noise(content: &str) -> bool {
 
 fn snippet_from_content(content: &str) -> String {
     let trimmed = content.trim();
-    if trimmed.chars().count() <= 200 {
-        return trimmed.to_string();
+    let mut chars = trimmed.chars();
+    let preview: String = chars.by_ref().take(200).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
     }
-    let preview: String = trimmed.chars().take(200).collect();
-    format!("{preview}...")
 }
 
 /// Deduplicate search hits by (source_id, content), keeping only the highest-scored hit
@@ -1836,19 +2208,45 @@ fn snippet_from_content(content: &str) -> String {
 /// appears as separate results, since they represent distinct conversations.
 ///
 /// Also filters out tool invocation noise that isn't useful for search results.
-fn deduplicate_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
-    // Key: (source_id, content_hash) -> index in deduped
-    let mut seen: HashMap<(String, u64), usize> = HashMap::new();
+pub(crate) fn deduplicate_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    // Key: (source_numeric_id, source_path_numeric_id, content_hash) -> index in deduped.
+    // Intern IDs to avoid cloning strings for every hit.
+    let mut source_ids: HashMap<String, u32> = HashMap::new();
+    let mut path_ids: HashMap<String, u32> = HashMap::new();
+    let mut next_source_id: u32 = 0;
+    let mut next_path_id: u32 = 0;
+    let mut seen: HashMap<(u32, u32, u64), usize> = HashMap::new();
     let mut deduped: Vec<SearchHit> = Vec::new();
 
     for hit in hits {
         // Skip tool invocation noise
-        if !hit.content.is_empty() && is_tool_invocation_noise(&hit.content) {
+        let content_to_check = if hit.content.is_empty() {
+            &hit.snippet
+        } else {
+            &hit.content
+        };
+        if !content_to_check.is_empty() && is_tool_invocation_noise(content_to_check) {
             continue;
         }
 
-        // Include source_id in the key so different sources keep their results
-        let key = (hit.source_id.clone(), hit.content_hash);
+        // Include source_id AND source_path in the key so different sessions keep their results.
+        let source_key = if let Some(id) = source_ids.get(hit.source_id.as_str()) {
+            *id
+        } else {
+            let id = next_source_id;
+            next_source_id = next_source_id.saturating_add(1);
+            source_ids.insert(hit.source_id.clone(), id);
+            id
+        };
+        let path_key = if let Some(id) = path_ids.get(hit.source_path.as_str()) {
+            *id
+        } else {
+            let id = next_path_id;
+            next_path_id = next_path_id.saturating_add(1);
+            path_ids.insert(hit.source_path.clone(), id);
+            id
+        };
+        let key = (source_key, path_key, hit.content_hash);
 
         if let Some(&existing_idx) = seen.get(&key) {
             // If existing hit has lower score, replace it
@@ -1867,30 +2265,39 @@ fn deduplicate_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
 
 impl SearchClient {
     pub fn open(index_path: &Path, db_path: Option<&Path>) -> Result<Option<Self>> {
-        let tantivy = Index::open_in_dir(index_path).ok().and_then(|mut idx| {
-            // Register custom tokenizer so searches work
-            crate::search::tantivy::ensure_tokenizer(&mut idx);
-            let schema = idx.schema();
-            let fields = fields_from_schema(&schema).ok()?;
-            idx.reader().ok().map(|reader| (reader, fields))
-        });
+        Self::open_with_options(index_path, db_path, SearchClientOptions::default())
+    }
 
-        let sqlite = db_path.and_then(|p| Connection::open(p).ok());
+    pub fn open_with_options(
+        index_path: &Path,
+        db_path: Option<&Path>,
+        options: SearchClientOptions,
+    ) -> Result<Option<Self>> {
+        let tantivy = fs_cass_open_search_reader(index_path, ReloadPolicy::Manual).ok();
 
-        if tantivy.is_none() && sqlite.is_none() {
+        let sqlite_path = db_path.map(Path::to_path_buf).filter(|path| path.exists());
+
+        if tantivy.is_none() && sqlite_path.is_some() {
+            tracing::warn!(
+                index_path = %index_path.display(),
+                "Tantivy search index not found or incompatible. \
+                 Search results will be degraded. \
+                 Run `cass index --full` to rebuild the index."
+            );
+        }
+
+        if tantivy.is_none() && sqlite_path.is_none() {
             return Ok(None);
         }
 
         let shared_filters = Arc::new(Mutex::new(()));
         let reload_epoch = Arc::new(AtomicU64::new(0));
         let metrics = Metrics::default();
-        let cache_namespace = format!(
-            "v{}|schema:{}",
-            CACHE_KEY_VERSION,
-            crate::search::tantivy::SCHEMA_HASH
-        );
+        let cache_namespace = format!("v{}|schema:{}", CACHE_KEY_VERSION, FS_CASS_SCHEMA_HASH);
 
-        let warm_pair = if let Some((reader, fields)) = &tantivy {
+        let warm_pair = if options.enable_warm
+            && let Some((reader, fields)) = &tantivy
+        {
             maybe_spawn_warm_worker(
                 reader.clone(),
                 *fields,
@@ -1904,8 +2311,10 @@ impl SearchClient {
 
         Ok(Some(Self {
             reader: tantivy,
-            sqlite,
+            sqlite: Mutex::new(None),
+            sqlite_path,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: options.enable_reload,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch,
@@ -1918,6 +2327,33 @@ impl SearchClient {
         }))
     }
 
+    fn sqlite_guard(&self) -> Result<std::sync::MutexGuard<'_, Option<SendConnection>>> {
+        let mut guard = self
+            .sqlite
+            .lock()
+            .map_err(|_| anyhow!("sqlite lock poisoned"))?;
+
+        if guard.is_none()
+            && let Some(path) = &self.sqlite_path
+        {
+            let path_str = path.to_string_lossy().to_string();
+            match Connection::open(&path_str) {
+                Ok(conn) => {
+                    *guard = Some(SendConnection(conn));
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        path = %path.display(),
+                        "sqlite open failed"
+                    );
+                }
+            }
+        }
+
+        Ok(guard)
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -1926,9 +2362,15 @@ impl SearchClient {
         offset: usize,
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
-        let sanitized = sanitize_query(query);
+        let sanitized = fs_cass_sanitize_query(query);
         let field_mask = effective_field_mask(field_mask);
-        let can_use_cache = field_mask.allows_cache() && field_mask.needs_content();
+        let limit = if limit == 0 {
+            self.total_docs().max(1)
+        } else {
+            limit
+        };
+        let can_use_cache =
+            field_mask.allows_cache() && (field_mask.needs_content() || field_mask.wants_snippet());
 
         // Schedule warmup for likely prefixes when user pauses typing.
         if offset == 0
@@ -1940,11 +2382,23 @@ impl SearchClient {
             });
         }
 
+        // Invalidate prefix cache if the index has been updated since last search.
+        // This must happen BEFORE the cache check below to avoid serving stale results.
+        if let Some((reader, _)) = &self.reader {
+            let _ = self.maybe_reload_reader(reader);
+            let searcher = self.searcher_for_thread(reader);
+            self.track_generation(searcher.generation().generation_id());
+        }
+
         // Fast path: reuse cached prefix when user is typing forward (offset 0 only).
         // Only use cache for simple queries (no wildcards, no boolean operators) because
         // the cache matching logic enforces strict prefix AND semantics which is incorrect
         // for suffixes, substrings, OR, NOT, or phrases.
-        if can_use_cache && offset == 0 && !query.contains('*') && !has_boolean_operators(query) {
+        if can_use_cache
+            && offset == 0
+            && !query.contains('*')
+            && !fs_cass_has_boolean_operators(query)
+        {
             if let Some(cached) = self.cached_prefix_hits(&sanitized, &filters) {
                 // Opt 2.4: Pre-compute lowercase query terms once, reuse for all hits
                 let query_terms = QueryTermsLower::from_query(&sanitized);
@@ -1969,13 +2423,26 @@ impl SearchClient {
             }
         }
 
+        // Adaptive fetch sizing: start at 2x target to reduce common-case work,
+        // retry at 3x only when deduplication causes shortfall.
+        // We always fetch from 0 to preserve global deduplication correctness.
+        let target_hits = offset.saturating_add(limit);
+        let initial_fetch_limit = if target_hits <= 16 {
+            target_hits.saturating_mul(2)
+        } else {
+            // Larger pages benefit from a lower first-pass over-fetch.
+            // Retry logic below preserves correctness on duplicate-heavy corpora.
+            target_hits.saturating_mul(3).div_ceil(2)
+        };
+        let fallback_fetch_limit = target_hits.saturating_mul(3);
+
         // Tantivy is the primary high-performance engine.
         if let Some((reader, fields)) = &self.reader {
             tracing::info!(
                 backend = "tantivy",
                 query = sanitized,
-                limit = limit,
-                offset = offset,
+                limit = initial_fetch_limit,
+                offset = 0,
                 "search_start"
             );
             let hits = self.search_tantivy(
@@ -1984,21 +2451,66 @@ impl SearchClient {
                 query,
                 &sanitized,
                 filters.clone(),
-                limit * 3,
-                offset,
+                initial_fetch_limit,
+                0, // Always fetch from 0 for global dedup
                 field_mask,
             )?;
             if !hits.is_empty() {
-                let mut deduped = deduplicate_hits(hits);
-                // Apply session_paths filter (post-search since source_path is not indexed)
-                if !filters.session_paths.is_empty() {
-                    deduped.retain(|h| filters.session_paths.contains(&h.source_path));
+                let initial_hit_count = hits.len();
+                let page_hits = |raw_hits: Vec<SearchHit>| {
+                    let mut deduped = deduplicate_hits(raw_hits);
+                    // Apply session_paths filter (post-search since source_path is not indexed)
+                    if !filters.session_paths.is_empty() {
+                        deduped.retain(|h| filters.session_paths.contains(&h.source_path));
+                    }
+                    let deduped_len = deduped.len();
+                    let paged_hits: Vec<SearchHit> =
+                        deduped.into_iter().skip(offset).take(limit).collect();
+                    (deduped_len, paged_hits)
+                };
+
+                let (mut deduped_len, mut paged_hits) = page_hits(hits);
+
+                let needs_retry = deduped_len < target_hits
+                    && initial_hit_count == initial_fetch_limit
+                    && initial_fetch_limit < fallback_fetch_limit;
+
+                if needs_retry {
+                    tracing::debug!(
+                        query = sanitized,
+                        target_hits,
+                        deduped_len,
+                        initial_fetch_limit,
+                        fallback_fetch_limit,
+                        "retrying lexical fetch due to dedup shortfall"
+                    );
+                    let retry_hits = self.search_tantivy(
+                        reader,
+                        fields,
+                        query,
+                        &sanitized,
+                        filters.clone(),
+                        fallback_fetch_limit,
+                        0,
+                        field_mask,
+                    )?;
+                    if !retry_hits.is_empty() {
+                        (deduped_len, paged_hits) = page_hits(retry_hits);
+                    }
                 }
-                deduped.truncate(limit);
-                if can_use_cache {
-                    self.put_cache(&sanitized, &filters, &deduped);
+
+                tracing::trace!(
+                    query = sanitized,
+                    target_hits,
+                    deduped_len,
+                    returned = paged_hits.len(),
+                    "lexical fetch complete"
+                );
+
+                if can_use_cache && offset == 0 {
+                    self.put_cache(&sanitized, &filters, &paged_hits);
                 }
-                return Ok(deduped);
+                return Ok(paged_hits);
             }
             // If Tantivy yields 0 results, we can optionally fall back to SQLite FTS
             // if we suspect consistency issues, but for now let's trust Tantivy
@@ -2007,30 +2519,34 @@ impl SearchClient {
             // If empty, we *can* try SQLite just in case index is lagging.
         }
 
-        // Fallback: SQLite FTS (slower, but strictly consistent with DB)
-        // Skip SQLite fallback when the query contains leading/trailing wildcards that
-        // FTS5 cannot parse (e.g., "*handler" or "*foo*"), to avoid "unknown special query" errors.
-        // Also skip SQLite fallback when source filtering is applied, since the FTS table
-        // doesn't have a source_id column (P3.1 limitation).
-        let query_has_wildcards = sanitized.contains('*');
-        let has_source_filter = !matches!(filters.source_filter, SourceFilter::All);
-        if let Some(conn) = &self.sqlite {
-            if query_has_wildcards || has_source_filter {
-                return Ok(Vec::new());
-            }
+        // Fallback: DB-resident FTS is currently disabled in frankensqlite-only
+        // mode. The primary lexical path is the Tantivy index above.
+        // Skip SQLite fallback when the query contains leading/internal wildcards that
+        // FTS5 cannot parse (e.g., "*handler" or "f*o").
+        // We ALLOW trailing wildcards ("foo*") as FTS5 supports prefix matching.
+        let unsupported_wildcards = sanitized.split_whitespace().any(|t| {
+            let core = t.trim_end_matches('*');
+            core.contains('*') // Any star remaining after trimming end is unsupported (leading or internal)
+        });
+
+        if unsupported_wildcards {
+            return Ok(Vec::new());
+        }
+
+        if let Some(db_path) = &self.sqlite_path {
             tracing::info!(
-                backend = "sqlite",
+                backend = "sqlite-fts5-disabled",
                 query = sanitized,
-                limit = limit,
-                offset = offset,
+                limit = fallback_fetch_limit,
+                offset = 0,
                 "search_start"
             );
-            let hits = self.search_sqlite(
-                conn,
-                &sanitized,
+            let hits = self.search_sqlite_fts5(
+                db_path,
+                query,
                 filters.clone(),
-                limit * 3,
-                offset,
+                fallback_fetch_limit,
+                0, // Always fetch from 0 for global dedup
                 field_mask,
             )?;
             let mut deduped = deduplicate_hits(hits);
@@ -2038,11 +2554,13 @@ impl SearchClient {
             if !filters.session_paths.is_empty() {
                 deduped.retain(|h| filters.session_paths.contains(&h.source_path));
             }
-            deduped.truncate(limit);
-            if can_use_cache {
-                self.put_cache(&sanitized, &filters, &deduped);
+
+            let paged_hits: Vec<SearchHit> = deduped.into_iter().skip(offset).take(limit).collect();
+
+            if can_use_cache && offset == 0 {
+                self.put_cache(&sanitized, &filters, &paged_hits);
             }
-            return Ok(deduped);
+            return Ok(paged_hits);
         }
 
         tracing::info!(backend = "none", query = query, "search_start");
@@ -2052,13 +2570,13 @@ impl SearchClient {
     pub fn set_semantic_context(
         &self,
         embedder: Arc<dyn Embedder>,
-        index: VectorIndex,
+        fs_semantic_index: VectorIndex,
         filter_maps: SemanticFilterMaps,
         roles: Option<HashSet<u8>>,
+        ann_path: Option<PathBuf>,
     ) -> Result<()> {
-        let header = index.header();
-        let embedder_id = header.embedder_id.clone();
-        let dimension = header.dimension as usize;
+        let embedder_id = fs_semantic_index.embedder_id().to_string();
+        let dimension = fs_semantic_index.dimension();
         if embedder_id != embedder.id() {
             bail!(
                 "embedder mismatch: index uses {}, embedder is {}",
@@ -2081,7 +2599,13 @@ impl SearchClient {
             .map_err(|_| anyhow!("semantic lock poisoned"))?;
         *state_guard = Some(SemanticSearchState {
             embedder,
-            index,
+            fs_semantic_index,
+            fs_ann_index: None,
+            ann_path,
+            fs_in_memory_two_tier_index: None,
+            in_memory_two_tier_init_attempted: false,
+            progressive_context: None,
+            progressive_context_init_attempted: false,
             filter_maps,
             roles,
             query_cache: QueryCache::new(embedder_id.as_str(), capacity),
@@ -2098,78 +2622,339 @@ impl SearchClient {
         Ok(())
     }
 
-    pub fn search_semantic(
-        &self,
-        query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        offset: usize,
-        field_mask: FieldMask,
-    ) -> Result<Vec<SearchHit>> {
-        let field_mask = effective_field_mask(field_mask);
-        let canonical = canonicalize_for_embedding(query);
-        if canonical.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut guard = self
-            .semantic
-            .lock()
-            .map_err(|_| anyhow!("semantic lock poisoned"))?;
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("semantic search unavailable (no embedder or vector index)"))?;
-
-        let embedding = state
-            .query_cache
-            .get_or_embed(state.embedder.as_ref(), &canonical)?;
-        let mut semantic_filter =
-            SemanticFilter::from_search_filters(&filters, &state.filter_maps)?;
-        if let Some(roles) = state.roles.clone() {
-            semantic_filter = semantic_filter.with_roles(Some(roles));
-        }
-
-        let fetch = limit.saturating_add(offset);
-        if fetch == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut results =
-            state
-                .index
-                .search_top_k_collapsed(&embedding, fetch, Some(&semantic_filter))?;
-        if offset > 0 {
-            results = results.into_iter().skip(offset).collect();
-        }
-
-        let mut hits = self.hydrate_semantic_hits(&results, field_mask)?;
-        // Apply session_paths filter (not supported at SemanticFilter level)
-        if !filters.session_paths.is_empty() {
-            hits.retain(|h| filters.session_paths.contains(&h.source_path));
-        }
-        Ok(hits)
+    pub fn can_progressively_refine(&self) -> bool {
+        let mut guard = match self.semantic.lock() {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
+        let Some(state) = guard.as_mut() else {
+            return false;
+        };
+        self.load_progressive_context(state)
+            .map(|context| {
+                context.as_ref().is_some_and(|ctx| {
+                    ctx.quality_embedder.is_some() && ctx.index.has_quality_index()
+                })
+            })
+            .unwrap_or(false)
     }
 
-    fn hydrate_semantic_hits(
+    fn load_progressive_context(
+        &self,
+        state: &mut SemanticSearchState,
+    ) -> Result<Option<Arc<ProgressiveTwoTierContext>>> {
+        if let Some(context) = state.progressive_context.as_ref() {
+            return Ok(Some(Arc::clone(context)));
+        }
+        if state.progressive_context_init_attempted {
+            return Ok(None);
+        }
+        state.progressive_context_init_attempted = true;
+
+        let Some(index_dir) = state
+            .ann_path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+        else {
+            return Ok(None);
+        };
+
+        let fast_path = {
+            let explicit = index_dir.join("vector.fast.idx");
+            if explicit.is_file() {
+                explicit
+            } else {
+                let fallback = index_dir.join("vector.idx");
+                if fallback.is_file() {
+                    fallback
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+        let quality_path = index_dir.join("vector.quality.idx");
+        if !quality_path.is_file() {
+            return Ok(None);
+        }
+
+        let fast_index = FsVectorIndex::open(&fast_path)
+            .map_err(|err| anyhow!("open fast-tier index failed: {err}"))?;
+        let quality_index = FsVectorIndex::open(&quality_path)
+            .map_err(|err| anyhow!("open quality-tier index failed: {err}"))?;
+        let index = Arc::new(
+            FsTwoTierIndex::open(&index_dir, frankensearch_two_tier_config())
+                .map_err(|err| anyhow!("open progressive two-tier index failed: {err}"))?,
+        );
+
+        let fast_embedder = self.load_embedder_for_progressive_id(
+            state,
+            fast_index.embedder_id(),
+            fast_index.dimension(),
+        )?;
+        let fast_embedder: Arc<dyn frankensearch::Embedder> = Arc::new(FsSyncEmbedderAdapter(
+            SharedCassSyncEmbedder::new(fast_embedder),
+        ));
+        let quality_embedder = Some(self.load_embedder_for_progressive_id(
+            state,
+            quality_index.embedder_id(),
+            quality_index.dimension(),
+        )?);
+        let quality_embedder = quality_embedder.map(|embedder| {
+            Arc::new(FsSyncEmbedderAdapter(SharedCassSyncEmbedder::new(embedder)))
+                as Arc<dyn frankensearch::Embedder>
+        });
+
+        let context = Arc::new(ProgressiveTwoTierContext {
+            index,
+            fast_embedder,
+            quality_embedder,
+        });
+        state.progressive_context = Some(Arc::clone(&context));
+        Ok(Some(context))
+    }
+
+    fn load_embedder_for_progressive_id(
+        &self,
+        state: &SemanticSearchState,
+        embedder_id: &str,
+        dimension: usize,
+    ) -> Result<Arc<dyn Embedder>> {
+        if state.embedder.id() == embedder_id {
+            return Ok(Arc::clone(&state.embedder));
+        }
+
+        if let Some(dim) = embedder_id.strip_prefix("fnv1a-")
+            && let Ok(parsed) = dim.parse::<usize>()
+        {
+            return Ok(Arc::new(crate::search::hash_embedder::HashEmbedder::new(
+                parsed.max(dimension),
+            )));
+        }
+
+        if embedder_id == crate::search::fastembed_embedder::FastEmbedder::embedder_id_static() {
+            let data_dir = self
+                .sqlite_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .ok_or_else(|| anyhow!("cannot resolve data dir for progressive embedder load"))?;
+            let model_dir =
+                crate::search::fastembed_embedder::FastEmbedder::default_model_dir(data_dir);
+            let embedder =
+                crate::search::fastembed_embedder::FastEmbedder::load_from_dir(&model_dir)
+                    .with_context(|| {
+                        format!("loading FastEmbed model from {}", model_dir.display())
+                    })?;
+            if embedder.dimension() != dimension {
+                bail!(
+                    "progressive embedder dimension mismatch: {} index expects {}, model has {}",
+                    embedder_id,
+                    dimension,
+                    embedder.dimension()
+                );
+            }
+            return Ok(Arc::new(embedder));
+        }
+
+        bail!("unsupported progressive embedder id: {embedder_id}");
+    }
+
+    fn resolve_semantic_doc_ids_for_hits(
+        &self,
+        hits: &[SearchHit],
+    ) -> Result<Vec<Option<ResolvedSemanticDocId>>> {
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let lookup_keys: Vec<Option<ProgressiveLookupKey>> = hits
+            .iter()
+            .map(|hit| {
+                let idx = hit
+                    .line_number
+                    .and_then(|line| line.checked_sub(1))
+                    .map(i64::try_from)
+                    .transpose()
+                    .ok()
+                    .flatten()?;
+                Some((hit.source_id.clone(), hit.source_path.clone(), idx))
+            })
+            .collect();
+
+        let unique_keys: Vec<ProgressiveLookupKey> = {
+            let mut seen = HashSet::new();
+            let mut keys = Vec::new();
+            for key in lookup_keys.iter().flatten() {
+                if seen.insert(key.clone()) {
+                    keys.push(key.clone());
+                }
+            }
+            keys
+        };
+
+        if unique_keys.is_empty() {
+            return Ok(vec![None; hits.len()]);
+        }
+
+        let sqlite_guard = self.sqlite_guard()?;
+        let conn = sqlite_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("progressive search requires database connection"))?;
+
+        let mut resolved_by_key = HashMap::new();
+
+        // SQLite has a maximum parameter limit (usually 999). Each key uses 3 params.
+        // Chunk to avoid hitting this limit.
+        const CHUNK_SIZE: usize = 300;
+        for chunk in unique_keys.chunks(CHUNK_SIZE) {
+            let mut sql = String::from(
+                "SELECT c.source_id, c.source_path, m.idx, m.id, c.agent_id, c.workspace_id, m.role, m.created_at, m.content
+                 FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 WHERE ",
+            );
+            let mut params = Vec::with_capacity(chunk.len().saturating_mul(3));
+            for (idx, (source_id, source_path, line_idx)) in chunk.iter().enumerate() {
+                if idx > 0 {
+                    sql.push_str(" OR ");
+                }
+                sql.push_str("(c.source_id = ? AND c.source_path = ? AND m.idx = ?)");
+                params.push(ParamValue::from(source_id.clone()));
+                params.push(ParamValue::from(source_path.clone()));
+                params.push(ParamValue::from(*line_idx));
+            }
+
+            let chunk_rows: Vec<ResolvedSemanticLookupRow> =
+                conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                    let source_id: String = row.get_typed(0)?;
+                    let source_path: String = row.get_typed(1)?;
+                    let idx: i64 = row.get_typed(2)?;
+                    let message_id_raw: i64 = row.get_typed(3)?;
+                    let agent_id_raw: i64 = row.get_typed(4)?;
+                    let workspace_id_raw: Option<i64> = row.get_typed(5)?;
+                    let role_raw: String = row.get_typed(6)?;
+                    let created_at_ms: Option<i64> = row.get_typed(7)?;
+                    let content: String = row.get_typed(8)?;
+
+                    let canonical = canonicalize_for_embedding(&content);
+                    if canonical.is_empty() {
+                        return Ok(None);
+                    }
+
+                    let message_id = u64::try_from(message_id_raw).map_err(|_| {
+                        std::io::Error::other("message id out of range for progressive doc_id")
+                    })?;
+                    let agent_id = if agent_id_raw < 0 {
+                        0
+                    } else {
+                        u32::try_from(agent_id_raw).unwrap_or(u32::MAX)
+                    };
+                    let workspace_id = if workspace_id_raw.unwrap_or(0) < 0 {
+                        0
+                    } else {
+                        u32::try_from(workspace_id_raw.unwrap_or(0)).unwrap_or(u32::MAX)
+                    };
+                    let role = role_code_from_str(&role_raw).unwrap_or(ROLE_USER);
+                    let doc_id = SemanticDocId {
+                        message_id,
+                        chunk_idx: 0,
+                        agent_id,
+                        workspace_id,
+                        source_id: crc32fast::hash(source_id.as_bytes()),
+                        role,
+                        created_at_ms: created_at_ms.unwrap_or(0),
+                        content_hash: Some(content_hash(&canonical)),
+                    }
+                    .to_doc_id_string();
+
+                    Ok(Some((
+                        (source_id, source_path, idx),
+                        ResolvedSemanticDocId { message_id, doc_id },
+                    )))
+                })?;
+
+            for row in chunk_rows.into_iter().flatten() {
+                resolved_by_key.insert(row.0, row.1);
+            }
+        }
+
+        Ok(lookup_keys
+            .into_iter()
+            .map(|key| key.and_then(|lookup| resolved_by_key.get(&lookup).cloned()))
+            .collect())
+    }
+
+    fn load_message_text_by_id(&self, message_id: u64) -> Result<Option<String>> {
+        let sqlite_guard = self.sqlite_guard()?;
+        let conn = sqlite_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("progressive search requires database connection"))?;
+        let rows: Vec<String> = conn.query_map_collect(
+            "SELECT content FROM messages WHERE id = ?",
+            &[ParamValue::from(i64::try_from(message_id)?)],
+            |row: &frankensqlite::Row| row.get_typed(0),
+        )?;
+        Ok(rows.into_iter().next())
+    }
+
+    fn collapse_progressive_scored_results(
+        &self,
+        results: &[FsScoredResult],
+        fetch_limit: usize,
+    ) -> Vec<VectorSearchResult> {
+        let fetch = fetch_limit.max(1);
+        let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+        for hit in results {
+            let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                continue;
+            };
+            best_by_message
+                .entry(parsed.message_id)
+                .and_modify(|entry| {
+                    if hit.score > entry.score {
+                        entry.score = hit.score;
+                        entry.chunk_idx = parsed.chunk_idx;
+                    }
+                })
+                .or_insert(VectorSearchResult {
+                    message_id: parsed.message_id,
+                    chunk_idx: parsed.chunk_idx,
+                    score: hit.score,
+                });
+        }
+        let mut collapsed: Vec<VectorSearchResult> = best_by_message.into_values().collect();
+        collapsed.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        if collapsed.len() > fetch {
+            collapsed.truncate(fetch);
+        }
+        collapsed
+    }
+
+    fn hydrate_semantic_hits_with_ids(
         &self,
         results: &[VectorSearchResult],
         field_mask: FieldMask,
-    ) -> Result<Vec<SearchHit>> {
+    ) -> Result<Vec<(u64, SearchHit)>> {
         if results.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self
-            .sqlite
+        let sqlite_guard = self.sqlite_guard()?;
+        let conn = sqlite_guard
             .as_ref()
             .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
 
-        let mut placeholders = String::new();
-        let mut params: Vec<i64> = Vec::with_capacity(results.len());
+        let placeholder_capacity = results.len().saturating_mul(2).saturating_sub(1);
+        let mut placeholders = String::with_capacity(placeholder_capacity);
+        let mut params: Vec<ParamValue> = Vec::with_capacity(results.len());
         for (idx, result) in results.iter().enumerate() {
             if idx > 0 {
                 placeholders.push(',');
             }
             placeholders.push('?');
-            params.push(i64::try_from(result.message_id)?);
+            params.push(ParamValue::from(i64::try_from(result.message_id)?));
         }
 
         let content_expr = if field_mask.needs_content() {
@@ -2183,7 +2968,7 @@ impl SearchClient {
             "''"
         };
         let sql = format!(
-            "SELECT m.id, {content_expr}, m.created_at, m.idx, m.role, {title_expr}, c.source_path, c.source_id, c.origin_host, a.slug, w.path, COALESCE(s.kind, 'local')
+            "SELECT m.id, {content_expr}, m.created_at, m.idx, m.role, {title_expr}, c.source_path, c.source_id, c.origin_host, a.slug, w.path, COALESCE(s.kind, 'local'), c.started_at
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              JOIN agents a ON c.agent_id = a.id
@@ -2192,33 +2977,41 @@ impl SearchClient {
              WHERE m.id IN ({placeholders})"
         );
 
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(params.iter()),
-            |row: &rusqlite::Row| -> rusqlite::Result<(u64, SearchHit)> {
-                let message_id: i64 = row.get(0)?;
-                let content: String = row.get(1)?;
-                let created_at: Option<i64> = row.get(2)?;
-                let idx: Option<i64> = row.get(3)?;
+        let rows: Vec<(u64, SearchHit)> =
+            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                let message_id: i64 = row.get_typed(0)?;
+                let content: String = row.get_typed(1)?;
+                let msg_created_at: Option<i64> = row.get_typed(2)?;
+                let idx: Option<i64> = row.get_typed(3)?;
                 let title: Option<String> = if field_mask.wants_title() {
-                    row.get(5)?
+                    row.get_typed(5)?
                 } else {
                     None
                 };
-                let source_path: String = row.get(6)?;
-                let source_id: Option<String> = row.get(7)?;
-                let origin_host: Option<String> = row.get(8)?;
-                let agent: String = row.get(9)?;
-                let workspace: Option<String> = row.get(10)?;
-                let origin_kind: String = row.get(11)?;
+                let source_path: String = row.get_typed(6)?;
+                let source_id: Option<String> = row.get_typed(7)?;
+                let origin_host: Option<String> = row.get_typed(8)?;
+                let agent: String = row.get_typed(9)?;
+                let workspace: Option<String> = row.get_typed(10)?;
+                let origin_kind: String = row.get_typed(11)?;
+                let started_at: Option<i64> = row.get_typed(12)?;
 
-                let line_number = idx.map(|i| (i + 1) as usize);
+                let created_at = msg_created_at.or(started_at);
+                let line_number = idx
+                    .and_then(|i| usize::try_from(i).ok())
+                    .map(|i| i.saturating_add(1));
                 let snippet = if field_mask.wants_snippet() {
                     snippet_from_content(&content)
                 } else {
                     String::new()
                 };
-                let content_hash = stable_hit_hash(&content, &source_path, line_number, created_at);
+                let hash_basis = if content.is_empty() {
+                    snippet.as_str()
+                } else {
+                    content.as_str()
+                };
+                let content_hash =
+                    stable_hit_hash(hash_basis, &source_path, line_number, created_at);
 
                 let hit = SearchHit {
                     title: if field_mask.wants_title() {
@@ -2243,12 +3036,10 @@ impl SearchClient {
                 };
 
                 Ok((message_id as u64, hit))
-            },
-        )?;
+            })?;
 
         let mut hits_by_id = HashMap::new();
-        for row in rows {
-            let (id, hit) = row?;
+        for (id, hit) in rows {
             hits_by_id.insert(id, hit);
         }
 
@@ -2256,11 +3047,610 @@ impl SearchClient {
         for result in results {
             if let Some(mut hit) = hits_by_id.remove(&result.message_id) {
                 hit.score = result.score;
-                ordered.push(hit);
+                ordered.push((result.message_id, hit));
             }
         }
 
         Ok(ordered)
+    }
+
+    fn overlay_progressive_lexical_hit(
+        &self,
+        hit: &mut SearchHit,
+        lexical: &ProgressiveLexicalHit,
+        field_mask: FieldMask,
+    ) {
+        if field_mask.wants_title() && !lexical.title.is_empty() {
+            hit.title = lexical.title.clone();
+        }
+        if field_mask.wants_snippet() && !lexical.snippet.is_empty() {
+            hit.snippet = lexical.snippet.clone();
+        }
+        if field_mask.needs_content() && !lexical.content.is_empty() {
+            hit.content = lexical.content.clone();
+        }
+        hit.match_type = lexical.match_type;
+        hit.line_number = lexical.line_number.or(hit.line_number);
+    }
+
+    fn progressive_phase_to_result(
+        &self,
+        results: &[FsScoredResult],
+        filters: &SearchFilters,
+        field_mask: FieldMask,
+        lexical_cache: Option<&ProgressiveLexicalCache>,
+        limit: usize,
+        fetch_limit: usize,
+    ) -> Result<SearchResult> {
+        let collapsed = self.collapse_progressive_scored_results(results, fetch_limit);
+        let missing: Vec<VectorSearchResult> = collapsed
+            .iter()
+            .filter(|result| {
+                lexical_cache
+                    .and_then(|cache| cache.hits_by_message.get(&result.message_id))
+                    .is_none()
+            })
+            .map(|result| VectorSearchResult {
+                message_id: result.message_id,
+                chunk_idx: result.chunk_idx,
+                score: result.score,
+            })
+            .collect();
+        let mut hydrated_by_id: HashMap<u64, SearchHit> = self
+            .hydrate_semantic_hits_with_ids(&missing, field_mask)?
+            .into_iter()
+            .collect();
+
+        let mut hydrated: Vec<(u64, SearchHit)> = Vec::with_capacity(collapsed.len());
+        for result in &collapsed {
+            if let Some(cache) = lexical_cache
+                && let Some(lexical) = cache.hits_by_message.get(&result.message_id)
+            {
+                hydrated.push((result.message_id, lexical.to_search_hit(result.score)));
+                continue;
+            }
+            if let Some(mut hit) = hydrated_by_id.remove(&result.message_id) {
+                if let Some(cache) = lexical_cache
+                    && let Some(lexical) = cache.hits_by_message.get(&result.message_id)
+                {
+                    self.overlay_progressive_lexical_hit(&mut hit, lexical, field_mask);
+                }
+                hydrated.push((result.message_id, hit));
+            }
+        }
+
+        let mut hits: Vec<SearchHit> = hydrated.into_iter().map(|(_, hit)| hit).collect();
+        (_, hits) = self.postprocess_hits_page(hits, filters, limit, 0);
+
+        let (wildcard_fallback, suggestions) = lexical_cache
+            .map(|cache| {
+                let suggestions = if hits.is_empty() {
+                    cache.suggestions.clone()
+                } else {
+                    Vec::new()
+                };
+                (cache.wildcard_fallback, suggestions)
+            })
+            .unwrap_or((false, Vec::new()));
+
+        Ok(SearchResult {
+            hits,
+            wildcard_fallback,
+            cache_stats: self.cache_stats(),
+            suggestions,
+            ann_stats: None,
+        })
+    }
+
+    pub(crate) async fn search_progressive_with_callback(
+        self: &Arc<Self>,
+        request: ProgressiveSearchRequest<'_>,
+        mut on_event: impl FnMut(ProgressiveSearchEvent) + Send,
+    ) -> Result<()> {
+        let ProgressiveSearchRequest {
+            cx,
+            query,
+            filters,
+            limit,
+            sparse_threshold,
+            field_mask,
+            mode,
+        } = request;
+        let field_mask = effective_field_mask(field_mask);
+        let limit = limit.max(1);
+        let fetch_limit = progressive_phase_fetch_limit(limit);
+
+        match mode {
+            SearchMode::Lexical => {
+                let started = Instant::now();
+                let result = self.search_with_fallback(
+                    query,
+                    filters,
+                    limit,
+                    0,
+                    sparse_threshold,
+                    field_mask,
+                )?;
+                on_event(ProgressiveSearchEvent::Phase {
+                    kind: ProgressivePhaseKind::Initial,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    result,
+                });
+                return Ok(());
+            }
+            SearchMode::Semantic | SearchMode::Hybrid => {}
+        }
+
+        let progressive_context = {
+            let mut guard = self
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?;
+            let state = guard.as_mut().ok_or_else(|| {
+                anyhow!("semantic search unavailable (no embedder or vector index)")
+            })?;
+            self.load_progressive_context(state)?
+                .ok_or_else(|| anyhow!("progressive two-tier context unavailable"))?
+        };
+
+        let lexical_cache: Arc<Mutex<ProgressiveLexicalSnapshot>> =
+            Arc::new(Mutex::new(Arc::new(ProgressiveLexicalCache::default())));
+        let text_cache: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let text_client = Arc::clone(self);
+        let text_cache_for_lookup = Arc::clone(&text_cache);
+        let text_fn = move |doc_id: &str| -> Option<String> {
+            let parsed = parse_semantic_doc_id(doc_id)?;
+            if let Ok(cache) = text_cache_for_lookup.lock()
+                && let Some(text) = cache.get(&parsed.message_id)
+            {
+                return Some(text.clone());
+            }
+            let loaded = text_client
+                .load_message_text_by_id(parsed.message_id)
+                .ok()
+                .flatten()?;
+            if let Ok(mut cache) = text_cache_for_lookup.lock() {
+                cache.insert(parsed.message_id, loaded.clone());
+            }
+            Some(loaded)
+        };
+
+        let mut searcher = FsTwoTierSearcher::new(
+            Arc::clone(&progressive_context.index),
+            Arc::clone(&progressive_context.fast_embedder),
+            frankensearch_two_tier_config(),
+        );
+
+        if let Some(quality_embedder) = progressive_context.quality_embedder.as_ref() {
+            searcher = searcher.with_quality_embedder(Arc::clone(quality_embedder));
+        }
+
+        if matches!(mode, SearchMode::Hybrid) {
+            let lexical = Arc::new(CassProgressiveLexicalAdapter::new(
+                Arc::clone(self),
+                filters.clone(),
+                field_mask,
+                sparse_threshold,
+                Arc::clone(&lexical_cache),
+            ));
+            searcher = searcher.with_lexical(lexical);
+        }
+
+        let phase_client = Arc::clone(self);
+        let phase_filters = filters.clone();
+        let phase_cache = Arc::clone(&lexical_cache);
+        let mut phase_error: Option<anyhow::Error> = None;
+
+        let search_result = searcher
+            .search(cx, query, fetch_limit, text_fn, |phase| {
+                if phase_error.is_some() {
+                    return;
+                }
+                let lexical_snapshot = phase_cache.lock().ok().map(|guard| Arc::clone(&guard));
+                let event_result = match phase {
+                    FsSearchPhase::Initial {
+                        results, latency, ..
+                    } => phase_client
+                        .progressive_phase_to_result(
+                            &results,
+                            &phase_filters,
+                            field_mask,
+                            lexical_snapshot.as_deref(),
+                            limit,
+                            fetch_limit,
+                        )
+                        .map(|result| ProgressiveSearchEvent::Phase {
+                            kind: ProgressivePhaseKind::Initial,
+                            elapsed_ms: latency.as_millis(),
+                            result,
+                        }),
+                    FsSearchPhase::Refined {
+                        results, latency, ..
+                    } => phase_client
+                        .progressive_phase_to_result(
+                            &results,
+                            &phase_filters,
+                            field_mask,
+                            lexical_snapshot.as_deref(),
+                            limit,
+                            fetch_limit,
+                        )
+                        .map(|result| ProgressiveSearchEvent::Phase {
+                            kind: ProgressivePhaseKind::Refined,
+                            elapsed_ms: latency.as_millis(),
+                            result,
+                        }),
+                    FsSearchPhase::RefinementFailed { error, latency, .. } => {
+                        Ok(ProgressiveSearchEvent::RefinementFailed {
+                            latency_ms: latency.as_millis(),
+                            error: error.to_string(),
+                        })
+                    }
+                };
+
+                match event_result {
+                    Ok(event) => on_event(event),
+                    Err(err) => {
+                        phase_error = Some(err);
+                        cx.set_cancel_requested(true);
+                    }
+                }
+            })
+            .await;
+
+        if let Some(err) = phase_error {
+            return Err(err);
+        }
+
+        search_result
+            .map(|_| ())
+            .map_err(|err| anyhow!("progressive search failed: {err}"))
+    }
+
+    /// Semantic search result containing hits and optional ANN statistics.
+    pub fn search_semantic(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+        approximate: bool,
+    ) -> Result<(
+        Vec<SearchHit>,
+        Option<crate::search::ann_index::AnnSearchStats>,
+    )> {
+        self.search_semantic_with_tier(
+            query,
+            filters,
+            limit,
+            offset,
+            field_mask,
+            approximate,
+            SemanticTierMode::Single,
+        )
+    }
+
+    /// Semantic search with optional progressive two-tier execution strategy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_semantic_with_tier(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+        approximate: bool,
+        tier_mode: SemanticTierMode,
+    ) -> Result<(
+        Vec<SearchHit>,
+        Option<crate::search::ann_index::AnnSearchStats>,
+    )> {
+        let field_mask = effective_field_mask(field_mask);
+        let canonical = canonicalize_for_embedding(query);
+        if canonical.trim().is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        let mut guard = self
+            .semantic
+            .lock()
+            .map_err(|_| anyhow!("semantic lock poisoned"))?;
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("semantic search unavailable (no embedder or vector index)"))?;
+
+        let embedding = state
+            .query_cache
+            .get_or_embed(state.embedder.as_ref(), &canonical)?;
+        let mut semantic_filter =
+            SemanticFilter::from_search_filters(&filters, &state.filter_maps)?;
+        if let Some(roles) = state.roles.clone() {
+            semantic_filter = semantic_filter.with_roles(Some(roles));
+        }
+
+        let limit = if limit == 0 {
+            self.total_docs().max(1)
+        } else {
+            limit
+        };
+        let target_hits = limit.saturating_add(offset);
+        if target_hits == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let initial_fetch_limit = target_hits;
+        let fallback_fetch_limit = target_hits.saturating_mul(3);
+
+        let collapse = |best_by_message: HashMap<u64, VectorSearchResult>, fetch_limit: usize| {
+            let mut collapsed: Vec<VectorSearchResult> = best_by_message.into_values().collect();
+            collapsed.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| a.message_id.cmp(&b.message_id))
+            });
+            if collapsed.len() > fetch_limit {
+                collapsed.truncate(fetch_limit);
+            }
+            collapsed
+        };
+
+        let mut search_candidates = |fetch_limit: usize| -> Result<(
+            Vec<VectorSearchResult>,
+            bool,
+            Option<crate::search::ann_index::AnnSearchStats>,
+        )> {
+            if tier_mode.wants_two_tier() && !approximate {
+                let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
+                if let Some(two_tier_index) = state.load_in_memory_two_tier_index(tier_mode) {
+                    let config = tier_mode.to_frankensearch_config();
+                    let searcher = FsSyncTwoTierSearcher::new(two_tier_index, config);
+                    let (tier_hits, metrics) = searcher
+                        .search_collect_with_filter(&embedding, fetch_limit, fs_filter)
+                        .map_err(|err| {
+                            anyhow!("frankensearch two-tier semantic search failed: {err}")
+                        })?;
+
+                    tracing::debug!(
+                        tier_mode = ?tier_mode,
+                        phase1_ms = metrics.phase1_total_ms,
+                        phase2_ms = metrics.phase2_total_ms,
+                        skip_reason = ?metrics.skip_reason,
+                        returned = tier_hits.len(),
+                        "semantic two-tier search executed"
+                    );
+
+                    let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+                    for hit in tier_hits.iter() {
+                        let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                            continue;
+                        };
+                        best_by_message
+                            .entry(parsed.message_id)
+                            .and_modify(|entry| {
+                                if hit.score > entry.score {
+                                    entry.score = hit.score;
+                                    entry.chunk_idx = parsed.chunk_idx;
+                                }
+                            })
+                            .or_insert(VectorSearchResult {
+                                message_id: parsed.message_id,
+                                chunk_idx: parsed.chunk_idx,
+                                score: hit.score,
+                            });
+                    }
+
+                    return Ok((
+                        collapse(best_by_message, fetch_limit),
+                        tier_hits.len() >= fetch_limit,
+                        None,
+                    ));
+                }
+
+                tracing::debug!(
+                    tier_mode = ?tier_mode,
+                    "two-tier semantic unavailable; falling back to exact single-tier search"
+                );
+
+                let fs_index = &state.fs_semantic_index;
+                let fs_hits = fs_index
+                    .search_top_k(&embedding, fetch_limit, fs_filter)
+                    .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
+
+                let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+                for hit in fs_hits.iter() {
+                    let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                        continue;
+                    };
+                    best_by_message
+                        .entry(parsed.message_id)
+                        .and_modify(|entry| {
+                            if hit.score > entry.score {
+                                entry.score = hit.score;
+                                entry.chunk_idx = parsed.chunk_idx;
+                            }
+                        })
+                        .or_insert(VectorSearchResult {
+                            message_id: parsed.message_id,
+                            chunk_idx: parsed.chunk_idx,
+                            score: hit.score,
+                        });
+                }
+
+                return Ok((
+                    collapse(best_by_message, fetch_limit),
+                    fs_hits.len() >= fetch_limit,
+                    None,
+                ));
+            }
+
+            if approximate {
+                if tier_mode.wants_two_tier() {
+                    tracing::debug!(
+                        tier_mode = ?tier_mode,
+                        "approximate search requested; bypassing two-tier mode"
+                    );
+                }
+                let fs_index = &state.fs_semantic_index;
+
+                if state.fs_ann_index.is_none() {
+                    let ann_path = state.ann_path.as_ref().ok_or_else(|| {
+                        anyhow!(
+                            "approximate search unavailable: HNSW index missing (run 'cass index --semantic --build-hnsw')"
+                        )
+                    })?;
+                    let ann = open_fs_semantic_ann_index(fs_index, ann_path)?;
+                    state.fs_ann_index = Some(ann);
+                }
+
+                let ann = state
+                    .fs_ann_index
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("HNSW index failed to initialize"))?;
+                let candidate = fetch_limit
+                    .saturating_mul(ANN_CANDIDATE_MULTIPLIER)
+                    .max(fetch_limit);
+                let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
+                let (ann_results, search_stats) = ann
+                    .knn_search_with_stats(&embedding, candidate, ef)
+                    .map_err(|err| anyhow!("frankensearch approximate search failed: {err}"))?;
+                let ann_stats = Some(crate::search::ann_index::AnnSearchStats {
+                    index_size: search_stats.index_size,
+                    dimension: search_stats.dimension,
+                    ef_search: search_stats.ef_search,
+                    k_requested: search_stats.k_requested,
+                    k_returned: search_stats.k_returned,
+                    search_time_us: search_stats.search_time_us,
+                    estimated_recall: search_stats.estimated_recall as f32,
+                    is_approximate: search_stats.is_approximate,
+                });
+
+                let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
+
+                let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+                for hit in ann_results.iter() {
+                    if let Some(filter) = fs_filter
+                        && !filter.matches(&hit.doc_id, None)
+                    {
+                        continue;
+                    }
+                    let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                        continue;
+                    };
+                    best_by_message
+                        .entry(parsed.message_id)
+                        .and_modify(|entry| {
+                            if hit.score > entry.score {
+                                entry.score = hit.score;
+                                entry.chunk_idx = parsed.chunk_idx;
+                            }
+                        })
+                        .or_insert(VectorSearchResult {
+                            message_id: parsed.message_id,
+                            chunk_idx: parsed.chunk_idx,
+                            score: hit.score,
+                        });
+                }
+
+                return Ok((
+                    collapse(best_by_message, fetch_limit),
+                    ann_results.len() >= candidate,
+                    ann_stats,
+                ));
+            }
+
+            let fs_index = &state.fs_semantic_index;
+            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
+            let fs_hits = fs_index
+                .search_top_k(&embedding, fetch_limit, fs_filter)
+                .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
+
+            let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+            for hit in fs_hits.iter() {
+                let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                    continue;
+                };
+                best_by_message
+                    .entry(parsed.message_id)
+                    .and_modify(|entry| {
+                        if hit.score > entry.score {
+                            entry.score = hit.score;
+                            entry.chunk_idx = parsed.chunk_idx;
+                        }
+                    })
+                    .or_insert(VectorSearchResult {
+                        message_id: parsed.message_id,
+                        chunk_idx: parsed.chunk_idx,
+                        score: hit.score,
+                    });
+            }
+
+            Ok((
+                collapse(best_by_message, fetch_limit),
+                fs_hits.len() >= fetch_limit,
+                None,
+            ))
+        };
+
+        let finalize_hits = |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
+            let hits = self.hydrate_semantic_hits(results, field_mask)?;
+            Ok(self.postprocess_hits_page(hits, &filters, limit, offset))
+        };
+
+        let (results, search_was_truncated, mut ann_stats) =
+            search_candidates(initial_fetch_limit)?;
+        let (mut available_hits, mut paged_hits) = finalize_hits(&results)?;
+
+        let needs_retry = available_hits < target_hits
+            && search_was_truncated
+            && initial_fetch_limit < fallback_fetch_limit;
+
+        if needs_retry {
+            tracing::debug!(
+                query = canonical,
+                target_hits,
+                available_hits,
+                initial_fetch_limit,
+                fallback_fetch_limit,
+                "retrying semantic fetch due to post-filter shortfall"
+            );
+            let (retry_results, _, retry_ann_stats) = search_candidates(fallback_fetch_limit)?;
+            (available_hits, paged_hits) = finalize_hits(&retry_results)?;
+            ann_stats = retry_ann_stats;
+        }
+
+        tracing::trace!(
+            query = canonical,
+            target_hits,
+            available_hits,
+            returned = paged_hits.len(),
+            "semantic fetch complete"
+        );
+
+        Ok((paged_hits, ann_stats))
+    }
+
+    fn hydrate_semantic_hits(
+        &self,
+        results: &[VectorSearchResult],
+        field_mask: FieldMask,
+    ) -> Result<Vec<SearchHit>> {
+        self.hydrate_semantic_hits_with_ids(results, field_mask)
+            .map(|rows| rows.into_iter().map(|(_, hit)| hit).collect())
+    }
+
+    fn postprocess_hits_page(
+        &self,
+        hits: Vec<SearchHit>,
+        filters: &SearchFilters,
+        limit: usize,
+        offset: usize,
+    ) -> (usize, Vec<SearchHit>) {
+        let mut hits = deduplicate_hits(hits);
+        if !filters.session_paths.is_empty() {
+            hits.retain(|hit| filters.session_paths.contains(&hit.source_path));
+        }
+        let available_hits = hits.len();
+        let paged_hits = hits.into_iter().skip(offset).take(limit).collect();
+        (available_hits, paged_hits)
     }
 
     /// Search with automatic wildcard fallback for sparse results.
@@ -2281,7 +3671,7 @@ impl SearchClient {
 
         // Check if we should try wildcard fallback
         let query_has_wildcards = query.contains('*');
-        let has_boolean_or_phrase = has_boolean_operators(query);
+        let has_boolean_or_phrase = fs_cass_has_boolean_operators(query);
         let is_sparse = hits.len() < sparse_threshold && offset == 0;
 
         if !is_sparse || query_has_wildcards || has_boolean_or_phrase || query.trim().is_empty() {
@@ -2298,6 +3688,7 @@ impl SearchClient {
                 wildcard_fallback: false,
                 cache_stats: baseline_stats,
                 suggestions,
+                ann_stats: None,
             });
         }
 
@@ -2336,6 +3727,7 @@ impl SearchClient {
                 wildcard_fallback: true,
                 cache_stats: fallback_stats,
                 suggestions,
+                ann_stats: None,
             })
         } else {
             // Keep original results even if sparse
@@ -2350,6 +3742,7 @@ impl SearchClient {
                 wildcard_fallback: false,
                 cache_stats: baseline_stats,
                 suggestions,
+                ann_stats: None,
             })
         }
     }
@@ -2365,7 +3758,43 @@ impl SearchClient {
         offset: usize,
         sparse_threshold: usize,
         field_mask: FieldMask,
+        approximate: bool,
     ) -> Result<SearchResult> {
+        self.search_hybrid_with_tier(
+            lexical_query,
+            semantic_query,
+            filters,
+            limit,
+            offset,
+            sparse_threshold,
+            field_mask,
+            approximate,
+            SemanticTierMode::Single,
+        )
+    }
+
+    /// Hybrid search that fuses lexical + semantic results with optional
+    /// progressive two-tier semantic execution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_hybrid_with_tier(
+        &self,
+        lexical_query: &str,
+        semantic_query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        sparse_threshold: usize,
+        field_mask: FieldMask,
+        approximate: bool,
+        semantic_tier_mode: SemanticTierMode,
+    ) -> Result<SearchResult> {
+        let requested_limit = limit;
+        let total_docs = self.total_docs().max(1);
+        let limit = if requested_limit == 0 {
+            total_docs
+        } else {
+            requested_limit
+        };
         let fetch = limit.saturating_add(offset);
         if fetch == 0 {
             return Ok(SearchResult {
@@ -2373,6 +3802,7 @@ impl SearchClient {
                 wildcard_fallback: false,
                 cache_stats: self.cache_stats(),
                 suggestions: Vec::new(),
+                ann_stats: None,
             });
         }
 
@@ -2387,17 +3817,26 @@ impl SearchClient {
             );
         }
 
-        let candidate = fetch.saturating_mul(HYBRID_CANDIDATE_MULTIPLIER);
+        let budget =
+            hybrid_candidate_budget(semantic_query, requested_limit, limit, offset, total_docs);
         let lexical = self.search_with_fallback(
             lexical_query,
             filters.clone(),
-            candidate,
+            budget.lexical_candidates,
             0,
             sparse_threshold,
             field_mask,
         )?;
-        let semantic = self.search_semantic(semantic_query, filters, candidate, 0, field_mask)?;
-        let fused = rrf_fuse_hits(&lexical.hits, &semantic, limit, offset);
+        let (semantic_hits, semantic_ann_stats) = self.search_semantic_with_tier(
+            semantic_query,
+            filters,
+            budget.semantic_candidates,
+            0,
+            field_mask,
+            approximate,
+            semantic_tier_mode,
+        )?;
+        let fused = rrf_fuse_hits(&lexical.hits, &semantic_hits, limit, offset);
         let suggestions = if fused.is_empty() {
             lexical.suggestions.clone()
         } else {
@@ -2408,6 +3847,7 @@ impl SearchClient {
             wildcard_fallback: lexical.wildcard_fallback,
             cache_stats: lexical.cache_stats,
             suggestions,
+            ann_stats: semantic_ann_stats,
         })
     }
 
@@ -2455,12 +3895,20 @@ impl SearchClient {
 
         // 4. Suggest alternative agents if we have SQLite connection and no agent filter
         if filters.agents.is_empty()
-            && let Some(ref conn) = self.sqlite
-            && let Ok(mut stmt) = conn
-                .prepare("SELECT DISTINCT agent_slug FROM conversations ORDER BY id DESC LIMIT 3")
-            && let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0))
+            && let Ok(sqlite_guard) = self.sqlite_guard()
+            && let Some(conn) = sqlite_guard.as_ref()
+            && let Ok(rows) = conn.query_map_collect(
+                "SELECT a.slug
+                 FROM conversations c
+                 JOIN agents a ON c.agent_id = a.id
+                 GROUP BY a.slug
+                 ORDER BY MAX(c.id) DESC
+                 LIMIT 3",
+                &[],
+                |row: &frankensqlite::Row| row.get_typed::<String>(0),
+            )
         {
-            for row in rows.flatten() {
+            for row in rows {
                 if suggestions.len() < 3 {
                     suggestions.push(
                         QuerySuggestion::try_agent(&row)
@@ -2515,7 +3963,7 @@ impl SearchClient {
     fn search_tantivy(
         &self,
         reader: &IndexReader,
-        fields: &crate::search::tantivy::Fields,
+        fields: &FsCassFields,
         raw_query: &str,
         sanitized_query: &str,
         filters: SearchFilters,
@@ -2528,140 +3976,50 @@ impl SearchClient {
         self.track_generation(searcher.generation().generation_id());
 
         let needs_content = field_mask.needs_content() || field_mask.wants_snippet();
-        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
-        // Parse query with boolean operator support (AND, OR, NOT, "phrases").
-        // Use the raw query so "-" and quotes are preserved for parsing, but
-        // normalize terms before building Tantivy clauses.
-        let tokens = parse_boolean_query(raw_query);
-        if tokens.is_empty() {
-            clauses.push((Occur::Must, Box::new(AllQuery)));
-        } else if has_boolean_operators(raw_query) {
-            // Use boolean query builder for complex queries
-            let bool_clauses = build_boolean_query_clauses(&tokens, fields);
-            clauses.extend(bool_clauses);
-        } else {
-            // Simple query: treat each term as MUST (implicit AND)
-            for token in tokens {
-                if let QueryToken::Term(term_str) = token {
-                    let parts = normalize_term_parts(&term_str);
-                    if let Some(term_query) = build_compound_term_query(&parts, fields) {
-                        clauses.push((Occur::Must, term_query));
-                    }
-                }
-            }
-        }
-
-        if !filters.agents.is_empty() {
-            let terms = filters
-                .agents
-                .into_iter()
-                .map(|agent| {
-                    (
-                        Occur::Should,
-                        Box::new(TermQuery::new(
-                            Term::from_field_text(fields.agent, &agent),
-                            IndexRecordOption::Basic,
-                        )) as Box<dyn Query>,
-                    )
-                })
-                .collect();
-            clauses.push((Occur::Must, Box::new(BooleanQuery::new(terms))));
-        }
-
-        if !filters.workspaces.is_empty() {
-            let terms = filters
-                .workspaces
-                .into_iter()
-                .map(|ws| {
-                    (
-                        Occur::Should,
-                        Box::new(TermQuery::new(
-                            Term::from_field_text(fields.workspace, &ws),
-                            IndexRecordOption::Basic,
-                        )) as Box<dyn Query>,
-                    )
-                })
-                .collect();
-            clauses.push((Occur::Must, Box::new(BooleanQuery::new(terms))));
-        }
-
-        if filters.created_from.is_some() || filters.created_to.is_some() {
-            use std::ops::Bound::{Included, Unbounded};
-            let lower = filters.created_from.map_or(Unbounded, |v| {
-                Included(Term::from_field_i64(fields.created_at, v))
-            });
-            let upper = filters.created_to.map_or(Unbounded, |v| {
-                Included(Term::from_field_i64(fields.created_at, v))
-            });
-            let range = RangeQuery::new(lower, upper);
-            clauses.push((Occur::Must, Box::new(range)));
-        }
-
-        // Source filter (P3.1)
-        match &filters.source_filter {
-            SourceFilter::All => {
-                // No filtering needed
-            }
-            SourceFilter::Local => {
-                // Filter to local sources only (origin_kind == "local")
-                let term = Term::from_field_text(fields.origin_kind, "local");
-                clauses.push((
-                    Occur::Must,
-                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
-                ));
-            }
-            SourceFilter::Remote => {
-                // Filter to remote sources only (origin_kind == "ssh")
-                // We use "ssh" since that's the only remote kind currently
-                let term = Term::from_field_text(fields.origin_kind, "ssh");
-                clauses.push((
-                    Occur::Must,
-                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
-                ));
-            }
-            SourceFilter::SourceId(source_id) => {
-                // Filter to specific source by ID
-                let term = Term::from_field_text(fields.source_id, source_id);
-                clauses.push((
-                    Occur::Must,
-                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
-                ));
-            }
-        }
+        // Delegate cass-compatible query parsing + Tantivy clause construction to frankensearch.
+        // cass retains ownership of paging/fallback orchestration and stored-field hydration.
+        let fs_filters = FsCassQueryFilters {
+            agents: filters.agents.into_iter().collect(),
+            workspaces: filters.workspaces.into_iter().collect(),
+            created_from: filters.created_from,
+            created_to: filters.created_to,
+            source_filter: match filters.source_filter {
+                SourceFilter::All => FsCassSourceFilter::All,
+                SourceFilter::Local => FsCassSourceFilter::Local,
+                SourceFilter::Remote => FsCassSourceFilter::Remote,
+                SourceFilter::SourceId(id) => FsCassSourceFilter::SourceId(id),
+            },
+        };
 
         // NOTE: session_paths filtering is applied post-search since source_path
         // is STORED but not indexed. See apply_session_paths_filter().
-
-        let q: Box<dyn Query> = if clauses.is_empty() {
-            Box::new(AllQuery)
-        } else if clauses.len() == 1 {
-            let (occur, query_box) = clauses.pop().unwrap();
-            match occur {
-                // For Must, we can safely unwrap and use the inner query directly
-                Occur::Must => query_box,
-                // For MustNot or Should, we must preserve the Occur by wrapping
-                // in a BooleanQuery. A lone MustNot (e.g., "NOT foo") should match
-                // nothing, not match "foo".
-                _ => Box::new(BooleanQuery::new(vec![(occur, query_box)])),
-            }
-        } else {
-            Box::new(BooleanQuery::new(clauses))
-        };
+        let q: Box<dyn Query> = fs_cass_build_tantivy_query(raw_query, &fs_filters, fields);
 
         let prefix_only = is_prefix_only(sanitized_query);
         let snippet_generator = if prefix_only || !field_mask.wants_snippet() {
             None
         } else {
-            Some(SnippetGenerator::create(&searcher, &*q, fields.content)?)
+            let snippet_cfg = FsSnippetConfig {
+                max_chars: 160,
+                highlight_prefix: "<b>".to_string(),
+                highlight_postfix: "</b>".to_string(),
+            };
+            fs_try_build_snippet_generator(&searcher, &*q, fields.content, &snippet_cfg)
         };
 
-        let top_docs = searcher.search(&q, &TopDocs::with_limit(limit).and_offset(offset))?;
+        let top_docs = fs_execute_query_with_offset(&searcher, &*q, limit, offset)?;
         // Compute match type once for all results (not per-hit)
         let query_match_type = dominant_match_type(sanitized_query);
         let mut hits = Vec::new();
-        for (score, addr) in top_docs {
-            let doc: TantivyDocument = searcher.doc(addr)?;
+        for ranked_hit in top_docs.hits {
+            let score = ranked_hit.bm25_score;
+            let doc: TantivyDocument = fs_load_doc(&searcher, ranked_hit.doc_address)?;
+            let raw_content = doc
+                .get_first(fields.content)
+                .or_else(|| doc.get_first(fields.preview))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let title = if field_mask.wants_title() {
                 doc.get_first(fields.title)
                     .and_then(|v| v.as_str())
@@ -2671,11 +4029,7 @@ impl SearchClient {
                 String::new()
             };
             let content = if needs_content {
-                doc.get_first(fields.content)
-                    .or_else(|| doc.get_first(fields.preview))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
+                raw_content.to_string()
             } else {
                 String::new()
             };
@@ -2686,11 +4040,9 @@ impl SearchClient {
                 .to_string();
             let snippet = if field_mask.wants_snippet() {
                 if let Some(r#gen) = &snippet_generator {
-                    r#gen
-                        .snippet_from_doc(&doc)
-                        .to_html()
-                        .replace("<b>", "**")
-                        .replace("</b>", "**")
+                    fs_render_snippet_html(r#gen, &doc, "<b>", "</b>")
+                        .map(|html| html.replace("<b>", "**").replace("</b>", "**"))
+                        .unwrap_or_default()
                 } else if let Some(sn) = cached_prefix_snippet(&content, sanitized_query, 160) {
                     sn
                 } else {
@@ -2719,8 +4071,14 @@ impl SearchClient {
             let line_number = doc
                 .get_first(fields.msg_idx)
                 .and_then(|v| v.as_u64())
-                .map(|i| (i + 1) as usize);
-            let content_hash = stable_hit_hash(&content, &source, line_number, created_at);
+                .and_then(|i| usize::try_from(i).ok())
+                .map(|i| i.saturating_add(1));
+            let hash_basis = if content.is_empty() {
+                raw_content
+            } else {
+                content.as_str()
+            };
+            let content_hash = stable_hit_hash(hash_basis, &source, line_number, created_at);
             // Provenance fields (P3.3)
             let source_id = doc
                 .get_first(fields.source_id)
@@ -2758,130 +4116,344 @@ impl SearchClient {
         Ok(hits)
     }
 
-    fn search_sqlite(
+    /// DB-resident FTS fallback is disabled until cass has a fully
+    /// frankensqlite-native implementation. The primary lexical engine is the
+    /// Tantivy index built during `cass index --full`.
+    fn search_sqlite_fts5(
         &self,
-        conn: &Connection,
-        query: &str,
+        _db_path: &Path,
+        raw_query: &str,
+        _filters: SearchFilters,
+        _limit: usize,
+        _offset: usize,
+        _field_mask: FieldMask,
+    ) -> Result<Vec<SearchHit>> {
+        let _ = transpile_to_fts5(raw_query);
+        Ok(Vec::new())
+    }
+
+    /// Browse messages ordered by date, without any text query.
+    ///
+    /// Used when the TUI query is empty and the user wants to see recent (or
+    /// oldest) sessions. Bypasses BM25 scoring entirely and returns results
+    /// ordered by `created_at`. Applies agent, workspace, time-range, and
+    /// source filters identically to the normal search path.
+    pub fn browse_by_date(
+        &self,
         filters: SearchFilters,
         limit: usize,
         offset: usize,
+        newest_first: bool,
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
-        // FTS5 cannot handle empty queries
-        if query.trim().is_empty() {
-            return Ok(Vec::new());
+        let sqlite_guard = self.sqlite_guard()?;
+        if let Some(conn) = sqlite_guard.as_ref() {
+            self.browse_by_date_sqlite(conn, filters, limit, offset, newest_first, field_mask)
+        } else {
+            Ok(Vec::new())
         }
-        // Compute match type once for all results
-        let query_match_type = dominant_match_type(query);
+    }
 
-        // FTS5 requires balanced double quotes.
-        // If unbalanced, strip them to avoid syntax error.
-        let mut safe_query = query.to_string();
-        if !safe_query.matches('"').count().is_multiple_of(2) {
-            safe_query = safe_query.replace('"', "");
-        }
-
+    fn browse_by_date_sqlite(
+        &self,
+        conn: &Connection,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        newest_first: bool,
+        field_mask: FieldMask,
+    ) -> Result<Vec<SearchHit>> {
+        let order = if newest_first { "DESC" } else { "ASC" };
         let content_expr = if field_mask.needs_content() {
-            "f.content"
+            "m.content"
+        } else if field_mask.wants_snippet() {
+            "substr(m.content, 1, 512)"
         } else {
             "''"
         };
         let title_expr = if field_mask.wants_title() {
-            "f.title"
+            "c.title"
         } else {
             "''"
         };
-        let snippet_expr = if field_mask.wants_snippet() {
-            "snippet(fts_messages, 0, '**', '**', '...', 64)"
-        } else {
-            "''"
-        };
-        let mut sql = format!(
-            "SELECT {title_expr}, {content_expr}, f.agent, f.workspace, f.source_path, f.created_at, bm25(fts_messages) AS score, {snippet_expr} AS snippet, m.idx
-             FROM fts_messages f
-             LEFT JOIN messages m ON f.message_id = m.id
-             WHERE fts_messages MATCH ?"
-        );
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(safe_query)];
+        let mut sql =
+            format!(
+                "SELECT {title_expr}, {content_expr}, a.slug, w.path, c.source_path, m.created_at, m.idx, \
+                 c.source_id, c.origin_host, COALESCE(s.kind, 'local')
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             LEFT JOIN sources s ON c.source_id = s.id
+             WHERE 1=1"
+            );
+        let mut params: Vec<ParamValue> = Vec::new();
 
         if !filters.agents.is_empty() {
-            let placeholders = (0..filters.agents.len())
-                .map(|_| "?".to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            sql.push_str(&format!(" AND f.agent IN ({placeholders})"));
-            for a in filters.agents {
-                params.push(Box::new(a));
+            let placeholders = sql_placeholders(filters.agents.len());
+            sql.push_str(&format!(" AND a.slug IN ({placeholders})"));
+            for a in &filters.agents {
+                params.push(ParamValue::from(a.as_str()));
             }
         }
 
         if !filters.workspaces.is_empty() {
-            let placeholders = (0..filters.workspaces.len())
-                .map(|_| "?".to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            sql.push_str(&format!(" AND f.workspace IN ({placeholders})"));
-            for w in filters.workspaces {
-                params.push(Box::new(w));
+            let placeholders = sql_placeholders(filters.workspaces.len());
+            sql.push_str(&format!(" AND COALESCE(w.path, '') IN ({placeholders})"));
+            for w in &filters.workspaces {
+                params.push(ParamValue::from(w.as_str()));
             }
         }
 
         if let Some(created_from) = filters.created_from {
-            sql.push_str(" AND f.created_at >= ?");
-            params.push(Box::new(created_from));
+            sql.push_str(" AND m.created_at >= ?");
+            params.push(ParamValue::from(created_from));
         }
         if let Some(created_to) = filters.created_to {
-            sql.push_str(" AND f.created_at <= ?");
-            params.push(Box::new(created_to));
+            sql.push_str(" AND m.created_at <= ?");
+            params.push(ParamValue::from(created_to));
         }
 
-        sql.push_str(" ORDER BY score LIMIT ? OFFSET ?");
-        params.push(Box::new(limit as i64));
-        params.push(Box::new(offset as i64));
+        // Apply source filter
+        match &filters.source_filter {
+            SourceFilter::All => {}
+            SourceFilter::Local => sql.push_str(" AND COALESCE(c.source_id, 'local') = 'local'"),
+            SourceFilter::Remote => sql.push_str(" AND COALESCE(c.source_id, 'local') != 'local'"),
+            SourceFilter::SourceId(id) => {
+                sql.push_str(" AND COALESCE(c.source_id, 'local') = ?");
+                params.push(ParamValue::from(id.as_str()));
+            }
+        }
 
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(params.iter().map(|b| &**b)),
-            |row| {
-                let title: String = row.get(0)?;
-                let content: String = row.get(1)?;
-                let agent: String = row.get(2)?;
-                let workspace: String = row.get(3)?;
-                let source_path: String = row.get(4)?;
-                let created_at: Option<i64> = row.get(5).ok();
-                let score: f32 = row.get::<_, f64>(6)? as f32;
-                let snippet: String = row.get(7)?;
-                // idx is 0-indexed message index; convert to 1-indexed line number for JSONL files
-                let idx: Option<i64> = row.get(8).ok();
-                let line_number = idx.map(|i| (i + 1) as usize);
-                let content_hash = stable_hit_hash(&content, &source_path, line_number, created_at);
-                // SQLite FTS doesn't have provenance or workspace_original - use defaults
+        sql.push_str(&format!(
+            " ORDER BY m.created_at IS NULL, m.created_at {order}, m.id {order} LIMIT ? OFFSET ?"
+        ));
+        params.push(ParamValue::from(limit as i64));
+        params.push(ParamValue::from(offset as i64));
+
+        let rows: Vec<SearchHit> =
+            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                let title: String = if field_mask.wants_title() {
+                    row.get_typed::<Option<String>>(0)?.unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let raw_content: String = row.get_typed(1)?;
+                let agent: String = row.get_typed(2)?;
+                let workspace: Option<String> = row.get_typed(3)?;
+                let source_path: String = row.get_typed(4)?;
+                let created_at: Option<i64> = row.get_typed(5)?;
+                let idx: Option<i64> = row.get_typed(6)?;
+                let source_id: String = row
+                    .get_typed::<Option<String>>(7)?
+                    .unwrap_or_else(default_source_id);
+                let origin_host: Option<String> = row.get_typed(8)?;
+                let origin_kind: String = row
+                    .get_typed::<Option<String>>(9)?
+                    .unwrap_or_else(default_origin_kind);
+                let line_number = idx
+                    .and_then(|i| usize::try_from(i).ok())
+                    .map(|i| i.saturating_add(1));
+                let snippet = if field_mask.wants_snippet() {
+                    snippet_from_content(&raw_content)
+                } else {
+                    String::new()
+                };
+                let content = if field_mask.needs_content() {
+                    raw_content
+                } else {
+                    String::new()
+                };
+                let hash_basis = if content.is_empty() {
+                    snippet.as_str()
+                } else {
+                    content.as_str()
+                };
+                let content_hash =
+                    stable_hit_hash(hash_basis, &source_path, line_number, created_at);
                 Ok(SearchHit {
                     title,
                     snippet,
                     content,
                     content_hash,
-                    score,
+                    score: 0.0,
                     source_path,
                     agent,
-                    workspace,
+                    workspace: workspace.unwrap_or_default(),
                     workspace_original: None,
                     created_at,
                     line_number,
-                    match_type: query_match_type,
-                    source_id: default_source_id(),
-                    origin_kind: default_origin_kind(),
-                    origin_host: None,
+                    match_type: MatchType::Exact,
+                    source_id,
+                    origin_kind,
+                    origin_host,
                 })
-            },
-        )?;
-
-        let mut hits = Vec::new();
-        for row in rows {
-            hits.push(row?);
-        }
-        Ok(hits)
+            })?;
+        Ok(rows)
     }
+}
+
+/// Transpile a raw query string into an FTS5-compatible query string.
+/// Preserves custom precedence (OR > AND) by adding parentheses.
+/// Returns None if the query contains features unsupported by FTS5 (e.g. leading wildcards).
+fn transpile_to_fts5(raw_query: &str) -> Option<String> {
+    let tokens = fs_cass_parse_boolean_query(raw_query);
+    if tokens.is_empty() {
+        return Some("".to_string());
+    }
+
+    let mut fts_clauses: Vec<(&str, String)> = Vec::new();
+    let mut pending_or_group: Vec<String> = Vec::new();
+    let mut next_op = "AND";
+    let mut in_or_sequence = false;
+    for token in tokens {
+        match token {
+            FsCassQueryToken::And => {
+                if !pending_or_group.is_empty() {
+                    let group = if pending_or_group.len() > 1 {
+                        format!("({})", pending_or_group.join(" OR "))
+                    } else {
+                        pending_or_group.pop().unwrap_or_default()
+                    };
+                    fts_clauses.push(("AND", group));
+                    pending_or_group.clear();
+                }
+                in_or_sequence = false;
+                next_op = "AND";
+            }
+            FsCassQueryToken::Or => {
+                if fts_clauses.is_empty() && pending_or_group.is_empty() {
+                    // Be permissive with a leading OR the same way we already
+                    // salvage a leading AND: ignore it instead of turning the
+                    // whole fallback query into an empty result set.
+                    continue;
+                }
+                // Start or continue an OR group. Unsupported `OR NOT` forms
+                // are rejected when the subsequent NOT token arrives.
+                in_or_sequence = true;
+            }
+            FsCassQueryToken::Not => {
+                // FTS5 supports binary (`foo NOT bar`) NOT, but not a leading
+                // unary-NOT query (`NOT foo`). We also reject `OR NOT` groupings
+                // in the fallback transpiler.
+                if in_or_sequence {
+                    return None;
+                }
+
+                if fts_clauses.is_empty() && pending_or_group.is_empty() {
+                    return None;
+                }
+
+                if !pending_or_group.is_empty() {
+                    let group = if pending_or_group.len() > 1 {
+                        format!("({})", pending_or_group.join(" OR "))
+                    } else {
+                        pending_or_group.pop().unwrap_or_default()
+                    };
+                    fts_clauses.push(("AND", group));
+                    pending_or_group.clear();
+                }
+                in_or_sequence = false;
+                next_op = "NOT";
+            }
+            FsCassQueryToken::Term(t) => {
+                // Sanitize and normalize. FTS5 implicitly ANDs words in a string.
+                // e.g. "foo bar" -> foo AND bar. Hyphens stay intact here so we can
+                // later emit them as quoted terms; bare `foo-bar` is invalid FTS5 syntax.
+                let term_parts = normalize_term_parts(&t);
+                if term_parts.is_empty() {
+                    continue;
+                }
+
+                let mut rendered_parts = Vec::with_capacity(term_parts.len());
+                for part in &term_parts {
+                    rendered_parts.push(render_fts5_term_part(part)?);
+                }
+
+                // If multiple parts, wrap in parens and join with AND to ensure they stay together.
+                // Stock FTS5 requires hyphenated tokens to be quoted (and prefix queries need the
+                // trailing * outside the quotes), otherwise bare `foo-bar` is parsed as syntax.
+                let fts_term = if rendered_parts.len() > 1 {
+                    format!("({})", rendered_parts.join(" AND "))
+                } else {
+                    rendered_parts[0].clone()
+                };
+
+                if in_or_sequence {
+                    if pending_or_group.is_empty() {
+                        let (op, _) = fts_clauses.last()?;
+                        if *op != "AND" {
+                            // `(... NOT ...) OR ...` cannot be represented
+                            // with our FTS5 fallback transpilation.
+                            return None;
+                        }
+                        let (_, val) = fts_clauses.pop()?;
+                        pending_or_group.push(val);
+                    }
+                    pending_or_group.push(fts_term);
+                    in_or_sequence = true;
+                } else {
+                    fts_clauses.push((next_op, fts_term));
+                }
+                next_op = "AND";
+            }
+            FsCassQueryToken::Phrase(p) => {
+                let phrase_parts = normalize_phrase_terms(&p);
+                if phrase_parts.is_empty() {
+                    continue;
+                }
+                let fts_phrase = format!("\"{}\"", phrase_parts.join(" "));
+
+                if in_or_sequence {
+                    if pending_or_group.is_empty() {
+                        let (op, _) = fts_clauses.last()?;
+                        if *op != "AND" {
+                            // `(... NOT ...) OR ...` cannot be represented
+                            // with our FTS5 fallback transpilation.
+                            return None;
+                        }
+                        let (_, val) = fts_clauses.pop()?;
+                        pending_or_group.push(val);
+                    }
+                    pending_or_group.push(fts_phrase);
+                    in_or_sequence = true;
+                } else {
+                    fts_clauses.push((next_op, fts_phrase));
+                }
+                next_op = "AND";
+            }
+        }
+    }
+
+    if !pending_or_group.is_empty() {
+        let group = if pending_or_group.len() > 1 {
+            format!("({})", pending_or_group.join(" OR "))
+        } else {
+            pending_or_group.pop().unwrap_or_default()
+        };
+        fts_clauses.push((next_op, group));
+    }
+
+    if fts_clauses.is_empty() {
+        return Some("".to_string());
+    }
+
+    // Safety guard: the fallback transpiler must never emit NOT as the first
+    // operator because SQLite FTS5 requires a left operand.
+    if fts_clauses.first().is_some_and(|(op, _)| *op == "NOT") {
+        return None;
+    }
+
+    // Join clauses. The first operator is ignored (start of query).
+    let mut query = String::new();
+    for (i, (op, text)) in fts_clauses.into_iter().enumerate() {
+        if i > 0 {
+            query.push_str(&format!(" {} ", op));
+        }
+        query.push_str(&text);
+    }
+
+    Some(query)
 }
 
 #[derive(Default, Clone)]
@@ -2935,77 +4507,80 @@ impl Metrics {
 
 fn maybe_spawn_warm_worker(
     reader: IndexReader,
-    fields: crate::search::tantivy::Fields,
+    fields: FsCassFields,
     filters_guard: std::sync::Weak<Mutex<()>>,
     reload_epoch: Arc<AtomicU64>,
     metrics: Metrics,
-) -> Option<(mpsc::UnboundedSender<WarmJob>, JoinHandle<()>)> {
-    // Only spawn if a Tokio runtime is available (tests may call without one).
-    if Handle::try_current().is_err() {
-        return None;
-    }
-
-    let (tx, mut rx) = mpsc::unbounded_channel::<WarmJob>();
-    let handle = tokio::spawn(async move {
-        // Simple debounce: process at most one warmup every WARM_DEBOUNCE_MS.
-        let mut last_run = Instant::now();
-        while let Some(job) = rx.recv().await {
-            let now = Instant::now();
-            if now.duration_since(last_run) < Duration::from_millis(*WARM_DEBOUNCE_MS) {
-                continue;
+) -> Option<(mpsc::Sender<WarmJob>, std::thread::JoinHandle<()>)> {
+    let (tx, rx) = mpsc::unbounded::<WarmJob>();
+    let handle = std::thread::Builder::new()
+        .name("cass-warm-worker".into())
+        .spawn(move || {
+            // Simple debounce: process at most one warmup every WARM_DEBOUNCE_MS.
+            let mut last_run = Instant::now();
+            while let Ok(job) = rx.recv() {
+                let now = Instant::now();
+                if now.duration_since(last_run) < Duration::from_millis(*WARM_DEBOUNCE_MS) {
+                    continue;
+                }
+                last_run = now;
+                if filters_guard.upgrade().is_none() {
+                    break;
+                }
+                let reload_started = Instant::now();
+                if let Err(err) = reader.reload() {
+                    tracing::warn!(error = ?err, "warm_worker_reload_failed");
+                    continue;
+                }
+                let elapsed = reload_started.elapsed();
+                let epoch = reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                metrics.record_reload(elapsed);
+                tracing::debug!(
+                    duration_ms = elapsed.as_millis() as u64,
+                    reload_epoch = epoch,
+                    "warm_worker_reload"
+                );
+                // Run a tiny warm search to prefill OS cache and hit the Tantivy reader
+                // without allocating full result sets. Limit 1 doc.
+                let searcher = reader.searcher();
+                let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+                for term_str in job.query.split_whitespace() {
+                    let term_lower = term_str.to_lowercase();
+                    let term_shoulds: Vec<(Occur, Box<dyn Query>)> = vec![
+                        (
+                            Occur::Should,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(fields.title, &term_lower),
+                                IndexRecordOption::WithFreqsAndPositions,
+                            )),
+                        ),
+                        (
+                            Occur::Should,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(fields.content, &term_lower),
+                                IndexRecordOption::WithFreqsAndPositions,
+                            )),
+                        ),
+                    ];
+                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(term_shoulds))));
+                }
+                if !clauses.is_empty() {
+                    let q: Box<dyn Query> = Box::new(BooleanQuery::new(clauses));
+                    let _ = searcher.search(&q, &TopDocs::with_limit(1));
+                }
             }
-            last_run = now;
-            if filters_guard.upgrade().is_none() {
-                break;
-            }
-            let reload_started = Instant::now();
-            if let Err(err) = reader.reload() {
-                tracing::warn!(error = ?err, "warm_worker_reload_failed");
-                continue;
-            }
-            let elapsed = reload_started.elapsed();
-            let epoch = reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-            metrics.record_reload(elapsed);
-            tracing::debug!(
-                duration_ms = elapsed.as_millis() as u64,
-                reload_epoch = epoch,
-                "warm_worker_reload"
-            );
-            // Run a tiny warm search to prefill OS cache and hit the Tantivy reader
-            // without allocating full result sets. Limit 1 doc.
-            let searcher = reader.searcher();
-            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-            for term_str in job.query.split_whitespace() {
-                let term_lower = term_str.to_lowercase();
-                let term_shoulds: Vec<(Occur, Box<dyn Query>)> = vec![
-                    (
-                        Occur::Should,
-                        Box::new(TermQuery::new(
-                            Term::from_field_text(fields.title, &term_lower),
-                            IndexRecordOption::WithFreqsAndPositions,
-                        )),
-                    ),
-                    (
-                        Occur::Should,
-                        Box::new(TermQuery::new(
-                            Term::from_field_text(fields.content, &term_lower),
-                            IndexRecordOption::WithFreqsAndPositions,
-                        )),
-                    ),
-                ];
-                clauses.push((Occur::Must, Box::new(BooleanQuery::new(term_shoulds))));
-            }
-            if !clauses.is_empty() {
-                let q: Box<dyn Query> = Box::new(BooleanQuery::new(clauses));
-                let _ = searcher.search(&q, &TopDocs::with_limit(1));
-            }
-        }
-    });
+        })
+        .ok()?;
     Some((tx, handle))
 }
 
 fn cached_hit_from(hit: &SearchHit) -> CachedHit {
-    let lc_content = hit.content.to_lowercase();
+    let cache_text = if hit.content.is_empty() {
+        hit.snippet.as_str()
+    } else {
+        hit.content.as_str()
+    };
+    let lc_content = cache_text.to_lowercase();
     let lc_title = (!hit.title.is_empty()).then(|| hit.title.to_lowercase());
     // Snippet is derived from content, so we don't index/bloom it separately
     let bloom64 = bloom_from_text(&lc_content, &lc_title);
@@ -3163,21 +4738,20 @@ fn hit_matches_query_cached(hit: &CachedHit, query: &str) -> bool {
 
 fn is_prefix_only(query: &str) -> bool {
     let tokens: Vec<&str> = query.split_whitespace().collect();
-    if tokens.is_empty() {
+    // Only strictly optimize single-term prefix queries.
+    // Multi-term queries benefit from Tantivy's snippet generation (highlighting both terms).
+    if tokens.len() != 1 {
         return false;
     }
-    tokens
-        .iter()
-        .all(|t| !t.is_empty() && t.chars().all(char::is_alphanumeric))
+    tokens[0].chars().all(char::is_alphanumeric)
 }
 
 fn quick_prefix_snippet(content: &str, query: &str, max_chars: usize) -> String {
-    let content_char_count = content.chars().count();
-
     // Handle empty query case first
     if query.is_empty() {
-        let snippet: String = content.chars().take(max_chars).collect();
-        return if content_char_count > max_chars {
+        let mut chars = content.chars();
+        let snippet: String = chars.by_ref().take(max_chars).collect();
+        return if chars.next().is_some() {
             format!("{snippet}…")
         } else {
             snippet
@@ -3186,23 +4760,54 @@ fn quick_prefix_snippet(content: &str, query: &str, max_chars: usize) -> String 
 
     let lc_content = content.to_lowercase();
     let lc_query = query.to_lowercase();
+
     if let Some(pos) = lc_content.find(&lc_query) {
         // Convert byte index in the lowercased string to a character index.
-        // IMPORTANT: Use lc_content[..pos], not content[..pos], because pos is a byte
-        // index valid only for the lowercased string (Unicode case mappings can change
-        // byte lengths, e.g., German ß → SS).
-        let start_char = lc_content[..pos].chars().count().saturating_sub(15);
-        let snippet: String = content.chars().skip(start_char).take(max_chars).collect();
-        // Check if we truncated: snippet covers chars [start_char, start_char + snippet_len)
-        let snippet_char_count = snippet.chars().count();
-        if start_char + snippet_char_count < content_char_count {
+        let match_start_char_idx = lc_content[..pos].chars().count();
+        let query_char_len = lc_query.chars().count();
+
+        // Determine where to start the snippet (aim for 15 chars before match)
+        let start_char = match_start_char_idx.saturating_sub(15);
+        let mut chars_iter = content.chars().skip(start_char);
+        let mut snippet = String::new();
+        let mut chars_taken = 0;
+        let mut current_idx = start_char;
+
+        while chars_taken < max_chars {
+            if current_idx == match_start_char_idx {
+                snippet.push_str("**");
+                for _ in 0..query_char_len {
+                    if let Some(ch) = chars_iter.next() {
+                        snippet.push(ch);
+                        chars_taken += 1;
+                        current_idx += 1;
+                    }
+                }
+                snippet.push_str("**");
+                if chars_taken >= max_chars {
+                    break;
+                }
+                continue;
+            }
+
+            if let Some(ch) = chars_iter.next() {
+                snippet.push(ch);
+                chars_taken += 1;
+                current_idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        if chars_iter.next().is_some() {
             format!("{snippet}…")
         } else {
             snippet
         }
     } else {
-        let snippet: String = content.chars().take(max_chars).collect();
-        if content_char_count > max_chars {
+        let mut chars = content.chars();
+        let snippet: String = chars.by_ref().take(max_chars).collect();
+        if chars.next().is_some() {
             format!("{snippet}…")
         } else {
             snippet
@@ -3216,17 +4821,43 @@ fn cached_prefix_snippet(content: &str, query: &str, max_chars: usize) -> Option
     }
     let lc_content = content.to_lowercase();
     let lc_query = query.to_lowercase();
-    let content_char_count = content.chars().count();
     lc_content.find(&lc_query).map(|pos| {
-        // Convert byte index in the lowercased string to a character index.
-        // IMPORTANT: Use lc_content[..pos], not content[..pos], because pos is a byte
-        // index valid only for the lowercased string (Unicode case mappings can change
-        // byte lengths, e.g., German ß → SS).
-        let start_char = lc_content[..pos].chars().count().saturating_sub(15);
-        let snippet: String = content.chars().skip(start_char).take(max_chars).collect();
-        // Check if we truncated: snippet covers chars [start_char, start_char + snippet_len)
-        let snippet_char_count = snippet.chars().count();
-        if start_char + snippet_char_count < content_char_count {
+        let match_start_char_idx = lc_content[..pos].chars().count();
+        let query_char_len = lc_query.chars().count();
+
+        let start_char = match_start_char_idx.saturating_sub(15);
+        let mut chars_iter = content.chars().skip(start_char);
+        let mut snippet = String::new();
+        let mut chars_taken = 0;
+        let mut current_idx = start_char;
+
+        while chars_taken < max_chars {
+            if current_idx == match_start_char_idx {
+                snippet.push_str("**");
+                for _ in 0..query_char_len {
+                    if let Some(ch) = chars_iter.next() {
+                        snippet.push(ch);
+                        chars_taken += 1;
+                        current_idx += 1;
+                    }
+                }
+                snippet.push_str("**");
+                if chars_taken >= max_chars {
+                    break;
+                }
+                continue;
+            }
+
+            if let Some(ch) = chars_iter.next() {
+                snippet.push(ch);
+                chars_taken += 1;
+                current_idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        if chars_iter.next().is_some() {
             format!("{snippet}…")
         } else {
             snippet
@@ -3269,7 +4900,23 @@ fn filters_fingerprint(filters: &SearchFilters) -> String {
 }
 
 impl SearchClient {
+    /// Return the total number of indexed Tantivy documents.
+    pub fn total_docs(&self) -> usize {
+        self.reader
+            .as_ref()
+            .map(|(reader, _)| reader.searcher().num_docs() as usize)
+            .unwrap_or(0)
+    }
+
+    /// Returns `true` if the Tantivy search index is available.
+    pub fn has_tantivy(&self) -> bool {
+        self.reader.is_some()
+    }
+
     fn maybe_reload_reader(&self, reader: &IndexReader) -> Result<()> {
+        if !self.reload_on_search {
+            return Ok(());
+        }
         const MIN_RELOAD_INTERVAL: Duration = Duration::from_millis(300);
         let now = Instant::now();
         let mut guard = self.last_reload.lock().unwrap_or_else(|e| e.into_inner());
@@ -3406,8 +5053,507 @@ impl SearchClient {
 mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::tantivy::TantivyIndex;
+    use crate::storage::sqlite::FrankenStorage;
+    use rusqlite::Connection as LegacyConnection;
+    use serde_json::json;
     use tempfile::TempDir;
+
+    #[derive(Debug)]
+    struct FixedTestEmbedder {
+        id: String,
+        vector: Vec<f32>,
+    }
+
+    impl FixedTestEmbedder {
+        fn new(id: &str, vector: &[f32]) -> Self {
+            Self {
+                id: id.to_string(),
+                vector: vector.to_vec(),
+            }
+        }
+    }
+
+    impl crate::search::embedder::Embedder for FixedTestEmbedder {
+        fn embed_sync(&self, _text: &str) -> crate::search::embedder::EmbedderResult<Vec<f32>> {
+            Ok(self.vector.clone())
+        }
+
+        fn dimension(&self) -> usize {
+            self.vector.len()
+        }
+
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> frankensearch::ModelCategory {
+            frankensearch::ModelCategory::HashEmbedder
+        }
+    }
+
+    struct SemanticTestFixture {
+        _dir: TempDir,
+        client: SearchClient,
+        doc_ids: Vec<String>,
+        source_paths: Vec<String>,
+    }
+
+    struct ProgressiveHybridFixture {
+        _dir: TempDir,
+        client: Arc<SearchClient>,
+        query: String,
+    }
+
+    fn build_semantic_test_fixture() -> Result<SemanticTestFixture> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path)?;
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent)?;
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path)?;
+        let workspace_id = storage.ensure_workspace(&workspace_path, None)?;
+
+        let documents = [
+            ("session-a.jsonl", "top semantic match", [1.0_f32, 0.0_f32]),
+            (
+                "session-b.jsonl",
+                "middle semantic match",
+                [0.9_f32, 0.1_f32],
+            ),
+            ("session-c.jsonl", "late semantic match", [0.8_f32, 0.2_f32]),
+        ];
+        let base_ts = 1_700_000_000_000_i64;
+        let mut doc_ids = Vec::with_capacity(documents.len());
+        let mut source_paths = Vec::with_capacity(documents.len());
+
+        for (idx, (name, content, _vector)) in documents.iter().enumerate() {
+            let source_path = dir.path().join(name);
+            source_paths.push(source_path.to_string_lossy().to_string());
+
+            let conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: Some(workspace_path.clone()),
+                external_id: Some(format!("semantic-{idx}")),
+                title: Some(format!("semantic session {idx}")),
+                source_path,
+                started_at: Some(base_ts + idx as i64),
+                ended_at: Some(base_ts + idx as i64),
+                approx_tokens: Some(16),
+                metadata_json: json!({"fixture": "semantic_search"}),
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(base_ts + idx as i64),
+                    content: (*content).to_string(),
+                    extra_json: json!({}),
+                    snippets: Vec::new(),
+                }],
+                source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+                origin_host: None,
+            };
+
+            storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
+        }
+
+        let message_rows: Vec<(u64, i64)> = storage.raw().query_map_collect(
+            "SELECT m.id, COALESCE(m.created_at, c.started_at, 0)
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             ORDER BY c.id",
+            &[],
+            |row: &frankensqlite::Row| {
+                let message_id: i64 = row.get_typed(0)?;
+                let created_at: i64 = row.get_typed(1)?;
+                Ok((u64::try_from(message_id).unwrap_or(u64::MAX), created_at))
+            },
+        )?;
+        assert_eq!(
+            message_rows.len(),
+            documents.len(),
+            "fixture should create 3 messages"
+        );
+
+        let filter_maps = SemanticFilterMaps::from_storage(&storage)?;
+        let embedder = Arc::new(FixedTestEmbedder::new("test-fixed-2d", &[1.0, 0.0]));
+        let source_hash = crc32fast::hash(crate::sources::provenance::LOCAL_SOURCE_ID.as_bytes());
+        let vector_path = dir
+            .path()
+            .join("vector_index")
+            .join("index-test-fixed-2d.fsvi");
+        std::fs::create_dir_all(vector_path.parent().expect("vector directory"))?;
+        let mut writer = VectorIndex::create_with_revision(
+            &vector_path,
+            embedder.id(),
+            "rev-1",
+            embedder.dimension(),
+            frankensearch::index::Quantization::F16,
+        )?;
+
+        for ((message_id, created_at_ms), (_, _, vector)) in message_rows.iter().zip(documents) {
+            let doc_id = SemanticDocId {
+                message_id: *message_id,
+                chunk_idx: 0,
+                agent_id: u32::try_from(agent_id)?,
+                workspace_id: u32::try_from(workspace_id)?,
+                source_id: source_hash,
+                role: ROLE_USER,
+                created_at_ms: *created_at_ms,
+                content_hash: None,
+            }
+            .to_doc_id_string();
+            doc_ids.push(doc_id.clone());
+            writer.write_record(&doc_id, &vector)?;
+        }
+        writer.finish()?;
+        let vector_index = VectorIndex::open(&vector_path)?;
+        drop(storage);
+
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("db-backed client");
+        client.set_semantic_context(embedder, vector_index, filter_maps, None, None)?;
+
+        Ok(SemanticTestFixture {
+            _dir: dir,
+            client,
+            doc_ids,
+            source_paths,
+        })
+    }
+
+    fn build_progressive_hybrid_fixture() -> Result<ProgressiveHybridFixture> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path)?;
+        let agent_id = 1_i64;
+        let workspace_id = 1_i64;
+        let source_id = crate::sources::provenance::LOCAL_SOURCE_ID;
+        let source_hash = crc32fast::hash(source_id.as_bytes());
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL
+            );
+            CREATE TABLE workspaces (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL
+            );
+            CREATE TABLE sources (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL
+            );
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                workspace_id INTEGER,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                origin_host TEXT,
+                started_at INTEGER
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                created_at INTEGER,
+                content TEXT NOT NULL
+            );
+            "#,
+        )?;
+        conn.execute_compat(
+            "INSERT INTO agents (id, slug) VALUES (?1, ?2)",
+            params![agent_id, "codex"],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
+            params![workspace_id, workspace_path.to_string_lossy().to_string()],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO sources (id, kind) VALUES (?1, ?2)",
+            params![source_id, "local"],
+        )?;
+
+        let query = "oauth refresh token middleware session cache".to_string();
+        let filler = " context window ranking provenance semantic upgrade lexical overlay";
+        let base_ts = 1_700_000_100_000_i64;
+        let doc_count = 64usize;
+        let mut message_rows = Vec::with_capacity(doc_count);
+
+        for idx in 0..doc_count {
+            let conversation_id = i64::try_from(idx + 1)?;
+            let message_id = u64::try_from(idx + 1)?;
+            let source_path = dir.path().join(format!("progressive-{idx:03}.jsonl"));
+            let repeated = filler.repeat(48);
+            let content = if idx % 4 == 0 {
+                format!(
+                    "{query} hot path candidate {idx} with detailed search diagnostics.{repeated}"
+                )
+            } else if idx % 4 == 1 {
+                format!(
+                    "search pipeline benchmark {idx} with lexical overlay and semantic ranking.{repeated}"
+                )
+            } else if idx % 4 == 2 {
+                format!(
+                    "interactive typing debounce benchmark {idx} for hybrid two tier search.{repeated}"
+                )
+            } else {
+                format!(
+                    "unrelated background chatter {idx} about build systems and formatting checks.{repeated}"
+                )
+            };
+            let created_at = base_ts + idx as i64;
+            let source_path_str = source_path.to_string_lossy().to_string();
+            let title = format!("progressive fixture {idx}");
+
+            conn.execute_compat(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, title, source_path, source_id, origin_host, started_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+                params![
+                    conversation_id,
+                    agent_id,
+                    workspace_id,
+                    title,
+                    source_path_str.clone(),
+                    source_id,
+                    created_at
+                ],
+            )?;
+            conn.execute_compat(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, created_at, content
+                 ) VALUES (?1, ?2, 0, 'user', ?3, ?4)",
+                params![
+                    i64::try_from(message_id)?,
+                    conversation_id,
+                    created_at,
+                    content.clone()
+                ],
+            )?;
+            message_rows.push((message_id, created_at, content.clone()));
+
+            let normalized = NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: Some(format!("progressive-{idx}")),
+                title: Some(format!("progressive fixture {idx}")),
+                workspace: Some(workspace_path.clone()),
+                source_path,
+                started_at: Some(created_at),
+                ended_at: Some(created_at),
+                metadata: json!({}),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".into(),
+                    author: Some("user".into()),
+                    created_at: Some(created_at),
+                    content,
+                    extra: json!({}),
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                }],
+            };
+            index.add_conversation(&normalized)?;
+        }
+        index.commit()?;
+
+        assert_eq!(
+            message_rows.len(),
+            doc_count,
+            "fixture should create the requested number of messages"
+        );
+
+        let fast_embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
+        let quality_embedder = crate::search::hash_embedder::HashEmbedder::new(384);
+        let filter_maps = SemanticFilterMaps::for_tests(
+            HashMap::from([("codex".to_string(), u32::try_from(agent_id)?)]),
+            HashMap::from([(
+                workspace_path.to_string_lossy().to_string(),
+                u32::try_from(workspace_id)?,
+            )]),
+            HashMap::from([(source_id.to_string(), source_hash)]),
+            HashSet::new(),
+        );
+        let fast_path = dir.path().join("vector.fast.idx");
+        let quality_path = dir.path().join("vector.quality.idx");
+
+        let mut fast_writer = VectorIndex::create_with_revision(
+            &fast_path,
+            fast_embedder.id(),
+            "rev-progressive-fast",
+            fast_embedder.dimension(),
+            frankensearch::index::Quantization::F16,
+        )?;
+        let mut quality_writer = VectorIndex::create_with_revision(
+            &quality_path,
+            quality_embedder.id(),
+            "rev-progressive-quality",
+            quality_embedder.dimension(),
+            frankensearch::index::Quantization::F16,
+        )?;
+
+        for (message_id, created_at_ms, content) in &message_rows {
+            let canonical = canonicalize_for_embedding(content);
+            let doc_id = SemanticDocId {
+                message_id: *message_id,
+                chunk_idx: 0,
+                agent_id: u32::try_from(agent_id)?,
+                workspace_id: u32::try_from(workspace_id)?,
+                source_id: source_hash,
+                role: ROLE_USER,
+                created_at_ms: *created_at_ms,
+                content_hash: Some(content_hash(&canonical)),
+            }
+            .to_doc_id_string();
+
+            let fast_vec = fast_embedder.embed_sync(content)?;
+            fast_writer.write_record(&doc_id, &fast_vec)?;
+            let quality_vec = quality_embedder.embed_sync(content)?;
+            quality_writer.write_record(&doc_id, &quality_vec)?;
+        }
+        fast_writer.finish()?;
+        quality_writer.finish()?;
+
+        let reader = fs_cass_open_search_reader(dir.path(), ReloadPolicy::Manual).ok();
+        let client = SearchClient {
+            reader,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{}|schema:{}", CACHE_KEY_VERSION, FS_CASS_SCHEMA_HASH),
+            semantic: Mutex::new(None),
+        };
+        let semantic_embedder: Arc<dyn Embedder> = fast_embedder;
+        client.set_semantic_context(
+            semantic_embedder,
+            VectorIndex::open(&fast_path)?,
+            filter_maps,
+            None,
+            Some(fast_path),
+        )?;
+
+        Ok(ProgressiveHybridFixture {
+            _dir: dir,
+            client: Arc::new(client),
+            query,
+        })
+    }
+
+    fn sanitize_query(raw: &str) -> String {
+        fs_cass_sanitize_query(raw)
+    }
+
+    fn parse_boolean_query(query: &str) -> Vec<FsCassQueryToken> {
+        fs_cass_parse_boolean_query(query)
+    }
+
+    type QueryToken = FsCassQueryToken;
+    type WildcardPattern = FsCassWildcardPattern;
+    type QueryTokenList = Vec<QueryToken>;
+
+    #[test]
+    #[ignore = "profiling harness for live hybrid progressive search"]
+    fn progressive_hybrid_profile_harness() -> Result<()> {
+        let fixture = build_progressive_hybrid_fixture()?;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|err| anyhow!("build test runtime failed: {err}"))?;
+        let iterations = 24usize;
+
+        runtime.block_on(async {
+            let cx = FsCx::for_request();
+            fixture
+                .client
+                .search_progressive_with_callback(
+                    ProgressiveSearchRequest {
+                        cx: &cx,
+                        query: &fixture.query,
+                        filters: SearchFilters::default(),
+                        limit: 16,
+                        sparse_threshold: 0,
+                        field_mask: FieldMask::new(false, true, true, true),
+                        mode: SearchMode::Hybrid,
+                    },
+                    |_| {},
+                )
+                .await
+        })?;
+
+        let mut initial_events = 0usize;
+        let mut refined_events = 0usize;
+        let mut total_hits = 0usize;
+        for _ in 0..iterations {
+            runtime.block_on(async {
+                let cx = FsCx::for_request();
+                fixture
+                    .client
+                    .search_progressive_with_callback(
+                        ProgressiveSearchRequest {
+                            cx: &cx,
+                            query: &fixture.query,
+                            filters: SearchFilters::default(),
+                            limit: 16,
+                            sparse_threshold: 0,
+                            field_mask: FieldMask::new(false, true, true, true),
+                            mode: SearchMode::Hybrid,
+                        },
+                        |event| match event {
+                            ProgressiveSearchEvent::Phase { kind, result, .. } => {
+                                assert!(
+                                    !result.hits.is_empty(),
+                                    "progressive harness expects non-empty hits for each phase"
+                                );
+                                total_hits += result.hits.len();
+                                match kind {
+                                    ProgressivePhaseKind::Initial => initial_events += 1,
+                                    ProgressivePhaseKind::Refined => refined_events += 1,
+                                }
+                            }
+                            ProgressiveSearchEvent::RefinementFailed { error, .. } => {
+                                panic!("progressive harness refinement failed: {error}");
+                            }
+                        },
+                    )
+                    .await
+            })?;
+        }
+
+        assert_eq!(initial_events, iterations);
+        assert_eq!(refined_events, iterations);
+        assert!(
+            total_hits >= iterations.saturating_mul(16),
+            "harness should observe a full page for each phase"
+        );
+
+        Ok(())
+    }
 
     // ==========================================================================
     // StringInterner Tests (Opt 2.3)
@@ -3488,21 +5634,17 @@ mod tests {
         let queries: Vec<String> = (0..100).map(|i| format!("query_{}", i)).collect();
 
         let handles: Vec<_> = (0..4)
-            .enumerate()
-            .map(|(i, _)| {
+            .map(|_| {
                 let interner = Arc::clone(&interner);
                 let queries = queries.clone();
 
-                thread::Builder::new()
-                    .name(format!("test-interner-{i}"))
-                    .spawn(move || {
-                        for _ in 0..10 {
-                            for query in &queries {
-                                let _ = interner.intern(query);
-                            }
+                thread::spawn(move || {
+                    for _ in 0..10 {
+                        for query in &queries {
+                            let _ = interner.intern(query);
                         }
-                    })
-                    .expect("failed to spawn test thread")
+                    }
+                })
             })
             .collect();
 
@@ -3875,11 +6017,95 @@ mod tests {
     }
 
     #[test]
+    fn search_deduplication_across_pages_repro() {
+        // Reproduction of "duplicate content across pages" bug.
+        // If we fetch page 1 (limit 1) and page 2 (limit 1) separately,
+        // and deduplication happens AFTER fetching the window,
+        // we might see the same content on both pages.
+
+        let dir = TempDir::new().unwrap();
+        let index_path = dir.path();
+        let mut index = TantivyIndex::open_or_create(index_path).unwrap();
+
+        // Add two documents with IDENTICAL content but distinct other fields.
+        // Tantivy scores them. If query matches both equally, one comes first.
+        // We'll use different source paths to ensure they are distinct hits initially.
+        let msg1 = NormalizedMessage {
+            idx: 0,
+            role: "user".into(),
+            author: None,
+            created_at: Some(1000),
+            content: "duplicate content".into(),
+            extra: serde_json::json!({}),
+            snippets: Vec::new(),
+            invocations: Vec::new(),
+        };
+        let conv1 = NormalizedConversation {
+            agent_slug: "agent1".into(),
+            external_id: None,
+            title: None,
+            workspace: None,
+            source_path: "path/1".into(),
+            started_at: None,
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![msg1],
+        };
+
+        let msg2 = NormalizedMessage {
+            idx: 0,
+            role: "user".into(),
+            author: None,
+            created_at: Some(2000),              // Different timestamp
+            content: "duplicate content".into(), // SAME content
+            extra: serde_json::json!({}),
+            snippets: Vec::new(),
+            invocations: Vec::new(),
+        };
+        let conv2 = NormalizedConversation {
+            agent_slug: "agent1".into(),
+            external_id: None,
+            title: None,
+            workspace: None,
+            source_path: "path/2".into(), // Different source path
+            started_at: None,
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![msg2],
+        };
+
+        index.add_conversation(&conv1).unwrap();
+        index.add_conversation(&conv2).unwrap();
+        index.commit().unwrap();
+
+        let client = SearchClient::open(index_path, None).unwrap().unwrap();
+
+        // Search page 1: limit 1, offset 0
+        let page1 = client
+            .search("duplicate", SearchFilters::default(), 1, 0, FieldMask::FULL)
+            .unwrap();
+        assert_eq!(page1.len(), 1);
+
+        // Search page 2: limit 1, offset 1
+        let page2 = client
+            .search("duplicate", SearchFilters::default(), 1, 1, FieldMask::FULL)
+            .unwrap();
+
+        // IF deduplication works globally, page 2 should be EMPTY (because we only have 1 unique content).
+        assert!(
+            page2.is_empty(),
+            "Page 2 should be empty because deduplication works globally"
+        );
+    }
+
+    #[test]
     fn cache_skips_complex_queries() {
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -3926,8 +6152,10 @@ mod tests {
     fn cache_prefix_lookup_handles_utf8_boundaries() {
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -3999,6 +6227,123 @@ mod tests {
     }
 
     #[test]
+    fn progressive_lexical_hit_omits_unused_content() {
+        let hit = SearchHit {
+            title: "hello world".into(),
+            snippet: "hello **world**".into(),
+            content: "hello world from a much larger conversation body".into(),
+            content_hash: stable_content_hash("hello world from a much larger conversation body"),
+            score: 1.0,
+            source_path: "p".into(),
+            agent: "a".into(),
+            workspace: "w".into(),
+            workspace_original: None,
+            created_at: None,
+            line_number: Some(3),
+            match_type: MatchType::Exact,
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+        };
+
+        let snippet_only =
+            ProgressiveLexicalHit::from_search_hit(&hit, FieldMask::new(false, true, true, true));
+        assert_eq!(snippet_only.title, hit.title);
+        assert_eq!(snippet_only.snippet, hit.snippet);
+        assert!(
+            snippet_only.content.is_empty(),
+            "snippet-only progressive cache should not retain full content"
+        );
+        assert_eq!(snippet_only.match_type, hit.match_type);
+        assert_eq!(snippet_only.line_number, hit.line_number);
+        assert_eq!(snippet_only.source_path, hit.source_path);
+        assert_eq!(snippet_only.agent, hit.agent);
+        assert_eq!(snippet_only.workspace, hit.workspace);
+
+        let full =
+            ProgressiveLexicalHit::from_search_hit(&hit, FieldMask::new(true, true, true, true));
+        assert_eq!(full.content, hit.content);
+    }
+
+    #[test]
+    fn progressive_phase_reuses_lexical_cache_without_db_hydration() -> Result<()> {
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+        let field_mask = FieldMask::new(false, true, true, true);
+        let lexical_hit = SearchHit {
+            title: "lexical title".into(),
+            snippet: "lexical snippet".into(),
+            content: "full lexical body".into(),
+            content_hash: stable_content_hash("full lexical body"),
+            score: 0.0,
+            source_path: "/tmp/session.jsonl".into(),
+            agent: "codex".into(),
+            workspace: "/tmp".into(),
+            workspace_original: Some("/original".into()),
+            created_at: Some(1_700_000_000_000),
+            line_number: Some(7),
+            match_type: MatchType::Exact,
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+        };
+        let mut lexical_cache = ProgressiveLexicalCache::default();
+        lexical_cache.hits_by_message.insert(
+            42,
+            ProgressiveLexicalHit::from_search_hit(&lexical_hit, field_mask),
+        );
+
+        let hash_hex = "00".repeat(32);
+        let results = vec![FsScoredResult {
+            doc_id: format!("m|42|0|1|1|1|1|1700000000000|{hash_hex}"),
+            score: 0.91,
+            source: FsScoreSource::Lexical,
+            index: None,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: Some(0.91),
+            rerank_score: None,
+            explanation: None,
+            metadata: None,
+        }];
+
+        let result = client.progressive_phase_to_result(
+            &results,
+            &SearchFilters::default(),
+            field_mask,
+            Some(&lexical_cache),
+            1,
+            1,
+        )?;
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].title, lexical_hit.title);
+        assert_eq!(result.hits[0].snippet, lexical_hit.snippet);
+        assert!(
+            result.hits[0].content.is_empty(),
+            "masked lexical cache should still avoid carrying full content"
+        );
+        assert_eq!(result.hits[0].source_path, lexical_hit.source_path);
+        assert_eq!(result.hits[0].score, 0.91);
+
+        Ok(())
+    }
+
+    #[test]
     fn search_returns_results_with_filters_and_pagination() -> Result<()> {
         let dir = TempDir::new()?;
         let mut index = TantivyIndex::open_or_create(dir.path())?;
@@ -4025,6 +6370,7 @@ mod tests {
                     language: None,
                     snippet_text: None,
                 }],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -4069,6 +6415,7 @@ mod tests {
                     language: None,
                     snippet_text: None,
                 }],
+                invocations: Vec::new(),
             }],
         };
         let conv_b = NormalizedConversation {
@@ -4094,6 +6441,7 @@ mod tests {
                     language: None,
                     snippet_text: None,
                 }],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv_a)?;
@@ -4132,7 +6480,8 @@ mod tests {
                     role: "user".into(),
                     author: None,
                     created_at: Some(100 + i),
-                    content: "pagination needle".into(),
+                    // Use unique content for each doc to avoid deduplication
+                    content: format!("pagination needle document number {i}"),
                     extra: serde_json::json!({}),
                     snippets: vec![NormalizedSnippet {
                         file_path: None,
@@ -4141,6 +6490,7 @@ mod tests {
                         language: None,
                         snippet_text: None,
                     }],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -4186,6 +6536,7 @@ mod tests {
                     language: None,
                     snippet_text: None,
                 }],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -4219,6 +6570,7 @@ mod tests {
                 content: "please calculate the entropy".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -4259,6 +6611,7 @@ mod tests {
                 content: "check the my_variable_name please".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -4304,6 +6657,7 @@ mod tests {
                 content: "working with c++ and foo.bar today".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -4344,6 +6698,7 @@ mod tests {
                 content: "the request handler delegates".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -4389,6 +6744,7 @@ mod tests {
                 content: "the request handler delegates".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -4415,11 +6771,13 @@ mod tests {
     #[test]
     fn sqlite_backend_skips_wildcard_queries() -> Result<()> {
         // Build a client with SQLite only; wildcard queries should short-circuit without errors.
-        let conn = Connection::open_in_memory()?;
+        let conn = Connection::open(":memory:")?;
         let client = SearchClient {
             reader: None,
-            sqlite: Some(conn),
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -4436,6 +6794,897 @@ mod tests {
             hits.is_empty(),
             "wildcard should skip sqlite fallback, not error"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_handles_null_workspace() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                content='',
+                tokenize='porter'
+             );",
+        )?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, NULL, 'local', NULL, 't', '/tmp/session.jsonl')",
+        )?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)")?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+            params![
+                1_i64,
+                "auth token failure",
+                "t",
+                "codex",
+                "/tmp/session.jsonl",
+                42_i64
+            ],
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].workspace, "");
+        assert_eq!(hits[0].line_number, Some(1));
+        assert_eq!(hits[0].source_id, "local");
+        assert_eq!(hits[0].origin_kind, "local");
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_supports_legacy_fts_message_id_schema() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                message_id UNINDEXED,
+                tokenize='porter'
+             );",
+        )?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/legacy')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+             VALUES(1, 1, 1, 'local', NULL, 'legacy title', '/tmp/legacy.jsonl')",
+        )?;
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(42, 1, 4, 'legacy auth token failure', 99)",
+        )?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                1_i64,
+                "legacy auth token failure",
+                "legacy title",
+                "codex",
+                "/legacy",
+                "/tmp/legacy.jsonl",
+                99_i64,
+                42_i64
+            ],
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "legacy title");
+        assert_eq!(hits[0].source_path, "/tmp/legacy.jsonl");
+        assert_eq!(hits[0].workspace, "/legacy");
+        assert_eq!(hits[0].line_number, Some(5));
+        assert_eq!(hits[0].content, "legacy auth token failure");
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_guard_does_not_persist_duplicate_fts_rows_on_legacy_schema() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("legacy-fts.db");
+
+        {
+            let conn = LegacyConnection::open(&db_path)?;
+            conn.execute_batch(
+                "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+                 CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+                 CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+                 CREATE TABLE conversations (
+                    id INTEGER PRIMARY KEY,
+                    agent_id INTEGER,
+                    workspace_id INTEGER,
+                    source_id TEXT,
+                    origin_host TEXT,
+                    title TEXT,
+                    source_path TEXT
+                 );
+                 CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    conversation_id INTEGER,
+                    idx INTEGER,
+                    content TEXT,
+                    created_at INTEGER
+                 );
+                 CREATE VIRTUAL TABLE fts_messages USING fts5(
+                    content,
+                    title,
+                    agent,
+                    workspace,
+                    source_path,
+                    created_at UNINDEXED,
+                    message_id UNINDEXED,
+                    tokenize='porter'
+                 );",
+            )?;
+        }
+
+        let legacy_count_before: i64 = LegacyConnection::open(&db_path)?.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            legacy_count_before, 1,
+            "legacy fixture should start with one sqlite_master entry"
+        );
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path.clone()),
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let guard = client.sqlite_guard()?;
+        assert!(guard.is_some(), "sqlite guard should open the legacy db");
+        drop(guard);
+
+        let legacy_count_after: i64 = LegacyConnection::open(&db_path)?.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            legacy_count_after, 1,
+            "opening the legacy db must not persist duplicate fts_messages schema rows"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_path_rusqlite_fallback_matches_hyphenated_ids_with_workspace_filter() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("hyphenated-rusqlite-fallback.db");
+
+        {
+            let conn = LegacyConnection::open(&db_path)?;
+            conn.execute_batch(
+                "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+                 CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+                 CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+                 CREATE TABLE conversations (
+                    id INTEGER PRIMARY KEY,
+                    agent_id INTEGER,
+                    workspace_id INTEGER,
+                    source_id TEXT,
+                    origin_host TEXT,
+                    title TEXT,
+                    source_path TEXT
+                 );
+                 CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    conversation_id INTEGER,
+                    idx INTEGER,
+                    content TEXT,
+                    created_at INTEGER
+                 );
+                 CREATE VIRTUAL TABLE fts_messages USING fts5(
+                    content,
+                    title,
+                    agent,
+                    workspace,
+                    source_path,
+                    created_at UNINDEXED,
+                    content='',
+                    tokenize='porter'
+                 );",
+            )?;
+            conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", [])?;
+            conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", [])?;
+            conn.execute(
+                "INSERT INTO workspaces(id, path) VALUES(1, '/ws/alpha')",
+                [],
+            )?;
+            conn.execute("INSERT INTO workspaces(id, path) VALUES(2, '/ws/beta')", [])?;
+            conn.execute(
+                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+                 VALUES(1, 1, 1, 'local', NULL, 'alpha bead', '/tmp/alpha.jsonl')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+                 VALUES(2, 1, 2, 'local', NULL, 'beta bead', '/tmp/beta.jsonl')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+                 VALUES(11, 1, 0, 'Need follow-up on br-123 root cause', 100)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+                 VALUES(12, 2, 0, 'Need follow-up on br-123 user report', 101)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    11_i64,
+                    "Need follow-up on br-123 root cause",
+                    "alpha bead",
+                    "codex",
+                    "/ws/alpha",
+                    "/tmp/alpha.jsonl",
+                    100_i64
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    12_i64,
+                    "Need follow-up on br-123 user report",
+                    "beta bead",
+                    "codex",
+                    "/ws/beta",
+                    "/tmp/beta.jsonl",
+                    101_i64
+                ],
+            )?;
+        }
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let all_hits = client.search("br-123", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
+        assert_eq!(all_hits.len(), 2);
+        assert!(
+            all_hits.iter().all(|hit| hit.content.contains("br-123")),
+            "hyphenated bead IDs should survive the rusqlite fallback path"
+        );
+
+        let leading_or_hits = client.search(
+            "OR br-123",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(leading_or_hits.len(), 2);
+
+        let dotted_hits = client.search(
+            "br-123.jsonl",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(dotted_hits.len(), 2);
+
+        let dotted_prefix_hits = client.search(
+            "br-123.json*",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(dotted_prefix_hits.len(), 2);
+
+        let prefix_hits =
+            client.search("br-12*", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
+        assert_eq!(prefix_hits.len(), 2);
+
+        let filtered_hits = client.search(
+            "br-123",
+            SearchFilters {
+                workspaces: HashSet::from_iter(["/ws/beta".to_string()]),
+                ..SearchFilters::default()
+            },
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(filtered_hits.len(), 1);
+        assert_eq!(filtered_hits[0].workspace, "/ws/beta");
+        assert_eq!(filtered_hits[0].source_path, "/tmp/beta.jsonl");
+        assert!(filtered_hits[0].content.contains("br-123"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_orders_hits_by_bm25_score() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                content='',
+                tokenize='porter'
+             );",
+        )?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, 'local', NULL, 'best', '/tmp/best.jsonl')",
+        )?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 1, 'local', NULL, 'worse', '/tmp/worse.jsonl')",
+        )?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(7, 1, 0, 'auth auth auth failure', 42)")?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(8, 2, 0, 'auth failure', 43)")?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                7_i64,
+                "auth auth auth failure",
+                "best",
+                "codex",
+                "/ws",
+                "/tmp/best.jsonl",
+                42_i64
+            ],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                8_i64,
+                "auth failure",
+                "worse",
+                "codex",
+                "/ws",
+                "/tmp/worse.jsonl",
+                43_i64
+            ],
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "best");
+        assert_eq!(hits[1].title, "worse");
+        assert!(hits[0].score > hits[1].score);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_generates_snippet_from_content() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                content='',
+                tokenize='porter'
+             );",
+        )?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, 'local', NULL, 'snippet title', '/tmp/snippet.jsonl')",
+        )?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'alpha beta gamma delta epsilon zeta eta theta', 42)")?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                1_i64,
+                "alpha beta gamma delta epsilon zeta eta theta",
+                "snippet title",
+                "codex",
+                "/ws",
+                "/tmp/snippet.jsonl",
+                42_i64
+            ],
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let hits = client.search("delta", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
+        assert_eq!(hits.len(), 1);
+        // With contentless FTS5, snippet is generated from content via snippet_from_content()
+        assert_eq!(hits[0].snippet, snippet_from_content(&hits[0].content));
+        assert!(hits[0].snippet.contains("delta"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_respects_source_filter() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                content='',
+                tokenize='porter'
+             );",
+        )?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('laptop', 'ssh')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/local')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(2, '/remote')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, 'local', NULL, 'local title', '/tmp/local.jsonl')",
+        )?;
+        conn.execute("INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 2, 'laptop', 'dev@laptop', 'remote title', '/tmp/remote.jsonl')")?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)")?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)")?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                1_i64,
+                "auth token failure",
+                "local title",
+                "codex",
+                "/local",
+                "/tmp/local.jsonl",
+                42_i64
+            ],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                2_i64,
+                "auth token failure",
+                "remote title",
+                "codex",
+                "/remote",
+                "/tmp/remote.jsonl",
+                43_i64
+            ],
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let local_hits = client.search(
+            "auth",
+            SearchFilters {
+                source_filter: SourceFilter::Local,
+                ..SearchFilters::default()
+            },
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(local_hits.len(), 1);
+        assert_eq!(local_hits[0].source_id, "local");
+
+        let remote_hits = client.search(
+            "auth",
+            SearchFilters {
+                source_filter: SourceFilter::SourceId("laptop".to_string()),
+                ..SearchFilters::default()
+            },
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(remote_hits.len(), 1);
+        assert_eq!(remote_hits[0].source_id, "laptop");
+        assert_eq!(remote_hits[0].origin_kind, "ssh");
+
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_workspace_filter_matches_null_workspace_as_empty_string() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                content='',
+                tokenize='porter'
+             );",
+        )?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/named')")?;
+        // Conversation 1: no workspace (workspace_id=NULL)
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, NULL, 'local', NULL, 'null workspace', '/tmp/null-workspace.jsonl')",
+        )?;
+        // Conversation 2: with workspace
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 1, 'local', NULL, 'named workspace', '/tmp/named-workspace.jsonl')",
+        )?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)")?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)")?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+            params![
+                1_i64,
+                "auth token failure",
+                "null workspace",
+                "codex",
+                "/tmp/null-workspace.jsonl",
+                42_i64
+            ],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                2_i64,
+                "auth token failure",
+                "named workspace",
+                "codex",
+                "/named",
+                "/tmp/named-workspace.jsonl",
+                43_i64
+            ],
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let hits = client.search(
+            "auth",
+            SearchFilters {
+                workspaces: HashSet::from_iter([String::new()]),
+                ..SearchFilters::default()
+            },
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].workspace, "");
+        assert_eq!(hits[0].source_path, "/tmp/null-workspace.jsonl");
+
+        Ok(())
+    }
+
+    #[test]
+    fn browse_by_date_treats_null_workspace_and_source_as_local() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL
+             );
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER,
+                content TEXT NOT NULL,
+                created_at INTEGER
+             );
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
+        )?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+             VALUES(1, 1, NULL, NULL, NULL, 'browse title', '/tmp/browse.jsonl')",
+        )?;
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(1, 1, 0, 'browse auth token failure', 123)",
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let hits = client.browse_by_date(
+            SearchFilters {
+                workspaces: HashSet::from_iter([String::new()]),
+                source_filter: SourceFilter::Local,
+                ..SearchFilters::default()
+            },
+            5,
+            0,
+            true,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].workspace, "");
+        assert_eq!(hits[0].source_id, "local");
+        assert_eq!(hits[0].origin_kind, "local");
 
         Ok(())
     }
@@ -4463,6 +7712,7 @@ mod tests {
                 content: "apple banana".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv1)?;
@@ -4501,6 +7751,7 @@ mod tests {
                 content: "apricot".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv2)?;
@@ -4533,8 +7784,10 @@ mod tests {
     fn track_generation_clears_cache_on_change() {
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -4588,8 +7841,10 @@ mod tests {
     fn cache_total_cap_evicts_across_shards() {
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)), // tiny entry cap, no byte cap
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -4639,8 +7894,10 @@ mod tests {
     fn cache_stats_reflect_metrics() {
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -4671,8 +7928,10 @@ mod tests {
         // tiny entry cap (2 entries), no byte cap - forces evictions
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)),
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -4733,8 +7992,10 @@ mod tests {
         // Large entry cap (1000), tiny byte cap (100 bytes) - forces byte-based evictions
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(1000, 100)), // byte cap of 100
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -4788,16 +8049,16 @@ mod tests {
     fn wildcard_pattern_parse_exact() {
         // No wildcards - exact match
         assert_eq!(
-            WildcardPattern::parse("hello"),
-            WildcardPattern::Exact("hello".into())
+            FsCassWildcardPattern::parse("hello"),
+            FsCassWildcardPattern::Exact("hello".into())
         );
         assert_eq!(
-            WildcardPattern::parse("HELLO"),
-            WildcardPattern::Exact("hello".into()) // lowercased
+            FsCassWildcardPattern::parse("HELLO"),
+            FsCassWildcardPattern::Exact("hello".into()) // lowercased
         );
         assert_eq!(
-            WildcardPattern::parse("FooBar123"),
-            WildcardPattern::Exact("foobar123".into())
+            FsCassWildcardPattern::parse("FooBar123"),
+            FsCassWildcardPattern::Exact("foobar123".into())
         );
     }
 
@@ -4805,16 +8066,16 @@ mod tests {
     fn wildcard_pattern_parse_prefix() {
         // Trailing wildcard: foo*
         assert_eq!(
-            WildcardPattern::parse("foo*"),
-            WildcardPattern::Prefix("foo".into())
+            FsCassWildcardPattern::parse("foo*"),
+            FsCassWildcardPattern::Prefix("foo".into())
         );
         assert_eq!(
-            WildcardPattern::parse("CONFIG*"),
-            WildcardPattern::Prefix("config".into())
+            FsCassWildcardPattern::parse("CONFIG*"),
+            FsCassWildcardPattern::Prefix("config".into())
         );
         assert_eq!(
-            WildcardPattern::parse("test*"),
-            WildcardPattern::Prefix("test".into())
+            FsCassWildcardPattern::parse("test*"),
+            FsCassWildcardPattern::Prefix("test".into())
         );
     }
 
@@ -4822,16 +8083,16 @@ mod tests {
     fn wildcard_pattern_parse_suffix() {
         // Leading wildcard: *foo
         assert_eq!(
-            WildcardPattern::parse("*foo"),
-            WildcardPattern::Suffix("foo".into())
+            FsCassWildcardPattern::parse("*foo"),
+            FsCassWildcardPattern::Suffix("foo".into())
         );
         assert_eq!(
-            WildcardPattern::parse("*Error"),
-            WildcardPattern::Suffix("error".into())
+            FsCassWildcardPattern::parse("*Error"),
+            FsCassWildcardPattern::Suffix("error".into())
         );
         assert_eq!(
-            WildcardPattern::parse("*Handler"),
-            WildcardPattern::Suffix("handler".into())
+            FsCassWildcardPattern::parse("*Handler"),
+            FsCassWildcardPattern::Suffix("handler".into())
         );
     }
 
@@ -4839,16 +8100,16 @@ mod tests {
     fn wildcard_pattern_parse_substring() {
         // Both wildcards: *foo*
         assert_eq!(
-            WildcardPattern::parse("*foo*"),
-            WildcardPattern::Substring("foo".into())
+            FsCassWildcardPattern::parse("*foo*"),
+            FsCassWildcardPattern::Substring("foo".into())
         );
         assert_eq!(
-            WildcardPattern::parse("*CONFIG*"),
-            WildcardPattern::Substring("config".into())
+            FsCassWildcardPattern::parse("*CONFIG*"),
+            FsCassWildcardPattern::Substring("config".into())
         );
         assert_eq!(
-            WildcardPattern::parse("*test*"),
-            WildcardPattern::Substring("test".into())
+            FsCassWildcardPattern::parse("*test*"),
+            FsCassWildcardPattern::Substring("test".into())
         );
     }
 
@@ -4856,58 +8117,59 @@ mod tests {
     fn wildcard_pattern_parse_edge_cases() {
         // Empty after trimming wildcards
         assert_eq!(
-            WildcardPattern::parse("*"),
-            WildcardPattern::Exact(String::new())
+            FsCassWildcardPattern::parse("*"),
+            FsCassWildcardPattern::Exact(String::new())
         );
         assert_eq!(
-            WildcardPattern::parse("**"),
-            WildcardPattern::Exact(String::new())
+            FsCassWildcardPattern::parse("**"),
+            FsCassWildcardPattern::Exact(String::new())
         );
         assert_eq!(
-            WildcardPattern::parse("***"),
-            WildcardPattern::Exact(String::new())
+            FsCassWildcardPattern::parse("***"),
+            FsCassWildcardPattern::Exact(String::new())
         );
 
         // Single char with wildcards
         assert_eq!(
-            WildcardPattern::parse("*a*"),
-            WildcardPattern::Substring("a".into())
+            FsCassWildcardPattern::parse("*a*"),
+            FsCassWildcardPattern::Substring("a".into())
         );
         assert_eq!(
-            WildcardPattern::parse("a*"),
-            WildcardPattern::Prefix("a".into())
+            FsCassWildcardPattern::parse("a*"),
+            FsCassWildcardPattern::Prefix("a".into())
         );
         assert_eq!(
-            WildcardPattern::parse("*a"),
-            WildcardPattern::Suffix("a".into())
+            FsCassWildcardPattern::parse("*a"),
+            FsCassWildcardPattern::Suffix("a".into())
         );
 
         // Multiple asterisks get trimmed
         assert_eq!(
-            WildcardPattern::parse("***foo***"),
-            WildcardPattern::Substring("foo".into())
+            FsCassWildcardPattern::parse("***foo***"),
+            FsCassWildcardPattern::Substring("foo".into())
         );
     }
 
     #[test]
     fn wildcard_pattern_to_regex_suffix() {
-        let pattern = WildcardPattern::Suffix("foo".into());
-        assert_eq!(pattern.to_regex(), Some(".*foo".into()));
+        let pattern = FsCassWildcardPattern::Suffix("foo".into());
+        // Suffix patterns need $ anchor to ensure "ends with" semantics
+        assert_eq!(pattern.to_regex(), Some(".*foo$".into()));
     }
 
     #[test]
     fn wildcard_pattern_to_regex_substring() {
-        let pattern = WildcardPattern::Substring("bar".into());
+        let pattern = FsCassWildcardPattern::Substring("bar".into());
         assert_eq!(pattern.to_regex(), Some(".*bar.*".into()));
     }
 
     #[test]
     fn wildcard_pattern_to_regex_exact_prefix_none() {
         // Exact and Prefix patterns don't need regex
-        let exact = WildcardPattern::Exact("foo".into());
+        let exact = FsCassWildcardPattern::Exact("foo".into());
         assert_eq!(exact.to_regex(), None);
 
-        let prefix = WildcardPattern::Prefix("bar".into());
+        let prefix = FsCassWildcardPattern::Prefix("bar".into());
         assert_eq!(prefix.to_regex(), None);
     }
 
@@ -4923,26 +8185,6 @@ mod tests {
         assert_eq!(MatchType::Substring.quality_factor(), 0.7);
         // Implicit wildcard is lowest
         assert_eq!(MatchType::ImplicitWildcard.quality_factor(), 0.6);
-    }
-
-    #[test]
-    fn wildcard_pattern_to_match_type() {
-        assert_eq!(
-            WildcardPattern::Exact("foo".into()).to_match_type(),
-            MatchType::Exact
-        );
-        assert_eq!(
-            WildcardPattern::Prefix("foo".into()).to_match_type(),
-            MatchType::Prefix
-        );
-        assert_eq!(
-            WildcardPattern::Suffix("foo".into()).to_match_type(),
-            MatchType::Suffix
-        );
-        assert_eq!(
-            WildcardPattern::Substring("foo".into()).to_match_type(),
-            MatchType::Substring
-        );
     }
 
     #[test]
@@ -4972,54 +8214,52 @@ mod tests {
     }
 
     #[test]
-    fn escape_regex_basic() {
-        // Plain text should pass through unchanged
-        assert_eq!(escape_regex("hello"), "hello");
-        assert_eq!(escape_regex("foo123"), "foo123");
-        assert_eq!(escape_regex(""), "");
+    fn wildcard_pattern_to_regex_escapes_special_chars() {
+        assert_eq!(
+            FsCassWildcardPattern::Suffix("foo.bar".into()).to_regex(),
+            Some(".*foo\\.bar$".into())
+        );
+        assert_eq!(
+            FsCassWildcardPattern::Substring("a+b*c?".into()).to_regex(),
+            Some(".*a\\+b\\*c\\?.*".into())
+        );
     }
 
     #[test]
-    fn escape_regex_special_chars() {
-        // All special regex chars should be escaped
-        assert_eq!(escape_regex("."), "\\.");
-        assert_eq!(escape_regex("*"), "\\*");
-        assert_eq!(escape_regex("+"), "\\+");
-        assert_eq!(escape_regex("?"), "\\?");
-        assert_eq!(escape_regex("("), "\\(");
-        assert_eq!(escape_regex(")"), "\\)");
-        assert_eq!(escape_regex("["), "\\[");
-        assert_eq!(escape_regex("]"), "\\]");
-        assert_eq!(escape_regex("{"), "\\{");
-        assert_eq!(escape_regex("}"), "\\}");
-        assert_eq!(escape_regex("|"), "\\|");
-        assert_eq!(escape_regex("^"), "\\^");
-        assert_eq!(escape_regex("$"), "\\$");
-        assert_eq!(escape_regex("\\"), "\\\\");
-    }
-
-    #[test]
-    fn escape_regex_complex_patterns() {
-        // Complex patterns with multiple special chars
-        assert_eq!(escape_regex("foo.bar"), "foo\\.bar");
-        assert_eq!(escape_regex("test[0-9]+"), "test\\[0-9\\]\\+");
-        assert_eq!(escape_regex("(a|b)"), "\\(a\\|b\\)");
-        assert_eq!(escape_regex("end$"), "end\\$");
-        assert_eq!(escape_regex("^start"), "\\^start");
-        assert_eq!(escape_regex("a*b+c?"), "a\\*b\\+c\\?");
+    fn wildcard_pattern_to_regex_escapes_complex_patterns() {
+        assert_eq!(
+            FsCassWildcardPattern::Suffix("test[0-9]+".into()).to_regex(),
+            Some(".*test\\[0-9\\]\\+$".into())
+        );
+        assert_eq!(
+            FsCassWildcardPattern::Substring("(a|b)".into()).to_regex(),
+            Some(".*\\(a\\|b\\).*".into())
+        );
+        assert_eq!(
+            FsCassWildcardPattern::Substring("end$".into()).to_regex(),
+            Some(".*end\\$.*".into())
+        );
+        assert_eq!(
+            FsCassWildcardPattern::Substring("^start".into()).to_regex(),
+            Some(".*\\^start.*".into())
+        );
     }
 
     #[test]
     fn is_tool_invocation_noise_detects_noise() {
-        // Short tool invocations are noise
-        assert!(is_tool_invocation_noise("[Tool: Bash]"));
-        assert!(is_tool_invocation_noise("[Tool: Read]"));
+        // "[Tool: Name]" is now kept (users search for tool usage)
+        assert!(!is_tool_invocation_noise("[Tool: Bash]"));
+        assert!(!is_tool_invocation_noise("[Tool: Read]"));
+
+        // Empty tool names are noise
+        assert!(is_tool_invocation_noise("[Tool:]"));
+        assert!(is_tool_invocation_noise("[Tool: ]"));
 
         // Useful content should NOT be filtered
         assert!(!is_tool_invocation_noise("[Tool: Bash - Check status]"));
         assert!(!is_tool_invocation_noise("  [Tool: Grep - Search files]  "));
 
-        // Very short tool markers
+        // Very short tool markers (< 20 chars with "tool" prefix)
         assert!(is_tool_invocation_noise("[tool]"));
         assert!(is_tool_invocation_noise("tool: Bash"));
     }
@@ -5033,8 +8273,12 @@ mod tests {
 
     #[test]
     fn is_tool_invocation_noise_detects_tool_markers() {
-        assert!(is_tool_invocation_noise("[Tool: Bash]"));
-        assert!(is_tool_invocation_noise("[Tool: Read]"));
+        // "[Tool: Name]" is now kept (searchable tool usage)
+        assert!(!is_tool_invocation_noise("[Tool: Bash]"));
+        assert!(!is_tool_invocation_noise("[Tool: Read]"));
+
+        // Empty names are still noise
+        assert!(is_tool_invocation_noise("[Tool:]"));
 
         // Useful content allowed
         assert!(!is_tool_invocation_noise("[Tool: Bash - Check status]"));
@@ -5180,8 +8424,8 @@ mod tests {
             SearchHit {
                 title: "title1".into(),
                 snippet: "snip1".into(),
-                content: "[Tool: Bash]".into(), // noise (short)
-                content_hash: stable_content_hash("[Tool: Bash]"),
+                content: "[Tool:]".into(), // noise (empty tool name)
+                content_hash: stable_content_hash("[Tool:]"),
                 score: 1.0,
                 source_path: "a.jsonl".into(),
                 agent: "agent".into(),
@@ -5354,6 +8598,7 @@ mod tests {
                     content: format!("apple fruit number {i} is delicious and healthy"),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -5401,6 +8646,7 @@ mod tests {
                 content: "configuration management system".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -5447,6 +8693,7 @@ mod tests {
                 content: "testing data".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -5499,6 +8746,7 @@ mod tests {
                     content: body.to_string(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -5540,8 +8788,10 @@ mod tests {
     fn search_with_fallback_emits_wildcard_suggestion_on_zero_hits() -> Result<()> {
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -5603,6 +8853,7 @@ mod tests {
                 content: "testing data".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -5629,8 +8880,10 @@ mod tests {
         // Even with zero hits, fallback should not run when paginating (offset > 0)
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -5671,8 +8924,10 @@ mod tests {
         // Build a client without backends; suggestions are purely local heuristics
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -5730,126 +8985,207 @@ mod tests {
     }
 
     #[test]
+    fn generate_suggestions_includes_recent_alternate_agents() -> Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let workspace_id = storage.ensure_workspace(dir.path(), None)?;
+        let base_ts = 1_700_000_010_000_i64;
+
+        for (idx, slug) in ["claude_code", "codex"].iter().enumerate() {
+            let agent = Agent {
+                id: None,
+                slug: (*slug).to_string(),
+                name: (*slug).to_string(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let conversation = Conversation {
+                id: None,
+                agent_slug: (*slug).to_string(),
+                workspace: Some(dir.path().to_path_buf()),
+                external_id: Some(format!("alt-agent-{idx}")),
+                title: Some(format!("alternate agent {idx}")),
+                source_path: dir.path().join(format!("{slug}.jsonl")),
+                started_at: Some(base_ts + idx as i64),
+                ended_at: Some(base_ts + idx as i64),
+                approx_tokens: Some(8),
+                metadata_json: json!({}),
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(base_ts + idx as i64),
+                    content: format!("content from {slug}"),
+                    extra_json: json!({}),
+                    snippets: Vec::new(),
+                }],
+                source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
+        }
+        drop(storage);
+
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("db-backed client");
+        let result = client.search_with_fallback(
+            "ghost",
+            SearchFilters::default(),
+            5,
+            0,
+            3,
+            FieldMask::FULL,
+        )?;
+
+        let alternate_agents: HashSet<String> = result
+            .suggestions
+            .iter()
+            .filter(|suggestion| matches!(suggestion.kind, SuggestionKind::AlternateAgent))
+            .filter_map(|suggestion| suggestion.suggested_filters.as_ref())
+            .flat_map(|filters| filters.agents.iter().cloned())
+            .collect();
+
+        assert!(
+            alternate_agents.contains("claude_code"),
+            "should suggest claude_code from normalized conversations schema"
+        );
+        assert!(
+            alternate_agents.contains("codex"),
+            "should suggest codex from normalized conversations schema"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn sanitize_query_preserves_wildcards() {
         // Wildcards should be preserved
-        assert_eq!(sanitize_query("*foo*"), "*foo*");
-        assert_eq!(sanitize_query("foo*"), "foo*");
-        assert_eq!(sanitize_query("*bar"), "*bar");
-        assert_eq!(sanitize_query("*config*"), "*config*");
+        assert_eq!(fs_cass_sanitize_query("*foo*"), "*foo*");
+        assert_eq!(fs_cass_sanitize_query("foo*"), "foo*");
+        assert_eq!(fs_cass_sanitize_query("*bar"), "*bar");
+        assert_eq!(fs_cass_sanitize_query("*config*"), "*config*");
     }
 
     #[test]
     fn sanitize_query_strips_other_special_chars() {
         // Non-wildcard special chars become spaces
-        assert_eq!(sanitize_query("foo.bar"), "foo bar");
-        assert_eq!(sanitize_query("c++"), "c  ");
-        assert_eq!(sanitize_query("foo-bar"), "foo bar");
-        assert_eq!(sanitize_query("test_case"), "test case");
+        assert_eq!(fs_cass_sanitize_query("foo.bar"), "foo bar");
+        assert_eq!(fs_cass_sanitize_query("c++"), "c  ");
+        assert_eq!(fs_cass_sanitize_query("foo-bar"), "foo-bar");
+        assert_eq!(fs_cass_sanitize_query("test_case"), "test case");
     }
 
     #[test]
     fn sanitize_query_combined() {
         // Mix of wildcards and special chars
-        assert_eq!(sanitize_query("*foo.bar*"), "*foo bar*");
-        assert_eq!(sanitize_query("test-*"), "test *");
-        assert_eq!(sanitize_query("*c++*"), "*c  *");
+        assert_eq!(fs_cass_sanitize_query("*foo.bar*"), "*foo bar*");
+        assert_eq!(fs_cass_sanitize_query("test-*"), "test-*");
+        assert_eq!(fs_cass_sanitize_query("*c++*"), "*c  *");
     }
 
     // Boolean query parsing tests
     #[test]
     fn parse_boolean_query_simple_terms() {
-        let tokens = parse_boolean_query("foo bar baz");
+        let tokens = fs_cass_parse_boolean_query("foo bar baz");
         assert_eq!(tokens.len(), 3);
-        assert_eq!(tokens[0], QueryToken::Term("foo".to_string()));
-        assert_eq!(tokens[1], QueryToken::Term("bar".to_string()));
-        assert_eq!(tokens[2], QueryToken::Term("baz".to_string()));
+        assert_eq!(tokens[0], FsCassQueryToken::Term("foo".to_string()));
+        assert_eq!(tokens[1], FsCassQueryToken::Term("bar".to_string()));
+        assert_eq!(tokens[2], FsCassQueryToken::Term("baz".to_string()));
     }
 
     #[test]
     fn parse_boolean_query_and_operator() {
-        let tokens = parse_boolean_query("foo AND bar");
+        let tokens = fs_cass_parse_boolean_query("foo AND bar");
         assert_eq!(tokens.len(), 3);
-        assert_eq!(tokens[0], QueryToken::Term("foo".to_string()));
-        assert_eq!(tokens[1], QueryToken::And);
-        assert_eq!(tokens[2], QueryToken::Term("bar".to_string()));
+        assert_eq!(tokens[0], FsCassQueryToken::Term("foo".to_string()));
+        assert_eq!(tokens[1], FsCassQueryToken::And);
+        assert_eq!(tokens[2], FsCassQueryToken::Term("bar".to_string()));
 
         // Also test && syntax
-        let tokens2 = parse_boolean_query("foo && bar");
+        let tokens2 = fs_cass_parse_boolean_query("foo && bar");
         assert_eq!(tokens2.len(), 3);
-        assert_eq!(tokens2[1], QueryToken::And);
+        assert_eq!(tokens2[1], FsCassQueryToken::And);
     }
 
     #[test]
     fn parse_boolean_query_or_operator() {
-        let tokens = parse_boolean_query("foo OR bar");
+        let tokens = fs_cass_parse_boolean_query("foo OR bar");
         assert_eq!(tokens.len(), 3);
-        assert_eq!(tokens[0], QueryToken::Term("foo".to_string()));
-        assert_eq!(tokens[1], QueryToken::Or);
-        assert_eq!(tokens[2], QueryToken::Term("bar".to_string()));
+        assert_eq!(tokens[0], FsCassQueryToken::Term("foo".to_string()));
+        assert_eq!(tokens[1], FsCassQueryToken::Or);
+        assert_eq!(tokens[2], FsCassQueryToken::Term("bar".to_string()));
 
         // Also test || syntax
-        let tokens2 = parse_boolean_query("foo || bar");
+        let tokens2 = fs_cass_parse_boolean_query("foo || bar");
         assert_eq!(tokens2.len(), 3);
-        assert_eq!(tokens2[1], QueryToken::Or);
+        assert_eq!(tokens2[1], FsCassQueryToken::Or);
     }
 
     #[test]
     fn parse_boolean_query_not_operator() {
-        let tokens = parse_boolean_query("foo NOT bar");
+        let tokens = fs_cass_parse_boolean_query("foo NOT bar");
         assert_eq!(tokens.len(), 3);
-        assert_eq!(tokens[0], QueryToken::Term("foo".to_string()));
-        assert_eq!(tokens[1], QueryToken::Not);
-        assert_eq!(tokens[2], QueryToken::Term("bar".to_string()));
+        assert_eq!(tokens[0], FsCassQueryToken::Term("foo".to_string()));
+        assert_eq!(tokens[1], FsCassQueryToken::Not);
+        assert_eq!(tokens[2], FsCassQueryToken::Term("bar".to_string()));
     }
 
     #[test]
     fn parse_boolean_query_quoted_phrase() {
-        let tokens = parse_boolean_query(r#"foo "exact phrase" bar"#);
+        let tokens = fs_cass_parse_boolean_query(r#"foo "exact phrase" bar"#);
         assert_eq!(tokens.len(), 3);
-        assert_eq!(tokens[0], QueryToken::Term("foo".to_string()));
-        assert_eq!(tokens[1], QueryToken::Phrase("exact phrase".to_string()));
-        assert_eq!(tokens[2], QueryToken::Term("bar".to_string()));
+        assert_eq!(tokens[0], FsCassQueryToken::Term("foo".to_string()));
+        assert_eq!(
+            tokens[1],
+            FsCassQueryToken::Phrase("exact phrase".to_string())
+        );
+        assert_eq!(tokens[2], FsCassQueryToken::Term("bar".to_string()));
     }
 
     #[test]
     fn parse_boolean_query_complex() {
-        let tokens = parse_boolean_query(r#"error OR warning NOT "false positive""#);
+        let tokens = fs_cass_parse_boolean_query(r#"error OR warning NOT "false positive""#);
         assert_eq!(tokens.len(), 5);
-        assert_eq!(tokens[0], QueryToken::Term("error".to_string()));
-        assert_eq!(tokens[1], QueryToken::Or);
-        assert_eq!(tokens[2], QueryToken::Term("warning".to_string()));
-        assert_eq!(tokens[3], QueryToken::Not);
-        assert_eq!(tokens[4], QueryToken::Phrase("false positive".to_string()));
+        assert_eq!(tokens[0], FsCassQueryToken::Term("error".to_string()));
+        assert_eq!(tokens[1], FsCassQueryToken::Or);
+        assert_eq!(tokens[2], FsCassQueryToken::Term("warning".to_string()));
+        assert_eq!(tokens[3], FsCassQueryToken::Not);
+        assert_eq!(
+            tokens[4],
+            FsCassQueryToken::Phrase("false positive".to_string())
+        );
     }
 
     #[test]
     fn has_boolean_operators_detection() {
-        assert!(!has_boolean_operators("foo bar"));
-        assert!(has_boolean_operators("foo AND bar"));
-        assert!(has_boolean_operators("foo OR bar"));
-        assert!(has_boolean_operators("foo NOT bar"));
-        assert!(has_boolean_operators(r#""exact phrase""#));
-        assert!(has_boolean_operators("foo && bar"));
-        assert!(has_boolean_operators("foo || bar"));
+        assert!(!fs_cass_has_boolean_operators("foo bar"));
+        assert!(fs_cass_has_boolean_operators("foo AND bar"));
+        assert!(fs_cass_has_boolean_operators("foo OR bar"));
+        assert!(fs_cass_has_boolean_operators("foo NOT bar"));
+        assert!(fs_cass_has_boolean_operators(r#""exact phrase""#));
+        assert!(fs_cass_has_boolean_operators("foo && bar"));
+        assert!(fs_cass_has_boolean_operators("foo || bar"));
     }
 
     #[test]
     fn parse_boolean_query_case_insensitive_operators() {
         // Operators should be case-insensitive
-        let tokens = parse_boolean_query("foo and bar or baz not qux");
+        let tokens = fs_cass_parse_boolean_query("foo and bar or baz not qux");
         assert_eq!(tokens.len(), 7);
-        assert_eq!(tokens[1], QueryToken::And);
-        assert_eq!(tokens[3], QueryToken::Or);
-        assert_eq!(tokens[5], QueryToken::Not);
+        assert_eq!(tokens[1], FsCassQueryToken::And);
+        assert_eq!(tokens[3], FsCassQueryToken::Or);
+        assert_eq!(tokens[5], FsCassQueryToken::Not);
     }
 
     #[test]
     fn parse_boolean_query_with_wildcards() {
-        let tokens = parse_boolean_query("*config* OR env*");
+        let tokens = fs_cass_parse_boolean_query("*config* OR env*");
         assert_eq!(tokens.len(), 3);
-        assert_eq!(tokens[0], QueryToken::Term("*config*".to_string()));
-        assert_eq!(tokens[1], QueryToken::Or);
-        assert_eq!(tokens[2], QueryToken::Term("env*".to_string()));
+        assert_eq!(tokens[0], FsCassQueryToken::Term("*config*".to_string()));
+        assert_eq!(tokens[1], FsCassQueryToken::Or);
+        assert_eq!(tokens[2], FsCassQueryToken::Term("env*".to_string()));
     }
 
     // ============================================================
@@ -5881,6 +9217,7 @@ mod tests {
                 content: "hello world findme alpha".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         // Agent B (claude)
@@ -5901,6 +9238,7 @@ mod tests {
                 content: "hello world findme beta".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv_a)?;
@@ -5958,6 +9296,7 @@ mod tests {
                 content: "workspace test needle".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         // Workspace B
@@ -5978,6 +9317,7 @@ mod tests {
                 content: "workspace test needle".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv_a)?;
@@ -6038,6 +9378,7 @@ mod tests {
                 content: "date range test".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         // Middle doc (ts=500)
@@ -6058,6 +9399,7 @@ mod tests {
                 content: "date range test".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         // Late doc (ts=900)
@@ -6078,6 +9420,7 @@ mod tests {
                 content: "date range test".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv_early)?;
@@ -6154,6 +9497,7 @@ mod tests {
                     content: "hello world combotest query".into(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -6213,6 +9557,7 @@ mod tests {
                 content: "source filter test local".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         // Remote source doc (would need to be indexed with ssh origin_kind)
@@ -6267,8 +9612,10 @@ mod tests {
         // Different filters should have different cache keys
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -6322,16 +9669,16 @@ mod tests {
     #[test]
     fn sanitize_query_preserves_unicode_alphanumeric() {
         // Unicode letters and digits should be preserved
-        assert_eq!(sanitize_query("こんにちは"), "こんにちは");
-        assert_eq!(sanitize_query("café"), "café");
-        assert_eq!(sanitize_query("日本語123"), "日本語123");
+        assert_eq!(fs_cass_sanitize_query("こんにちは"), "こんにちは");
+        assert_eq!(fs_cass_sanitize_query("café"), "café");
+        assert_eq!(fs_cass_sanitize_query("日本語123"), "日本語123");
     }
 
     #[test]
     fn sanitize_query_handles_multiple_consecutive_special_chars() {
-        assert_eq!(sanitize_query("foo---bar"), "foo   bar");
+        assert_eq!(fs_cass_sanitize_query("foo---bar"), "foo---bar");
         // a!@#$%^&()b has 9 special chars between a and b: ! @ # $ % ^ & ( )
-        assert_eq!(sanitize_query("a!@#$%^&()b"), "a         b");
+        assert_eq!(fs_cass_sanitize_query("a!@#$%^&()b"), "a         b");
     }
 
     // --- Additional WildcardPattern::parse tests (edge cases) ---
@@ -6339,66 +9686,34 @@ mod tests {
     #[test]
     fn wildcard_pattern_empty_after_trim_returns_exact_empty() {
         assert_eq!(
-            WildcardPattern::parse("*"),
-            WildcardPattern::Exact(String::new())
+            FsCassWildcardPattern::parse("*"),
+            FsCassWildcardPattern::Exact(String::new())
         );
         assert_eq!(
-            WildcardPattern::parse("**"),
-            WildcardPattern::Exact(String::new())
+            FsCassWildcardPattern::parse("**"),
+            FsCassWildcardPattern::Exact(String::new())
         );
         assert_eq!(
-            WildcardPattern::parse("***"),
-            WildcardPattern::Exact(String::new())
+            FsCassWildcardPattern::parse("***"),
+            FsCassWildcardPattern::Exact(String::new())
         );
     }
 
     #[test]
     fn wildcard_pattern_to_regex_generation() {
         // Exact and prefix patterns don't need regex
-        assert_eq!(WildcardPattern::Exact("foo".into()).to_regex(), None);
-        assert_eq!(WildcardPattern::Prefix("foo".into()).to_regex(), None);
+        assert_eq!(FsCassWildcardPattern::Exact("foo".into()).to_regex(), None);
+        assert_eq!(FsCassWildcardPattern::Prefix("foo".into()).to_regex(), None);
         // Suffix and substring need regex
+        // Suffix needs $ anchor for "ends with" semantics
         assert_eq!(
-            WildcardPattern::Suffix("foo".into()).to_regex(),
-            Some(".*foo".into())
+            FsCassWildcardPattern::Suffix("foo".into()).to_regex(),
+            Some(".*foo$".into())
         );
         assert_eq!(
-            WildcardPattern::Substring("foo".into()).to_regex(),
+            FsCassWildcardPattern::Substring("foo".into()).to_regex(),
             Some(".*foo.*".into())
         );
-    }
-
-    // --- escape_regex tests ---
-
-    #[test]
-    fn escape_regex_escapes_all_special_chars() {
-        assert_eq!(escape_regex("."), "\\.");
-        assert_eq!(escape_regex("*"), "\\*");
-        assert_eq!(escape_regex("+"), "\\+");
-        assert_eq!(escape_regex("?"), "\\?");
-        assert_eq!(escape_regex("["), "\\[");
-        assert_eq!(escape_regex("]"), "\\]");
-        assert_eq!(escape_regex("("), "\\(");
-        assert_eq!(escape_regex(")"), "\\)");
-        assert_eq!(escape_regex("{"), "\\{");
-        assert_eq!(escape_regex("}"), "\\}");
-        assert_eq!(escape_regex("|"), "\\|");
-        assert_eq!(escape_regex("^"), "\\^");
-        assert_eq!(escape_regex("$"), "\\$");
-        assert_eq!(escape_regex("\\"), "\\\\");
-    }
-
-    #[test]
-    fn escape_regex_preserves_alphanumeric() {
-        assert_eq!(escape_regex("hello"), "hello");
-        assert_eq!(escape_regex("abc123"), "abc123");
-    }
-
-    #[test]
-    fn escape_regex_mixed_content() {
-        assert_eq!(escape_regex("foo.bar"), "foo\\.bar");
-        assert_eq!(escape_regex("a+b*c"), "a\\+b\\*c");
-        assert_eq!(escape_regex("(test)"), "\\(test\\)");
     }
 
     // --- Additional parse_boolean_query tests (edge cases) ---
@@ -6406,22 +9721,21 @@ mod tests {
     #[test]
     fn parse_boolean_query_prefix_minus_not() {
         // Prefix minus at start of query should trigger NOT
-        let tokens = parse_boolean_query("-world");
-        assert_eq!(
-            tokens,
-            vec![QueryToken::Not, QueryToken::Term("world".into())]
-        );
+        let tokens = fs_cass_parse_boolean_query("-world");
+        let expected = vec![
+            FsCassQueryToken::Not,
+            FsCassQueryToken::Term("world".into()),
+        ];
+        assert_eq!(tokens, expected);
 
         // Prefix minus after space should trigger NOT
-        let tokens = parse_boolean_query("hello -world");
-        assert_eq!(
-            tokens,
-            vec![
-                QueryToken::Term("hello".into()),
-                QueryToken::Not,
-                QueryToken::Term("world".into())
-            ]
-        );
+        let tokens = fs_cass_parse_boolean_query("hello -world");
+        let expected = vec![
+            FsCassQueryToken::Term("hello".into()),
+            FsCassQueryToken::Not,
+            FsCassQueryToken::Term("world".into()),
+        ];
+        assert_eq!(tokens, expected);
     }
 
     #[test]
@@ -6430,20 +9744,64 @@ mod tests {
         assert!(tokens.is_empty());
 
         let tokens = parse_boolean_query("foo \"\" bar");
-        assert_eq!(
-            tokens,
-            vec![
-                QueryToken::Term("foo".into()),
-                QueryToken::Term("bar".into())
-            ]
-        );
+        let expected: QueryTokenList = vec![
+            QueryToken::Term("foo".into()),
+            QueryToken::Term("bar".into()),
+        ];
+        assert_eq!(tokens, expected);
     }
 
     #[test]
     fn parse_boolean_query_unclosed_quote() {
         // Unclosed quote should collect until end
         let tokens = parse_boolean_query("\"hello world");
-        assert_eq!(tokens, vec![QueryToken::Phrase("hello world".into())]);
+        let expected: QueryTokenList = vec![QueryToken::Phrase("hello world".into())];
+        assert_eq!(tokens, expected);
+    }
+
+    #[test]
+    fn transpile_to_fts5_rejects_leading_unary_not_queries() {
+        assert_eq!(transpile_to_fts5("NOT foo"), None);
+        assert_eq!(transpile_to_fts5("-foo"), None);
+    }
+
+    #[test]
+    fn transpile_to_fts5_rejects_or_not_forms_it_cannot_represent() {
+        assert_eq!(transpile_to_fts5("foo OR NOT bar"), None);
+        assert_eq!(transpile_to_fts5("foo NOT bar OR baz"), None);
+    }
+
+    #[test]
+    fn transpile_to_fts5_ignores_leading_or() {
+        assert_eq!(transpile_to_fts5("OR test"), Some("test".to_string()));
+        assert_eq!(
+            transpile_to_fts5("OR foo-bar"),
+            Some("\"foo-bar\"".to_string())
+        );
+    }
+
+    #[test]
+    fn transpile_to_fts5_quotes_hyphenated_subterms_after_sanitization_split() {
+        assert_eq!(
+            transpile_to_fts5("br-123.jsonl"),
+            Some("(\"br-123\" AND jsonl)".to_string())
+        );
+        assert_eq!(
+            transpile_to_fts5("br-123.json*"),
+            Some("(\"br-123\" AND json*)".to_string())
+        );
+    }
+
+    #[test]
+    fn transpile_to_fts5_preserves_supported_binary_not() {
+        assert_eq!(
+            transpile_to_fts5("foo NOT bar").as_deref(),
+            Some("foo NOT bar")
+        );
+        assert_eq!(
+            transpile_to_fts5("foo NOT bar-baz"),
+            Some("foo NOT \"bar-baz\"".to_string())
+        );
     }
 
     // --- levenshtein_distance tests ---
@@ -6522,6 +9880,7 @@ mod tests {
                 content: "alpha beta gamma".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         let conv2 = NormalizedConversation {
@@ -6541,6 +9900,7 @@ mod tests {
                 content: "alpha delta".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv1)?;
@@ -6596,6 +9956,7 @@ mod tests {
                 content: "unique xyzzy term".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         let conv2 = NormalizedConversation {
@@ -6615,6 +9976,7 @@ mod tests {
                 content: "unique plugh term".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv1)?;
@@ -6658,6 +10020,7 @@ mod tests {
                 content: "nottest keep this".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         let conv2 = NormalizedConversation {
@@ -6677,6 +10040,7 @@ mod tests {
                 content: "nottest exclude this".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv1)?;
@@ -6739,6 +10103,7 @@ mod tests {
                 content: "the quick brown fox".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         let conv2 = NormalizedConversation {
@@ -6758,6 +10123,7 @@ mod tests {
                 content: "the brown quick fox".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv1)?;
@@ -6812,6 +10178,7 @@ mod tests {
                 content: "foo bar baz".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -6840,7 +10207,8 @@ mod tests {
         assert_eq!(exp.estimated_cost, QueryCost::Low);
         assert!(exp.parsed.terms.len() == 1);
         assert_eq!(exp.parsed.terms[0].text, "hello");
-        assert_eq!(exp.parsed.terms[0].pattern, "exact");
+        assert!(!exp.parsed.terms[0].subterms.is_empty());
+        assert_eq!(exp.parsed.terms[0].subterms[0].pattern, "exact");
     }
 
     #[test]
@@ -6849,7 +10217,12 @@ mod tests {
         assert_eq!(exp.query_type, QueryType::Wildcard);
         assert_eq!(exp.index_strategy, IndexStrategy::RegexScan);
         assert_eq!(exp.estimated_cost, QueryCost::High);
-        assert!(exp.parsed.terms[0].pattern.contains("substring"));
+        assert!(!exp.parsed.terms[0].subterms.is_empty());
+        assert!(
+            exp.parsed.terms[0].subterms[0]
+                .pattern
+                .contains("substring")
+        );
         assert!(exp.warnings.iter().any(|w| w.contains("regex scan")));
     }
 
@@ -7001,6 +10374,7 @@ mod tests {
                     content: (*content).into(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -7054,6 +10428,7 @@ mod tests {
                     content: format!("needle from {agent}"),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -7086,8 +10461,10 @@ mod tests {
     fn cache_metrics_incremented_on_operations() {
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -7122,8 +10499,10 @@ mod tests {
         // Verify that shard name generation is deterministic for same filters
         let client = SearchClient {
             reader: None,
-            sqlite: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
             last_reload: Mutex::new(None),
             last_generation: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
@@ -7185,6 +10564,7 @@ mod tests {
                 content: "unique specific term here".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
 
@@ -7205,6 +10585,7 @@ mod tests {
                 content: "unique specific also here".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
 
@@ -7248,6 +10629,7 @@ mod tests {
                 content: "authentication authorization oauth".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -7304,6 +10686,7 @@ mod tests {
                     content: "Help me implement JWT authentication for my Express API".into(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 },
                 NormalizedMessage {
                     idx: 1,
@@ -7319,6 +10702,7 @@ mod tests {
                         language: Some("json".into()),
                         snippet_text: Some(r#"{"dependencies":{"jsonwebtoken":"^9.0.0"}}"#.into()),
                     }],
+                    invocations: Vec::new(),
                 },
                 NormalizedMessage {
                     idx: 2,
@@ -7328,6 +10712,7 @@ mod tests {
                     content: "Can you also add refresh token support?".into(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 },
             ],
         };
@@ -7403,6 +10788,7 @@ mod tests {
                     content: "implement the sorting algorithm".into(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -7461,6 +10847,7 @@ mod tests {
                     content: format!("needle content for session {}", i),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -7524,6 +10911,7 @@ mod tests {
                 content: "needle content".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -7539,6 +10927,219 @@ mod tests {
         assert_eq!(hits.len(), 1);
 
         Ok(())
+    }
+
+    #[test]
+    fn semantic_search_session_paths_filter_retries_past_initial_candidates() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        let mut filters = SearchFilters::default();
+        filters
+            .session_paths
+            .insert(fixture.source_paths[2].clone());
+
+        let (hits, ann_stats) = fixture.client.search_semantic(
+            "semantic fixture query",
+            filters,
+            1,
+            0,
+            FieldMask::FULL,
+            false,
+        )?;
+
+        assert!(
+            ann_stats.is_none(),
+            "exact search should not emit ANN stats"
+        );
+        assert_eq!(
+            hits.len(),
+            1,
+            "filtered semantic search should still return a hit"
+        );
+        assert_eq!(
+            hits[0].source_path, fixture.source_paths[2],
+            "semantic search should keep searching until it finds the requested session path"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_search_offsets_after_session_paths_filtering() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        let mut filters = SearchFilters::default();
+        filters
+            .session_paths
+            .insert(fixture.source_paths[1].clone());
+        filters
+            .session_paths
+            .insert(fixture.source_paths[2].clone());
+
+        let (hits, _) = fixture.client.search_semantic(
+            "semantic fixture query",
+            filters,
+            1,
+            1,
+            FieldMask::FULL,
+            false,
+        )?;
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "second filtered page should still return one hit"
+        );
+        assert_eq!(
+            hits[0].source_path, fixture.source_paths[2],
+            "offset must apply after semantic deduplication and session path filtering"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn progressive_phase_overfetches_before_session_paths_filtering() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        let mut filters = SearchFilters::default();
+        filters
+            .session_paths
+            .insert(fixture.source_paths[2].clone());
+
+        let results = vec![
+            FsScoredResult {
+                doc_id: fixture.doc_ids[0].clone(),
+                score: 1.0,
+                source: FsScoreSource::SemanticFast,
+                index: None,
+                fast_score: Some(1.0),
+                quality_score: None,
+                lexical_score: None,
+                rerank_score: None,
+                explanation: None,
+                metadata: None,
+            },
+            FsScoredResult {
+                doc_id: fixture.doc_ids[1].clone(),
+                score: 0.9,
+                source: FsScoreSource::SemanticFast,
+                index: None,
+                fast_score: Some(0.9),
+                quality_score: None,
+                lexical_score: None,
+                rerank_score: None,
+                explanation: None,
+                metadata: None,
+            },
+            FsScoredResult {
+                doc_id: fixture.doc_ids[2].clone(),
+                score: 0.8,
+                source: FsScoreSource::SemanticFast,
+                index: None,
+                fast_score: Some(0.8),
+                quality_score: None,
+                lexical_score: None,
+                rerank_score: None,
+                explanation: None,
+                metadata: None,
+            },
+        ];
+
+        let result = fixture.client.progressive_phase_to_result(
+            &results,
+            &filters,
+            FieldMask::FULL,
+            None,
+            1,
+            3,
+        )?;
+
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "progressive phase should retain enough overfetched hits to satisfy post-search session path filtering"
+        );
+        assert_eq!(
+            result.hits[0].source_path, fixture.source_paths[2],
+            "progressive phase should page after session path filtering"
+        );
+
+        Ok(())
+    }
+
+    // =============================================================================
+    // SQL Placeholder Builder Tests (Opt 4.5: Pre-sized String Buffers)
+    // =============================================================================
+
+    #[test]
+    fn sql_placeholders_empty() {
+        assert_eq!(sql_placeholders(0), "");
+    }
+
+    #[test]
+    fn sql_placeholders_single() {
+        assert_eq!(sql_placeholders(1), "?");
+    }
+
+    #[test]
+    fn sql_placeholders_multiple() {
+        assert_eq!(sql_placeholders(3), "?,?,?");
+        assert_eq!(sql_placeholders(5), "?,?,?,?,?");
+    }
+
+    #[test]
+    fn sql_placeholders_capacity_efficient() {
+        // For count=3, capacity should be exactly 2*3-1=5 ("?,?,?" = 5 chars)
+        let result = sql_placeholders(3);
+        assert_eq!(result.len(), 5);
+        assert!(result.capacity() >= 5); // Should have allocated at least 5
+
+        // For count=10, capacity should be exactly 2*10-1=19
+        let result = sql_placeholders(10);
+        assert_eq!(result.len(), 19);
+        assert!(result.capacity() >= 19);
+    }
+
+    #[test]
+    fn sql_placeholders_large_count() {
+        // Test with a large count to ensure no off-by-one errors
+        let result = sql_placeholders(100);
+        assert_eq!(result.len(), 199); // 100 "?" + 99 ","
+        assert_eq!(result.chars().filter(|c| *c == '?').count(), 100);
+        assert_eq!(result.chars().filter(|c| *c == ',').count(), 99);
+    }
+
+    #[test]
+    fn hybrid_budget_identifier_biases_lexical() {
+        let budget = hybrid_candidate_budget("src/main.rs", 20, 20, 5, 10_000);
+        assert!(
+            budget.lexical_candidates > budget.semantic_candidates,
+            "identifier queries should allocate more lexical than semantic fanout"
+        );
+        assert!(budget.lexical_candidates >= 25);
+    }
+
+    #[test]
+    fn hybrid_budget_natural_language_biases_semantic() {
+        let budget = hybrid_candidate_budget(
+            "how do we fix authentication middleware latency",
+            20,
+            20,
+            5,
+            10_000,
+        );
+        assert!(
+            budget.semantic_candidates > budget.lexical_candidates,
+            "natural language queries should allocate more semantic than lexical fanout"
+        );
+    }
+
+    #[test]
+    fn hybrid_budget_no_limit_caps_semantic_without_capping_lexical() {
+        let total_docs = 30_000;
+        let budget =
+            hybrid_candidate_budget("authentication middleware", 0, total_docs, 0, total_docs);
+        assert_eq!(budget.lexical_candidates, total_docs);
+        assert!(budget.semantic_candidates <= HYBRID_NO_LIMIT_SEMANTIC_CAP);
+        assert!(budget.semantic_candidates < budget.lexical_candidates);
     }
 
     // =============================================================================
@@ -7716,5 +11317,1938 @@ mod tests {
         for hit in &fused {
             assert!(seen.insert(&hit.title), "Duplicate hit: {}", hit.title);
         }
+    }
+
+    // ==========================================================================
+    // QueryTokenList Behavior Tests (Opt 4.4)
+    // ==========================================================================
+
+    #[test]
+    fn query_token_list_parses_small_queries() {
+        // Single term
+        let tokens = parse_boolean_query("hello");
+        assert_eq!(tokens.len(), 1);
+
+        // Two terms
+        let tokens = parse_boolean_query("hello world");
+        assert_eq!(tokens.len(), 2);
+
+        // Three tokens with operator
+        let tokens = parse_boolean_query("hello AND world");
+        assert_eq!(tokens.len(), 3);
+
+        // Four tokens
+        let tokens = parse_boolean_query("hello world foo bar");
+        assert_eq!(tokens.len(), 4);
+    }
+
+    #[test]
+    fn query_token_list_parses_large_queries() {
+        let tokens = parse_boolean_query("a b c d e f g h i");
+        assert_eq!(tokens.len(), 9);
+    }
+
+    #[test]
+    fn query_token_list_handles_quoted_phrases() {
+        let tokens = parse_boolean_query("\"hello world\" test");
+        assert_eq!(tokens.len(), 2);
+
+        // Verify the phrase is correctly parsed
+        assert!(
+            matches!(&tokens[0], QueryToken::Phrase(phrase) if phrase == "hello world"),
+            "Expected Phrase token"
+        );
+    }
+
+    #[test]
+    fn query_token_list_handles_operators() {
+        let tokens = parse_boolean_query("foo AND bar OR baz");
+        assert_eq!(tokens.len(), 5);
+        assert_eq!(tokens[1], QueryToken::And);
+        assert_eq!(tokens[3], QueryToken::Or);
+    }
+
+    #[test]
+    fn query_token_list_empty_query() {
+        let tokens = parse_boolean_query("");
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn query_token_list_iteration_works() {
+        let tokens = parse_boolean_query("a b c");
+        let terms: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                QueryToken::Term(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terms, vec!["a", "b", "c"]);
+    }
+
+    // ==========================================================================
+    // Unicode Query Parsing Tests (br-327c)
+    // Comprehensive Unicode handling tests covering emoji, CJK, RTL, mixed
+    // scripts, zero-width characters, combining characters, normalization,
+    // supplementary plane characters, and bidirectional text.
+    // ==========================================================================
+
+    // --- Emoji queries ---
+
+    #[test]
+    fn unicode_emoji_treated_as_separator() {
+        // Emoji are not alphanumeric per Unicode, so sanitize_query replaces them with spaces
+        let sanitized = sanitize_query("🚀 launch");
+        assert_eq!(sanitized, "  launch", "Emoji should become space");
+    }
+
+    #[test]
+    fn unicode_emoji_splits_terms() {
+        // Emoji between words acts as a separator
+        let sanitized = sanitize_query("hot🔥code");
+        assert_eq!(sanitized, "hot code", "Emoji between words splits them");
+    }
+
+    #[test]
+    fn unicode_multiple_emoji_become_spaces() {
+        let sanitized = sanitize_query("🚀🔥💻");
+        assert_eq!(
+            sanitized.trim(),
+            "",
+            "All-emoji query sanitizes to whitespace"
+        );
+    }
+
+    #[test]
+    fn unicode_emoji_query_parses_without_panic() {
+        let tokens = parse_boolean_query("🚀 launch code 🔥");
+        let terms: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                QueryToken::Term(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        // Emoji removed by sanitization in normalize_term_parts, only words remain
+        assert!(
+            terms
+                .iter()
+                .any(|t| t.contains("launch") || t.contains("code"))
+        );
+    }
+
+    #[test]
+    fn unicode_emoji_query_terms_lower() {
+        let terms = QueryTermsLower::from_query("🚀 LAUNCH");
+        // Emoji becomes space, LAUNCH lowercased
+        let tokens: Vec<&str> = terms.tokens().collect();
+        assert!(
+            tokens.contains(&"launch"),
+            "Should extract 'launch' from emoji query"
+        );
+    }
+
+    // --- CJK character queries ---
+
+    #[test]
+    fn unicode_cjk_chinese_preserved() {
+        assert_eq!(sanitize_query("测试代码"), "测试代码");
+        assert_eq!(sanitize_query("测试 代码"), "测试 代码");
+    }
+
+    #[test]
+    fn unicode_cjk_japanese_preserved() {
+        assert_eq!(sanitize_query("テスト"), "テスト");
+        // Hiragana and Katakana are alphanumeric
+        assert_eq!(sanitize_query("こんにちは世界"), "こんにちは世界");
+    }
+
+    #[test]
+    fn unicode_cjk_korean_preserved() {
+        assert_eq!(sanitize_query("테스트"), "테스트");
+        assert_eq!(sanitize_query("안녕하세요"), "안녕하세요");
+    }
+
+    #[test]
+    fn unicode_cjk_parsed_as_terms() {
+        let tokens = parse_boolean_query("测试 代码 search");
+        let terms: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                QueryToken::Term(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terms, vec!["测试", "代码", "search"]);
+    }
+
+    #[test]
+    fn unicode_cjk_query_terms_lower() {
+        let terms = QueryTermsLower::from_query("测试 代码");
+        let tokens: Vec<&str> = terms.tokens().collect();
+        assert_eq!(tokens, vec!["测试", "代码"]);
+    }
+
+    // --- RTL text queries ---
+
+    #[test]
+    fn unicode_hebrew_preserved() {
+        assert_eq!(sanitize_query("שלום עולם"), "שלום עולם");
+    }
+
+    #[test]
+    fn unicode_arabic_preserved() {
+        assert_eq!(sanitize_query("مرحبا"), "مرحبا");
+    }
+
+    #[test]
+    fn unicode_hebrew_parsed_as_terms() {
+        let tokens = parse_boolean_query("שלום עולם");
+        let terms: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                QueryToken::Term(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terms, vec!["שלום", "עולם"]);
+    }
+
+    #[test]
+    fn unicode_arabic_query_terms_lower() {
+        // Arabic doesn't have case, so lowercasing is a no-op
+        let terms = QueryTermsLower::from_query("مرحبا بالعالم");
+        let tokens: Vec<&str> = terms.tokens().collect();
+        assert_eq!(tokens, vec!["مرحبا", "بالعالم"]);
+    }
+
+    // --- Mixed script queries ---
+
+    #[test]
+    fn unicode_mixed_scripts_preserved() {
+        let sanitized = sanitize_query("Hello 世界 мир");
+        assert_eq!(sanitized, "Hello 世界 мир");
+    }
+
+    #[test]
+    fn unicode_mixed_scripts_parsed() {
+        let tokens = parse_boolean_query("Hello 世界 мир");
+        let terms: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                QueryToken::Term(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terms, vec!["Hello", "世界", "мир"]);
+    }
+
+    #[test]
+    fn unicode_mixed_scripts_with_emoji() {
+        // Emoji stripped, scripts preserved
+        let sanitized = sanitize_query("Hello 🌍 世界");
+        assert_eq!(sanitized, "Hello   世界");
+    }
+
+    #[test]
+    fn unicode_latin_cyrillic_arabic_query() {
+        let terms = QueryTermsLower::from_query("Hello Мир مرحبا");
+        let tokens: Vec<&str> = terms.tokens().collect();
+        assert_eq!(tokens, vec!["hello", "мир", "مرحبا"]);
+    }
+
+    // --- Zero-width characters ---
+
+    #[test]
+    fn unicode_zero_width_joiner_removed() {
+        // Zero-width joiner (U+200D) is not alphanumeric → becomes space
+        let sanitized = sanitize_query("test\u{200D}query");
+        assert_eq!(sanitized, "test query");
+    }
+
+    #[test]
+    fn unicode_zero_width_non_joiner_removed() {
+        // Zero-width non-joiner (U+200C) is not alphanumeric → becomes space
+        let sanitized = sanitize_query("test\u{200C}query");
+        assert_eq!(sanitized, "test query");
+    }
+
+    #[test]
+    fn unicode_zero_width_space_removed() {
+        // Zero-width space (U+200B) is not alphanumeric → becomes space
+        let sanitized = sanitize_query("test\u{200B}query");
+        assert_eq!(sanitized, "test query");
+    }
+
+    #[test]
+    fn unicode_bom_removed() {
+        // Byte-order mark (U+FEFF) should not appear in search terms
+        let sanitized = sanitize_query("\u{FEFF}test");
+        assert_eq!(sanitized, " test");
+    }
+
+    // --- Combining characters ---
+
+    #[test]
+    fn unicode_precomposed_accent_preserved() {
+        // Precomposed é (U+00E9) is a single letter → alphanumeric
+        let sanitized = sanitize_query("café");
+        assert_eq!(sanitized, "café");
+    }
+
+    #[test]
+    fn unicode_combining_accent_becomes_separator() {
+        // Decomposed: 'e' + combining acute accent (U+0301)
+        // The combining mark itself is NOT alphanumeric → becomes space
+        // This means "cafe\u{0301}" becomes "cafe " (accent stripped)
+        let input = "cafe\u{0301}";
+        let sanitized = sanitize_query(input);
+        // 'c','a','f','e' are alphanumeric; U+0301 is Mark category → space
+        assert_eq!(sanitized, "cafe ");
+    }
+
+    #[test]
+    fn unicode_nfc_vs_nfd_differ_in_sanitization() {
+        // NFC (precomposed): é = U+00E9 (single char, alphanumeric)
+        let nfc = "caf\u{00E9}";
+        // NFD (decomposed): e + ◌́ = U+0065 U+0301 (two chars, accent not alphanumeric)
+        let nfd = "cafe\u{0301}";
+
+        let san_nfc = sanitize_query(nfc);
+        let san_nfd = sanitize_query(nfd);
+
+        // NFC preserves the é
+        assert_eq!(san_nfc, "café");
+        // NFD strips the combining accent
+        assert_eq!(san_nfd, "cafe ");
+        // They differ — this is expected behavior (no normalization applied)
+        assert_ne!(san_nfc, san_nfd);
+    }
+
+    #[test]
+    fn unicode_combining_marks_do_not_panic() {
+        // Multiple combining marks stacked (e.g., Zalgo text)
+        let zalgo = "t\u{0301}\u{0302}\u{0303}e\u{0304}\u{0305}st";
+        let sanitized = sanitize_query(zalgo);
+        // Should not panic; combining marks become spaces
+        assert!(sanitized.contains('t'));
+        assert!(sanitized.contains('s'));
+    }
+
+    // --- Supplementary plane characters (outside BMP) ---
+
+    #[test]
+    fn unicode_mathematical_bold_letters_preserved() {
+        // Mathematical Bold Capital A (U+1D400) — classified as Letter
+        let input = "\u{1D400}\u{1D401}\u{1D402}";
+        let sanitized = sanitize_query(input);
+        assert_eq!(
+            sanitized, input,
+            "Mathematical bold letters are alphanumeric"
+        );
+    }
+
+    #[test]
+    fn unicode_supplementary_ideograph_preserved() {
+        // CJK Unified Ideographs Extension B character (U+20000)
+        let input = "\u{20000}";
+        let sanitized = sanitize_query(input);
+        assert_eq!(
+            sanitized, input,
+            "Supplementary CJK ideographs are alphanumeric"
+        );
+    }
+
+    #[test]
+    fn unicode_supplementary_emoji_removed() {
+        // Grinning face (U+1F600) — Symbol, not alphanumeric
+        let input = "test\u{1F600}query";
+        let sanitized = sanitize_query(input);
+        assert_eq!(sanitized, "test query");
+    }
+
+    // --- Bidirectional text ---
+
+    #[test]
+    fn unicode_bidi_mixed_ltr_rtl_no_panic() {
+        let input = "hello שלום world עולם";
+        let tokens = parse_boolean_query(input);
+        let terms: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                QueryToken::Term(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terms.len(), 4);
+        assert!(terms.contains(&"hello"));
+        assert!(terms.contains(&"שלום"));
+        assert!(terms.contains(&"world"));
+        assert!(terms.contains(&"עולם"));
+    }
+
+    #[test]
+    fn unicode_bidi_override_chars_removed() {
+        // Left-to-right override (U+202D) and pop directional (U+202C)
+        // These are format characters, not alphanumeric
+        let input = "test\u{202D}content\u{202C}end";
+        let sanitized = sanitize_query(input);
+        assert_eq!(sanitized, "test content end");
+    }
+
+    #[test]
+    fn unicode_bidi_rtl_mark_removed() {
+        // Right-to-left mark (U+200F) is not alphanumeric
+        let input = "test\u{200F}content";
+        let sanitized = sanitize_query(input);
+        assert_eq!(sanitized, "test content");
+    }
+
+    // --- Full pipeline integration tests ---
+
+    #[test]
+    fn unicode_full_pipeline_cjk_query() {
+        let explanation = QueryExplanation::analyze("测试 代码", &SearchFilters::default());
+        assert_eq!(explanation.parsed.terms.len(), 2);
+        assert!(!explanation.parsed.terms[0].text.is_empty());
+        assert!(!explanation.parsed.terms[1].text.is_empty());
+    }
+
+    #[test]
+    fn unicode_full_pipeline_mixed_script_boolean() {
+        let explanation =
+            QueryExplanation::analyze("Hello AND 世界 OR مرحبا", &SearchFilters::default());
+        // Should parse operators correctly even with mixed scripts
+        assert!(
+            explanation.parsed.operators.iter().any(|op| op == "AND"),
+            "AND operator should be recognized in mixed-script query"
+        );
+    }
+
+    #[test]
+    fn unicode_full_pipeline_emoji_query_type() {
+        // An all-emoji query sanitizes to empty — should handle gracefully
+        let explanation = QueryExplanation::analyze("🚀🔥💻", &SearchFilters::default());
+        // Should not panic; terms may be empty after sanitization
+        assert!(
+            explanation.parsed.terms.is_empty()
+                || explanation
+                    .parsed
+                    .terms
+                    .iter()
+                    .all(|t| t.subterms.is_empty()),
+            "All-emoji query should produce no meaningful terms"
+        );
+    }
+
+    #[test]
+    fn unicode_full_pipeline_phrase_with_cjk() {
+        let explanation = QueryExplanation::analyze("\"测试代码\"", &SearchFilters::default());
+        assert!(
+            !explanation.parsed.phrases.is_empty(),
+            "CJK phrase should be recognized"
+        );
+    }
+
+    #[test]
+    fn unicode_full_pipeline_wildcard_with_unicode() {
+        let explanation = QueryExplanation::analyze("*测试*", &SearchFilters::default());
+        assert!(
+            !explanation.parsed.terms.is_empty(),
+            "Wildcard with CJK should produce terms"
+        );
+        // Check that the term has a substring/wildcard pattern
+        if let Some(term) = explanation.parsed.terms.first() {
+            assert!(
+                term.subterms
+                    .iter()
+                    .any(|s| s.pattern.contains("*") || s.pattern == "exact"),
+                "CJK wildcard should produce wildcard or exact pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_query_terms_lower_case_folding() {
+        // German sharp s (ß) lowercases to ß (not ss in Rust)
+        let terms = QueryTermsLower::from_query("STRAßE");
+        assert_eq!(terms.query_lower, "straße");
+
+        // Turkish dotless I (İ → i with dot below in some locales, but
+        // Rust uses simple Unicode case mapping)
+        let terms2 = QueryTermsLower::from_query("HELLO");
+        assert_eq!(terms2.query_lower, "hello");
+    }
+
+    #[test]
+    fn unicode_normalize_term_parts_cjk() {
+        let parts = normalize_term_parts("测试 代码");
+        assert_eq!(parts, vec!["测试", "代码"]);
+    }
+
+    #[test]
+    fn unicode_normalize_term_parts_strips_emoji() {
+        let parts = normalize_term_parts("🚀launch🔥code");
+        // Emoji replaced with space, splitting into two terms
+        assert!(parts.contains(&"launch".to_string()));
+        assert!(parts.contains(&"code".to_string()));
+    }
+
+    // ── Special character query tests (br-g650) ────────────────────────────
+
+    // Category 1: Unbalanced quotes
+
+    #[test]
+    fn special_char_unbalanced_quote_no_panic() {
+        let tokens = parse_boolean_query("\"hello world");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, QueryToken::Phrase(p) if p.contains("hello"))),
+            "Unbalanced quote should still produce a phrase: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn special_char_unbalanced_trailing_quote() {
+        let tokens = parse_boolean_query("test\"");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, QueryToken::Term(w) if w == "test")),
+            "Text before trailing quote should parse as term: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn special_char_multiple_unbalanced_quotes() {
+        let tokens = parse_boolean_query("\"foo \"bar");
+        assert!(
+            !tokens.is_empty(),
+            "Should parse despite odd quotes: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn special_char_empty_quotes() {
+        let tokens = parse_boolean_query("\"\" test");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, QueryToken::Term(w) if w == "test")),
+            "Empty quotes should be skipped: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn special_char_unbalanced_via_sanitize() {
+        let sanitized = sanitize_query("\"hello world");
+        assert!(
+            sanitized.contains('"'),
+            "Quotes preserved by sanitize_query"
+        );
+    }
+
+    // Category 2: Escaped quotes
+
+    #[test]
+    fn special_char_backslash_quote_sanitize() {
+        let sanitized = sanitize_query("\\\"test\\\"");
+        assert!(sanitized.contains('"'));
+        assert!(!sanitized.contains('\\'), "Backslash should be stripped");
+    }
+
+    #[test]
+    fn special_char_backslash_quote_parse() {
+        let tokens = parse_boolean_query("\\\"test\\\"");
+        assert!(!tokens.is_empty(), "Should parse without panic: {tokens:?}");
+    }
+
+    #[test]
+    fn special_char_inner_escaped_quotes() {
+        let tokens = parse_boolean_query("\"test \\\"inner\\\" test\"");
+        assert!(
+            !tokens.is_empty(),
+            "Nested escaped quotes should not panic: {tokens:?}"
+        );
+    }
+
+    // Category 3: Backslash sequences
+
+    #[test]
+    fn special_char_windows_path_sanitize() {
+        let sanitized = sanitize_query("C:\\Users\\test");
+        assert_eq!(sanitized, "C  Users test");
+    }
+
+    #[test]
+    fn special_char_unc_path_sanitize() {
+        let sanitized = sanitize_query("\\\\server\\share");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert!(parts.contains(&"server"));
+        assert!(parts.contains(&"share"));
+    }
+
+    #[test]
+    fn special_char_windows_path_terms() {
+        let parts = normalize_term_parts("C:\\Users\\test\\file.rs");
+        assert!(parts.contains(&"C".to_string()));
+        assert!(parts.contains(&"Users".to_string()));
+        assert!(parts.contains(&"test".to_string()));
+        assert!(parts.contains(&"file".to_string()));
+        assert!(parts.contains(&"rs".to_string()));
+    }
+
+    // Category 4: Regex metacharacters
+
+    #[test]
+    fn special_char_regex_dot_star() {
+        let sanitized = sanitize_query("foo.*bar");
+        assert_eq!(sanitized, "foo *bar");
+    }
+
+    #[test]
+    fn special_char_regex_char_class() {
+        let sanitized = sanitize_query("[a-z]+");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert_eq!(parts, vec!["a", "z"]);
+    }
+
+    #[test]
+    fn special_char_regex_anchors() {
+        let sanitized = sanitize_query("^start$");
+        assert_eq!(sanitized.trim(), "start");
+    }
+
+    #[test]
+    fn special_char_regex_pipe_groups() {
+        let sanitized = sanitize_query("(foo|bar)");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert_eq!(parts, vec!["foo", "bar"]);
+    }
+
+    // Category 5: SQL injection patterns
+
+    #[test]
+    fn special_char_sql_injection_or() {
+        let sanitized = sanitize_query("'OR 1=1--");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert!(parts.contains(&"OR"));
+        assert!(parts.contains(&"1"));
+        assert!(!sanitized.contains('\''));
+        assert!(!sanitized.contains('='));
+    }
+
+    #[test]
+    fn special_char_sql_injection_drop() {
+        let sanitized = sanitize_query("; DROP TABLE users;--");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert!(parts.contains(&"DROP"));
+        assert!(parts.contains(&"TABLE"));
+        assert!(parts.contains(&"users"));
+        assert!(!sanitized.contains(';'));
+    }
+
+    #[test]
+    fn special_char_sql_injection_union() {
+        let sanitized = sanitize_query("' UNION SELECT * FROM passwords --");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert!(parts.contains(&"UNION"));
+        assert!(parts.contains(&"SELECT"));
+        assert!(parts.contains(&"*"));
+        assert!(parts.contains(&"FROM"));
+        assert!(parts.contains(&"passwords"));
+    }
+
+    #[test]
+    fn special_char_sql_parse_as_literal() {
+        let tokens = parse_boolean_query("OR 1=1");
+        assert!(
+            tokens.iter().any(|t| matches!(t, QueryToken::Or)),
+            "OR should be parsed as Or operator: {tokens:?}"
+        );
+    }
+
+    // Category 6: Shell injection patterns
+
+    #[test]
+    fn special_char_shell_subshell() {
+        let sanitized = sanitize_query("$(cmd)");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert_eq!(parts, vec!["cmd"]);
+    }
+
+    #[test]
+    fn special_char_shell_backticks() {
+        let sanitized = sanitize_query("`cmd`");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert_eq!(parts, vec!["cmd"]);
+    }
+
+    #[test]
+    fn special_char_shell_pipe_rm() {
+        let sanitized = sanitize_query("| rm -rf /");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert!(parts.contains(&"rm"));
+        assert!(parts.contains(&"rf"));
+        assert!(!sanitized.contains('|'));
+        assert!(!sanitized.contains('/'));
+    }
+
+    #[test]
+    fn special_char_shell_semicolon_chain() {
+        let sanitized = sanitize_query("test; echo pwned; cat /etc/passwd");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert!(parts.contains(&"test"));
+        assert!(parts.contains(&"echo"));
+        assert!(parts.contains(&"pwned"));
+        assert!(!sanitized.contains(';'));
+    }
+
+    // Category 7: Null bytes
+
+    #[test]
+    fn special_char_null_byte_mid_string() {
+        let sanitized = sanitize_query("test\x00hidden");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert_eq!(parts, vec!["test", "hidden"]);
+    }
+
+    #[test]
+    fn special_char_null_byte_leading() {
+        let sanitized = sanitize_query("\x00\x00attack");
+        assert_eq!(sanitized.trim(), "attack");
+    }
+
+    #[test]
+    fn special_char_null_byte_trailing() {
+        let sanitized = sanitize_query("query\x00\x00\x00");
+        assert_eq!(sanitized.trim(), "query");
+    }
+
+    #[test]
+    fn special_char_null_byte_parse() {
+        let tokens = parse_boolean_query("test\x00hidden");
+        assert!(
+            !tokens.is_empty(),
+            "Null bytes should not prevent parsing: {tokens:?}"
+        );
+    }
+
+    // Category 8: Control characters
+
+    #[test]
+    fn special_char_control_newline() {
+        let sanitized = sanitize_query("line1\nline2");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert_eq!(parts, vec!["line1", "line2"]);
+    }
+
+    #[test]
+    fn special_char_control_tab_cr() {
+        let sanitized = sanitize_query("tab\there\r\nend");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert_eq!(parts, vec!["tab", "here", "end"]);
+    }
+
+    #[test]
+    fn special_char_control_parse_whitespace() {
+        let tokens = parse_boolean_query("hello\tworld\ntest");
+        let terms: Vec<&str> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                QueryToken::Term(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terms, vec!["hello", "world", "test"]);
+    }
+
+    #[test]
+    fn special_char_control_bell_escape() {
+        let sanitized = sanitize_query("test\x07\x1b[31mred");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert!(parts.contains(&"test"));
+        assert!(parts.contains(&"31mred"));
+    }
+
+    // Category 9: HTML/XML entities
+
+    #[test]
+    fn special_char_html_entity_lt() {
+        let sanitized = sanitize_query("&lt;script&gt;");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert_eq!(parts, vec!["lt", "script", "gt"]);
+    }
+
+    #[test]
+    fn special_char_html_numeric_entity() {
+        let sanitized = sanitize_query("&#x3C;script&#x3E;");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert!(parts.contains(&"x3C"));
+        assert!(parts.contains(&"script"));
+        assert!(parts.contains(&"x3E"));
+    }
+
+    #[test]
+    fn special_char_html_tags_stripped() {
+        let sanitized = sanitize_query("<script>alert('xss')</script>");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert!(parts.contains(&"script"));
+        assert!(parts.contains(&"alert"));
+        assert!(parts.contains(&"xss"));
+    }
+
+    #[test]
+    fn special_char_html_attribute() {
+        let sanitized = sanitize_query("<img src=\"evil.js\" onerror=\"alert(1)\">");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert!(parts.contains(&"img"));
+        assert!(parts.contains(&"src"));
+        assert!(parts.contains(&"onerror"));
+    }
+
+    // Category 10: URL encoding
+
+    #[test]
+    fn special_char_url_percent_encoding() {
+        let sanitized = sanitize_query("%20space%2Fslash");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert_eq!(parts, vec!["20space", "2Fslash"]);
+    }
+
+    #[test]
+    fn special_char_url_null_byte_encoded() {
+        let sanitized = sanitize_query("test%00hidden");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert_eq!(parts, vec!["test", "00hidden"]);
+    }
+
+    #[test]
+    fn special_char_url_full_query_string() {
+        let sanitized = sanitize_query("search?q=hello&lang=en");
+        let parts: Vec<&str> = sanitized.split_whitespace().collect();
+        assert_eq!(parts, vec!["search", "q", "hello", "lang", "en"]);
+    }
+
+    // Cross-cutting: full pipeline integration
+
+    #[test]
+    fn special_char_explain_sql_injection() {
+        let filters = SearchFilters::default();
+        let explanation = QueryExplanation::analyze("'OR 1=1--", &filters);
+        assert!(
+            !explanation.parsed.terms.is_empty() || !explanation.parsed.phrases.is_empty(),
+            "SQL injection should produce parseable terms"
+        );
+    }
+
+    #[test]
+    fn special_char_explain_shell_injection() {
+        let filters = SearchFilters::default();
+        let explanation = QueryExplanation::analyze("$(rm -rf /)", &filters);
+        assert!(
+            !explanation.parsed.terms.is_empty(),
+            "Shell injection should produce parseable terms"
+        );
+    }
+
+    #[test]
+    fn special_char_explain_html_xss() {
+        let filters = SearchFilters::default();
+        let explanation = QueryExplanation::analyze("<script>alert('xss')</script>", &filters);
+        assert!(
+            !explanation.parsed.terms.is_empty(),
+            "XSS payload should produce parseable terms"
+        );
+    }
+
+    #[test]
+    fn special_char_terms_lower_injection() {
+        let qt = QueryTermsLower::from_query("'; DROP TABLE--");
+        let tokens: Vec<&str> = qt.tokens().collect();
+        for token in &tokens {
+            assert!(
+                token.chars().all(|c| c.is_alphanumeric()),
+                "Token should only contain alphanumeric characters: {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn special_char_terms_lower_null_bytes() {
+        let qt = QueryTermsLower::from_query("test\x00hidden");
+        let tokens: Vec<&str> = qt.tokens().collect();
+        assert!(tokens.contains(&"test"));
+        assert!(tokens.contains(&"hidden"));
+    }
+
+    #[test]
+    fn special_char_boolean_with_injection() {
+        let tokens = parse_boolean_query("search AND 'OR 1=1-- NOT drop");
+        assert!(
+            tokens.iter().any(|t| matches!(t, QueryToken::And)),
+            "Boolean AND should still be recognized: {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|t| matches!(t, QueryToken::Not)),
+            "Boolean NOT should still be recognized: {tokens:?}"
+        );
+    }
+
+    // ==========================================================================
+    // Query Length Stress Tests (coding_agent_session_search-z1bk)
+    // Tests for extreme input sizes to ensure parser robustness.
+    // ==========================================================================
+
+    #[test]
+    fn stress_query_100k_chars_completes_quickly() {
+        // 100k character query - must complete in <1 second
+        let long_query = "a ".repeat(50000);
+        assert_eq!(long_query.len(), 100000);
+
+        let start = std::time::Instant::now();
+        let sanitized = sanitize_query(&long_query);
+        let elapsed_sanitize = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let tokens = parse_boolean_query(&sanitized);
+        let elapsed_parse = start.elapsed();
+
+        assert!(
+            elapsed_sanitize < std::time::Duration::from_secs(1),
+            "sanitize_query with 100k chars took {:?} (>1s)",
+            elapsed_sanitize
+        );
+        assert!(
+            elapsed_parse < std::time::Duration::from_secs(1),
+            "parse_boolean_query with 100k chars took {:?} (>1s)",
+            elapsed_parse
+        );
+        assert!(!tokens.is_empty(), "100k char query should produce tokens");
+    }
+
+    #[test]
+    fn stress_query_1000_terms() {
+        // 1000 space-separated words
+        let words: Vec<String> = (0..1000).map(|i| format!("word{}", i)).collect();
+        let query = words.join(" ");
+
+        let start = std::time::Instant::now();
+        let sanitized = sanitize_query(&query);
+        let tokens = parse_boolean_query(&sanitized);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "1000 terms query took {:?} (>1s)",
+            elapsed
+        );
+        // Should have roughly 1000 Term tokens
+        let term_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Term(_)))
+            .count();
+        assert!(
+            term_count >= 900,
+            "Expected ~1000 terms, got {} terms",
+            term_count
+        );
+    }
+
+    #[test]
+    fn stress_query_1000_identical_terms() {
+        // Same word repeated 1000 times
+        let query = "test ".repeat(1000);
+
+        let start = std::time::Instant::now();
+        let sanitized = sanitize_query(&query);
+        let tokens = parse_boolean_query(&sanitized);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "1000 identical terms query took {:?} (>1s)",
+            elapsed
+        );
+
+        // Verify parse_boolean_query produced expected tokens
+        let parsed_term_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Term(_)))
+            .count();
+        assert_eq!(parsed_term_count, 1000, "Parser should produce 1000 terms");
+
+        // QueryTermsLower should handle this efficiently
+        let qt = QueryTermsLower::from_query(&query);
+        let tokens_lower: Vec<&str> = qt.tokens().collect();
+        assert_eq!(
+            tokens_lower.len(),
+            1000,
+            "All 1000 identical terms should be preserved"
+        );
+        assert!(
+            tokens_lower.iter().all(|t| *t == "test"),
+            "All tokens should be 'test'"
+        );
+    }
+
+    #[test]
+    fn stress_query_10k_char_single_term() {
+        // 10k character single continuous string (no spaces)
+        let long_term = "a".repeat(10000);
+
+        let start = std::time::Instant::now();
+        let sanitized = sanitize_query(&long_term);
+        let tokens = parse_boolean_query(&sanitized);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "10k char single term took {:?} (>1s)",
+            elapsed
+        );
+        assert_eq!(tokens.len(), 1, "Should produce exactly one token");
+        assert!(
+            matches!(&tokens[0], QueryToken::Term(t) if t.len() == 10000),
+            "Expected Term token"
+        );
+    }
+
+    #[test]
+    fn stress_deeply_nested_parentheses() {
+        // 100+ levels of nested parentheses (though parser doesn't use them,
+        // they become spaces and shouldn't cause issues)
+        let open_parens = "(".repeat(100);
+        let close_parens = ")".repeat(100);
+        let query = format!("{}test{}", open_parens, close_parens);
+
+        let start = std::time::Instant::now();
+        let sanitized = sanitize_query(&query);
+        let tokens = parse_boolean_query(&sanitized);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "Deeply nested parens took {:?} (>100ms)",
+            elapsed
+        );
+        // Parentheses become spaces, leaving just "test"
+        let term_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Term(_)))
+            .count();
+        assert_eq!(term_count, 1, "Should have 1 term after sanitizing parens");
+    }
+
+    #[test]
+    fn stress_many_boolean_operators() {
+        // 100+ boolean operators: "a AND b AND c AND ..."
+        let terms: Vec<String> = (0..101).map(|i| format!("term{}", i)).collect();
+        let query = terms.join(" AND ");
+
+        let start = std::time::Instant::now();
+        let tokens = parse_boolean_query(&query);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "100+ boolean ops took {:?} (>1s)",
+            elapsed
+        );
+
+        let and_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::And))
+            .count();
+        let term_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Term(_)))
+            .count();
+
+        assert_eq!(and_count, 100, "Should have 100 AND operators");
+        assert_eq!(term_count, 101, "Should have 101 terms");
+    }
+
+    #[test]
+    fn stress_many_or_operators() {
+        // 100+ OR operators: "a OR b OR c OR ..."
+        let terms: Vec<String> = (0..101).map(|i| format!("opt{}", i)).collect();
+        let query = terms.join(" OR ");
+
+        let start = std::time::Instant::now();
+        let tokens = parse_boolean_query(&query);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "100+ OR ops took {:?} (>1s)",
+            elapsed
+        );
+
+        let or_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Or))
+            .count();
+        assert_eq!(or_count, 100, "Should have 100 OR operators");
+    }
+
+    #[test]
+    fn stress_mixed_boolean_operators() {
+        // Complex query with many mixed operators
+        let query = "a AND b OR c NOT d AND e OR f NOT g ".repeat(50);
+
+        let start = std::time::Instant::now();
+        let tokens = parse_boolean_query(&query);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "Mixed boolean ops took {:?} (>1s)",
+            elapsed
+        );
+        assert!(
+            !tokens.is_empty(),
+            "Complex boolean query should produce tokens"
+        );
+    }
+
+    #[test]
+    fn stress_memory_bounds_large_query() {
+        // Verify no excessive memory allocation with large input
+        // We can't easily measure memory in a unit test, but we can verify
+        // the output size is reasonable relative to input.
+        let large_query = "x".repeat(100000);
+
+        let sanitized = sanitize_query(&large_query);
+        let tokens = parse_boolean_query(&sanitized);
+
+        // Sanitized output shouldn't be larger than input
+        assert!(
+            sanitized.len() <= large_query.len(),
+            "Sanitized output should not exceed input size"
+        );
+
+        // Should produce exactly 1 token
+        assert_eq!(tokens.len(), 1);
+
+        // QueryTermsLower internal storage should be bounded
+        let qt = QueryTermsLower::from_query(&large_query);
+        let token_count = qt.tokens().count();
+        assert_eq!(token_count, 1, "Should be 1 token of 100k chars");
+    }
+
+    #[test]
+    fn stress_concurrent_queries() {
+        use std::thread;
+
+        let queries: Vec<String> = (0..100)
+            .map(|i| format!("concurrent_query_{} test search", i))
+            .collect();
+
+        let handles: Vec<_> = queries
+            .into_iter()
+            .map(|query| {
+                thread::spawn(move || {
+                    let sanitized = sanitize_query(&query);
+                    let tokens = parse_boolean_query(&sanitized);
+                    let qt = QueryTermsLower::from_query(&query);
+                    (tokens.len(), qt.tokens().count())
+                })
+            })
+            .collect();
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            let (token_len, qt_len) = handle.join().expect("Thread panicked");
+            assert!(token_len > 0, "Query {} should produce tokens", i);
+            assert!(qt_len > 0, "Query {} QueryTermsLower should have tokens", i);
+        }
+    }
+
+    #[test]
+    fn stress_many_quoted_phrases() {
+        // 50 quoted phrases
+        let phrases: Vec<String> = (0..50)
+            .map(|i| format!("\"phrase number {}\"", i))
+            .collect();
+        let query = phrases.join(" AND ");
+
+        let start = std::time::Instant::now();
+        let tokens = parse_boolean_query(&query);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "50 quoted phrases took {:?} (>1s)",
+            elapsed
+        );
+
+        let phrase_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Phrase(_)))
+            .count();
+        assert_eq!(phrase_count, 50, "Should have 50 phrases");
+    }
+
+    #[test]
+    fn stress_alternating_quotes() {
+        // Alternating quoted and unquoted: "a" b "c" d "e" ...
+        let parts: Vec<String> = (0..100)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("\"word{}\"", i)
+                } else {
+                    format!("word{}", i)
+                }
+            })
+            .collect();
+        let query = parts.join(" ");
+
+        let start = std::time::Instant::now();
+        let tokens = parse_boolean_query(&query);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "100 alternating quotes took {:?} (>1s)",
+            elapsed
+        );
+
+        let phrase_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Phrase(_)))
+            .count();
+        let term_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Term(_)))
+            .count();
+
+        assert_eq!(phrase_count, 50, "Should have 50 phrases");
+        assert_eq!(term_count, 50, "Should have 50 terms");
+    }
+
+    #[test]
+    fn stress_many_wildcards() {
+        // Many wildcard patterns
+        let patterns: Vec<&str> = vec!["pre*", "*suf", "*sub*", "a*b", "test*", "*ing", "*tion*"];
+        let query = patterns
+            .iter()
+            .cycle()
+            .take(100)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let start = std::time::Instant::now();
+        let sanitized = sanitize_query(&query);
+        let tokens = parse_boolean_query(&sanitized);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "100 wildcards took {:?} (>1s)",
+            elapsed
+        );
+        assert!(!tokens.is_empty());
+    }
+
+    #[test]
+    fn stress_query_explanation_large_query() {
+        // Test QueryExplanation with a large query
+        let words: Vec<String> = (0..100).map(|i| format!("term{}", i)).collect();
+        let query = words.join(" ");
+        let filters = SearchFilters::default();
+
+        let start = std::time::Instant::now();
+        let explanation = QueryExplanation::analyze(&query, &filters);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "QueryExplanation for 100 terms took {:?} (>2s)",
+            elapsed
+        );
+        assert!(
+            !explanation.parsed.terms.is_empty(),
+            "Should parse terms successfully"
+        );
+    }
+
+    #[test]
+    fn stress_very_long_single_quoted_phrase() {
+        // Single quoted phrase with many words
+        let words: Vec<String> = (0..500).map(|i| format!("word{}", i)).collect();
+        let phrase = format!("\"{}\"", words.join(" "));
+
+        let start = std::time::Instant::now();
+        let tokens = parse_boolean_query(&phrase);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "500-word phrase took {:?} (>1s)",
+            elapsed
+        );
+
+        let phrase_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Phrase(_)))
+            .count();
+        assert_eq!(phrase_count, 1, "Should have exactly 1 phrase");
+    }
+
+    #[test]
+    fn stress_not_prefix_many() {
+        // Many NOT prefixes: -a -b -c -d ...
+        let terms: Vec<String> = (0..100).map(|i| format!("-term{}", i)).collect();
+        let query = terms.join(" ");
+
+        let start = std::time::Instant::now();
+        let tokens = parse_boolean_query(&query);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "100 NOT prefixes took {:?} (>1s)",
+            elapsed
+        );
+
+        let not_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Not))
+            .count();
+        assert_eq!(not_count, 100, "Should have 100 NOT operators");
+    }
+
+    #[test]
+    fn stress_unicode_large_cjk_query() {
+        // Large CJK query (each char is alphanumeric)
+        let cjk_chars = "中文日本語한국어".repeat(1000);
+
+        let start = std::time::Instant::now();
+        let sanitized = sanitize_query(&cjk_chars);
+        let qt = QueryTermsLower::from_query(&sanitized);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "Large CJK query took {:?} (>1s)",
+            elapsed
+        );
+        assert!(!qt.is_empty(), "CJK query should produce tokens");
+    }
+
+    #[test]
+    fn stress_unicode_many_emoji() {
+        // Query with many emoji (non-alphanumeric, become spaces)
+        let emoji_query = "🚀 🔍 📝 💻 🎯 ".repeat(500);
+
+        let start = std::time::Instant::now();
+        let sanitized = sanitize_query(&emoji_query);
+        let tokens = parse_boolean_query(&sanitized);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "Emoji query took {:?} (>1s)",
+            elapsed
+        );
+        // Emoji are stripped, leaving empty
+        assert!(
+            tokens.is_empty(),
+            "Emoji-only query should produce no tokens"
+        );
+    }
+
+    #[test]
+    fn stress_mixed_content_large() {
+        // Mixed content: code, prose, symbols, unicode
+        let mixed = r#"
+            function test() { return x + y; }
+            SELECT * FROM users WHERE id = 1;
+            The quick brown fox 狐狸 jumps over lazy dog
+            Error: "undefined is not a function" at line 42
+            https://example.com/path?query=value&other=123
+        "#
+        .repeat(100);
+
+        let start = std::time::Instant::now();
+        let sanitized = sanitize_query(&mixed);
+        let tokens = parse_boolean_query(&sanitized);
+        let qt = QueryTermsLower::from_query(&mixed);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "Mixed content query took {:?} (>2s)",
+            elapsed
+        );
+        assert!(!tokens.is_empty());
+        assert!(!qt.is_empty());
+    }
+
+    // ==========================================================================
+    // Query Parser Unit Tests (br-335y) - Unicode, Special Chars, Edge Cases
+    // ==========================================================================
+
+    // --- Unicode queries with emoji in terms ---
+
+    #[test]
+    fn unicode_emoji_mixed_with_alphanumeric() {
+        // Emoji surrounded by alphanumeric text
+        let tokens = parse_boolean_query("rocket🚀launch");
+        assert_eq!(tokens.len(), 1);
+        // sanitize_query strips emoji (non-alphanumeric), so this becomes "rocket launch"
+        let sanitized = sanitize_query("rocket🚀launch");
+        assert_eq!(sanitized, "rocket launch");
+
+        // Multiple emoji between words
+        let sanitized2 = sanitize_query("test🔥🎯code");
+        assert_eq!(sanitized2, "test  code");
+    }
+
+    #[test]
+    fn unicode_emoji_with_boolean_operators() {
+        // AND/OR/NOT with queries containing emoji
+        let tokens = parse_boolean_query("🚀code AND test");
+        // After parsing, we should have 3 tokens (emoji becomes space/empty)
+        let term_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Term(_)))
+            .count();
+        assert!(term_count >= 1, "Should have at least one term");
+
+        // OR with emoji
+        let tokens_or = parse_boolean_query("deploy OR 🎯target");
+        let has_or = tokens_or.iter().any(|t| matches!(t, QueryToken::Or));
+        assert!(has_or, "Should detect OR operator");
+    }
+
+    #[test]
+    fn unicode_emoji_at_word_boundaries() {
+        // Emoji at start of query
+        let sanitized_start = sanitize_query("🔍search");
+        assert_eq!(sanitized_start, " search");
+
+        // Emoji at end of query
+        let sanitized_end = sanitize_query("complete✅");
+        assert_eq!(sanitized_end, "complete ");
+
+        // Only emoji - becomes empty
+        let sanitized_only = sanitize_query("🎉🎊🎁");
+        assert!(
+            sanitized_only.trim().is_empty(),
+            "Emoji-only should be empty after trimming"
+        );
+    }
+
+    // --- RTL (Right-to-Left) text: Arabic and Hebrew ---
+
+    #[test]
+    fn unicode_arabic_text_preserved() {
+        // Arabic text should be preserved as alphanumeric
+        let arabic = "مرحبا بالعالم"; // "Hello World" in Arabic
+        let sanitized = sanitize_query(arabic);
+        assert_eq!(
+            sanitized, arabic,
+            "Arabic alphanumeric chars should be preserved"
+        );
+
+        let tokens = parse_boolean_query(arabic);
+        assert!(!tokens.is_empty(), "Arabic query should produce tokens");
+    }
+
+    #[test]
+    fn unicode_hebrew_text_preserved() {
+        // Hebrew text should be preserved
+        let hebrew = "שלום עולם"; // "Hello World" in Hebrew
+        let sanitized = sanitize_query(hebrew);
+        assert_eq!(
+            sanitized, hebrew,
+            "Hebrew alphanumeric chars should be preserved"
+        );
+
+        let tokens = parse_boolean_query(hebrew);
+        assert!(!tokens.is_empty(), "Hebrew query should produce tokens");
+    }
+
+    #[test]
+    fn unicode_mixed_rtl_and_ltr() {
+        // Mixed RTL (Arabic) and LTR (English) text
+        let mixed = "hello مرحبا world";
+        let sanitized = sanitize_query(mixed);
+        assert_eq!(sanitized, mixed, "Mixed RTL/LTR should be preserved");
+
+        let tokens = parse_boolean_query(mixed);
+        let term_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Term(_)))
+            .count();
+        assert_eq!(term_count, 3, "Should have 3 terms");
+    }
+
+    #[test]
+    fn unicode_rtl_with_boolean_operators() {
+        // Hebrew with AND operator
+        let hebrew_and = "שלום AND עולם";
+        let tokens = parse_boolean_query(hebrew_and);
+        let has_and = tokens.iter().any(|t| matches!(t, QueryToken::And));
+        assert!(has_and, "Should detect AND operator in Hebrew query");
+
+        // Arabic with NOT operator
+        let arabic_not = "مرحبا NOT بالعالم";
+        let tokens_not = parse_boolean_query(arabic_not);
+        let has_not = tokens_not.iter().any(|t| matches!(t, QueryToken::Not));
+        assert!(has_not, "Should detect NOT operator in Arabic query");
+    }
+
+    // --- Backslash handling ---
+
+    #[test]
+    fn special_chars_backslash_stripped() {
+        // Backslash is not alphanumeric, so it becomes space
+        let query = r"path\to\file";
+        let sanitized = sanitize_query(query);
+        assert_eq!(sanitized, "path to file");
+    }
+
+    #[test]
+    fn special_chars_escaped_quotes_handling() {
+        // Backslash before quote - backslash stripped, quote preserved
+        let query = r#"say \"hello\""#;
+        let sanitized = sanitize_query(query);
+        // Backslash becomes space, quotes preserved
+        assert!(sanitized.contains('"'), "Quotes should be preserved");
+    }
+
+    #[test]
+    fn special_chars_windows_paths() {
+        // Windows-style paths with backslashes
+        let path = r"C:\Users\test\Documents";
+        let sanitized = sanitize_query(path);
+        assert_eq!(sanitized, "C  Users test Documents");
+    }
+
+    // --- Nested/Complex boolean operators ---
+
+    #[test]
+    fn boolean_deeply_nested_operators() {
+        // Complex nested expression (parser treats this as linear)
+        let query = "a AND b OR c NOT d AND e";
+        let tokens = parse_boolean_query(query);
+
+        let mut and_count = 0;
+        let mut or_count = 0;
+        let mut not_count = 0;
+        for token in &tokens {
+            match token {
+                QueryToken::And => and_count += 1,
+                QueryToken::Or => or_count += 1,
+                QueryToken::Not => not_count += 1,
+                _ => {}
+            }
+        }
+
+        assert_eq!(and_count, 2, "Should have 2 AND operators");
+        assert_eq!(or_count, 1, "Should have 1 OR operator");
+        assert_eq!(not_count, 1, "Should have 1 NOT operator");
+    }
+
+    #[test]
+    fn boolean_consecutive_operators_degenerate() {
+        // Consecutive operators: "AND AND" - second AND becomes a term
+        let tokens = parse_boolean_query("foo AND AND bar");
+        // "AND" as the final part of "AND AND" is treated as operator, then next "bar" is term
+        let term_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Term(_)))
+            .count();
+        assert!(
+            term_count >= 2,
+            "Should have at least 2 terms (foo and bar)"
+        );
+    }
+
+    #[test]
+    fn boolean_operator_at_start() {
+        // Operator at start of query
+        let tokens = parse_boolean_query("AND foo");
+        let has_and = tokens.iter().any(|t| matches!(t, QueryToken::And));
+        assert!(has_and, "Leading AND should be detected");
+
+        let tokens_or = parse_boolean_query("OR test");
+        let has_or = tokens_or.iter().any(|t| matches!(t, QueryToken::Or));
+        assert!(has_or, "Leading OR should be detected");
+    }
+
+    #[test]
+    fn boolean_operator_at_end() {
+        // Operator at end of query
+        let tokens = parse_boolean_query("foo AND");
+        let has_and = tokens.iter().any(|t| matches!(t, QueryToken::And));
+        assert!(has_and, "Trailing AND should be detected");
+    }
+
+    // --- Numeric-only queries ---
+
+    #[test]
+    fn numeric_query_digits_only() {
+        // Query with only digits
+        let tokens = parse_boolean_query("12345");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], QueryToken::Term("12345".to_string()));
+
+        let sanitized = sanitize_query("12345");
+        assert_eq!(sanitized, "12345");
+    }
+
+    #[test]
+    fn numeric_query_with_text() {
+        // Mixed numeric and text
+        let tokens = parse_boolean_query("error 404 not found");
+        let term_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Term(_)))
+            .count();
+        // "404", "error", "found" are terms, "not" is NOT operator
+        assert!(term_count >= 3, "Should have at least 3 terms");
+    }
+
+    #[test]
+    fn numeric_versions_with_dots() {
+        // Version numbers like "1.2.3"
+        let sanitized = sanitize_query("version 1.2.3");
+        assert_eq!(sanitized, "version 1 2 3"); // dots become spaces
+    }
+
+    // --- Tab and newline handling ---
+
+    #[test]
+    fn whitespace_tabs_treated_as_separators() {
+        let tokens = parse_boolean_query("foo\tbar\tbaz");
+        let term_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Term(_)))
+            .count();
+        assert_eq!(term_count, 3, "Tabs should separate terms");
+    }
+
+    #[test]
+    fn whitespace_newlines_treated_as_separators() {
+        let tokens = parse_boolean_query("foo\nbar\nbaz");
+        let term_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Term(_)))
+            .count();
+        assert_eq!(term_count, 3, "Newlines should separate terms");
+    }
+
+    #[test]
+    fn whitespace_mixed_types() {
+        let tokens = parse_boolean_query("a \t b \n c   d");
+        let term_count = tokens
+            .iter()
+            .filter(|t| matches!(t, QueryToken::Term(_)))
+            .count();
+        assert_eq!(term_count, 4, "Mixed whitespace should separate properly");
+    }
+
+    // --- Very long single terms (no spaces) ---
+
+    #[test]
+    fn stress_very_long_single_term() {
+        // Single term with 10K characters (no spaces)
+        let long_term = "a".repeat(10_000);
+
+        let start = std::time::Instant::now();
+        let tokens = parse_boolean_query(&long_term);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "10K char term took {:?} (>1s)",
+            elapsed
+        );
+        assert_eq!(tokens.len(), 1);
+        if let QueryToken::Term(t) = &tokens[0] {
+            assert_eq!(t.len(), 10_000);
+        } else {
+            panic!("Expected Term token");
+        }
+    }
+
+    #[test]
+    fn stress_very_long_term_with_wildcard() {
+        // Long term with wildcard suffix
+        let long_pattern = format!("{}*", "prefix".repeat(1000));
+
+        let start = std::time::Instant::now();
+        let sanitized = sanitize_query(&long_pattern);
+        let pattern = WildcardPattern::parse(&sanitized);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "Long wildcard pattern took {:?} (>1s)",
+            elapsed
+        );
+        assert!(
+            matches!(pattern, WildcardPattern::Prefix(_)),
+            "Should parse as prefix pattern"
+        );
+    }
+
+    // --- QueryExplanation edge cases ---
+
+    #[test]
+    fn query_explanation_empty_query() {
+        let explanation = QueryExplanation::analyze("", &SearchFilters::default());
+        assert_eq!(explanation.query_type, QueryType::Empty);
+    }
+
+    #[test]
+    fn query_explanation_whitespace_only_query() {
+        let explanation = QueryExplanation::analyze("   \t\n  ", &SearchFilters::default());
+        assert_eq!(explanation.query_type, QueryType::Empty);
+    }
+
+    #[test]
+    fn query_explanation_unicode_query() {
+        let explanation = QueryExplanation::analyze("日本語 search", &SearchFilters::default());
+        // Should classify as Simple (no operators, multiple terms = implicit AND)
+        assert!(!explanation.parsed.terms.is_empty());
+    }
+
+    // --- QueryTermsLower edge cases ---
+
+    #[test]
+    fn query_terms_lower_unicode_normalization() {
+        // Accented characters should be lowercased properly
+        let terms = QueryTermsLower::from_query("CAFÉ RÉSUMÉ");
+        assert_eq!(terms.query_lower, "café résumé");
+    }
+
+    #[test]
+    fn query_terms_lower_mixed_case_unicode() {
+        // Mixed case CJK and Latin
+        let terms = QueryTermsLower::from_query("Hello日本語World");
+        // CJK chars have no case, Latin chars should be lowercased
+        assert!(terms.query_lower.contains("hello"));
+        assert!(terms.query_lower.contains("world"));
+    }
+
+    #[test]
+    fn query_terms_lower_preserves_numbers() {
+        let terms = QueryTermsLower::from_query("ABC123XYZ");
+        assert_eq!(terms.query_lower, "abc123xyz");
+    }
+
+    // --- WildcardPattern edge cases ---
+
+    #[test]
+    fn wildcard_pattern_internal_asterisk() {
+        // Internal wildcard: f*o
+        let pattern = WildcardPattern::parse("f*o");
+        assert!(
+            matches!(pattern, WildcardPattern::Complex(_)),
+            "Internal asterisk should be Complex"
+        );
+    }
+
+    #[test]
+    fn wildcard_pattern_multiple_internal_asterisks() {
+        // Multiple internal wildcards: a*b*c
+        let pattern = WildcardPattern::parse("a*b*c");
+        assert!(
+            matches!(pattern, WildcardPattern::Complex(_)),
+            "Multiple internal asterisks should be Complex"
+        );
+    }
+
+    #[test]
+    fn wildcard_pattern_regex_escapes_special_chars() {
+        // Pattern with regex-special characters
+        let pattern = WildcardPattern::parse("*foo.bar*");
+        if let Some(regex) = pattern.to_regex() {
+            assert!(
+                regex.contains("\\."),
+                "Dot should be escaped in regex: {}",
+                regex
+            );
+        }
+    }
+
+    #[test]
+    fn wildcard_pattern_complex_regex_generation() {
+        let pattern = WildcardPattern::parse("f*o*o");
+        if let Some(regex) = pattern.to_regex() {
+            // Should handle internal wildcards
+            assert!(
+                regex.contains(".*"),
+                "Should have .* for internal wildcards: {}",
+                regex
+            );
+        }
+    }
+
+    #[test]
+    fn test_transpile_to_fts5() {
+        // Simple terms
+        assert_eq!(
+            transpile_to_fts5("foo bar"),
+            Some("foo AND bar".to_string())
+        );
+
+        // Boolean operators
+        assert_eq!(
+            transpile_to_fts5("foo AND bar"),
+            Some("foo AND bar".to_string())
+        );
+        assert_eq!(
+            transpile_to_fts5("foo OR bar"),
+            Some("(foo OR bar)".to_string())
+        );
+        assert_eq!(transpile_to_fts5("OR foo"), Some("foo".to_string()));
+        assert_eq!(transpile_to_fts5("NOT foo"), None);
+
+        // Precedence: OR binds tighter than AND in our parser logic
+        // "A AND B OR C" -> "A AND (B OR C)"
+        assert_eq!(
+            transpile_to_fts5("A AND B OR C"),
+            Some("A AND (B OR C)".to_string())
+        );
+
+        // "A OR B AND C" -> "(A OR B) AND C"
+        assert_eq!(
+            transpile_to_fts5("A OR B AND C"),
+            Some("(A OR B) AND C".to_string())
+        );
+
+        // "A OR B OR C" -> "(A OR B OR C)"
+        assert_eq!(
+            transpile_to_fts5("A OR B OR C"),
+            Some("(A OR B OR C)".to_string())
+        );
+
+        // Phrases
+        assert_eq!(
+            transpile_to_fts5("\"foo bar\""),
+            Some("\"foo bar\"".to_string())
+        );
+
+        // Wildcards (allowed trailing)
+        assert_eq!(transpile_to_fts5("foo*"), Some("foo*".to_string()));
+
+        // Unsupported wildcards (leading/internal)
+        assert_eq!(transpile_to_fts5("*foo"), None);
+        assert_eq!(transpile_to_fts5("f*o"), None);
+
+        // Hyphens are preserved by cass_sanitize_query, then quoted for FTS5
+        // so stock SQLite parses the term instead of treating `-bar` as syntax.
+        assert_eq!(
+            transpile_to_fts5("foo-bar"),
+            Some("\"foo-bar\"".to_string())
+        );
+        assert_eq!(
+            transpile_to_fts5("foo-bar*"),
+            Some("\"foo-bar\"*".to_string())
+        );
+        assert_eq!(
+            transpile_to_fts5("br-123.jsonl"),
+            Some("(\"br-123\" AND jsonl)".to_string())
+        );
+        assert_eq!(
+            transpile_to_fts5("br-123.json*"),
+            Some("(\"br-123\" AND json*)".to_string())
+        );
+
+        // Leading unary-NOT forms are not valid FTS5 queries.
+        assert_eq!(transpile_to_fts5("NOT A OR B"), None);
+    }
+
+    #[test]
+    fn semantic_doc_id_roundtrip_from_query() {
+        let hash_hex = "00".repeat(32);
+        let doc_id = format!("m|42|2|3|7|11|1|1700000000000|{hash_hex}");
+        let parsed = parse_semantic_doc_id(&doc_id).expect("roundtrip parse");
+        assert_eq!(parsed.message_id, 42);
+        assert_eq!(parsed.chunk_idx, 2);
+        assert_eq!(parsed.agent_id, 3);
+        assert_eq!(parsed.workspace_id, 7);
+        assert_eq!(parsed.source_id, 11);
+        assert_eq!(parsed.role, 1);
+        assert_eq!(parsed.created_at_ms, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn semantic_filter_applies_all_constraints() {
+        use frankensearch::core::filter::SearchFilter;
+
+        let filter = SemanticFilter {
+            agents: Some(HashSet::from([3])),
+            workspaces: Some(HashSet::from([7])),
+            sources: Some(HashSet::from([11])),
+            roles: Some(HashSet::from([1])),
+            created_from: Some(1_700_000_000_000),
+            created_to: Some(1_700_000_000_100),
+        };
+
+        assert!(filter.matches("m|42|2|3|7|11|1|1700000000001", None));
+        assert!(!filter.matches("m|42|2|99|7|11|1|1700000000001", None));
+        assert!(!filter.matches("m|42|2|3|7|11|1|1699999999999", None));
+        assert!(!filter.matches("not-a-doc-id", None));
+    }
+
+    #[test]
+    fn fs_semantic_index_runs_filtered_search() -> Result<()> {
+        let temp = TempDir::new()?;
+        let index_path = crate::search::vector_index::vector_index_path(temp.path(), "embed-fast");
+        if let Some(parent) = index_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let hash_a = "00".repeat(32);
+        let hash_b = "11".repeat(32);
+        let doc_a = format!("m|101|0|1|10|100|1|1700000000001|{hash_a}");
+        let doc_b = format!("m|202|0|2|20|200|1|1700000000002|{hash_b}");
+
+        let mut writer = VectorIndex::create_with_revision(
+            &index_path,
+            "embed-fast",
+            "rev-1",
+            2,
+            frankensearch::index::Quantization::F16,
+        )
+        .map_err(|err| anyhow!("create fsvi index failed: {err}"))?;
+        writer
+            .write_record(&doc_a, &[1.0, 0.0])
+            .map_err(|err| anyhow!("write_record failed: {err}"))?;
+        writer
+            .write_record(&doc_b, &[0.0, 1.0])
+            .map_err(|err| anyhow!("write_record failed: {err}"))?;
+        writer
+            .finish()
+            .map_err(|err| anyhow!("finish fsvi index failed: {err}"))?;
+
+        let fs_index =
+            VectorIndex::open(&index_path).map_err(|err| anyhow!("open fsvi failed: {err}"))?;
+        let filter = SemanticFilter {
+            agents: Some(HashSet::from([1])),
+            workspaces: None,
+            sources: None,
+            roles: None,
+            created_from: None,
+            created_to: None,
+        };
+        let fs_filter = semantic_filter_as_search_filter(&filter).expect("expected active filter");
+        let hits = fs_index
+            .search_top_k(&[1.0, 0.0], 5, Some(fs_filter))
+            .map_err(|err| anyhow!("frankensearch search failed: {err}"))?;
+        assert_eq!(hits.len(), 1);
+        let parsed = parse_semantic_doc_id(&hits[0].doc_id).expect("parse bridged doc_id");
+        assert_eq!(parsed.message_id, 101);
+        assert_eq!(parsed.agent_id, 1);
+        Ok(())
     }
 }

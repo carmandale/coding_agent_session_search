@@ -12,7 +12,7 @@ fn build_small_index() -> (TempDir, SearchClient) {
     let dir = TempDir::new().expect("tmp");
     let data_dir = dir.path().to_path_buf();
     let db_path = data_dir.join("agent_search.db");
-    let mut storage = SqliteStorage::open(&db_path).expect("storage");
+    let storage = SqliteStorage::open(&db_path).expect("storage");
     let mut index = TantivyIndex::open_or_create(
         &coding_agent_search::search::tantivy::index_dir(&data_dir).unwrap(),
     )
@@ -42,6 +42,7 @@ fn build_small_index() -> (TempDir, SearchClient) {
                     language: None,
                     snippet_text: None,
                 }],
+                invocations: Vec::new(),
             },
             NormalizedMessage {
                 idx: 1,
@@ -51,11 +52,12 @@ fn build_small_index() -> (TempDir, SearchClient) {
                 content: "delta epsilon zeta".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             },
         ],
     };
 
-    persist::persist_conversation(&mut storage, &mut index, &conv).expect("persist");
+    persist::persist_conversation(&storage, &mut index, &conv).expect("persist");
     index.commit().expect("commit");
 
     let client = SearchClient::open(

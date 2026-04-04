@@ -12,6 +12,11 @@ use std::path::Path;
 
 mod util;
 use util::EnvGuard;
+use util::e2e_log::{E2ePerformanceMetrics, PhaseTracker};
+
+fn tracker_for(test_name: &str) -> PhaseTracker {
+    PhaseTracker::new("e2e_filters", test_name)
+}
 
 /// Creates a Codex session with specific date and content.
 /// Timestamp should be in milliseconds.
@@ -48,6 +53,9 @@ fn make_claude_session_at(claude_home: &Path, project_name: &str, content: &str,
 /// Test: Agent filter correctly limits results to specified connector
 #[test]
 fn filter_by_agent_codex() {
+    let tracker = tracker_for("filter_by_agent_codex");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -58,7 +66,7 @@ fn filter_by_agent_codex() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Create sessions for both connectors with identifiable content
+    let ps = tracker.start("setup_fixtures", Some("Create codex and claude sessions"));
     make_codex_session_at(
         &codex_home,
         "2024/11/20",
@@ -72,8 +80,13 @@ fn filter_by_agent_codex() {
         "claude_specific agenttest",
         "2024-11-20T10:00:00Z",
     );
+    tracker.end(
+        "setup_fixtures",
+        Some("Create codex and claude sessions"),
+        ps,
+    );
 
-    // Index both
+    let ps = tracker.start("run_index", Some("Run full index"));
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
@@ -81,8 +94,9 @@ fn filter_by_agent_codex() {
         .env("HOME", home)
         .assert()
         .success();
+    tracker.end("run_index", Some("Run full index"), ps);
 
-    // Search with agent filter for codex only
+    let ps = tracker.start("test_agent_filter", Some("Search with --agent codex"));
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -96,15 +110,22 @@ fn filter_by_agent_codex() {
         .env("HOME", home)
         .output()
         .expect("search command");
+    let filter_duration = ps.elapsed().as_millis() as u64;
+    tracker.end("test_agent_filter", Some("Search with --agent codex"), ps);
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify only codex hits returned"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
         .and_then(|h| h.as_array())
         .expect("hits array");
 
-    // All hits should be from codex
     for hit in hits {
         assert_eq!(
             hit["agent"], "codex",
@@ -112,11 +133,26 @@ fn filter_by_agent_codex() {
         );
     }
     assert!(!hits.is_empty(), "Should find at least one codex hit");
+    tracker.end(
+        "verify_results",
+        Some("Verify only codex hits returned"),
+        ps,
+    );
+
+    tracker.metrics(
+        "filter_query_agent",
+        &E2ePerformanceMetrics::new()
+            .with_duration(filter_duration)
+            .with_custom("result_count", serde_json::json!(hits.len())),
+    );
 }
 
 /// Test: Time filter --since correctly limits results
 #[test]
 fn filter_by_time_since() {
+    let tracker = tracker_for("filter_by_time_since");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -126,8 +162,7 @@ fn filter_by_time_since() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Nov 15, 2024 10:00 UTC = 1731682800000
-    // Nov 25, 2024 10:00 UTC = 1732546800000
+    let ps = tracker.start("setup_fixtures", Some("Create old and new sessions"));
     make_codex_session_at(
         &codex_home,
         "2024/11/15",
@@ -142,7 +177,9 @@ fn filter_by_time_since() {
         "newsession sincetest",
         1732546800000,
     );
+    tracker.end("setup_fixtures", Some("Create old and new sessions"), ps);
 
+    let ps = tracker.start("run_index", Some("Run full index"));
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
@@ -150,8 +187,9 @@ fn filter_by_time_since() {
         .env("HOME", home)
         .assert()
         .success();
+    tracker.end("run_index", Some("Run full index"), ps);
 
-    // Search with --since Nov 20, 2024 - should only find Nov 25 session
+    let ps = tracker.start("test_since_filter", Some("Search with --since 2024-11-20"));
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -166,8 +204,20 @@ fn filter_by_time_since() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    let filter_duration = ps.elapsed().as_millis() as u64;
+    tracker.end(
+        "test_since_filter",
+        Some("Search with --since 2024-11-20"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify only new session returned"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -186,11 +236,26 @@ fn filter_by_time_since() {
             content
         );
     }
+    tracker.end(
+        "verify_results",
+        Some("Verify only new session returned"),
+        ps,
+    );
+
+    tracker.metrics(
+        "filter_query_since",
+        &E2ePerformanceMetrics::new()
+            .with_duration(filter_duration)
+            .with_custom("result_count", serde_json::json!(hits.len())),
+    );
 }
 
 /// Test: Time filter --until correctly limits results
 #[test]
 fn filter_by_time_until() {
+    let tracker = tracker_for("filter_by_time_until");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -200,8 +265,7 @@ fn filter_by_time_until() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Nov 15, 2024 10:00 UTC = 1731682800000
-    // Nov 25, 2024 10:00 UTC = 1732546800000
+    let ps = tracker.start("setup_fixtures", Some("Create old and new sessions"));
     make_codex_session_at(
         &codex_home,
         "2024/11/15",
@@ -216,7 +280,9 @@ fn filter_by_time_until() {
         "newsession untiltest",
         1732546800000,
     );
+    tracker.end("setup_fixtures", Some("Create old and new sessions"), ps);
 
+    let ps = tracker.start("run_index", Some("Run full index"));
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
@@ -224,8 +290,9 @@ fn filter_by_time_until() {
         .env("HOME", home)
         .assert()
         .success();
+    tracker.end("run_index", Some("Run full index"), ps);
 
-    // Search with --until Nov 20, 2024 - should only find Nov 15 session
+    let ps = tracker.start("test_until_filter", Some("Search with --until 2024-11-20"));
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -240,8 +307,20 @@ fn filter_by_time_until() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    let filter_duration = ps.elapsed().as_millis() as u64;
+    tracker.end(
+        "test_until_filter",
+        Some("Search with --until 2024-11-20"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify only old session returned"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -260,11 +339,26 @@ fn filter_by_time_until() {
             content
         );
     }
+    tracker.end(
+        "verify_results",
+        Some("Verify only old session returned"),
+        ps,
+    );
+
+    tracker.metrics(
+        "filter_query_until",
+        &E2ePerformanceMetrics::new()
+            .with_duration(filter_duration)
+            .with_custom("result_count", serde_json::json!(hits.len())),
+    );
 }
 
 /// Test: Combined time filters (--since AND --until) for date range
 #[test]
 fn filter_by_time_range() {
+    let tracker = tracker_for("filter_by_time_range");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -274,9 +368,10 @@ fn filter_by_time_range() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Nov 10, 2024 = 1731250800000
-    // Nov 20, 2024 = 1732114800000
-    // Nov 30, 2024 = 1732978800000
+    let ps = tracker.start(
+        "setup_fixtures",
+        Some("Create early, middle, and late sessions"),
+    );
     make_codex_session_at(
         &codex_home,
         "2024/11/10",
@@ -298,7 +393,13 @@ fn filter_by_time_range() {
         "latesession rangetest",
         1732978800000,
     );
+    tracker.end(
+        "setup_fixtures",
+        Some("Create early, middle, and late sessions"),
+        ps,
+    );
 
+    let ps = tracker.start("run_index", Some("Run full index"));
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
@@ -306,8 +407,12 @@ fn filter_by_time_range() {
         .env("HOME", home)
         .assert()
         .success();
+    tracker.end("run_index", Some("Run full index"), ps);
 
-    // Search with date range Nov 15 to Nov 25 - should only find Nov 20 session
+    let ps = tracker.start(
+        "test_range_filter",
+        Some("Search with --since/--until date range"),
+    );
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -324,8 +429,23 @@ fn filter_by_time_range() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    let filter_duration = ps.elapsed().as_millis() as u64;
+    tracker.end(
+        "test_range_filter",
+        Some("Search with --since/--until date range"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start(
+        "verify_results",
+        Some("Verify only middle session returned"),
+    );
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -344,11 +464,26 @@ fn filter_by_time_range() {
             content
         );
     }
+    tracker.end(
+        "verify_results",
+        Some("Verify only middle session returned"),
+        ps,
+    );
+
+    tracker.metrics(
+        "filter_query_range",
+        &E2ePerformanceMetrics::new()
+            .with_duration(filter_duration)
+            .with_custom("result_count", serde_json::json!(hits.len())),
+    );
 }
 
 /// Test: Combined agent + time filter
 #[test]
 fn filter_combined_agent_and_time() {
+    let tracker = tracker_for("filter_combined_agent_and_time");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -359,7 +494,7 @@ fn filter_combined_agent_and_time() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Create codex sessions (old and new)
+    let ps = tracker.start("setup_fixtures", Some("Create codex and claude sessions"));
     make_codex_session_at(
         &codex_home,
         "2024/11/15",
@@ -374,8 +509,6 @@ fn filter_combined_agent_and_time() {
         "codex_combined_new combinedtest",
         1732546800000,
     );
-
-    // Create claude sessions (old and new)
     make_claude_session_at(
         &claude_home,
         "project-old",
@@ -388,7 +521,13 @@ fn filter_combined_agent_and_time() {
         "claude_combined_new combinedtest",
         "2024-11-25T10:00:00Z",
     );
+    tracker.end(
+        "setup_fixtures",
+        Some("Create codex and claude sessions"),
+        ps,
+    );
 
+    let ps = tracker.start("run_index", Some("Run full index"));
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
@@ -396,8 +535,12 @@ fn filter_combined_agent_and_time() {
         .env("HOME", home)
         .assert()
         .success();
+    tracker.end("run_index", Some("Run full index"), ps);
 
-    // Search with agent=codex AND since=Nov 20
+    let ps = tracker.start(
+        "test_combined_filter",
+        Some("Search with --agent codex --since"),
+    );
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -414,8 +557,23 @@ fn filter_combined_agent_and_time() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    let filter_duration = ps.elapsed().as_millis() as u64;
+    tracker.end(
+        "test_combined_filter",
+        Some("Search with --agent codex --since"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start(
+        "verify_results",
+        Some("Verify only new codex session returned"),
+    );
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -435,11 +593,26 @@ fn filter_combined_agent_and_time() {
             content
         );
     }
+    tracker.end(
+        "verify_results",
+        Some("Verify only new codex session returned"),
+        ps,
+    );
+
+    tracker.metrics(
+        "filter_query_combined",
+        &E2ePerformanceMetrics::new()
+            .with_duration(filter_duration)
+            .with_custom("result_count", serde_json::json!(hits.len())),
+    );
 }
 
 /// Test: Empty result set when filters exclude everything
 #[test]
 fn filter_no_matches() {
+    let tracker = tracker_for("filter_no_matches");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -449,7 +622,7 @@ fn filter_no_matches() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Create session in November 2024
+    let ps = tracker.start("setup_fixtures", Some("Create November session"));
     make_codex_session_at(
         &codex_home,
         "2024/11/20",
@@ -457,7 +630,9 @@ fn filter_no_matches() {
         "november nomatchtest",
         1732114800000,
     );
+    tracker.end("setup_fixtures", Some("Create November session"), ps);
 
+    let ps = tracker.start("run_index", Some("Run full index"));
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
@@ -465,8 +640,12 @@ fn filter_no_matches() {
         .env("HOME", home)
         .assert()
         .success();
+    tracker.end("run_index", Some("Run full index"), ps);
 
-    // Search with impossible date filter (until October 2024, but content is November 2024)
+    let ps = tracker.start(
+        "test_no_match_filter",
+        Some("Search with impossible date filter"),
+    );
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -481,8 +660,20 @@ fn filter_no_matches() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    let filter_duration = ps.elapsed().as_millis() as u64;
+    tracker.end(
+        "test_no_match_filter",
+        Some("Search with impossible date filter"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify empty result set"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -493,11 +684,22 @@ fn filter_no_matches() {
         hits.is_empty(),
         "Should find no hits when filter excludes all results"
     );
+    tracker.end("verify_results", Some("Verify empty result set"), ps);
+
+    tracker.metrics(
+        "filter_query_no_match",
+        &E2ePerformanceMetrics::new()
+            .with_duration(filter_duration)
+            .with_custom("result_count", serde_json::json!(0)),
+    );
 }
 
 /// Test: Workspace filter using --workspace flag
 #[test]
 fn filter_by_workspace() {
+    let tracker = tracker_for("filter_by_workspace");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let claude_home = home.join(".claude");
@@ -506,20 +708,18 @@ fn filter_by_workspace() {
 
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
 
-    // Create Claude sessions with different workspaces (using cwd field)
     let workspace_alpha = "/projects/workspace-alpha";
     let workspace_beta = "/projects/workspace-beta";
 
+    let ps = tracker.start("setup_fixtures", Some("Create workspace-specific sessions"));
     let project_a = claude_home.join("projects/project-a");
     fs::create_dir_all(&project_a).unwrap();
     let sample_a = format!(
         r#"{{"type": "user", "timestamp": "2024-11-20T10:00:00Z", "cwd": "{workspace_alpha}", "message": {{"role": "user", "content": "workspace_alpha workspacetest"}}}}
 {{"type": "assistant", "timestamp": "2024-11-20T10:00:05Z", "cwd": "{workspace_alpha}", "message": {{"role": "assistant", "content": "workspace_alpha_response workspacetest"}}}}"#
     );
-    // Use unique filename to avoid external_id collision in storage
     fs::write(project_a.join("session-alpha.jsonl"), sample_a).unwrap();
 
-    // Add small delay to ensure different mtime
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     let project_b = claude_home.join("projects/project-b");
@@ -528,17 +728,26 @@ fn filter_by_workspace() {
         r#"{{"type": "user", "timestamp": "2024-11-20T11:00:00Z", "cwd": "{workspace_beta}", "message": {{"role": "user", "content": "workspace_beta workspacetest"}}}}
 {{"type": "assistant", "timestamp": "2024-11-20T11:00:05Z", "cwd": "{workspace_beta}", "message": {{"role": "assistant", "content": "workspace_beta_response workspacetest"}}}}"#
     );
-    // Use unique filename to avoid external_id collision in storage
     fs::write(project_b.join("session-beta.jsonl"), sample_b).unwrap();
+    tracker.end(
+        "setup_fixtures",
+        Some("Create workspace-specific sessions"),
+        ps,
+    );
 
+    let ps = tracker.start("run_index", Some("Run full index"));
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
         .assert()
         .success();
+    tracker.end("run_index", Some("Run full index"), ps);
 
-    // Search with workspace filter for workspace-alpha (exact path match)
+    let ps = tracker.start(
+        "test_workspace_filter",
+        Some("Search with --workspace filter"),
+    );
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -552,8 +761,20 @@ fn filter_by_workspace() {
         .env("HOME", home)
         .output()
         .expect("search command");
+    let filter_duration = ps.elapsed().as_millis() as u64;
+    tracker.end(
+        "test_workspace_filter",
+        Some("Search with --workspace filter"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify only workspace-alpha hits"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -572,11 +793,26 @@ fn filter_by_workspace() {
             ws
         );
     }
+    tracker.end(
+        "verify_results",
+        Some("Verify only workspace-alpha hits"),
+        ps,
+    );
+
+    tracker.metrics(
+        "filter_query_workspace",
+        &E2ePerformanceMetrics::new()
+            .with_duration(filter_duration)
+            .with_custom("result_count", serde_json::json!(hits.len())),
+    );
 }
 
 /// Test: Days filter (--days N)
 #[test]
 fn filter_by_days() {
+    let tracker = tracker_for("filter_by_days");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -586,15 +822,13 @@ fn filter_by_days() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Create a session with a recent timestamp (today)
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-
-    // Create recent session (now) and old session (30 days ago)
     let thirty_days_ago = now - (30 * 24 * 60 * 60 * 1000);
 
+    let ps = tracker.start("setup_fixtures", Some("Create recent and old sessions"));
     make_codex_session_at(
         &codex_home,
         "2024/12/01",
@@ -609,7 +843,9 @@ fn filter_by_days() {
         "oldsession daystest",
         thirty_days_ago,
     );
+    tracker.end("setup_fixtures", Some("Create recent and old sessions"), ps);
 
+    let ps = tracker.start("run_index", Some("Run full index"));
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
@@ -617,8 +853,9 @@ fn filter_by_days() {
         .env("HOME", home)
         .assert()
         .success();
+    tracker.end("run_index", Some("Run full index"), ps);
 
-    // Search with --days 7 - should only find recent session
+    let ps = tracker.start("test_days_filter", Some("Search with --days 7"));
     let output = cargo_bin_cmd!("cass")
         .args(["search", "daystest", "--days", "7", "--robot", "--data-dir"])
         .arg(&data_dir)
@@ -626,8 +863,19 @@ fn filter_by_days() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    let filter_duration = ps.elapsed().as_millis() as u64;
+    tracker.end("test_days_filter", Some("Search with --days 7"), ps);
 
-    assert!(output.status.success());
+    let ps = tracker.start(
+        "verify_results",
+        Some("Verify only recent session returned"),
+    );
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -646,6 +894,18 @@ fn filter_by_days() {
             content
         );
     }
+    tracker.end(
+        "verify_results",
+        Some("Verify only recent session returned"),
+        ps,
+    );
+
+    tracker.metrics(
+        "filter_query_days",
+        &E2ePerformanceMetrics::new()
+            .with_duration(filter_duration)
+            .with_custom("result_count", serde_json::json!(hits.len())),
+    );
 }
 
 // =============================================================================
@@ -655,6 +915,9 @@ fn filter_by_days() {
 /// Test: search --source local filters to local sources only
 #[test]
 fn filter_by_source_local() {
+    let tracker = tracker_for("filter_by_source_local");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -664,7 +927,7 @@ fn filter_by_source_local() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Create local codex session
+    let ps = tracker.start("setup_fixtures", Some("Create local codex session"));
     make_codex_session_at(
         &codex_home,
         "2024/11/20",
@@ -672,8 +935,9 @@ fn filter_by_source_local() {
         "localsession sourcetest",
         1732118400000,
     );
+    tracker.end("setup_fixtures", Some("Create local codex session"), ps);
 
-    // Index
+    let ps = tracker.start("run_index", Some("Run full index"));
     cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
@@ -681,8 +945,9 @@ fn filter_by_source_local() {
         .env("HOME", home)
         .assert()
         .success();
+    tracker.end("run_index", Some("Run full index"), ps);
 
-    // Search with --source local
+    let ps = tracker.start("test_source_local", Some("Search with --source local"));
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -697,8 +962,16 @@ fn filter_by_source_local() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    let filter_duration = ps.elapsed().as_millis() as u64;
+    tracker.end("test_source_local", Some("Search with --source local"), ps);
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify local source hits"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -710,7 +983,6 @@ fn filter_by_source_local() {
         "Should find local sessions with --source local"
     );
 
-    // Verify source_id is local for all hits
     for hit in hits {
         let source = hit
             .get("source_id")
@@ -722,11 +994,22 @@ fn filter_by_source_local() {
             source
         );
     }
+    tracker.end("verify_results", Some("Verify local source hits"), ps);
+
+    tracker.metrics(
+        "filter_query_source_local",
+        &E2ePerformanceMetrics::new()
+            .with_duration(filter_duration)
+            .with_custom("result_count", serde_json::json!(hits.len())),
+    );
 }
 
 /// Test: search --source with specific source name filters correctly
 #[test]
 fn filter_by_source_specific_name() {
+    let tracker = tracker_for("filter_by_source_specific_name");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -736,25 +1019,27 @@ fn filter_by_source_specific_name() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Create local codex session
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "searchdata specifictest",
-        1732118400000,
+    tracker.phase("setup_and_index", "Create session and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-1.jsonl",
+            "searchdata specifictest",
+            1732118400000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
+
+    let ps = tracker.start(
+        "test_source_specific",
+        Some("Search with --source local name"),
     );
-
-    // Index first to create the database
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
-    // Search with --source local (specific source name)
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -769,8 +1054,20 @@ fn filter_by_source_specific_name() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    let filter_duration = ps.elapsed().as_millis() as u64;
+    tracker.end(
+        "test_source_specific",
+        Some("Search with --source local name"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify results found"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -781,11 +1078,20 @@ fn filter_by_source_specific_name() {
         !hits.is_empty(),
         "Should find sessions when filtering by specific source name 'local'"
     );
+    tracker.end("verify_results", Some("Verify results found"), ps);
+
+    tracker.metrics(
+        "filter_query_source_specific",
+        &E2ePerformanceMetrics::new().with_duration(filter_duration),
+    );
 }
 
 /// Test: search --source with nonexistent source returns empty results
 #[test]
 fn filter_by_source_nonexistent() {
+    let tracker = tracker_for("filter_by_source_nonexistent");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -795,24 +1101,27 @@ fn filter_by_source_nonexistent() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Create local session
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "somedata nonexistentsourcetest",
-        1732118400000,
+    tracker.phase("setup_and_index", "Create session and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-1.jsonl",
+            "somedata nonexistentsourcetest",
+            1732118400000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
+
+    let ps = tracker.start(
+        "test_source_nonexistent",
+        Some("Search with nonexistent source"),
     );
-
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
-    // Search with --source pointing to a nonexistent source
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -827,8 +1136,19 @@ fn filter_by_source_nonexistent() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    tracker.end(
+        "test_source_nonexistent",
+        Some("Search with nonexistent source"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify empty results"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -839,11 +1159,15 @@ fn filter_by_source_nonexistent() {
         hits.is_empty(),
         "Should find no hits when filtering by nonexistent source"
     );
+    tracker.end("verify_results", Some("Verify empty results"), ps);
 }
 
 /// Test: search --source remote returns empty when no remote sources exist
 #[test]
 fn filter_by_source_remote_empty() {
+    let tracker = tracker_for("filter_by_source_remote_empty");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -853,24 +1177,24 @@ fn filter_by_source_remote_empty() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Create local session only
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "localonly remotefiltertest",
-        1732118400000,
-    );
+    tracker.phase("setup_and_index", "Create local session and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-1.jsonl",
+            "localonly remotefiltertest",
+            1732118400000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
 
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
-    // Search with --source remote should find nothing (only local exists)
+    let ps = tracker.start("test_source_remote", Some("Search with --source remote"));
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -885,8 +1209,19 @@ fn filter_by_source_remote_empty() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    tracker.end(
+        "test_source_remote",
+        Some("Search with --source remote"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify no remote hits"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -897,11 +1232,15 @@ fn filter_by_source_remote_empty() {
         hits.is_empty(),
         "Should find no remote hits when only local sessions exist"
     );
+    tracker.end("verify_results", Some("Verify no remote hits"), ps);
 }
 
 /// Test: search --source all returns all sources (explicit)
 #[test]
 fn filter_by_source_all_explicit() {
+    let tracker = tracker_for("filter_by_source_all_explicit");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -911,23 +1250,24 @@ fn filter_by_source_all_explicit() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "allsources allsourcetest",
-        1732118400000,
-    );
+    tracker.phase("setup_and_index", "Create session and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-1.jsonl",
+            "allsources allsourcetest",
+            1732118400000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
 
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
-    // Search with --source all (explicit)
+    let ps = tracker.start("test_source_all", Some("Search with --source all"));
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -942,8 +1282,15 @@ fn filter_by_source_all_explicit() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    tracker.end("test_source_all", Some("Search with --source all"), ps);
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify results found"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -951,14 +1298,15 @@ fn filter_by_source_all_explicit() {
         .expect("hits array");
 
     assert!(!hits.is_empty(), "Should find sessions with --source all");
+    tracker.end("verify_results", Some("Verify results found"), ps);
 }
 
 /// Test: search --source remote returns empty when no remote data indexed
-/// Note: Remote source indexing via build_scan_roots is not fully integrated yet.
-/// This test verifies that --source remote filter correctly returns empty results
-/// when only local sessions exist (correct behavior - no false positives from local data).
 #[test]
 fn filter_by_source_remote_returns_empty_without_remote_indexing() {
+    let tracker = tracker_for("filter_by_source_remote_returns_empty_without_remote_indexing");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -968,24 +1316,24 @@ fn filter_by_source_remote_returns_empty_without_remote_indexing() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Create local session with searchable content
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-local.jsonl",
-        "searchabledata remotefiltertest",
-        1732118400000,
-    );
+    tracker.phase("setup_and_index", "Create local session and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-local.jsonl",
+            "searchabledata remotefiltertest",
+            1732118400000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
 
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
-    // Search with --source remote should return empty (no remote data indexed)
+    let ps = tracker.start("test_source_remote", Some("Search with --source remote"));
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -1000,29 +1348,38 @@ fn filter_by_source_remote_returns_empty_without_remote_indexing() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    tracker.end(
+        "test_source_remote",
+        Some("Search with --source remote"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify empty remote results"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
         .and_then(|h| h.as_array())
         .expect("hits array");
 
-    // --source remote should return empty because:
-    // 1. No remote data is indexed (build_scan_roots not called in run_index)
-    // 2. SQLite fallback is skipped when source filter is applied
-    // This verifies the filter is working correctly (not returning local data)
     assert!(
         hits.is_empty(),
         "Remote filter should return empty when no remote data indexed"
     );
+    tracker.end("verify_results", Some("Verify empty remote results"), ps);
 }
 
 /// Test: search --source with specific source name returns empty for nonexistent sources
-/// Note: This test verifies that filtering by a specific source name that has no indexed
-/// data correctly returns empty results, demonstrating the filter is working.
 #[test]
 fn filter_by_source_specific_unindexed_source() {
+    let tracker = tracker_for("filter_by_source_specific_unindexed_source");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -1032,24 +1389,27 @@ fn filter_by_source_specific_unindexed_source() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Create local session with searchable content
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-local.jsonl",
-        "searchabledata specificsourcetest",
-        1732118400000,
+    tracker.phase("setup_and_index", "Create local session and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-local.jsonl",
+            "searchabledata specificsourcetest",
+            1732118400000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
+
+    let ps = tracker.start(
+        "test_source_unindexed",
+        Some("Search with unindexed source name"),
     );
-
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
-    // Search with --source work-laptop (source that doesn't exist in index)
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -1064,19 +1424,30 @@ fn filter_by_source_specific_unindexed_source() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
+    tracker.end(
+        "test_source_unindexed",
+        Some("Search with unindexed source name"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify empty results"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
         .and_then(|h| h.as_array())
         .expect("hits array");
 
-    // Should return empty because work-laptop source has no indexed data
     assert!(
         hits.is_empty(),
         "Filtering by unindexed source should return empty results"
     );
+    tracker.end("verify_results", Some("Verify empty results"), ps);
 }
 
 // =============================================================================
@@ -1086,6 +1457,9 @@ fn filter_by_source_specific_unindexed_source() {
 /// Test: timeline --source local shows only local sessions
 #[test]
 fn timeline_source_local() {
+    let tracker = tracker_for("timeline_source_local");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -1095,22 +1469,27 @@ fn timeline_source_local() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "timelinelocal sessiondata",
-        1732118400000,
+    tracker.phase("setup_and_index", "Create session and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-1.jsonl",
+            "timelinelocal sessiondata",
+            1732118400000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
+
+    let ps = tracker.start(
+        "test_timeline_source_local",
+        Some("Timeline with --source local"),
     );
-
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
     let output = cargo_bin_cmd!("cass")
         .args(["timeline", "--source", "local", "--json", "--data-dir"])
         .arg(&data_dir)
@@ -1118,20 +1497,34 @@ fn timeline_source_local() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("timeline command");
+    tracker.end(
+        "test_timeline_source_local",
+        Some("Timeline with --source local"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify timeline structure"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
 
-    // Should have timeline data
     assert!(
         json.get("groups").is_some() || json.get("total_sessions").is_some(),
         "Timeline should return valid data structure"
     );
+    tracker.end("verify_results", Some("Verify timeline structure"), ps);
 }
 
 /// Test: timeline --source remote with no remote data
 #[test]
 fn timeline_source_remote_empty() {
+    let tracker = tracker_for("timeline_source_remote_empty");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -1141,22 +1534,27 @@ fn timeline_source_remote_empty() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "timelineremote sessiondata",
-        1732118400000,
+    tracker.phase("setup_and_index", "Create session and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-1.jsonl",
+            "timelineremote sessiondata",
+            1732118400000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
+
+    let ps = tracker.start(
+        "test_timeline_source_remote",
+        Some("Timeline with --source remote"),
     );
-
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
     let output = cargo_bin_cmd!("cass")
         .args(["timeline", "--source", "remote", "--json", "--data-dir"])
         .arg(&data_dir)
@@ -1164,11 +1562,21 @@ fn timeline_source_remote_empty() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("timeline command");
+    tracker.end(
+        "test_timeline_source_remote",
+        Some("Timeline with --source remote"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify 0 remote sessions"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
 
-    // With only local data, remote filter should return 0 sessions
     let total = json
         .get("total_sessions")
         .and_then(|t| t.as_i64())
@@ -1177,11 +1585,15 @@ fn timeline_source_remote_empty() {
         total, 0,
         "Timeline with --source remote should show 0 sessions when no remote data"
     );
+    tracker.end("verify_results", Some("Verify 0 remote sessions"), ps);
 }
 
 /// Test: timeline --source specific-name
 #[test]
 fn timeline_source_specific() {
+    let tracker = tracker_for("timeline_source_specific");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -1191,23 +1603,27 @@ fn timeline_source_specific() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "timelinespecific data",
-        1732118400000,
+    tracker.phase("setup_and_index", "Create session and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-1.jsonl",
+            "timelinespecific data",
+            1732118400000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
+
+    let ps = tracker.start(
+        "test_timeline_source_specific",
+        Some("Timeline with specific source"),
     );
-
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
-    // Query with specific source name
     let output = cargo_bin_cmd!("cass")
         .args(["timeline", "--source", "local", "--json", "--data-dir"])
         .arg(&data_dir)
@@ -1215,16 +1631,29 @@ fn timeline_source_specific() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("timeline command");
+    tracker.end(
+        "test_timeline_source_specific",
+        Some("Timeline with specific source"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify valid timeline structure"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
 
-    // Should have valid timeline structure with source filter applied
-    // Note: timeline may return 0 sessions if outside default date range, but
-    // structure should still be valid and source filter accepted
     assert!(
         json.get("groups").is_some() || json.get("total_sessions").is_some(),
         "Timeline with --source local should return valid structure"
+    );
+    tracker.end(
+        "verify_results",
+        Some("Verify valid timeline structure"),
+        ps,
     );
 }
 
@@ -1235,6 +1664,9 @@ fn timeline_source_specific() {
 /// Test: stats --source local filters stats to local
 #[test]
 fn stats_source_local() {
+    let tracker = tracker_for("stats_source_local");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -1244,22 +1676,24 @@ fn stats_source_local() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "statslocal data",
-        1732118400000,
-    );
+    tracker.phase("setup_and_index", "Create session and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-1.jsonl",
+            "statslocal data",
+            1732118400000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
 
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
+    let ps = tracker.start("test_stats_source_local", Some("Stats with --source local"));
     let output = cargo_bin_cmd!("cass")
         .args(["stats", "--source", "local", "--json", "--data-dir"])
         .arg(&data_dir)
@@ -1267,11 +1701,21 @@ fn stats_source_local() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("stats command");
+    tracker.end(
+        "test_stats_source_local",
+        Some("Stats with --source local"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify local stats"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
 
-    // Should have conversation count
     let count = json
         .get("conversations")
         .and_then(|c| c.as_i64())
@@ -1281,17 +1725,20 @@ fn stats_source_local() {
         "Stats with --source local should show local conversations"
     );
 
-    // Check source_filter is reported in output
     let filter = json
         .get("source_filter")
         .and_then(|f| f.as_str())
         .unwrap_or("");
     assert_eq!(filter, "local", "source_filter should be 'local' in output");
+    tracker.end("verify_results", Some("Verify local stats"), ps);
 }
 
 /// Test: stats --source remote shows 0 when no remote data
 #[test]
 fn stats_source_remote_empty() {
+    let tracker = tracker_for("stats_source_remote_empty");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -1301,22 +1748,27 @@ fn stats_source_remote_empty() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "statsremote data",
-        1732118400000,
+    tracker.phase("setup_and_index", "Create session and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-1.jsonl",
+            "statsremote data",
+            1732118400000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
+
+    let ps = tracker.start(
+        "test_stats_source_remote",
+        Some("Stats with --source remote"),
     );
-
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
     let output = cargo_bin_cmd!("cass")
         .args(["stats", "--source", "remote", "--json", "--data-dir"])
         .arg(&data_dir)
@@ -1324,8 +1776,19 @@ fn stats_source_remote_empty() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("stats command");
+    tracker.end(
+        "test_stats_source_remote",
+        Some("Stats with --source remote"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify 0 remote conversations"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
 
     let count = json
@@ -1336,11 +1799,15 @@ fn stats_source_remote_empty() {
         count, 0,
         "Stats with --source remote should show 0 when no remote data"
     );
+    tracker.end("verify_results", Some("Verify 0 remote conversations"), ps);
 }
 
 /// Test: stats --by-source groups by source
 #[test]
 fn stats_by_source_grouping() {
+    let tracker = tracker_for("stats_by_source_grouping");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -1350,22 +1817,24 @@ fn stats_by_source_grouping() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "bysource data",
-        1732118400000,
-    );
+    tracker.phase("setup_and_index", "Create session and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-1.jsonl",
+            "bysource data",
+            1732118400000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
 
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
+    let ps = tracker.start("test_stats_by_source", Some("Stats with --by-source"));
     let output = cargo_bin_cmd!("cass")
         .args(["stats", "--by-source", "--json", "--data-dir"])
         .arg(&data_dir)
@@ -1373,37 +1842,43 @@ fn stats_by_source_grouping() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("stats command");
+    tracker.end("test_stats_by_source", Some("Stats with --by-source"), ps);
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify by_source grouping"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
 
-    // Should have by_source breakdown
     let by_source = json.get("by_source");
     assert!(
         by_source.is_some(),
         "Stats --by-source should include 'by_source' field in JSON"
     );
 
-    // Should have at least local source
     if let Some(sources) = by_source.and_then(|s| s.as_array()) {
         assert!(
             !sources.is_empty(),
             "by_source should have at least one entry"
         );
-        // First entry should be local
         let first_source = sources[0]
             .get("source_id")
             .and_then(|s| s.as_str())
             .unwrap_or("");
         assert_eq!(first_source, "local", "First source should be 'local'");
     }
+    tracker.end("verify_results", Some("Verify by_source grouping"), ps);
 }
 
 /// Test: stats --by-source with source filter combination
-/// Note: Remote source indexing is not fully integrated yet (build_scan_roots not used in run_index),
-/// so this test only verifies the --by-source flag works with local sources.
 #[test]
 fn stats_by_source_with_filter() {
+    let tracker = tracker_for("stats_by_source_with_filter");
+    let _trace_guard = tracker.trace_env_guard();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -1413,31 +1888,34 @@ fn stats_by_source_with_filter() {
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-    // Create local sessions
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "statsbyfilter data1",
-        1732118400000,
-    );
-    make_codex_session_at(
-        &codex_home,
-        "2024/11/21",
-        "rollout-2.jsonl",
-        "statsbyfilter data2",
-        1732204800000,
-    );
+    tracker.phase("setup_and_index", "Create sessions and index", || {
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/20",
+            "rollout-1.jsonl",
+            "statsbyfilter data1",
+            1732118400000,
+        );
+        make_codex_session_at(
+            &codex_home,
+            "2024/11/21",
+            "rollout-2.jsonl",
+            "statsbyfilter data2",
+            1732204800000,
+        );
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .assert()
+            .success();
+    });
 
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
-
-    // Combine --by-source with --source local filter
+    let ps = tracker.start(
+        "test_stats_by_source_filtered",
+        Some("Stats --by-source --source local"),
+    );
     let output = cargo_bin_cmd!("cass")
         .args([
             "stats",
@@ -1452,15 +1930,24 @@ fn stats_by_source_with_filter() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .expect("stats command");
+    tracker.end(
+        "test_stats_by_source_filtered",
+        Some("Stats --by-source --source local"),
+        ps,
+    );
 
-    assert!(output.status.success());
+    let ps = tracker.start("verify_results", Some("Verify filtered by_source data"));
+    assert!(
+        output.status.success(),
+        "command failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
 
-    // Should have by_source breakdown
     let by_source = json.get("by_source").and_then(|s| s.as_array());
     assert!(by_source.is_some(), "Stats should include by_source array");
 
-    // Should have local source with multiple conversations
     if let Some(sources) = by_source {
         let local_source = sources
             .iter()
@@ -1479,4 +1966,5 @@ fn stats_by_source_with_filter() {
             );
         }
     }
+    tracker.end("verify_results", Some("Verify filtered by_source data"), ps);
 }

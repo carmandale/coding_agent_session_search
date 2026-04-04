@@ -28,17 +28,14 @@
 //! use crate::search::hash_embedder::HashEmbedder;
 //!
 //! let embedder = HashEmbedder::new(384);
-//! let embedding = embedder.embed("hello world").unwrap();
+//! let embedding = embedder.embed_sync("hello world").unwrap();
 //! assert_eq!(embedding.len(), 384);
 //! ```
 
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
-
-/// FNV-1a offset basis (64-bit).
-const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-
-/// FNV-1a prime (64-bit).
-const FNV_PRIME: u64 = 0x100000001b3;
+use frankensearch::{
+    HashAlgorithm as FsHashAlgorithm, HashEmbedder as FsHashEmbedder, ModelCategory, ModelTier,
+};
 
 /// Default embedding dimension (matches MiniLM for compatibility).
 pub const DEFAULT_DIMENSION: usize = 384;
@@ -55,6 +52,7 @@ const MIN_TOKEN_LEN: usize = 2;
 pub struct HashEmbedder {
     dimension: usize,
     id: String,
+    delegate: FsHashEmbedder,
 }
 
 impl HashEmbedder {
@@ -73,6 +71,7 @@ impl HashEmbedder {
         Self {
             dimension,
             id: format!("fnv1a-{dimension}"),
+            delegate: FsHashEmbedder::new(dimension, FsHashAlgorithm::FnvModular),
         }
     }
 
@@ -89,52 +88,17 @@ impl HashEmbedder {
     fn tokenize(text: &str) -> Vec<String> {
         text.to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
-            .filter(|s| s.len() >= MIN_TOKEN_LEN)
+            .filter(|s| s.chars().count() >= MIN_TOKEN_LEN)
             .map(String::from)
             .collect()
     }
 
-    /// Compute FNV-1a hash of a byte slice.
-    ///
-    /// FNV-1a is a fast, non-cryptographic hash with good distribution
-    /// properties for feature hashing.
-    fn fnv1a_hash(bytes: &[u8]) -> u64 {
-        let mut hash = FNV_OFFSET_BASIS;
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(FNV_PRIME);
+    fn uniform_fallback(&self) -> Vec<f32> {
+        let mut embedding = vec![1.0f32; self.dimension];
+        let norm = (self.dimension as f32).sqrt();
+        for value in &mut embedding {
+            *value /= norm;
         }
-        hash
-    }
-
-    /// L2 normalize a vector in place.
-    ///
-    /// After normalization, the vector has unit length (L2 norm ≈ 1.0),
-    /// which is required for cosine similarity to work correctly.
-    fn l2_normalize(vec: &mut [f32]) {
-        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > f32::EPSILON {
-            for x in vec.iter_mut() {
-                *x /= norm;
-            }
-        }
-    }
-
-    /// Generate embedding for tokenized input.
-    fn embed_tokens(&self, tokens: &[String]) -> Vec<f32> {
-        let mut embedding = vec![0.0f32; self.dimension];
-
-        for token in tokens {
-            let hash = Self::fnv1a_hash(token.as_bytes());
-
-            // Use hash to determine dimension index and sign
-            let idx = (hash as usize) % self.dimension;
-            let sign = if (hash >> 63) == 0 { 1.0 } else { -1.0 };
-
-            embedding[idx] += sign;
-        }
-
-        Self::l2_normalize(&mut embedding);
         embedding
     }
 }
@@ -146,27 +110,41 @@ impl Default for HashEmbedder {
 }
 
 impl Embedder for HashEmbedder {
-    fn embed(&self, text: &str) -> EmbedderResult<Vec<f32>> {
+    fn embed_sync(&self, text: &str) -> EmbedderResult<Vec<f32>> {
         if text.is_empty() {
-            return Err(EmbedderError::InvalidInput("empty text".to_string()));
+            return Err(EmbedderError::InvalidConfig {
+                field: "input_text".to_string(),
+                value: "(empty)".to_string(),
+                reason: "empty text".to_string(),
+            });
         }
 
         let tokens = Self::tokenize(text);
 
-        // If no valid tokens, return zero vector (normalized to avoid NaN)
+        // Preserve cass legacy behavior for low-signal inputs.
         if tokens.is_empty() {
-            // Single punctuation or short text - return uniform vector
-            let mut embedding = vec![1.0 / (self.dimension as f32).sqrt(); self.dimension];
-            Self::l2_normalize(&mut embedding);
-            return Ok(embedding);
+            return Ok(self.uniform_fallback());
         }
 
-        Ok(self.embed_tokens(&tokens))
+        // Delegate core hashing/projection logic to frankensearch implementation.
+        // We pass canonicalized text to preserve cass's case-insensitive semantics.
+        let canonical = tokens.join(" ");
+        let embedding = self.delegate.embed_sync(&canonical);
+        if embedding.len() != self.dimension {
+            return Err(EmbedderError::EmbeddingFailed {
+                model: self.id.clone(),
+                source: Box::new(std::io::Error::other(format!(
+                    "delegate dimension mismatch: expected {}, got {}",
+                    self.dimension,
+                    embedding.len()
+                ))),
+            });
+        }
+        Ok(embedding)
     }
 
-    fn embed_batch(&self, texts: &[&str]) -> EmbedderResult<Vec<Vec<f32>>> {
-        // Use the trait's default implementation which properly propagates errors
-        texts.iter().map(|t| self.embed(t)).collect()
+    fn embed_batch_sync(&self, texts: &[&str]) -> EmbedderResult<Vec<Vec<f32>>> {
+        texts.iter().map(|t| self.embed_sync(t)).collect()
     }
 
     fn dimension(&self) -> usize {
@@ -178,7 +156,15 @@ impl Embedder for HashEmbedder {
     }
 
     fn is_semantic(&self) -> bool {
-        false // Hash embedder is not truly semantic
+        false
+    }
+
+    fn category(&self) -> ModelCategory {
+        ModelCategory::HashEmbedder
+    }
+
+    fn tier(&self) -> ModelTier {
+        ModelTier::Fast
     }
 }
 
@@ -189,7 +175,7 @@ mod tests {
     #[test]
     fn test_hash_embedder_basic() {
         let embedder = HashEmbedder::new(256);
-        let embedding = embedder.embed("hello world").unwrap();
+        let embedding = embedder.embed_sync("hello world").unwrap();
 
         assert_eq!(embedding.len(), 256);
         assert_eq!(embedder.id(), "fnv1a-256");
@@ -209,8 +195,8 @@ mod tests {
         let embedder = HashEmbedder::new(256);
 
         let text = "deterministic embedding test with some words";
-        let embedding1 = embedder.embed(text).unwrap();
-        let embedding2 = embedder.embed(text).unwrap();
+        let embedding1 = embedder.embed_sync(text).unwrap();
+        let embedding2 = embedder.embed_sync(text).unwrap();
 
         // Exact same output
         assert_eq!(embedding1, embedding2);
@@ -219,7 +205,7 @@ mod tests {
     #[test]
     fn test_hash_embedder_l2_normalized() {
         let embedder = HashEmbedder::new(256);
-        let embedding = embedder.embed("normalize this vector").unwrap();
+        let embedding = embedder.embed_sync("normalize this vector").unwrap();
 
         // Compute L2 norm
         let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -235,8 +221,8 @@ mod tests {
     fn test_hash_embedder_different_texts_different_embeddings() {
         let embedder = HashEmbedder::new(256);
 
-        let embedding1 = embedder.embed("hello world").unwrap();
-        let embedding2 = embedder.embed("goodbye world").unwrap();
+        let embedding1 = embedder.embed_sync("hello world").unwrap();
+        let embedding2 = embedder.embed_sync("goodbye world").unwrap();
 
         // Should be different
         assert_ne!(embedding1, embedding2);
@@ -245,13 +231,9 @@ mod tests {
     #[test]
     fn test_hash_embedder_empty_input_error() {
         let embedder = HashEmbedder::new(256);
-        let result = embedder.embed("");
+        let result = embedder.embed_sync("");
 
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            EmbedderError::InvalidInput(_)
-        ));
     }
 
     #[test]
@@ -259,7 +241,7 @@ mod tests {
         let embedder = HashEmbedder::new(256);
 
         // Should handle gracefully (all tokens filtered out)
-        let embedding = embedder.embed("!@#$%^&*()").unwrap();
+        let embedding = embedder.embed_sync("!@#$%^&*()").unwrap();
 
         assert_eq!(embedding.len(), 256);
         // Still normalized
@@ -275,7 +257,7 @@ mod tests {
         let embedder = HashEmbedder::new(256);
         let texts = &["hello world", "goodbye world", "test batch"];
 
-        let embeddings = embedder.embed_batch(texts).unwrap();
+        let embeddings = embedder.embed_batch_sync(texts).unwrap();
 
         assert_eq!(embeddings.len(), 3);
         for embedding in &embeddings {
@@ -295,7 +277,7 @@ mod tests {
         let embedder = HashEmbedder::new(256);
         let texts = &["hello", "", "world"];
 
-        let result = embedder.embed_batch(texts);
+        let result = embedder.embed_batch_sync(texts);
         assert!(result.is_err());
     }
 
@@ -326,27 +308,12 @@ mod tests {
     }
 
     #[test]
-    fn test_fnv1a_hash_known_values() {
-        // FNV-1a is a well-known algorithm, test against known values
-        let hash_empty = HashEmbedder::fnv1a_hash(b"");
-        assert_eq!(hash_empty, FNV_OFFSET_BASIS);
-
-        // These values can be verified against other FNV-1a implementations
-        let hash_a = HashEmbedder::fnv1a_hash(b"a");
-        assert_ne!(hash_a, FNV_OFFSET_BASIS);
-
-        // Different inputs should produce different hashes
-        let hash_b = HashEmbedder::fnv1a_hash(b"b");
-        assert_ne!(hash_a, hash_b);
-    }
-
-    #[test]
     fn test_case_insensitivity() {
         let embedder = HashEmbedder::new(256);
 
-        let embedding1 = embedder.embed("Hello World").unwrap();
-        let embedding2 = embedder.embed("hello world").unwrap();
-        let embedding3 = embedder.embed("HELLO WORLD").unwrap();
+        let embedding1 = embedder.embed_sync("Hello World").unwrap();
+        let embedding2 = embedder.embed_sync("hello world").unwrap();
+        let embedding3 = embedder.embed_sync("HELLO WORLD").unwrap();
 
         // All should produce the same embedding (case insensitive)
         assert_eq!(embedding1, embedding2);
@@ -357,9 +324,9 @@ mod tests {
     fn test_whitespace_insensitivity() {
         let embedder = HashEmbedder::new(256);
 
-        let embedding1 = embedder.embed("hello   world").unwrap();
-        let embedding2 = embedder.embed("hello world").unwrap();
-        let embedding3 = embedder.embed("hello\n\tworld").unwrap();
+        let embedding1 = embedder.embed_sync("hello   world").unwrap();
+        let embedding2 = embedder.embed_sync("hello world").unwrap();
+        let embedding3 = embedder.embed_sync("hello\n\tworld").unwrap();
 
         // All should produce the same embedding (whitespace collapsed)
         assert_eq!(embedding1, embedding2);
@@ -375,7 +342,7 @@ mod tests {
     #[test]
     fn test_large_dimension() {
         let embedder = HashEmbedder::new(4096);
-        let embedding = embedder.embed("test large dimension").unwrap();
+        let embedding = embedder.embed_sync("test large dimension").unwrap();
 
         assert_eq!(embedding.len(), 4096);
 
@@ -392,7 +359,7 @@ mod tests {
         let embedder = HashEmbedder::new(256);
 
         // Should handle unicode gracefully
-        let embedding = embedder.embed("café résumé naïve").unwrap();
+        let embedding = embedder.embed_sync("café résumé naïve").unwrap();
         assert_eq!(embedding.len(), 256);
 
         // Normalized
@@ -408,9 +375,9 @@ mod tests {
         let embedder = HashEmbedder::new(256);
 
         // Similar texts should have higher cosine similarity
-        let emb_dog = embedder.embed("the quick brown dog").unwrap();
-        let emb_fox = embedder.embed("the quick brown fox").unwrap();
-        let emb_unrelated = embedder.embed("quantum physics equations").unwrap();
+        let emb_dog = embedder.embed_sync("the quick brown dog").unwrap();
+        let emb_fox = embedder.embed_sync("the quick brown fox").unwrap();
+        let emb_unrelated = embedder.embed_sync("quantum physics equations").unwrap();
 
         // Compute cosine similarity (dot product of normalized vectors)
         let sim_dog_fox: f32 = emb_dog.iter().zip(&emb_fox).map(|(a, b)| a * b).sum();
@@ -421,5 +388,18 @@ mod tests {
             sim_dog_fox > sim_dog_unrelated,
             "similar texts should have higher cosine similarity: dog_fox={sim_dog_fox}, dog_unrelated={sim_dog_unrelated}"
         );
+    }
+
+    #[test]
+    fn test_sync_embedder_adapter_bridge() {
+        use frankensearch::SyncEmbedderAdapter;
+
+        let embedder = HashEmbedder::new(256);
+        let adapted = SyncEmbedderAdapter(embedder);
+
+        // The adapter implements frankensearch::Embedder (async trait)
+        assert_eq!(frankensearch::Embedder::dimension(&adapted), 256);
+        assert_eq!(frankensearch::Embedder::id(&adapted), "fnv1a-256");
+        assert!(!frankensearch::Embedder::is_semantic(&adapted));
     }
 }

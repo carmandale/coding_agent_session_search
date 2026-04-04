@@ -30,3 +30,6 @@ beads.right.meta.json
 !issues.jsonl
 !metadata.json
 !config.json
+
+# br history snapshots (runtime, not tracked)
+.br_history/

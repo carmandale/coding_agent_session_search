@@ -1,14 +1,310 @@
+pub mod e2e_log;
+
+// =============================================================================
+// Verbose Logging Support
+// =============================================================================
+
+use coding_agent_search::ftui_harness;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::sync::Mutex;
+
+/// Global verbose log file handle (lazily initialized).
+static VERBOSE_LOG_FILE: std::sync::LazyLock<Mutex<Option<File>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// Check if verbose logging is enabled via E2E_VERBOSE environment variable.
+#[allow(dead_code)]
+pub fn is_verbose() -> bool {
+    std::env::var("E2E_VERBOSE").is_ok()
+}
+
+/// Initialize verbose logging with a specific log file path.
+/// Called automatically by VerboseLogger, but can be called manually for custom paths.
+#[allow(dead_code)]
+pub fn init_verbose_log(path: &std::path::Path) -> std::io::Result<()> {
+    if !is_verbose() {
+        return Ok(());
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+
+    let mut guard = VERBOSE_LOG_FILE.lock().unwrap();
+    *guard = Some(file);
+
+    // Write init message
+    drop(guard);
+    verbose_log("Verbose logging initialized");
+    Ok(())
+}
+
+/// Log a verbose message if E2E_VERBOSE is set.
+/// Writes to both stderr and a file (if initialized).
+/// Includes ISO-8601 timestamp for correlation with other logs.
+#[allow(dead_code)]
+pub fn verbose_log(msg: &str) {
+    if !is_verbose() {
+        return;
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let line = format!("[{} VERBOSE] {}", timestamp, msg);
+
+    // Write to stderr
+    eprintln!("{}", line);
+
+    // Write to file if initialized
+    if let Ok(mut guard) = VERBOSE_LOG_FILE.lock()
+        && let Some(ref mut file) = *guard
+    {
+        let _ = writeln!(file, "{}", line);
+        let _ = file.flush();
+    }
+}
+
+/// Macro for verbose logging with format string support.
+///
+/// # Example
+/// ```ignore
+/// verbose!("Starting test with {} fixtures", fixture_count);
+/// verbose!("Created temp directory at {:?}", temp_dir);
+/// ```
+#[macro_export]
+macro_rules! verbose {
+    ($($arg:tt)*) => {
+        $crate::util::verbose_log(&format!($($arg)*))
+    };
+}
+
+/// RAII guard for verbose logging session.
+/// Automatically initializes the verbose log file and provides structured logging.
+#[allow(dead_code)]
+pub struct VerboseLogger {
+    log_path: std::path::PathBuf,
+}
+
+#[allow(dead_code)]
+impl VerboseLogger {
+    /// Create a new VerboseLogger for a test.
+    /// Log file is written to: test-results/e2e/verbose_{suite}_{test}_{timestamp}.log
+    pub fn new(suite: &str, test_name: &str) -> Self {
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+
+        let log_path = manifest_dir
+            .join("test-results")
+            .join("e2e")
+            .join(format!("verbose_rust_{}_{}.log", suite, timestamp));
+
+        if is_verbose() {
+            let _ = init_verbose_log(&log_path);
+            verbose_log(&format!("=== Verbose log for {suite}::{test_name} ==="));
+        }
+
+        Self { log_path }
+    }
+
+    /// Get the path to the verbose log file.
+    pub fn log_path(&self) -> &std::path::Path {
+        &self.log_path
+    }
+
+    /// Log a phase start.
+    pub fn phase_start(&self, phase: &str, description: Option<&str>) {
+        if let Some(desc) = description {
+            verbose_log(&format!("PHASE_START name={phase} description=\"{desc}\""));
+        } else {
+            verbose_log(&format!("PHASE_START name={phase}"));
+        }
+    }
+
+    /// Log a phase end with duration.
+    pub fn phase_end(&self, phase: &str, duration_ms: u64) {
+        verbose_log(&format!("PHASE_END name={phase} duration_ms={duration_ms}"));
+    }
+
+    /// Log an operation with context.
+    pub fn operation(&self, op: &str, details: &str) {
+        verbose_log(&format!("{op}: {details}"));
+    }
+
+    /// Log a file operation.
+    pub fn file_op(&self, op: &str, path: &std::path::Path) {
+        verbose_log(&format!("FILE_{op} path={}", path.display()));
+    }
+
+    /// Log a command execution.
+    pub fn command(&self, cmd: &str, args: &[&str]) {
+        verbose_log(&format!("COMMAND {} {}", cmd, args.join(" ")));
+    }
+
+    /// Log an assertion with context.
+    pub fn assertion(&self, name: &str, expected: &str, actual: &str) {
+        verbose_log(&format!(
+            "ASSERT {name}: expected={expected} actual={actual}"
+        ));
+    }
+
+    /// Log state transition.
+    pub fn state(&self, key: &str, value: &str) {
+        verbose_log(&format!("STATE {key}={value}"));
+    }
+}
+
+// =============================================================================
+// FrankenTUI Snapshot Harness Helpers
+// =============================================================================
+
+/// Render a FrankenTUI view and assert against a plain-text snapshot.
+///
+/// Snapshot files are stored under `tests/snapshots/*.snap`.
+/// Set `BLESS=1` to create or update snapshots.
+#[allow(dead_code)]
+pub fn assert_ftui_snapshot(
+    name: &str,
+    width: u16,
+    height: u16,
+    render: impl for<'a> FnOnce(ftui::core::geometry::Rect, &mut ftui::Frame<'a>),
+) {
+    let mut pool = ftui::GraphemePool::new();
+    let mut frame = ftui::Frame::new(width, height, &mut pool);
+    let area = ftui::core::geometry::Rect::new(0, 0, width, height);
+    render(area, &mut frame);
+    assert_ftui_snapshot_buffer(name, &frame.buffer);
+}
+
+/// Assert an existing `ftui::Buffer` against a plain-text snapshot.
+#[allow(dead_code)]
+pub fn assert_ftui_snapshot_buffer(name: &str, buf: &ftui::Buffer) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ftui_harness::assert_buffer_snapshot(
+            name,
+            buf,
+            env!("CARGO_MANIFEST_DIR"),
+            ftui_harness::MatchMode::TrimTrailing,
+        );
+    }));
+
+    if let Err(payload) = result {
+        eprintln!(
+            "FTUI snapshot failure: name='{name}', size={}x{}, bless_hint='BLESS=1 cargo test --test ftui_harness_snapshots'",
+            buf.width(),
+            buf.height()
+        );
+        eprintln!(
+            "Rendered output preview:\n{}",
+            ftui_harness::buffer_to_text(buf)
+        );
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// Render a FrankenTUI view and assert against an ANSI snapshot (`*.ansi.snap`).
+#[allow(dead_code)]
+pub fn assert_ftui_snapshot_ansi(
+    name: &str,
+    width: u16,
+    height: u16,
+    render: impl for<'a> FnOnce(ftui::core::geometry::Rect, &mut ftui::Frame<'a>),
+) {
+    let mut pool = ftui::GraphemePool::new();
+    let mut frame = ftui::Frame::new(width, height, &mut pool);
+    let area = ftui::core::geometry::Rect::new(0, 0, width, height);
+    render(area, &mut frame);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ftui_harness::assert_buffer_snapshot_ansi(name, &frame.buffer, env!("CARGO_MANIFEST_DIR"));
+    }));
+
+    if let Err(payload) = result {
+        eprintln!(
+            "FTUI ANSI snapshot failure: name='{name}', size={}x{}, bless_hint='BLESS=1 cargo test --test ftui_harness_snapshots'",
+            frame.buffer.width(),
+            frame.buffer.height()
+        );
+        std::panic::resume_unwind(payload);
+    }
+}
+
 use coding_agent_search::connectors::{
     NormalizedConversation, NormalizedMessage, NormalizedSnippet,
 };
 use coding_agent_search::model::types::{Conversation, Message, MessageRole, Snippet};
 use coding_agent_search::search::query::{MatchType, SearchHit};
-use rand::{Rng, SeedableRng};
+use coding_agent_search::sources::probe::HostProbeResult;
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+// =============================================================================
+// Source/Probe Fixture Loaders
+// =============================================================================
+
+/// Load a probe fixture by name from tests/fixtures/sources/probe/{name}.json
+///
+/// Available fixtures:
+/// - `indexed_host` - Host with cass installed and indexed
+/// - `not_indexed_host` - Host with cass installed but not indexed
+/// - `no_cass_host` - Host without cass installed
+/// - `empty_index_host` - Host with cass but empty index
+/// - `unreachable_host` - Host that couldn't be reached via SSH
+/// - `unknown_status_host` - Host where status couldn't be determined
+#[allow(dead_code)]
+pub fn load_probe_fixture(name: &str) -> HostProbeResult {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/sources/probe")
+        .join(format!("{}.json", name));
+    let content = std::fs::read_to_string(&path).expect("Failed to read probe fixture");
+    serde_json::from_str(&content).expect("Failed to parse probe fixture")
+}
+
+/// Pre-built probe fixtures for common test scenarios.
+#[allow(dead_code)]
+pub mod probe_fixtures {
+    use super::*;
+
+    /// Host with cass installed and fully indexed (847 sessions).
+    pub fn indexed_host() -> HostProbeResult {
+        load_probe_fixture("indexed_host")
+    }
+
+    /// Host with cass installed but not yet indexed.
+    pub fn not_indexed_host() -> HostProbeResult {
+        load_probe_fixture("not_indexed_host")
+    }
+
+    /// Host without cass installed.
+    pub fn no_cass_host() -> HostProbeResult {
+        load_probe_fixture("no_cass_host")
+    }
+
+    /// Host with cass indexed but 0 sessions.
+    pub fn empty_index_host() -> HostProbeResult {
+        load_probe_fixture("empty_index_host")
+    }
+
+    /// Host that couldn't be reached via SSH.
+    pub fn unreachable_host() -> HostProbeResult {
+        load_probe_fixture("unreachable_host")
+    }
+
+    /// Host where cass status couldn't be determined.
+    pub fn unknown_status_host() -> HostProbeResult {
+        load_probe_fixture("unknown_status_host")
+    }
+}
 
 /// Captures tracing output for tests.
 #[allow(dead_code)]
@@ -273,6 +569,7 @@ impl ConversationFixtureBuilder {
                     content,
                     extra: json!({"seed": i}),
                     snippets,
+                    invocations: Vec::new(),
                 }
             })
             .collect();
@@ -769,14 +1066,14 @@ impl SeededRng {
 
     /// Generate a random f32 in the range [0, 1).
     pub fn f32(&mut self) -> f32 {
-        self.rng.r#gen::<f32>()
+        self.rng.random::<f32>()
     }
 
     /// Generate a random f32 in the given range [min, max).
     /// If min > max, they are swapped.
     pub fn f32_range(&mut self, min: f32, max: f32) -> f32 {
         let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
-        lo + self.rng.r#gen::<f32>() * (hi - lo)
+        lo + self.rng.random::<f32>() * (hi - lo)
     }
 
     /// Generate a random i64 in the given range [min, max).
@@ -785,7 +1082,7 @@ impl SeededRng {
         if min >= max {
             return min;
         }
-        self.rng.r#gen_range(min..max)
+        self.rng.random_range(min..max)
     }
 
     /// Generate a random usize in the given range [min, max).
@@ -794,7 +1091,7 @@ impl SeededRng {
         if min >= max {
             return min;
         }
-        self.rng.r#gen_range(min..max)
+        self.rng.random_range(min..max)
     }
 
     /// Generate a random alphanumeric string of the given length.
@@ -802,7 +1099,7 @@ impl SeededRng {
         const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         (0..len)
             .map(|_| {
-                let idx = self.rng.r#gen_range(0..CHARSET.len());
+                let idx = self.rng.random_range(0..CHARSET.len());
                 CHARSET[idx] as char
             })
             .collect()

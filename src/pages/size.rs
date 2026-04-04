@@ -4,7 +4,9 @@
 //! exporting/encrypting data that would exceed GitHub Pages limits.
 
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
+use frankensqlite::Connection;
+use frankensqlite::Row;
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -61,29 +63,29 @@ impl SizeEstimate {
         since_ts: Option<i64>,
         until_ts: Option<i64>,
     ) -> Result<Self> {
-        let conn = Connection::open(db_path.as_ref())
+        let conn = Connection::open(db_path.as_ref().to_string_lossy().as_ref())
             .context("Failed to open database for size estimation")?;
 
         // Build filter conditions
         let mut conditions = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut param_values: Vec<ParamValue> = Vec::new();
 
         if let Some(agents) = agents.filter(|a| !a.is_empty()) {
             let placeholders: Vec<_> = agents.iter().map(|_| "?").collect();
             conditions.push(format!("c.agent IN ({})", placeholders.join(", ")));
             for agent in agents {
-                params.push(Box::new(agent.clone()));
+                param_values.push(ParamValue::from(agent.as_str()));
             }
         }
 
         if let Some(since) = since_ts {
             conditions.push("c.started_at >= ?".to_string());
-            params.push(Box::new(since));
+            param_values.push(ParamValue::from(since));
         }
 
         if let Some(until) = until_ts {
             conditions.push("c.started_at <= ?".to_string());
-            params.push(Box::new(until));
+            param_values.push(ParamValue::from(until));
         }
 
         let where_clause = if conditions.is_empty() {
@@ -92,30 +94,33 @@ impl SizeEstimate {
             format!(" WHERE {}", conditions.join(" AND "))
         };
 
+        let params_slice = &param_values;
+
         // Query conversation count
         let conv_sql = format!("SELECT COUNT(*) FROM conversations c{}", where_clause);
         let conversation_count: u64 = conn
-            .query_row(
-                &conv_sql,
-                rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-                |row| row.get(0),
-            )
+            .query_row_map(&conv_sql, params_slice, |row: &Row| {
+                row.get_typed::<i64>(0).map(|v| v as u64)
+            })
             .unwrap_or(0);
 
         // Query message count and content size
         let msg_sql = format!(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(m.content)), 0)
+            "SELECT COUNT(*), SUM(LENGTH(m.content))
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              {}",
             where_clause
         );
         let (message_count, plaintext_bytes): (u64, u64) = conn
-            .query_row(
-                &msg_sql,
-                rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-                |row| Ok((row.get(0).unwrap_or(0), row.get(1).unwrap_or(0))),
-            )
+            .query_row_map(&msg_sql, params_slice, |row: &Row| {
+                let raw_message_count = row.get_typed::<i64>(0).unwrap_or(0);
+                let raw_plaintext_bytes = row.get_typed::<Option<i64>>(1)?.unwrap_or(0);
+                Ok((
+                    raw_message_count.max(0) as u64,
+                    raw_plaintext_bytes.max(0) as u64,
+                ))
+            })
             .unwrap_or((0, 0));
 
         Self::from_plaintext_size(plaintext_bytes, conversation_count, message_count)
@@ -131,13 +136,21 @@ impl SizeEstimate {
         let compressed_bytes = (plaintext_bytes as f64 * COMPRESSION_RATIO) as u64;
 
         // Calculate chunk count (minimum of 1 chunk even for empty content)
-        let chunk_count = compressed_bytes.div_ceil(DEFAULT_CHUNK_SIZE).max(1) as u32;
+        let chunk_count_u64 = compressed_bytes.div_ceil(DEFAULT_CHUNK_SIZE).max(1);
+        let chunk_count = u32::try_from(chunk_count_u64).unwrap_or(u32::MAX);
 
         // Add AEAD overhead
-        let encrypted_bytes = compressed_bytes + (chunk_count as u64 * AEAD_TAG_OVERHEAD);
+        let aead_overhead = u64::from(chunk_count)
+            .checked_mul(AEAD_TAG_OVERHEAD)
+            .ok_or_else(|| anyhow::anyhow!("AEAD overhead overflow"))?;
+        let encrypted_bytes = compressed_bytes
+            .checked_add(aead_overhead)
+            .ok_or_else(|| anyhow::anyhow!("Encrypted size overflow"))?;
 
         // Total with static assets
-        let total_site_bytes = encrypted_bytes + STATIC_ASSETS_SIZE;
+        let total_site_bytes = encrypted_bytes
+            .checked_add(STATIC_ASSETS_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("Total site size overflow"))?;
 
         Ok(Self {
             plaintext_bytes,
@@ -369,11 +382,16 @@ where
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
 
-        if path.is_dir() {
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
             visit_files(&path, f)?;
-        } else {
-            let metadata = std::fs::metadata(&path)?;
+        } else if file_type.is_file() {
             f(&path, metadata.len())?;
         }
     }
@@ -548,5 +566,51 @@ mod tests {
             estimate.chunk_count, 2,
             "Exactly two chunks' worth should be 2 chunks, not 3"
         );
+    }
+
+    #[test]
+    fn test_from_plaintext_size_handles_extremely_large_inputs() {
+        let estimate = SizeEstimate::from_plaintext_size(u64::MAX, 1, 1).unwrap();
+        assert_eq!(estimate.chunk_count, u32::MAX);
+        assert!(estimate.total_site_bytes >= estimate.compressed_bytes);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_visit_files_skips_symlink_paths() {
+        use std::collections::HashSet;
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let src = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        std::fs::write(src.path().join("root.txt"), "root").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        std::fs::create_dir_all(outside.path().join("nested")).unwrap();
+        std::fs::write(outside.path().join("nested/hidden.txt"), "hidden").unwrap();
+
+        symlink(
+            outside.path().join("secret.txt"),
+            src.path().join("linked-file.txt"),
+        )
+        .unwrap();
+        symlink(outside.path().join("nested"), src.path().join("linked-dir")).unwrap();
+
+        let mut visited = HashSet::new();
+        visit_files(src.path(), &mut |path, _size| {
+            visited.insert(
+                path.strip_prefix(src.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(visited.contains("root.txt"));
+        assert!(!visited.contains("linked-file.txt"));
+        assert!(!visited.iter().any(|p| p.starts_with("linked-dir/")));
     }
 }
