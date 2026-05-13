@@ -4,6 +4,9 @@ date: 2026-05-13
 bead: coding_agent_session_search-3vm6
 ---
 
+<!-- Codex Review: APPROVED after 5 rounds | model: gpt-5.3-codex | date: 2026-05-13 | trust_level: full | round_records: .codex-round-893bb04a/ -->
+
+
 <!-- plan:complete:v1 | harness: unknown | date: 2026-05-13T15:22:07Z -->
 
 
@@ -71,11 +74,11 @@ The heartbeat is opt-in (gated by RUST_LOG target) so it does not affect normal-
 
 ### Surface 3 — Watchdog (R4 + C4 reconciliation)
 
-The existing `stall_detected` event at `src/lib.rs:72639` carries lexical checkpoint, Tantivy segment count, run-lock metadata. R4 requires extending the payload with the Surface-2 fields. Three sub-deliveries on this surface:
+Three sub-deliveries on this surface. The plist mutation IS in scope (it is the minimal C4-safe path); wrapper scripts and uninstaller infrastructure are out of scope.
 
-- **Payload extension** — embed the same fields the heartbeat emits, taken at the moment the watchdog fires. This is additive; existing consumers are not broken.
-- **Emission gating fix** — the event currently fires only in structured-output / progress-events mode (`src/lib.rs:72250, 72531`). Remove the gating so the event always emits to the structured log channel; consumers who want JSON still set `--json`.
-- **Escalation posture (C4-safe)** — given `KeepAlive=true` boolean (not dictionary), the safest reconciliation is: indexer writes a sentinel file at `<data_dir>/stall-detected.json` carrying the full event payload AND emits the structured event, but does NOT exit on its own. A small wrapper script invoked by launchd (or the existing health-watchdog plist) checks the sentinel before re-exec; if present, it backs off the relaunch and surfaces a noticeable failure. This keeps the indexer's exit path unchanged, avoids a `KeepAlive` respawn loop, and gives R4 the loud signal it asks for.
+- **Payload extension** — embed Surface-2 fields the heartbeat emits at the moment the watchdog fires (active producers, channel len/cap, byte-limiter state, consumer phase, raw-mirror lock state, per-thread heartbeat counters, lldb backtrace when `CASS_INDEX_STALL_CAPTURE_LLDB=1`). Additive; existing consumers unaffected.
+- **Emission gating fix (load-bearing)** — the event currently fires only in structured-output mode (`src/lib.rs:72250, 72531`). Removing the gating is the prerequisite for Group A's recovery to fail loud instead of silent. Group A T5 documents the interim `--json` workaround until Group E T21 lands. Group C T12 also uses `--json` for the same reason.
+- **C4 via plist mutation** — boolean `KeepAlive=true` respawns on ANY exit (including clean), so "indexer exits cleanly on sentinel" creates the respawn loop C4 forbids. The minimal C4-safe change: edit `~/Library/LaunchAgents/com.cass.index-watch.plist` to use `KeepAlive=<dict>{SuccessfulExit=false}</dict>` dictionary form. Combined with the indexer's exit-0 on detecting an existing `stall-detected.json`, dictionary `KeepAlive` treats exit-0 as "do not respawn" — no loop. Revert is a single-line edit back to boolean. Sentinel-clear procedure documented in `recovery.md`: operator deletes the sentinel and runs `launchctl kickstart -k gui/<uid>/com.cass.index-watch`.
 
 ### Surface 4 — Targeted fix (one of six candidates)
 
@@ -103,6 +106,21 @@ The fixture exercises the actual deadlocked primitive — not panic propagation 
 - Asserts either bounded recovery (the fix path) or a bounded `stall_detected` event with the new R4 fields (the watchdog path, used when the fix path is not yet implemented)
 
 The fixture must NOT require the user's full corpus (C2); a synthetic generator inside the test fakes the producer/consumer pressure shape.
+
+### Surface 7 — Per-source completion proof (A2 acceptance gate)
+
+A2 requires that EVERY source file is either ingested or has a structured failure reason — not just an aggregate ≤2% match. Aggregate stat-count matching is insufficient.
+
+The completion proof is a file-level reconciliation ledger built by tasks.md T19a:
+
+- **Pre-backfill inventory**: enumerate every source file for claude_code (`~/.claude/projects/**/*.jsonl`), codex (`~/.codex/sessions/**/*.jsonl`), openclaw (`~/.openclaw/**/*.jsonl`), opencode (`~/.opencode/**/*.{jsonl,json}`). Compute the canonical SHA-256 of each path.
+- **Post-backfill DB query**: for each agent, query `(source_path, conversation_id)` pairs from the canonical DB.
+- **Per-file classification**: for each pre-backfill path, classify as:
+  - **(a) Ingested**: matched by source_path in DB, conversation_id non-null.
+  - **(b) Structured skip**: matched in `<data_dir>/ingest-skipped.ndjson` (a new NDJSON ledger the indexer writes when it encounters a source file but chooses not to ingest it; T19a step 1 adds this surface). Acceptable reasons: empty-file (0 bytes), parse-error (malformed JSON), encoding-error (binary content where text expected), permission-denied, not-conversation-shape. The existing `RawMirrorManifestFile` schema has no skip-reason field (`src/raw_mirror.rs:94`); this new NDJSON ledger is small additive infrastructure.
+  - **(c) Silent loss**: no entry in DB, no skip_reason. **A2 acceptance requires zero files in class (c).**
+- **Ledger output**: `specs/013-cass-rebuild-stall-asupersync/reconciliation-ledger.md` with one row per file: `| path | class | conversation_id | skip_reason | notes |`. Plus aggregate summary.
+- **A2 fail mode**: any class (c) entries fail A2; investigation must extend the fix or expand the structured-skip catalog.
 
 ## Risk analysis
 

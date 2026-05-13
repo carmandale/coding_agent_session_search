@@ -4,6 +4,9 @@ date: 2026-05-13
 bead: coding_agent_session_search-3vm6
 ---
 
+<!-- Codex Review: APPROVED after 5 rounds | model: gpt-5.3-codex | date: 2026-05-13 | trust_level: full | round_records: .codex-round-893bb04a/ -->
+
+
 <!-- issue:complete:v1 | harness: unknown | date: 2026-05-13T14:17:15Z -->
 
 ## Source (verbatim)
@@ -56,7 +59,7 @@ R2. Implement a fix or confirmed workaround that lets a single foreground run in
 
 R3. Preserve the partial work already on disk: do not require throwing away the current 1,648-conversation canonical DB or the 25 GB raw-mirror archive. The fix should pick up where the killed rebuild left off (via content-hash dedup), not restart from zero.
 
-R4. Add or enable a stall-detection signal that fires within bounded time (≤120s default per upstream `CASS_INDEX_STALL_DETECT_SECS`) when forward progress halts mid-phase. Emission must include enough diagnostic snapshot (thread states, queue depths, current connector, current source path) for an operator to file a precise upstream bug if the underlying defect is upstream.
+R4. Add or enable a stall-detection signal that fires within bounded time (≤120s default per upstream `CASS_INDEX_STALL_DETECT_SECS`) when forward progress halts mid-phase. Emission must include enough diagnostic snapshot for an operator to file a precise upstream bug if the underlying defect is upstream. "Thread states" in this requirement is satisfied by EITHER: (a) OS-level symbolic backtrace via `lldb -batch -ex "thread apply all bt"` captured by the watchdog on fire (required for diagnostic runs that triggered the stall), OR (b) per-thread `std::thread::Builder::name()` plus a heartbeat counter exposing logical park-or-running state (sufficient when no real stall has occurred yet). Queue depths, current connector, current source path must always be in the payload.
 
 R5. Regression coverage: add a focused test that exercises whichever channel / dispatch path is at fault, demonstrating that a stuck producer or consumer is recoverable (or detectable) rather than producing the observed silent hang.
 
@@ -79,7 +82,7 @@ A1. A documented root-cause writeup exists at `specs/013-cass-rebuild-stall-asup
 - The producer / consumer pair involved and which side failed to wake the other.
 - Why the existing v0.3.7 stall-detection watchdog did not catch this case (or, if it did, why the emitted event was not visible).
 
-A2. `cass index --full --force-rebuild` against the user's full corpus (or an equivalent synthetic fixture covering the same dispatch pattern) completes end-to-end with zero manual intervention. End-state: DB conversation count ≥ source-file count for each connector minus a documented allowed-skip set (e.g., known-malformed sessions).
+A2. `cass index --full` against the user's full corpus (or an equivalent synthetic fixture covering the same dispatch pattern) completes end-to-end with zero manual intervention. End-state: DB conversation count ≥ source-file count for each connector minus a documented allowed-skip set (e.g., known-malformed sessions). Note: the `--full --force-rebuild` variant takes the canonical-only short-circuit on a non-empty DB (`src/indexer/mod.rs:9675-9680`) and is intentionally out of scope for this spec; fixing that short-circuit would be a separate spec.
 
 A3. After completion, `cass stats` shows non-zero per-connector counts for claude_code, codex, openclaw (all agents), opencode that match within ≤2% of the on-disk source file counts. Date range covers 2025-09-15 through current.
 
@@ -106,7 +109,7 @@ Approach is determined: this is a clear bug fix with a concrete reproduction and
 
 The investigation path is:
 
-1. Re-run `cass index --full --force-rebuild` with `CASS_INDEX_STALL_DETECT_SECS=60` and `RUST_LOG=cass=debug,coding_agent_search::indexer=trace` to capture both the structured stall event and high-resolution traces of the asupersync worker dispatch around the freeze.
+1. Re-run `cass index --full --json` (NOT `--full --force-rebuild` — that takes the canonical-only short-circuit on a non-empty DB per `src/indexer/mod.rs:9675-9680` and never enters the streaming pipeline) with `CASS_INDEX_STALL_DETECT_SECS=60` and `RUST_LOG=cass=debug,coding_agent_search::indexer=trace`. The `--json` flag is required because the existing watchdog only emits inside `emit_progress_events = structured_output && !no_progress_events` at `src/lib.rs:72250, 72531`; without it, the stall event is silent. Captures both the structured stall event and high-resolution traces of the asupersync worker dispatch around the freeze.
 2. Attach a debugger (lldb) at the deadlock point and capture exact stack frames in symbolic form (the `sample` output during the original stall had unresolved addresses because the binary was stripped); confirm which mutex / channel handle is held by which thread.
 3. Cross-reference with upstream issue #196 thread on `Dicklesworthstone/coding_agent_session_search` — the v0.3.7 fix targeted a different deadlock (zero-writer init in `FrankenConnectionManager`); the v0.4.2 stall is in a downstream stage and probably warrants a sibling fix or a missed handoff between the producer and the asupersync workers.
 4. Patch the identified primitive (most likely candidates: a bounded channel without a wakeup on backpressure, or a condvar signaled inside a critical section the receiver also holds). Add the regression test from A5.

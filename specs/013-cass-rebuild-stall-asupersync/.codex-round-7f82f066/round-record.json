@@ -1,0 +1,21 @@
+{
+  "baseline_sha": "ed590b9bcab4c65e4214ae6c0278bc647ad13479",
+  "checkpoint_sessions": [
+    "019e21fe-73d0-78d2-82a8-7c92341d929b"
+  ],
+  "codex_session_id": "019e21fe-73d0-78d2-82a8-7c92341d929b",
+  "command": "codex-review",
+  "halt_detected_at": null,
+  "halt_marker_line": null,
+  "parent_round": null,
+  "phase": "default",
+  "review_id": "7f82f066",
+  "round_state": "closed-success",
+  "schema_version": 1,
+  "spec_path": "specs/013-cass-rebuild-stall-asupersync",
+  "staging_path": "/Users/dalecarman/dev/coding_agent_session_search/specs/013-cass-rebuild-stall-asupersync/.codex-round-rphm0kvh-7f82f066-staging/output.md",
+  "start_timestamp": "2026-05-13T15:54:48.383914Z",
+  "surfaceable_path": "/Users/dalecarman/dev/coding_agent_session_search/specs/013-cass-rebuild-stall-asupersync/.codex-round-7f82f066/output.md",
+  "temp_file_family": "codex-review-*-7f82f066.md",
+  "trust_level": "full"
+}
