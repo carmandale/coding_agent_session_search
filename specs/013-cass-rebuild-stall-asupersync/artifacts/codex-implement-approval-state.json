@@ -1,0 +1,59 @@
+{
+  "approval_target_sha": "a7d09255c37c0f1b5e09c6024f915b024db6d2f3",
+  "baseline_sha": "a7d09255c37c0f1b5e09c6024f915b024db6d2f3",
+  "chunk_map": [
+    {
+      "header": "## Group A \u2014 Recovery + operational baseline",
+      "line": 14,
+      "ordinal": 0
+    },
+    {
+      "header": "## Group B \u2014 Liveness instrumentation",
+      "line": 22,
+      "ordinal": 1
+    },
+    {
+      "header": "## Group C \u2014 Diagnostic localization + root-cause writeup",
+      "line": 31,
+      "ordinal": 2
+    },
+    {
+      "header": "## Group D \u2014 Targeted fix",
+      "line": 39,
+      "ordinal": 3
+    },
+    {
+      "header": "## Group E \u2014 Watchdog enhancement (R4 + C4)",
+      "line": 57,
+      "ordinal": 4
+    },
+    {
+      "header": "## Group F \u2014 Regression test",
+      "line": 68,
+      "ordinal": 5
+    },
+    {
+      "header": "## Group G \u2014 Upstream PR preparation",
+      "line": 74,
+      "ordinal": 6
+    },
+    {
+      "header": "## Group H \u2014 Post-backfill reconciliation + cutback",
+      "line": 81,
+      "ordinal": 7
+    }
+  ],
+  "closeout_surface": [],
+  "created_at": "2026-05-13T16:01:07Z",
+  "findings": [],
+  "proof_manifest": [],
+  "rounds": [],
+  "schema_version": 1,
+  "state_fingerprint": {
+    "baseline_sha": "a7d09255c37c0f1b5e09c6024f915b024db6d2f3",
+    "chunk_count": 8,
+    "spec_relpath": "specs/013-cass-rebuild-stall-asupersync"
+  },
+  "updated_at": "2026-05-13T16:01:07Z",
+  "validator_capability": "read-only"
+}
