@@ -57,3 +57,25 @@
   (367 conversations and growing as live sessions accrue).
 - Full findings in `findings-2026-05-14.md`. Groups B-H of `tasks.md` remain
   the right path to a permanent fix.
+
+## 2026-05-14T15:25Z — root cause located AND fixed (commit e429eaa8)
+
+The "stall" in the watch-once code path is not a deadlock in
+raw_mirror/asupersync/staged-merge. It is a **single-chunk hot path**:
+`reindex_paths_with_semantic_delta` forced `ingest_chunk_size =
+conv_count.max(1)` when `explicit_watch_once` was true, so a connector root
+with thousands of files (~/.claude/projects has 2,500+) was attempted as one
+transaction. The OOM-split safety net only fires on OOM, so a merely-slow
+giant batch held the writer mutex forever while every worker thread parked
+as a starved producer.
+
+Fix: use `watch_ingest_chunk_size()` unconditionally
+(`src/indexer/mod.rs:16325-16334`). With the fix, claude_code backfill
+progresses ~40 conversations/min in 32-conv chunks, each chunk committing
+visibly. The watcher daemon, watch-once, and full rebuild are now
+re-aligned on a single chunked ingest path.
+
+What this does NOT fix: the `--full` rebuild path uses the lexical-rebuild
+pipeline rather than the watch-ingest loop; D1-D6 candidates remain valid
+investigation targets for that path. Out of scope for the immediate user
+goal (priority connector backfill).
