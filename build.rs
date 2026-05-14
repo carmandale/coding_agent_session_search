@@ -47,8 +47,8 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "266dc98f",
-        expected_version: "0.1.2",
+        expected_rev: "eba969ec45d102071b90519d3b819ddbcecf3d61",
+        expected_version: "0.1.3",
         expected_features: &["fts5"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -64,8 +64,8 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "266dc98f",
-        expected_version: "0.1.2",
+        expected_rev: "eba969ec45d102071b90519d3b819ddbcecf3d61",
+        expected_version: "0.1.3",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -81,8 +81,8 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "2262339794520540d52cb3a2e0fa9cfc627ad4fb",
-        expected_version: "0.1.3",
+        expected_rev: "5115da8e515ee8a76cf676e78bc2d351e14abc82",
+        expected_version: "0.1.7",
         expected_features: &[
             "chatgpt",
             "connectors",
@@ -127,8 +127,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankensearch",
         // Bumped from a982f33a to pick up the cass-compatible prefix-field
-        // tokenizer split in 831b3b13. The crate version remains 0.3.0; our
-        // `version = "*"` in Cargo.toml accepts it.
+        // tokenizer split in 831b3b13.
         expected_rev: "831b3b13",
         expected_version: "0.3.0",
         expected_features: &["ann", "fastembed-reranker", "hash", "lexical"],
@@ -244,6 +243,8 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed={STRICT_PATH_DEP_ENV}");
 
+    emit_platform_link_hints();
+
     let manifest_dir = PathBuf::from(
         env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set by Cargo"),
     );
@@ -253,15 +254,28 @@ fn main() {
     let manifest: Value = toml::from_str(&manifest_text)
         .unwrap_or_else(|err| panic!("failed to parse {}: {err}", manifest_path.display()));
 
-    validate_path_dependency_contracts(&manifest_dir, &manifest);
+    let packaged_manifest = manifest_dir.join("Cargo.toml.orig").is_file();
+    validate_path_dependency_contracts(&manifest_dir, &manifest, packaged_manifest);
     emit_vergen_metadata();
 }
 
-fn validate_path_dependency_contracts(manifest_dir: &Path, manifest: &Value) {
+fn emit_platform_link_hints() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        // The aarch64-apple-darwin ONNX Runtime static archive used by ort-sys
+        // references CoreML symbols, but ort-sys only emits Foundation today.
+        println!("cargo:rustc-link-lib=framework=CoreML");
+    }
+}
+
+fn validate_path_dependency_contracts(
+    manifest_dir: &Path,
+    manifest: &Value,
+    packaged_manifest: bool,
+) {
     let strict_enabled = strict_path_dep_validation_enabled();
 
     for contract in CONTRACTS {
-        validate_manifest_dependency_spec(manifest, contract);
+        validate_manifest_dependency_spec(manifest, contract, packaged_manifest);
 
         if contract.mode == ValidationMode::ActivePathOverride {
             validate_patch_path(manifest, contract);
@@ -273,29 +287,21 @@ fn validate_path_dependency_contracts(manifest_dir: &Path, manifest: &Value) {
     }
 }
 
-fn validate_manifest_dependency_spec(manifest: &Value, contract: &DependencyContract) {
+fn validate_manifest_dependency_spec(
+    manifest: &Value,
+    contract: &DependencyContract,
+    packaged_manifest: bool,
+) {
     let spec = inline_table(
         table(manifest, contract.dep_table, "manifest root"),
         contract.dep_key,
         contract.dep_table,
     );
 
-    // When `expected_git` is empty the contract describes a pure crates.io
-    // dependency (e.g. asupersync after the 0.3.0 migration moved all
-    // sibling crates onto crates.io). Skip the git/rev shape checks and
-    // instead lock in the `version` field, which is the only pin that
-    // crates.io gives us.
     if contract.expected_git.is_empty() {
-        let actual_version = string_value(spec, "version", contract.dep_key);
-        if actual_version != contract.expected_version {
-            contract_error(
-                contract,
-                format!(
-                    "dependency `{}` in [{}] must pin version = `{}`, found `{}`",
-                    contract.dep_key, contract.dep_table, contract.expected_version, actual_version
-                ),
-            );
-        }
+        // Pure crates.io dependency: lock in the registry version, which is the
+        // only source identity crates.io gives us.
+        validate_manifest_dependency_version(spec, contract);
         if spec.contains_key("git") || spec.contains_key("rev") {
             contract_error(
                 contract,
@@ -305,6 +311,12 @@ fn validate_manifest_dependency_spec(manifest: &Value, contract: &DependencyCont
                 ),
             );
         }
+    } else if packaged_manifest && !spec.contains_key("git") && !spec.contains_key("rev") {
+        // Cargo rewrites git dependencies to registry dependencies in the
+        // generated package manifest used by `cargo publish` verification.
+        // Validate that rewritten shape against the version we expect instead
+        // of requiring `git`/`rev` keys that no longer exist there.
+        validate_manifest_dependency_version(spec, contract);
     } else {
         let actual_git = string_value(spec, "git", contract.dep_key);
         if actual_git != contract.expected_git {
@@ -375,6 +387,22 @@ fn validate_manifest_dependency_spec(manifest: &Value, contract: &DependencyCont
                 ),
             );
         }
+    }
+}
+
+fn validate_manifest_dependency_version(
+    spec: &toml::map::Map<String, Value>,
+    contract: &DependencyContract,
+) {
+    let actual_version = string_value(spec, "version", contract.dep_key);
+    if actual_version != contract.expected_version {
+        contract_error(
+            contract,
+            format!(
+                "dependency `{}` in [{}] must pin version = `{}`, found `{}`",
+                contract.dep_key, contract.dep_table, contract.expected_version, actual_version
+            ),
+        );
     }
 }
 

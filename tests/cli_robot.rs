@@ -425,6 +425,30 @@ fn capabilities_are_self_describing_for_agents() {
     assert!(
         recoveries
             .iter()
+            .any(|recovery| recovery["wrong"] == "cass commands --json"
+                && recovery["canonical"] == "cass robot-docs commands"
+                && recovery["accepted"] == true),
+        "capabilities should advertise robot-docs topic shorthand recovery"
+    );
+    assert!(
+        recoveries
+            .iter()
+            .any(|recovery| recovery["wrong"] == "cass help --json"
+                && recovery["canonical"] == "cass robot-docs guide"
+                && recovery["accepted"] == true),
+        "capabilities should advertise structured help recovery"
+    );
+    assert!(
+        recoveries
+            .iter()
+            .any(|recovery| recovery["wrong"] == "cass search --help --json"
+                && recovery["canonical"] == "cass robot-docs commands"
+                && recovery["accepted"] == true),
+        "capabilities should advertise structured command help recovery"
+    );
+    assert!(
+        recoveries
+            .iter()
             .any(|recovery| recovery["wrong"] == "cass current --json"
                 && recovery["canonical"] == "cass sessions --current --json"
                 && recovery["accepted"] == true),
@@ -534,6 +558,14 @@ fn capabilities_are_self_describing_for_agents() {
             && recovery["canonical"] == "cass search auth --limit 5 --json"
             && recovery["accepted"] == true),
         "capabilities should advertise snake-case long flag recovery"
+    );
+    assert!(
+        recoveries.iter().any(
+            |recovery| recovery["wrong"] == "cass search auth --output json"
+                && recovery["canonical"] == "cass search auth --robot-format json"
+                && recovery["accepted"] == true
+        ),
+        "capabilities should advertise output format alias recovery"
     );
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
@@ -1221,6 +1253,36 @@ fn search_format_json_alias_attaches_to_robot_format() {
 }
 
 #[test]
+fn search_output_json_aliases_attach_to_robot_format() {
+    for format_args in [
+        vec!["--output", "json"],
+        vec!["--output=json"],
+        vec!["--output-format=json"],
+        vec!["--output_format", "json"],
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let mut args = vec!["search", "foo"];
+        args.extend(format_args);
+        args.extend(["--data-dir", data_dir]);
+
+        let mut cmd = base_cmd();
+        cmd.args(args);
+        let output = cmd.assert().failure().get_output().clone();
+
+        assert_eq!(output.status.code(), Some(3));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let last_line = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .expect("stderr should contain JSON error");
+        let json: Value = serde_json::from_str(last_line).expect("valid JSON error");
+        assert_eq!(json["error"]["kind"], "missing-index");
+    }
+}
+
+#[test]
 fn status_format_json_alias_outputs_status_json() {
     let tmp = TempDir::new().unwrap();
     let mut cmd = base_cmd();
@@ -1236,6 +1298,30 @@ fn status_format_json_alias_outputs_status_json() {
 
     assert_eq!(json["status"], "not_initialized");
     assert_eq!(json["initialized"], false);
+}
+
+#[test]
+fn status_output_json_aliases_output_status_json() {
+    for format_args in [
+        vec!["status", "--output", "json"],
+        vec!["status", "--output=json"],
+        vec!["status", "--output-format=json"],
+        vec!["--output", "json", "status"],
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let mut args = format_args;
+        args.extend(["--data-dir", data_dir]);
+
+        let mut cmd = base_cmd();
+        cmd.args(args);
+        let output = cmd.assert().success().get_output().clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: Value = serde_json::from_str(stdout.trim()).expect("valid status JSON");
+
+        assert_eq!(json["status"], "not_initialized");
+        assert_eq!(json["initialized"], false);
+    }
 }
 
 #[test]
@@ -1273,9 +1359,36 @@ fn root_format_json_defaults_to_triage() {
 }
 
 #[test]
+fn root_output_json_defaults_to_triage() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_string_lossy().to_string();
+    let mut cmd = base_cmd();
+    cmd.args(["--output", "json", "--data-dir", &data_dir]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid triage JSON");
+
+    assert_eq!(json["surface"], "triage");
+    assert_eq!(json["status"], "not_initialized");
+    assert_not_initialized_recommended_commands(&json, tmp.path());
+}
+
+#[test]
 fn capabilities_format_json_alias_outputs_capabilities_json() {
     let mut cmd = base_cmd();
     cmd.args(["capabilities", "--format", "json"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid capabilities JSON");
+
+    assert_eq!(json["contract_version"], "1");
+    assert!(json["mistake_recoveries"].as_array().is_some());
+}
+
+#[test]
+fn capabilities_output_json_alias_outputs_capabilities_json() {
+    let mut cmd = base_cmd();
+    cmd.args(["capabilities", "--output", "json"]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid capabilities JSON");
@@ -1300,6 +1413,25 @@ fn export_format_json_missing_path_is_not_robot_error_wrapped() {
     assert!(
         serde_json::from_str::<Value>(last_line).is_err(),
         "export --format json is the export format enum, not robot mode"
+    );
+}
+
+#[test]
+fn export_output_json_missing_path_is_not_robot_error_wrapped() {
+    let mut cmd = base_cmd();
+    cmd.args(["export", "--output", "json"]);
+    let output = cmd.assert().failure().code(2).get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("stderr should contain a usage error");
+
+    assert_eq!(last_line, "Could not parse arguments");
+    assert!(
+        serde_json::from_str::<Value>(last_line).is_err(),
+        "export --output json is an output file path, not robot mode"
     );
 }
 
@@ -1552,6 +1684,7 @@ fn state_and_status_report_active_rebuild_pipeline_runtime() {
     let expected_runtime = serde_json::json!({
         "queue_depth": 3,
         "inflight_message_bytes": 65_536,
+        "max_message_bytes_in_flight": 262_144,
         "pending_batch_conversations": 9,
         "pending_batch_message_bytes": 131_072,
         "page_prep_workers": 6,
@@ -1611,6 +1744,14 @@ fn state_and_status_report_active_rebuild_pipeline_runtime() {
     assert_eq!(
         state_runtime["inflight_message_bytes"].as_u64(),
         Some(65_536)
+    );
+    assert_eq!(
+        state_runtime["max_message_bytes_in_flight"].as_u64(),
+        Some(262_144)
+    );
+    assert_eq!(
+        state_runtime["inflight_message_bytes_headroom"].as_u64(),
+        Some(196_608)
     );
     assert_eq!(
         state_runtime["producer_budget_wait_count"].as_u64(),
@@ -5112,6 +5253,120 @@ fn flag_as_subcommand_robot_docs() {
     );
 }
 
+#[test]
+fn robot_docs_topic_shorthands_route_to_robot_docs() {
+    for (alias, expected) in [
+        ("commands", "commands:"),
+        ("command", "commands:"),
+        ("cmds", "commands:"),
+        ("schemas", "schemas:"),
+        ("examples", "examples:"),
+        ("example", "examples:"),
+        ("env", "env:"),
+        ("paths", "paths:"),
+        ("contracts", "contracts:"),
+        ("exit-codes", "exit-codes:"),
+        ("exit_codes", "exit-codes:"),
+        ("guide", "guide:"),
+    ] {
+        let mut cmd = base_cmd();
+        cmd.args([alias, "--json", "--color=never"]);
+
+        let output = cmd.assert().success().get_output().clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            stdout.contains(expected),
+            "{alias} should route to robot-docs topic {expected}, got: {stdout}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(stdout.trim()).is_err(),
+            "{alias} should emit robot-docs text, not search JSON"
+        );
+        assert!(
+            !stdout.contains('\u{1b}'),
+            "{alias} should honor hoisted --color=never"
+        );
+    }
+
+    let mut cmd = base_cmd();
+    cmd.args(["--json", "schemas", "--color=never"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("schemas:"));
+    assert!(
+        serde_json::from_str::<Value>(stdout.trim()).is_err(),
+        "leading --json schemas should emit robot-docs text, not search JSON"
+    );
+}
+
+#[test]
+fn structured_help_requests_route_to_robot_docs() {
+    for (args, expected) in [
+        (vec!["help", "--json", "--color=never"], "guide:"),
+        (
+            vec!["help", "commands", "--json", "--color=never"],
+            "commands:",
+        ),
+        (
+            vec!["help", "--json", "commands", "--color=never"],
+            "commands:",
+        ),
+        (
+            vec!["--json", "help", "schemas", "--color=never"],
+            "schemas:",
+        ),
+        (
+            vec!["help", "doctor", "--output", "json", "--color=never"],
+            "# cass doctor",
+        ),
+        (
+            vec!["help", "sources", "--output", "json", "--color=never"],
+            "sources:",
+        ),
+        (
+            vec!["help", "--output", "json", "doctor", "--color=never"],
+            "# cass doctor",
+        ),
+        (
+            vec!["sources", "--help", "--json", "--color=never"],
+            "sources:",
+        ),
+        (
+            vec!["search", "--help", "--json", "--color=never"],
+            "commands:",
+        ),
+        (
+            vec!["search", "--json", "--help", "--color=never"],
+            "commands:",
+        ),
+        (
+            vec!["--json", "search", "--help", "--color=never"],
+            "commands:",
+        ),
+        (vec!["--help", "--json", "--color=never"], "guide:"),
+    ] {
+        let mut cmd = base_cmd();
+        cmd.args(args);
+        let output = cmd.assert().success().get_output().clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            stdout.contains(expected),
+            "structured help should route to {expected}, got: {stdout}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(stdout.trim()).is_err(),
+            "structured help recovery should emit robot-docs text, not JSON"
+        );
+        assert!(
+            !stdout.contains('\u{1b}'),
+            "structured help should honor hoisted --color=never"
+        );
+    }
+}
+
 /// Correction notices appear on stderr when auto-correcting
 #[test]
 fn correction_notice_appears_on_stderr() {
@@ -7174,18 +7429,24 @@ fn search_explicit_semantic_mode_errors_when_embedder_absent() {
         "semantic-unavailable must be reported as non-retryable so agents don't loop; got: {err:?}"
     );
 
-    // Invariant 4: hint names `--mode lexical` as the cheap recovery
-    // path. The exact hint text from src/lib.rs:8141 is
-    // "Run 'cass tui' and press Alt+S to set up semantic search, or use --mode lexical".
+    // Invariant 4: hint names the semantic setup path and avoids the
+    // legacy lexical override hint. Lexical is already the default fail-open
+    // behavior when the operator does not explicitly request semantic-only
+    // search, so the recovery is to drop the semantic-only request or build
+    // the semantic assets.
     let hint = err
         .get("hint")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("error must include a `hint` operator can act on; got: {err:?}"));
     let hint_lower = hint.to_lowercase();
+    let legacy_lexical_hint = concat!("--mode ", "lexical");
     assert!(
-        hint_lower.contains("--mode lexical"),
-        "hint must name `--mode lexical` as the cheap recovery path so the operator can \
-         continue without installing the semantic model; got: {hint:?}"
+        !hint_lower.contains(legacy_lexical_hint),
+        "hint must not point operators at the legacy lexical override; got: {hint:?}"
+    );
+    assert!(
+        hint_lower.contains("index --semantic") && hint_lower.contains("omit --mode semantic"),
+        "hint must explain how to build semantic assets or drop semantic-only mode; got: {hint:?}"
     );
 
     // Invariant 5: non-empty message string (matches the 7k7pl contract

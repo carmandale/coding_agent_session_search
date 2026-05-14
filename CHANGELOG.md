@@ -7,14 +7,103 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
-> **Releases vs. tags**: [v0.1.64](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.1.64), [v0.2.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0)–[v0.2.7](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.7), [v0.3.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.0), and [v0.3.7](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.7) have published GitHub Releases with downloadable binaries. All other version numbers below are git tags only (no release artifacts).
+> **Releases vs. tags**: Published GitHub Releases with downloadable binaries
+> are tracked on the [Releases
+> page](https://github.com/Dicklesworthstone/coding_agent_session_search/releases).
+> Not every version below has release artifacts; entries without a GitHub
+> Release are source tags only.
 
 ---
 
 ## Unreleased
 
+## [v0.4.7] -- 2026-05-14
+
+**Registry and source-release alignment for the v0.4.6 publication fix.**
+
+The `v0.4.6` tag remains immutable, but crates.io publication required one
+more dependency and build-script correction after that tag. This patch release
+cuts the registry-ready source from the matching commit instead of mixing
+post-tag source into the `v0.4.6` release line.
+
+### Fixed
+
+- **crates.io installation**: publish against `franken-agent-detection` 0.1.7
+  so the enabled `chatgpt` connector feature resolves from crates.io instead of
+  depending on an unpublished registry feature set.
+- **registry package verification**: allow Cargo's packaged manifest rewrite for
+  git dependencies with explicit registry versions while keeping local
+  path/git dependency contract checks strict during normal development.
+- **fresh source reproducibility**: replace wildcard dependency constraints with
+  the current resolved minimums and include the required source files in the
+  package manifest so `cargo install coding-agent-search --version 0.4.7
+  --locked` has a stable registry surface.
+
+## [v0.4.6] -- 2026-05-14
+
+**Windows release-build fix for the v0.4.5 publication attempt.**
+
+The `v0.4.5` tag remains immutable, but local fallback release builds uncovered
+that CASS's direct vendored OpenSSL dependency was Unix release packaging glue,
+not application logic. Keeping it active on Windows forced MSVC cross-builds
+through OpenSSL's `VC-WIN64A` source build and blocked a real PE artifact.
+
+### Fixed
+
+- **Windows MSVC release builds**: scope the direct vendored OpenSSL dependency
+  to non-Windows targets while preserving static OpenSSL linking for Unix
+  release binaries.
+
+## [v0.4.5] -- 2026-05-13
+
+**Release-integrity fix for the v0.4.4 publication attempt.**
+
+The `v0.4.4` tag remains immutable, but `main` received one more doctor cleanup
+fix before the binary fallback build completed. This patch release keeps the
+macOS CoreML link fix from v0.4.4 and publishes artifacts from the matching
+post-tag commit instead of mixing untagged code into v0.4.4 assets.
+
+### Fixed
+
+- **Doctor cleanup journaling diagnostics**: cleanup-apply now logs structured
+  warnings when `RunStarted` or `RunEnded` journal appends fail, so operators can
+  see why crash recovery would otherwise classify a run as malformed or
+  indefinitely in-flight.
+
+## [v0.4.4] -- 2026-05-13
+
+**Release-publication fix for the v0.4.3 stability work.**
+
+The `v0.4.3` tag was already pushed before the macOS release builder exposed a
+native link failure in the ONNX Runtime static archive. This patch release keeps
+the v0.4.3 issue fixes intact and adds the missing macOS CoreML framework link
+hint so Apple Silicon release artifacts can be built without rewriting the
+already-pushed tag.
+
+### Fixed
+
+- **Apple Silicon release builds**: emit a macOS-only `CoreML` framework link
+  hint from `build.rs` because the aarch64 ONNX Runtime static archive used by
+  `ort-sys` references CoreML classes while `ort-sys` currently emits only
+  Foundation.
+
+## [v0.4.3] -- 2026-05-13
+
+**Stability release for the v0.4.2 indexing, doctor, and connector reports.**
+
+This release resolves the recent open GitHub issue cluster around watch indexing,
+Codex/OpenCode ingest, doctor recovery, raw-mirror retention, and schema drift.
+
 ### Added
 
+- **Raw-mirror retention tooling**: `cass mirror prune` now provides explicit
+  dry-run/apply plans, `--keep-tag` pinning, a 7-day safety hold-down, audit
+  logging, and doctor/stat surfaces for raw-mirror storage growth
+  ([#221](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/221)).
+- **Codex ingest trace mode**: `cass index --json --robot-trace-ingest` emits
+  per-batch NDJSON with `batch_n`, `batch_msgs`, `wall_ms`,
+  `lookups_against_global`, and detailed duplicate-lookup counters for future
+  performance bisects ([#228](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/228)).
 - Archive-first doctor documentation: the recovery runbook and README now
   describe the doctor v2 command suite, candidate-based repair flow,
   fingerprinted restore/cleanup/archive export workflows, source-pruning and
@@ -23,11 +112,51 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ### Changed
 
+- **OpenCode support**: cass now pins `franken-agent-detection` to a revision
+  that understands the current Drizzle-backed `opencode.db` schema
+  ([#227](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/227)).
+- **Claude discovery resilience**: the pinned detector now keeps
+  `$HOME/.claude/projects` as a fallback when `XDG_CONFIG_HOME` is set, so
+  isolated automation profiles do not accidentally hide existing Claude Code
+  histories.
+- **Dependency refresh**: routine library updates include `lru 0.18`,
+  `fastembed 5.13.4`, `pbkdf2 0.13`, `wide 1.4`, `assert_cmd 2.2.2`,
+  `blake3 1.8.5`, `clap_complete 4.6.5`, and the latest compatible OpenSSL
+  crate line.
 - Doctor migration guidance now treats historical cass archives, raw-session
   mirrors, backup bundles, receipts, and source ledgers as preservation targets.
   Existing data dirs migrate additively; derived assets can be rebuilt through
   planned doctor workflows, but recovery recipes should not instruct users to
   hand-remove archive paths or provider session logs.
+
+### Fixed
+
+- **Watcher OOM progress**: watch ingest now processes bounded chunks, splits
+  out-of-memory batches recursively, quarantines irreducible oversized records,
+  and still advances the high-water mark after partial success
+  ([#218](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/218)).
+- **Token-column drift**: schema repair restores missing `conversations`
+  token-total columns so upgraded/downgraded archives can resume ingest
+  ([#222](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/222)).
+- **Duplicate message/index invariants**: batched persistence refreshes partial
+  pending lookups, keeps duplicate `(conversation_id, idx)` handling aligned
+  with SQL uniqueness, and raises stale-low lexical shard footprints before
+  rebuild planning
+  ([#212](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/212),
+  [#226](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/226)).
+- **Post-rebuild incremental stalls**: the streaming byte limiter no longer
+  loses wakeups during repeated shrink/grow controller updates
+  ([#213](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/213)).
+- **Doctor/search hints**: removed stale `--mode lexical` repair hints from
+  status/doctor guidance where default hybrid fail-open behavior is the correct
+  operator path.
+
+### Testing
+
+- Added regression coverage for watch OOM splitting, schema repair, duplicate
+  message merging, shard-footprint planning, byte-limiter wakeups, raw-mirror
+  pruning/doctor warnings, OpenCode Drizzle ingest, and Codex ingest tracing.
+- Regenerated robot JSON and robot-doc goldens for the new CLI/docs contract.
 
 ## [v0.3.7] -- 2026-04-23
 
