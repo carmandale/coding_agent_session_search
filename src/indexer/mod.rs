@@ -16322,11 +16322,16 @@ fn reindex_paths_with_semantic_delta(
                 .as_mut()
                 .expect("lazy watch index must be open before ingest");
 
-            let ingest_chunk_size = if explicit_watch_once {
-                conv_count.max(1)
-            } else {
-                watch_ingest_chunk_size()
-            };
+            // Explicit watch-once on a large connector root (e.g. ~/.claude/projects
+            // with thousands of jsonl files) previously sent every discovered
+            // conversation through ingest as one chunk, which produced a single
+            // multi-thousand-conversation frankensqlite transaction + Tantivy
+            // commit that did not OOM but stopped making observable forward
+            // progress for hours. Always chunk through `watch_ingest_chunk_size()`
+            // so each chunk commits visibly, advances the progress counter, and
+            // releases the writer between chunks. (Spec 013, 2026-05-14 fix.)
+            let ingest_chunk_size = watch_ingest_chunk_size();
+            let _ = explicit_watch_once;
             let capture_semantic_delta = semantic_delta.is_some();
             for chunk in convs.chunks(ingest_chunk_size) {
                 let chunk_outcome = ingest_watch_batch_with_oom_split(
