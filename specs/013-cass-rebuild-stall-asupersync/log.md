@@ -36,3 +36,24 @@
 2026-05-13 11:12 | — | claude-code/opus-4.7 | /codex-review | round 3 — VERDICT: REVISE
 2026-05-13 11:13 | — | claude-code/opus-4.7 | /codex-review | round 4 — VERDICT: REVISE
 2026-05-13 11:14 | — | claude-code/opus-4.7 | /codex-review | round 5 — VERDICT: APPROVED
+
+## 2026-05-14 — deep recovery session
+
+- Identified two new failure modes on top of the original spec-013 stall:
+  - sqlite_master DDL corruption (assistant_message_count column name fused
+    with type metadata). Fixed via writable_schema rewrite.
+  - conversations btree rowid corruption (hundreds of rowids out of order on
+    Tree 11 page 2410638). Snapshot DB was unrecoverable; archived and started
+    fresh.
+- Upgraded binary from v0.4.2 → v0.4.7 (latest upstream release with
+  frankensqlite 0.1.3 bump and "harden watch ingest, schema repair,
+  duplicate-index handling" — none of those landed a fix for the stall).
+- Merged upstream/main into dac/main; source tree now matches v0.4.7 binary.
+- Spec-013 stall reproduces on a fresh DB across every knob combination tried
+  (streaming, batch, serial, watch, watch-once). Watchdog correctly fires
+  stall_detected after 300s; thread sample shows the expected
+  cond_wait/single-active-IO-thread pattern.
+- Watcher restarted on v0.4.7 binary; forward capture is healthy
+  (367 conversations and growing as live sessions accrue).
+- Full findings in `findings-2026-05-14.md`. Groups B-H of `tasks.md` remain
+  the right path to a permanent fix.
