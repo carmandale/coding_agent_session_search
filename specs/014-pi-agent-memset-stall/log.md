@@ -48,3 +48,5 @@
 2026-05-15 12:25 | — | claude-code/opus-4.7 | /codex-implement | T5 — ESCALATED: profile evidence does not match plan.md decision tree (C1–C5 all out-of-scope). Proposed paths D1–D4 documented in notes/T5-candidate-decision.md; user decision required before further implementation work.
 
 2026-05-15 12:42 | — | claude-code/opus-4.7 | /codex-implement | side-finding bead created: coding_agent_session_search-d907f (fsqlite_ext_fts5 stores values even for contentless tables) — separate fix path, not blocking spec 014's primary D-choice.
+
+2026-05-15 14:25 | — | claude-code/opus-4.7 | /codex-implement | T8 D1 prep complete (read-only of upstream + local-only writes). Patch committed to ~/dev/spec014-frankensqlite-fix branch fix/fts5-vtab-snapshot-via-delta-journal (SHA f298dfa). 9 new tests pass; 0 workspace regressions. PR body + patch saved to notes/T8-*. PR creation pending user yes/no on external-facing write.
