@@ -4,7 +4,7 @@ pub(crate) mod parallel_wal_shadow;
 pub mod redact_secrets;
 pub mod refresh_ledger;
 pub(crate) mod responsiveness;
-pub(crate) mod scratch_root;
+pub mod scratch_root;
 pub mod semantic;
 
 use self::refresh_ledger::{
