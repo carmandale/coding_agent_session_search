@@ -1,0 +1,215 @@
+# GoalBuddy v2 state.yaml
+# Board truth for spec 015 — watch-once scan streaming.
+# goal.md is the editable charter; spec.md owns what/why; this file owns task state.
+
+version: 2
+
+goal:
+  title: "Ship spec 015 — watch-once scan streaming for pi-agent historical backfill"
+  slug: "watch-once-streaming-scan"
+  kind: existing_plan
+  tranche: "Drive spec 015 through $codex-plan → $codex-review → $codex-implement → $code-verify → $finalize until pi-agent watch-once completes the user's full historical backfill (≥1,970 conversations indexed) with no forward-capture regression and no spec-013 regression."
+  status: active
+  intake:
+    original_request: "if 1 works...if 33 work, than 2700 will work. what is the right way to do it?"
+    interpreted_outcome: "Ship a cass-side change so cass index --watch-once ~/.pi/agent/sessions completes the user's pi-agent historical backfill (≥1,970 conversations indexed, ≥95% of the 2,073 jsonl corpus) by chunking the scan phase the same way PR #233 chunked the persist phase."
+    input_shape: existing_plan
+    audience: "Dale Carman (cass user) and upstream Dicklesworthstone/coding_agent_session_search"
+    authority: requested
+    proof_type: artifact
+    completion_proof: "cass index --watch-once ~/.pi/agent/sessions --json --no-progress-events returns success:true with pi_agent row count in DB ≥1,970; forward-capture watcher unchanged; spec-013 chunk-size behaviour preserved; no message-coverage regression."
+    likely_misfire: "Re-litigating spec 014's 8 GB peak-RSS threshold inside this spec. That threshold is explicitly dropped per spec 015 Constraint section; the architectural fix for the in-memory FTS5 floor is tracked separately and is not gating spec 015."
+    blind_spots_considered:
+      - "ScanContext may not natively support file-scoped sub-contexts for Shape A — plan must verify."
+      - "Connector::supports_streaming_scan() returns false for pi today; Shape B's optimal path only reached after a separate upstream FAD PR."
+      - "Per-conversation transformations (compact_large_connector_extras, attach_raw_mirror_capture at src/indexer/mod.rs:16263-16268) must still run on each chunk."
+      - "Forward-capture watcher path must remain untouched."
+    existing_plan_facts:
+      - "$issue satisfied: specs/015-watch-once-streaming-scan/spec.md exists with bead coding_agent_session_search-81z91 and provenance sentinel issue:complete:v1."
+      - "$codex-shape satisfied via explicit shape-skip recorded in specs/015-watch-once-streaming-scan/log.md (chunk-the-scan extension of PR #233 chunk-the-persist pattern; clear precedent and well-defined surface at src/indexer/mod.rs:16248)."
+      - "Spec 015 Selected Shape names Shape A (discover_source_files + per-batch scan(), cass-only) as the default route, with Shape B (scan_with_callback with per-callback batching) as automatic fall-forward when supports_streaming_scan() returns true."
+      - "Connector trait infrastructure for streaming already exists (scan_with_callback, discover_source_files, supports_streaming_scan) per FAD connectors/mod.rs:62-104. Cass already uses scan_with_callback in non-watch-once paths at src/indexer/mod.rs:8534, :8596. Watch-once is the holdout that still calls bulk scan() at :16248."
+      - "PR #233 chunked-persist behaviour (CASS_WATCH_INGEST_CHUNK_SIZE) is preserved; new scan chunking composes with it, not replaces it."
+      - "Spec 014's acceptance #2 (peak RSS < 8 GB) is dropped for this spec; the fsqlite_ext_fts5 in-memory floor (~30 GB at the user's corpus size) requires a separate upstream architectural change tracked in a follow-up bead."
+      - "PR #90 (upstream frankensqlite savepoint-clone fix) is orthogonal to spec 015 and merges on its own merits."
+
+rules:
+  pm_owns_state: true
+  one_active_task: true
+  max_write_workers: 1
+  no_implementation_without_worker_or_pm_task: true
+  no_completion_without_judge_or_pm_audit: true
+  planning_is_not_completion: true
+  queued_required_worker_blocks_completion: true
+  continuous_until_full_outcome: true
+  missing_input_or_credentials_do_not_stop_goal: true
+  preserve_and_validate_existing_plan: true
+  intake_misfire_must_be_audited: true
+  slice_policy:
+    max_consecutive_tiny_tasks: 2
+    prefer_vertical_slices: true
+    judge_picks_largest_safe_slice: true
+    worker_completes_whole_slice: true
+
+agents:
+  scout: bundled_not_installed
+  worker: bundled_not_installed
+  judge: bundled_not_installed
+
+visual_board:
+  selected: local
+  local:
+    status: live
+    url: "http://goalbuddy.localhost:41737/watch-once-streaming-scan/"
+    command: "npx goalbuddy board docs/goals/watch-once-streaming-scan"
+  github_projects:
+    status: not_requested
+    url: null
+    command: "npx goalbuddy extend github-projects"
+    missing: []
+
+active_task: T002
+
+tasks:
+  - id: T001
+    type: pm
+    assignee: PM
+    status: done
+    reasoning_hint: medium
+    objective: "Run $codex-plan for specs/015-watch-once-streaming-scan/ and produce plan.md, tasks.md, planning-transcript.md, and the plan:complete:v1 provenance sentinel."
+    inputs:
+      - specs/015-watch-once-streaming-scan/spec.md
+      - specs/015-watch-once-streaming-scan/log.md
+      - "src/indexer/mod.rs:16248 (watch-once scan boundary)"
+      - "src/indexer/mod.rs:8534, :8596, :9188 (existing scan_with_callback / supports_streaming_scan usage)"
+      - "PR #233 (e429eaab) — chunked-persist pattern this spec extends"
+    constraints:
+      - "$codex-plan owns its own gate checks. Do not pre-create plan.md or tasks.md by hand."
+      - "Preserve the spec 015 Selected Shape decision tree. Plan operationalises the shape; it does not redesign it."
+      - "Plan must explicitly verify whether ScanContext supports file-scoped sub-contexts; if not, plan a small cass-side ScanContext extension."
+      - "Plan must call out the spec 013 regression check (CASS_WATCH_INGEST_CHUNK_SIZE preserved) and the forward-capture watcher non-regression check."
+    expected_output:
+      - "specs/015-watch-once-streaming-scan/plan.md"
+      - "specs/015-watch-once-streaming-scan/tasks.md"
+      - "specs/015-watch-once-streaming-scan/planning-transcript.md"
+      - "plan:complete:v1 sentinel in spec.md/log.md"
+      - "Next-command pointer: /codex-review specs/015-watch-once-streaming-scan/"
+    receipt:
+      result: done
+      command: "/codex-plan specs/015-watch-once-streaming-scan/"
+      summary: "Plan + tasks + planning transcript persisted. Phase A took 7 rounds (1 protocol-violation reject + 6 substantive iterations) to lock the research. Phase B took 5 rounds to APPROVED (trust_level: full). Selected shape: Route 5 — per-batch hardlink/copy scratch root + source_path remap; cass-only; FAD parser stays the oracle. Gate is `explicit_watch_once && kind.slug() == \"pi_agent\" && !discovered.is_empty()` (Phase B Round 2 caught that claude_code/codex/opencode all implement discover_source_files; capability-detection alone was insufficient). Split file-level + conversation-level reconciliation receipt; explicit per-path quarantine records for parser-skipped files."
+      artifacts:
+        - specs/015-watch-once-streaming-scan/plan.md
+        - specs/015-watch-once-streaming-scan/tasks.md
+        - specs/015-watch-once-streaming-scan/planning-transcript.md
+        - specs/015-watch-once-streaming-scan/artifacts/boundary-B-52e96656-06607ecc.md
+      provenance:
+        - "plan:complete:v1 sentinel recorded by gate.sh"
+        - "north-star Phase B outcome: BOOTSTRAP (first plan for spec 015)"
+        - "Phase B Codex review: VERDICT: APPROVED at round 5"
+      next_command: "/codex-review specs/015-watch-once-streaming-scan/"
+
+  - id: T002
+    type: pm
+    assignee: PM
+    status: active
+    reasoning_hint: high
+    objective: "Run $codex-review on the spec-015 plan and iterate with Codex until VERDICT: APPROVED. This is the gate between plan and implement; do not skip."
+    inputs:
+      - "T001 receipt + plan.md + tasks.md + planning-transcript.md"
+    constraints:
+      - "Never skip $codex-review. The same-session Phase B approval inside $codex-plan does not substitute for this fresh independent review (per Dale Codex Workflow rule)."
+      - "Iterate until Codex returns APPROVED, or escalate to user if Codex finds a structural problem that requires re-shaping."
+    expected_output:
+      - "specs/015-watch-once-streaming-scan/codex-review.md with VERDICT: APPROVED"
+      - "codex-review:approved:v1 sentinel"
+      - "Next-command pointer: /codex-implement specs/015-watch-once-streaming-scan/"
+    receipt: null
+
+  - id: T003
+    type: pm
+    assignee: PM
+    status: queued
+    reasoning_hint: medium
+    objective: "Run $codex-implement for the approved spec-015 plan. Implementation includes ScanContext audit (Shape A's prerequisite), the streaming-scan diff, regression coverage, and the implementation receipt."
+    inputs:
+      - "T002 receipt + codex-review.md (APPROVED)"
+      - "tasks.md (task list from $codex-plan)"
+    constraints:
+      - "$codex-implement owns its own write boundaries via tasks.md allowed_files. Do not add a separate Worker task for the same work."
+      - "Implementation must keep PR #233 chunk-size behaviour intact (regression-test it explicitly per spec 015 Acceptance #3)."
+      - "Implementation must keep forward-capture watcher path unchanged (regression check per spec 015 Acceptance #4)."
+      - "If implementation discovers the fix can only be done by changing FAD or frankensqlite, pause and escalate to user with a one-question choice — do not silently widen scope."
+    expected_output:
+      - "specs/015-watch-once-streaming-scan/implement-receipt.md"
+      - "implement:complete:v1 sentinel"
+      - "Source diff committed on dac/main (focused, mirroring PR #233 style)."
+      - "Next-command pointer: /code-verify specs/015-watch-once-streaming-scan/"
+    receipt: null
+
+  - id: T004
+    type: pm
+    assignee: PM
+    status: queued
+    reasoning_hint: high
+    objective: "Run $code-verify after implementation. Codex performs an independent acceptance check against spec 015's five criteria, including the full-corpus pi backfill run."
+    inputs:
+      - "T003 receipt + implement-receipt.md"
+      - "spec 015 Acceptance Criteria 1..5"
+    constraints:
+      - "$code-verify is independent of the implementer. Treat its verdict as authoritative."
+      - "If $code-verify rejects, bounce back to $codex-implement (T003) with the verifier's findings; do not advance the board until a clean verify."
+    expected_output:
+      - "specs/015-watch-once-streaming-scan/code-verify.md with VERDICT: APPROVED"
+      - "verify:complete:v1 sentinel"
+      - "Confirmation that all five spec-015 acceptance criteria hold."
+      - "Next-command pointer: /finalize specs/015-watch-once-streaming-scan/"
+    receipt: null
+
+  - id: T005
+    type: pm
+    assignee: PM
+    status: queued
+    reasoning_hint: medium
+    objective: "Run $finalize: close bead coding_agent_session_search-81z91, write the handoff artifact under thoughts/shared/handoffs/, commit any remaining spec updates, and push dac/main."
+    inputs:
+      - "T004 receipt + code-verify.md (APPROVED)"
+    constraints:
+      - "$finalize closes the bead; do not leave it in_progress."
+      - "Handoff artifact must capture: final acceptance evidence, full-corpus pi backfill numbers (pi_agent row count, run duration, peak working-set delta), DB snapshot locations, and any follow-up beads spawned (e.g. fsqlite_ext_fts5 architectural change)."
+    expected_output:
+      - "thoughts/shared/handoffs/<timestamp>-watch-once-streaming-scan.md"
+      - "Bead coding_agent_session_search-81z91 closed with summary."
+      - "dac/main pushed to origin with all spec-015 commits."
+    receipt: null
+
+  - id: T999
+    type: judge
+    assignee: Judge
+    status: queued
+    reasoning_hint: high
+    objective: "Final audit: do all five spec-015 acceptance criteria hold? Pi backfill completed? Forward-capture watcher unchanged? Spec-013 chunk-size preserved? Bead closed? Handoff written?"
+    inputs:
+      - "All done task receipts T001..T005"
+      - "specs/015-watch-once-streaming-scan/code-verify.md"
+      - "thoughts/shared/handoffs/<timestamp>-watch-once-streaming-scan.md"
+      - "Output of: cass status && launchctl list | grep cass"
+      - "DB query: SELECT a.slug, COUNT(*) FROM conversations c JOIN agents a ON c.agent_id=a.id GROUP BY a.slug"
+    constraints:
+      - "Reject completion if any acceptance criterion is unverified."
+      - "Reject completion if the launchd watcher is not running on the post-fix binary."
+      - "Reject completion if claude_code/codex spot-checks fail (spec 013 regression)."
+      - "Reject completion if pi message-coverage spot-check fails (spec 015 Acceptance #5)."
+    expected_output:
+      - "complete | not_complete"
+      - "full_outcome_complete: true | false"
+      - "missing evidence (if not_complete)"
+      - "next task (if not_complete)"
+    receipt: null
+
+checks:
+  dirty_fingerprint: unknown
+  last_verification:
+    result: unknown
+    task: null
+    commands: []
