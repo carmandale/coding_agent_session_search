@@ -46,3 +46,5 @@
 2026-05-15 12:24 | — | claude-code/opus-4.7 | /codex-implement | T3/T4 — indexer killed cleanly; watcher reloaded (new PID 30892)
 2026-05-15 12:25 | — | claude-code/opus-4.7 | /codex-implement | T4 — evidence note written (notes/T4-profile-evidence.md); hot frame = fsqlite_ext_fts5::Fts5Table::snapshot_state (lib.rs:2147–2148), called via live_vtab_savepoint_all on every SQLite insert. NOT in cass / FAD / watch-ingest — in frankensqlite crate.
 2026-05-15 12:25 | — | claude-code/opus-4.7 | /codex-implement | T5 — ESCALATED: profile evidence does not match plan.md decision tree (C1–C5 all out-of-scope). Proposed paths D1–D4 documented in notes/T5-candidate-decision.md; user decision required before further implementation work.
+
+2026-05-15 12:42 | — | claude-code/opus-4.7 | /codex-implement | side-finding bead created: coding_agent_session_search-d907f (fsqlite_ext_fts5 stores values even for contentless tables) — separate fix path, not blocking spec 014's primary D-choice.
