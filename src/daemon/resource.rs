@@ -218,6 +218,7 @@ impl ResourceMonitor {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_resource_monitor_creation() {
         let monitor = ResourceMonitor::new();
