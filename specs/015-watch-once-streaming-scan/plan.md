@@ -5,6 +5,7 @@ bead: coding_agent_session_search-81z91
 ---
 
 <!-- plan:complete:v1 | harness: unknown | date: 2026-05-15T22:37:12Z -->
+<!-- Codex Review: APPROVED after 4 rounds | model: gpt-5.3-codex | date: 2026-05-15 | trust_level: full | round_records: .codex-round-be974918/, .codex-round-a7d0fb93/, .codex-round-0f612fb8/, .codex-round-b8cbdaf0/ | Status: REVISED -->
 
 # Plan: watch-once streaming scan (spec 015)
 
@@ -73,19 +74,17 @@ for chunk in convs.chunks(ingest_chunk_size) {         // PR #233 chunked persis
 New streaming structure (gated to `explicit_watch_once && kind.slug() == "pi_agent" && !discovered.is_empty()`):
 
 ```
-let discovered = conn.discover_source_files(&ctx).unwrap_or_default();
-
-// Connector-specific gate (Phase B Round 2 correction):
-// Streaming via Route 5 assumes pi's `sessions/<workspace>/<file>` layout
-// and FAD pi's sessions_dir/external_id derivation. claude_code, codex, and
-// opencode also implement discover_source_files but have DIFFERENT canonical
-// paths and DIFFERENT external_id derivations. Capability-detection alone
-// (Phase B Round 1) would mis-route those connectors into a scratch-root
-// that doesn't match their layout. Gate explicitly to the pi_agent connector
-// kind. Future connectors that want streaming need their own scratch-root
-// contract OR a generic connector-side hook (out of scope for spec 015).
-if !explicit_watch_once || kind.slug() != "pi_agent" || discovered.is_empty() {
+// Short-circuit on kind/mode BEFORE discovery (Codex-review Round 1 finding):
+// without this short-circuit, claude/codex/opencode would pay for a full
+// discover_source_files call even though they take the bulk path. The check
+// for pi-only routing must come FIRST.
+if !explicit_watch_once || kind.slug() != "pi_agent" {
     // FALL THROUGH to the existing bulk Vec path (unchanged)
+    return existing_bulk_watch_once(...);
+}
+
+let discovered = conn.discover_source_files(&ctx).unwrap_or_default();
+if discovered.is_empty() {
     return existing_bulk_watch_once(...);
 }
 
@@ -105,9 +104,11 @@ let mut emitted_conversations: usize = 0;
 let mut ingest_success_conversations: usize = 0;
 let mut quarantined_oom: usize = 0;
 let mut inserted_messages: usize = 0;
+let mut scratch_skips: Vec<ScratchBuildSkip> = Vec::new();   // Codex-review Round 3: accumulate skips
 
 for file_batch in chunk_by_files_and_bytes(&discovered, scan_batch_limits) {
-    let scratch = build_scratch_root(&file_batch, &workdir, &original_sessions_root)?;
+    let (scratch, batch_skips) = build_scratch_root(&file_batch, &workdir, &original_sessions_root)?;
+    scratch_skips.extend(batch_skips);
     let scratch_sessions_root = scratch.path().join("sessions");
     let scratch_ctx = ScanContext::with_roots(
         data_dir.clone(),
@@ -130,11 +131,15 @@ for file_batch in chunk_by_files_and_bytes(&discovered, scan_batch_limits) {
             flush_buffer(&mut buffer, &mut counters, storage, t_index, ...)?;
         }
     }
+
+    // MANDATORY flush at the end of every scan batch (Codex-review Round 1
+    // finding): without this, conversations could carry across batches in the
+    // buffer, breaking the "drop the working set after each batch" guarantee
+    // that spec 015 Requirement #1 makes load-bearing.
+    if !buffer.is_empty() {
+        flush_buffer(&mut buffer, &mut counters, storage, t_index, ...)?;
+    }
     // scratch dropped here — RAII cleanup
-}
-// Final flush
-if !buffer.is_empty() {
-    flush_buffer(&mut buffer, &mut counters, storage, t_index, ...)?;
 }
 ```
 
@@ -168,33 +173,54 @@ impl Drop for ScratchRootGuard {
     }
 }
 
+pub struct ScratchBuildSkip {
+    pub source_path: PathBuf,
+    pub error_message: String,
+}
+
 pub fn build_scratch_root(
     batch: &[DiscoveredSourceFile],
     workdir: &Path,
-    original_sessions_root: &Path,   // e.g. ~/.pi/agent/sessions
-) -> Result<ScratchRootGuard> {
+    original_sessions_root: &Path,
+) -> Result<(ScratchRootGuard, Vec<ScratchBuildSkip>)> {
     let id = uuid::Uuid::new_v4();
     let root = workdir.join(format!("{}", id));
     let sessions = root.join("sessions");
-    std::fs::create_dir_all(&sessions)?;
+    std::fs::create_dir_all(&sessions)?;  // systemic — propagates
+    let mut skips: Vec<ScratchBuildSkip> = Vec::new();
     for src in batch {
-        // src.source_path is e.g. <original_sessions_root>/<workspace>/<file>.jsonl
-        let rel = src.source_path.strip_prefix(original_sessions_root)?;
+        let rel = match src.source_path.strip_prefix(original_sessions_root) {
+            Ok(r) => r,
+            Err(e) => { skips.push(ScratchBuildSkip { source_path: src.source_path.clone(), error_message: format!("path not under sessions root: {e}") }); continue; }
+        };
         let dest = sessions.join(rel);
-        std::fs::create_dir_all(dest.parent().unwrap())?;
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                skips.push(ScratchBuildSkip { source_path: src.source_path.clone(), error_message: format!("create_dir_all: {e}") });
+                continue;
+            }
+        }
         match std::fs::hard_link(&src.source_path, &dest) {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                std::fs::copy(&src.source_path, &dest)?;  // APFS clonefile on macOS
+                if let Err(copy_err) = std::fs::copy(&src.source_path, &dest) {
+                    skips.push(ScratchBuildSkip { source_path: src.source_path.clone(), error_message: format!("copy fallback: {copy_err}") });
+                }
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                skips.push(ScratchBuildSkip { source_path: src.source_path.clone(), error_message: format!("hard_link: {e}") });
+            }
         }
     }
-    Ok(ScratchRootGuard { path: root })
+    Ok((ScratchRootGuard { path: root }, skips))
 }
 ```
 
-`workdir` defaults to `<data_dir>/scratch/watch-once-streaming/`. `original_sessions_root` is the canonical pi sessions root (derived from the connector's `ScanContext` — for pi that's `<home>/sessions` where `<home>` is the cass-side scan root, typically `~/.pi/agent`). RAII cleanup via `Drop` ensures scratch directories are removed even on panic.
+Helper returns the guard plus the skip list; the **caller writes the quarantine records** (single source of truth — Codex-review Round 2 finding: prior wording had the helper writing quarantine directly AND the caller doing it, which was contradictory).
+
+`workdir` defaults to `<data_dir>/scratch/watch-once-streaming/`. `original_sessions_root` is derived using FAD-equivalent logic (Codex-review Round 1 finding): given the user's scan root `R` (the `--watch-once <R>` argument, e.g. `~/.pi/agent` OR `~/.pi/agent/sessions`), if `R/sessions` exists, `original_sessions_root = R/sessions`; else `original_sessions_root = R`. This matches FAD's `sessions_dir(home)` resolution at `pi_agent.rs:74-105` exactly. The cass-side helper that derives this MUST be exercised in tests for both `~/.pi/agent` and `~/.pi/agent/sessions` user roots (T4 / new T4a). RAII cleanup via `Drop` ensures scratch directories are removed even on panic.
+
+**Scratch-build failure handling**: `build_scratch_root` MUST NOT propagate per-file hardlink/copy errors as fatal. Per-file failures (missing source, permission, non-EXDEV filesystem error) become `ScratchBuildSkip` entries in the returned `Vec<ScratchBuildSkip>` and the helper continues with the rest of the batch. Only systemic errors (workdir creation failure, scratch root permission issues, `original_sessions_root` doesn't exist) propagate via `Result::Err`. The caller is the single source of truth for writing quarantine records (Codex-review Round 2 finding — prior wording had both the helper and the caller writing, which was contradictory). Caller writes a quarantine line per `ScratchBuildSkip` at run completion with `{"source_path": ..., "reason": "scratch_build_failure", "io_error": <error_message>, "agent": "pi_agent", "timestamp_ms": ...}`.
 
 ### 3. New helper: `remap_source_path`
 
@@ -226,24 +252,35 @@ Three call-sites change semantics from "compute from full Vec post-scan" to "acc
 
 ### 5. Run receipt + reconciliation + skipped-file recording
 
-End-of-run JSON record (extension of existing watch-once log output):
+End-of-run JSON record, placed in the existing `cass index` JSON output at a new TOP-LEVEL key `watch_once_receipt` (Codex-review Round 1 finding — receipt location must be a stable JSON contract; top-level keeps it discoverable and survives existing `indexing_stats` schema goldens unchanged). T9 includes updating the response schema at `src/lib.rs:70961+` and any associated goldens. Shape:
 
 ```json
 {
-  "discovered_files": N,
-  "emitted_source_files": E,
-  "parser_skip_records": N - E,
-  "emitted_conversations": C,
-  "ingest_success_conversations": S,
-  "quarantined_oom": Q,
-  "parse_unaccounted_files": 0,            // discovered_files - emitted_source_files - parser_skip_records
-  "ingest_unaccounted_conversations": 0    // emitted_conversations - ingest_success_conversations - quarantined_oom
+  "watch_once_receipt": {
+    "discovered_files": N,
+    "emitted_source_files": E,
+    "scratch_build_skips": K,
+    "parser_skip_records": N - E - K,
+    "emitted_conversations": C,
+    "ingest_success_conversations": S,
+    "quarantined_oom": Q,
+    "parse_unaccounted_files": 0,            // discovered_files - emitted_source_files - parser_skip_records - scratch_build_skips
+    "ingest_unaccounted_conversations": 0    // emitted_conversations - ingest_success_conversations - quarantined_oom
+  }
 }
 ```
 
+Files in three disjoint terminal buckets (Codex-review Round 2 finding): `emitted_source_files` (made it through scan), `scratch_build_skips` (failed to scratch-mirror; never saw the parser), `parser_skip_records` (scratch-mirrored fine but parser yielded zero conversations). These three sum exactly to `discovered_files`; any deviation surfaces as `parse_unaccounted_files != 0`, which the run-completion assertion catches.
+
 `parse_unaccounted_files` and `ingest_unaccounted_conversations` MUST be 0. If non-zero, list paths/conversations in the receipt with reasons. Acceptance #1 maps to `ingest_success_conversations >= 1970` for the pi connector.
 
-**Skipped-file recording (Phase B Round 4 finding)**: spec 015 Acceptance #1 requires "any skipped files MUST be recorded in `<data_dir>/quarantine/watch_ingest_poison.jsonl`." The reconciliation receipt's `parser_skip_records` count is necessary but not sufficient — each skipped file's path must also appear in the quarantine file with a reason. Concretely: cass computes `parser_skipped_paths = discovered_source_paths - emitted_source_paths` (set difference at end of run) and for each path in that set, appends a line to `<data_dir>/quarantine/watch_ingest_poison.jsonl` shaped like `{"source_path": "...", "reason": "parser_skip", "agent": "pi_agent", "timestamp_ms": ...}`. The existing OOM-quarantine path at `:15717` continues to record `reason: "ingest_oom"` for single-conv OOMs. Both reason values share the same file. The reconciliation's `parse_unaccounted_files == 0` invariant is structurally guaranteed by the set-difference computation, but the spec contract requires the explicit per-path record for downstream tooling.
+**Skipped-file recording**: spec 015 Acceptance #1 requires "any skipped files MUST be recorded in `<data_dir>/quarantine/watch_ingest_poison.jsonl`." The reconciliation receipt's counts are necessary but not sufficient — each skipped file's path must also appear in the quarantine file with a reason. Concretely: cass computes the three disjoint terminal sets:
+
+- `scratch_skipped_paths`: collected during run from each batch's `ScratchBuildSkip` list.
+- `parser_skipped_paths = discovered_source_paths - emitted_source_paths - scratch_skipped_paths` (Codex-review Round 3 finding — subtracting `scratch_skipped_paths` keeps the three buckets disjoint per the receipt model above).
+- `emitted_source_paths`: collected during run from the streaming callback.
+
+For each path in `scratch_skipped_paths`, append `{"source_path":"...", "reason":"scratch_build_failure", "io_error":<error_message>, "agent":"pi_agent", "timestamp_ms":...}`. For each path in `parser_skipped_paths`, append `{"source_path":"...", "reason":"parser_skip", "agent":"pi_agent", "timestamp_ms":...}`. The existing OOM-quarantine path at `:15717` continues to record `reason: "ingest_oom"` for single-conv OOMs. All three reason values share the same `<data_dir>/quarantine/watch_ingest_poison.jsonl` file.
 
 ### 6. Forward-capture watcher path unchanged
 

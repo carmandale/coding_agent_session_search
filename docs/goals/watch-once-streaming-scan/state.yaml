@@ -68,7 +68,7 @@ visual_board:
     command: "npx goalbuddy extend github-projects"
     missing: []
 
-active_task: T002
+active_task: T003
 
 tasks:
   - id: T001
@@ -112,7 +112,7 @@ tasks:
   - id: T002
     type: pm
     assignee: PM
-    status: active
+    status: done
     reasoning_hint: high
     objective: "Run $codex-review on the spec-015 plan and iterate with Codex until VERDICT: APPROVED. This is the gate between plan and implement; do not skip."
     inputs:
@@ -124,12 +124,21 @@ tasks:
       - "specs/015-watch-once-streaming-scan/codex-review.md with VERDICT: APPROVED"
       - "codex-review:approved:v1 sentinel"
       - "Next-command pointer: /codex-implement specs/015-watch-once-streaming-scan/"
-    receipt: null
+    receipt:
+      result: done
+      command: "/codex-review specs/015-watch-once-streaming-scan/"
+      summary: "4 rounds to APPROVED (trust_level: full). Round 1 caught 5 substantive findings (non-pi short-circuit ordering, end-of-batch flush mandatory, scan-root derivation matching FAD's sessions_dir logic, receipt JSON top-level vs nested, scratch-build failures must record-and-continue not abort). Round 2 caught receipt-math units mismatch and build_scratch_root signature contradiction. Round 3 caught two stale internal-consistency issues (parser_skipped formula not subtracting scratch skips, streaming pseudocode signature out of date). Round 4: APPROVED."
+      artifacts:
+        - specs/015-watch-once-streaming-scan/codex-review.md
+      provenance:
+        - "codex-review:approved:v1 sentinel recorded by gate.sh"
+        - "Round records: .codex-round-be974918/, .codex-round-a7d0fb93/, .codex-round-0f612fb8/, .codex-round-b8cbdaf0/"
+      next_command: "/codex-implement specs/015-watch-once-streaming-scan/"
 
   - id: T003
     type: pm
     assignee: PM
-    status: queued
+    status: active
     reasoning_hint: medium
     objective: "Run $codex-implement for the approved spec-015 plan. Implementation includes ScanContext audit (Shape A's prerequisite), the streaming-scan diff, regression coverage, and the implementation receipt."
     inputs:
