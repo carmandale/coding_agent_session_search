@@ -1,0 +1,301 @@
+# GoalBuddy v2 state.yaml
+# Board truth for spec 014 — pi_agent watch-once memset stall.
+# goal.md is the editable charter; spec.md owns what/why; this file owns task state.
+# Repaired 2026-05-15: seed now follows Dale Codex Workflow sequence per goalbuddy v0.3.6.
+
+version: 2
+
+goal:
+  title: "pi_agent watch-once stalls after first chunk with 22 GB RSS memset loop"
+  slug: "pi-agent-memset-stall"
+  kind: existing_plan
+  tranche: "Drive spec 014 through $codex-plan → $codex-review → $codex-implement → $code-verify → $finalize until the upstream PR is open and the pi-agent backfill completes for ≥2,500 conversations with peak RSS <8 GB."
+  status: active
+  intake:
+    original_request: "/issue for pi_agent stall (~10 min) — captures findings (PID, RSS pattern, that it was a different signature from spec-013) before they get stale"
+    interpreted_outcome: "Ship a small, upstreamable fix so cass index --watch-once ~/.pi/agent/sessions completes the user's pi-agent historical backfill (≥2,500 conversations) with peak RSS < 8 GB on v0.4.7 + PR #233."
+    input_shape: existing_plan
+    audience: "Dale Carman (fork maintainer) and upstream Dicklesworthstone/coding_agent_session_search"
+    authority: requested
+    proof_type: artifact
+    completion_proof: "cass index --watch-once ~/.pi/agent/sessions --json --no-progress-events returns success:true with conversations>=2,500, peak RSS<8 GB, the post-fix sample output no longer shows the _platform_memset hot frame, and the upstream PR is open."
+    likely_misfire: "Skipping $codex-review between $codex-plan and $codex-implement, or jumping to a fix before profiling locates the actual allocation site."
+    blind_spots_considered:
+      - "Release binary frames are stripped; profiling build (target/profiling) is required to symbolicate."
+      - "Bad allocation may live inside franken-agent-detection (external crate) — fix at cass ingest boundary, not by vendoring."
+      - "22 GB RSS may be cumulative across the in-memory Vec<NormalizedConversation>, not one pathological conversation; that changes the fix shape."
+      - "stall_detected watchdog did not fire because lock heartbeat kept it satisfied. Out of scope here; worth a follow-up issue."
+    existing_plan_facts:
+      - "$issue satisfied: specs/014-pi-agent-memset-stall/spec.md exists with bead coding_agent_session_search-373b1 and provenance sentinel issue:complete:v1."
+      - "$codex-shape satisfied via explicit shape-skip recorded in specs/014-pi-agent-memset-stall/log.md (clear bug fix with precise reproducer and well-precedented fix class; the open question is the specific allocation site, which is a profiling question not a shaping question)."
+      - "Spec 014 Selected Shape names Phase 1 (Localise via profiling build + sample), Phase 2 candidate (a) cap-at-normalization or (b) cap-at-ingest, and Phase 3 (verify + focused regression test + single-commit upstream PR mirroring PR #233 style)."
+      - "Same-binary verification: post-PR #233 cass v0.4.7 already processed claude_code (2,573), codex (5,712), opencode (976) without stall, so the bug is pi-specific not a general indexer regression."
+
+rules:
+  pm_owns_state: true
+  one_active_task: true
+  max_write_workers: 1
+  no_implementation_without_worker_or_pm_task: true
+  no_completion_without_judge_or_pm_audit: true
+  planning_is_not_completion: true
+  queued_required_worker_blocks_completion: true
+  continuous_until_full_outcome: true
+  missing_input_or_credentials_do_not_stop_goal: true
+  preserve_and_validate_existing_plan: true
+  intake_misfire_must_be_audited: true
+  slice_policy:
+    max_consecutive_tiny_tasks: 2
+    prefer_vertical_slices: true
+    judge_picks_largest_safe_slice: true
+    worker_completes_whole_slice: true
+
+agents:
+  scout: bundled_not_installed
+  worker: bundled_not_installed
+  judge: bundled_not_installed
+
+visual_board:
+  selected: local
+  local:
+    status: live
+    url: "http://goalbuddy.localhost:41737/pi-agent-memset-stall/"
+    command: "npx goalbuddy board docs/goals/pi-agent-memset-stall"
+  github_projects:
+    status: not_requested
+    url: null
+    command: "npx goalbuddy extend github-projects"
+    missing: []
+
+active_task: T008
+
+tasks:
+  - id: T001
+    type: pm
+    assignee: PM
+    status: done
+    reasoning_hint: medium
+    objective: "Run $codex-plan for specs/014-pi-agent-memset-stall/ and produce plan.md, tasks.md, planning-transcript.md, and the plan:complete:v1 provenance sentinel."
+    inputs:
+      - specs/014-pi-agent-memset-stall/spec.md
+      - specs/014-pi-agent-memset-stall/log.md
+      - "PR #233 / commit e429eaab (the chunk-size fix already in the binary)"
+      - "src/indexer/mod.rs (around line 16266 compact_large_connector_extras and line 15579 ingest_watch_batch_with_oom_split)"
+    constraints:
+      - "$codex-plan owns its own gate checks. Do not pre-create plan.md or tasks.md by hand."
+      - "Preserve the spec 014 Selected Shape (Phase 1 Localise → Phase 2 cap-or-split → Phase 3 verify + upstream PR). The plan operationalises it; it does not redesign it."
+      - "Plan must call out the spec 013 regression check (claude_code/codex/opencode rows must remain queryable post-fix)."
+    expected_output:
+      - "specs/014-pi-agent-memset-stall/plan.md"
+      - "specs/014-pi-agent-memset-stall/tasks.md"
+      - "specs/014-pi-agent-memset-stall/planning-transcript.md"
+      - "plan:complete:v1 sentinel in spec.md/log.md"
+      - "Next-command pointer: /codex-review specs/014-pi-agent-memset-stall/"
+    receipt:
+      result: done
+      command: "/codex-plan specs/014-pi-agent-memset-stall/"
+      summary: "Plan + tasks + planning transcript persisted. Phase A took 3 rounds (1 protocol-violation reject + 2 substantive); Phase B took 4 rounds to APPROVED. Candidate space expanded from spec's named (a)/(b) to five (C1-C5) with a binding decision tree forbidding deferred peak-RSS satisfaction. spec.md acceptance #1 amended in-flight (≥2,500 → ≥1,970, corpus is 2,073 not 2,800)."
+      artifacts:
+        - specs/014-pi-agent-memset-stall/plan.md
+        - specs/014-pi-agent-memset-stall/tasks.md
+        - specs/014-pi-agent-memset-stall/planning-transcript.md
+      provenance:
+        - "plan:complete:v1 sentinel recorded by gate.sh"
+        - "north-star Phase B outcome: BOOTSTRAP (first plan for spec 014)"
+      next_command: "/codex-review specs/014-pi-agent-memset-stall/"
+
+  - id: T002
+    type: pm
+    assignee: PM
+    status: done
+    reasoning_hint: high
+    objective: "Run $codex-review on the spec-014 plan and iterate with Codex until VERDICT: APPROVED. This is the gate between plan and implement; do not skip."
+    inputs:
+      - "T001 receipt + plan.md + tasks.md + planning-transcript.md"
+    constraints:
+      - "Never skip $codex-review. The same-session Phase B approval inside $codex-plan does not substitute for this fresh independent review (per Dale Codex Workflow rule)."
+      - "Iterate until Codex returns APPROVED, or escalate to user if Codex finds a structural problem that requires re-shaping."
+    expected_output:
+      - "specs/014-pi-agent-memset-stall/codex-review.md with VERDICT: APPROVED"
+      - "codex-review:complete:v1 sentinel"
+      - "Next-command pointer: /codex-implement specs/014-pi-agent-memset-stall/"
+    receipt:
+      result: done
+      command: "/codex-review specs/014-pi-agent-memset-stall/"
+      summary: "5 rounds to APPROVED (trust_level: full). Codex caught material gaps each round — installation/symlink proof step missing, cargo command shape wrong, raw-mirror discover-source parity for C4 underspecified, message-coverage script using wrong field names, hand-rolled flattener undercounting thinking/toolCall blocks. Final approach mandates Rust harness using the pinned FAD PiAgentConnector for message-count parity. Spec.md Requirement 3 amended in-flight (Codex caught the prior /codex-plan amendment had been applied to Acceptance #1 but missed in Requirements)."
+      artifacts:
+        - specs/014-pi-agent-memset-stall/codex-review.md
+      provenance:
+        - "codex-review:approved:v1 sentinel recorded by gate.sh"
+        - "Round records: .codex-round-91909777/, .codex-round-7f3ae320/, .codex-round-11ebb7d2/, .codex-round-8f680d33/, .codex-round-a8204eb3/"
+      next_command: "/codex-implement specs/014-pi-agent-memset-stall/"
+
+  - id: T003
+    type: pm
+    assignee: PM
+    status: blocked
+    reasoning_hint: medium
+    objective: "Run $codex-implement for the approved spec-014 plan. Implementation includes Phase 1 profiling, Phase 2 fix diff, Phase 3 regression test, and the implementation receipt."
+    inputs:
+      - "T002 receipt + codex-review.md (APPROVED)"
+      - "tasks.md (task list from $codex-plan)"
+    constraints:
+      - "$codex-implement owns its own write boundaries via tasks.md allowed_files. Do not add a separate Worker task for the same work."
+      - "Implementation must keep the PR #233 chunk-size behaviour intact (regression-test it explicitly per spec 014 acceptance #3)."
+      - "If implementation discovers the fix needs to touch franken-agent-detection (external crate), pause and escalate to user with a one-question choice — do not silently vendor."
+    expected_output:
+      - "specs/014-pi-agent-memset-stall/implement-receipt.md"
+      - "implement:complete:v1 sentinel"
+      - "Source diff committed on dac/main (mirrors PR #233 style: one focused commit)."
+      - "Next-command pointer: /code-verify specs/014-pi-agent-memset-stall/"
+    receipt:
+      result: blocked
+      command: "/codex-implement specs/014-pi-agent-memset-stall/"
+      summary: "Phase 1 (T1-T4) complete; T5 escalated. Profile evidence does NOT match plan.md's binding decision tree. Hot frame is fsqlite_ext_fts5::Fts5Table::snapshot_state (frankensqlite crate, pinned rev eba969e) called from SQLite's per-row vtab savepoint plumbing. Allocation is HashMap<SmallText,SmallVec<Posting>>::clone on every INSERT; in-memory inverted index is 30+ GB after claude_code/codex/opencode already indexed. None of C1-C5 address this. Spec's binding 'no deferred peak-RSS' rule forbids shipping any of them as the fix. Four follow-up paths (D1 upstream fsqlite fix, D2 cass-side vtab knob, D3 deferred-lexical-updates already-present path, D4 one-Worker spike to read fsqlite_ext_fts5 source) documented in notes/T5-candidate-decision.md."
+      artifacts:
+        - specs/014-pi-agent-memset-stall/notes/T2-repro.log
+        - specs/014-pi-agent-memset-stall/notes/T3-sample.txt
+        - specs/014-pi-agent-memset-stall/notes/T3-vmmap.txt
+        - specs/014-pi-agent-memset-stall/notes/T3-monitor.csv
+        - specs/014-pi-agent-memset-stall/notes/T4-profile-evidence.md
+        - specs/014-pi-agent-memset-stall/notes/T5-candidate-decision.md
+      provenance:
+        - "Repro PID 87884, peak RSS 49.85 GB, 99-100% CPU for 5+ min, pi count frozen at 33"
+        - "Indexer killed cleanly post-evidence-capture; launchd watcher reloaded (new PID 30892)"
+        - "Tasks.md T1-T4 checked off; T5 marked ESCALATED (not done)"
+        - "log.md updated with T1-T5 timeline"
+      blocking_question: "Which path: D1 upstream fsqlite fix / D2 cass-side vtab knob / D3 deferred-lexical-updates / D4 one-Worker spike?"
+
+  - id: T007
+    type: scout
+    assignee: Scout
+    status: done
+    reasoning_hint: medium
+    objective: "Map fsqlite_ext_fts5 source — characterise Fts5Table::snapshot_state contract, identify whether the snapshot is needed for cass's INSERT-only watch-once path, and surface candidate D1/D2/D3 specifics so user choice is informed."
+    inputs:
+      - "T4 evidence: specs/014-pi-agent-memset-stall/notes/T4-profile-evidence.md"
+      - "T5 candidate decision: specs/014-pi-agent-memset-stall/notes/T5-candidate-decision.md"
+      - "FAD/frankensqlite checkouts under ~/.cargo/git/checkouts/frankensqlite-*/<rev>/"
+      - "Cass strings: CASS_DEFER_LEXICAL_UPDATES, defer_lexical_updates (already present in release binary)"
+    constraints:
+      - "Read-only. No source edits, no upstream issue/PR creation, no rev bumps."
+      - "Output a single note: specs/014-pi-agent-memset-stall/notes/T3a-fts5-snapshot-surface.md"
+      - "Do NOT decide between D1/D2/D3 — that is the user's call. Just surface what each would cost / how each would look."
+    expected_output:
+      - "specs/014-pi-agent-memset-stall/notes/T3a-fts5-snapshot-surface.md with: snapshot_state body (or relevant excerpt), savepoint/release contract, whether SQLITE can skip vtab savepoint, where defer_lexical_updates is wired in cass, and a one-paragraph cost estimate per D1/D2/D3."
+    receipt:
+      result: done
+      note: specs/014-pi-agent-memset-stall/notes/T3a-fts5-snapshot-surface.md
+      summary: "FTS5 snapshot contract mapped. Confirmed: every INSERT into fts_messages triggers Fts5Table::xSavepoint → snapshot_state → clone of {InvertedIndex, documents HashMap, …}. begin() (lib.rs:2529) also clones on every transaction start. CASS_DEFER_LEXICAL_UPDATES defers Tantivy, NOT the FTS5 vtab. Side-finding: fsqlite_ext_fts5 stores column_values into self.documents even for ContentMode::Contentless tables (lib.rs:2185) — a separate bug worth its own bead. Cost estimates per D-path written in the note: D1 = 30–150 LOC upstream PR in frankensqlite; D2 = same coordination as D1 plus a small cass-side flag; D3 = cass-local only, ~30–80 LOC, but acceptance #2 (peak RSS < 8GB) is at risk because the final maintenance INSERT still triggers one full-state savepoint clone."
+      evidence:
+        - "~/.cargo/git/checkouts/frankensqlite-8b961831d226b905/eba969e/crates/fsqlite-ext-fts5/src/lib.rs:2143–2151 (snapshot_state)"
+        - "~/.cargo/git/checkouts/frankensqlite-8b961831d226b905/eba969e/crates/fsqlite-ext-fts5/src/lib.rs:2529–2532 (begin)"
+        - "~/.cargo/git/checkouts/frankensqlite-8b961831d226b905/eba969e/crates/fsqlite-ext-fts5/src/lib.rs:2617–2625 (savepoint/release)"
+        - "~/.cargo/git/checkouts/frankensqlite-8b961831d226b905/eba969e/crates/fsqlite-func/src/vtab.rs:155–228 (TransactionalVtabState)"
+        - "~/.cargo/git/checkouts/frankensqlite-8b961831d226b905/eba969e/crates/fsqlite-core/src/connection.rs:20618+ (per-statement savepoint wrapper)"
+        - "src/storage/sqlite.rs:1085 (cass fts_messages schema)"
+        - "src/indexer/mod.rs:18066–18070, 18610–18632 (cass defer_lexical_updates path — Tantivy, not FTS5)"
+      spawned_tasks: []
+
+  - id: T008
+    type: pm
+    assignee: PM
+    status: active
+    reasoning_hint: medium
+    objective: "Hold while user picks the D-path. PM cannot decide between D1/D2/D3 — that's a scope-change call per goal.md ('escalate before activating any change [in external crate]')."
+    inputs:
+      - "T003 escalation receipt"
+      - "T007 receipt + notes/T3a-fts5-snapshot-surface.md"
+      - "notes/T4-profile-evidence.md, notes/T5-candidate-decision.md"
+    constraints:
+      - "Do not begin any code change until user picks D1, D2, or D3."
+      - "Do not modify spec.md, plan.md, or tasks.md content until the user's decision sets the new scope — that's a $codex-shape or $codex-plan amendment, not a PM edit."
+      - "Watcher must keep running while waiting. Do not stop it for any 'preparatory' work."
+    expected_output:
+      - "User decision recorded as a one-line update to this task's receipt: 'chose D1 / D2 / D3 / amend-spec / other'."
+      - "Based on choice, next active task is created: D1 → new spec for upstream fsqlite PR; D2 → same plus cass-side glue; D3 → re-scope spec 014 to cass-local-only and re-run $codex-plan or $codex-shape."
+    receipt: null
+
+  - id: T004
+    type: pm
+    assignee: PM
+    status: queued
+    reasoning_hint: high
+    objective: "Run $code-verify after implementation. Codex performs an independent acceptance check against spec 014's five criteria."
+    inputs:
+      - "T003 receipt + implement-receipt.md"
+      - "spec 014 Acceptance Criteria 1..5"
+    constraints:
+      - "$code-verify is independent of the implementer. Treat its verdict as authoritative."
+      - "If $code-verify rejects, bounce back to $codex-implement (T003) with the verifier's findings; do not advance the board until a clean verify."
+    expected_output:
+      - "specs/014-pi-agent-memset-stall/code-verify.md with VERDICT: APPROVED"
+      - "verify:complete:v1 sentinel"
+      - "Confirmation that all five spec-014 acceptance criteria hold."
+      - "Next-command pointer: /finalize specs/014-pi-agent-memset-stall/"
+    receipt: null
+
+  - id: T005
+    type: pm
+    assignee: PM
+    status: queued
+    reasoning_hint: medium
+    objective: "Run $finalize: close bead coding_agent_session_search-373b1, write the handoff artifact under thoughts/shared/handoffs/, commit any remaining spec updates, and push dac/main."
+    inputs:
+      - "T004 receipt + code-verify.md (APPROVED)"
+    constraints:
+      - "$finalize closes the bead; do not leave it in_progress."
+      - "Handoff artifact must capture: final acceptance evidence, upstream-PR URL (created in T006 unless $codex-implement already opened it), DB snapshot locations, and any follow-up beads spawned."
+    expected_output:
+      - "thoughts/shared/handoffs/<timestamp>-pi-agent-memset-stall.md"
+      - "Bead coding_agent_session_search-373b1 closed with summary."
+      - "dac/main pushed to origin with all spec-014 commits."
+    receipt: null
+
+  - id: T006
+    type: pm
+    assignee: PM
+    status: queued
+    reasoning_hint: medium
+    objective: "Open the upstream PR mirroring PR #233 style. Branch from upstream/main, single focused commit, no internal-spec language, no AI attribution."
+    inputs:
+      - "T005 receipt OR $codex-implement output (whichever produced the focused fix commit)."
+    constraints:
+      - "PR body must follow PR #233 shape: Symptom / Repro / Root cause / Fix / Verification."
+      - "Branch off the current upstream/main, not dac/main. Cherry-pick or rebuild the single commit cleanly."
+      - "Do not push beads/issues.jsonl or any internal spec/docs/goals files in this PR — keep it to the source change and its regression test."
+      - "If $codex-implement already opened the upstream PR, mark this task done with a pointer in the receipt instead of duplicating."
+    expected_output:
+      - "Open PR URL on Dicklesworthstone/coding_agent_session_search."
+      - "Confirmation that the diff is one commit, clean of internal/AI artifacts."
+    receipt: null
+
+  - id: T999
+    type: judge
+    assignee: Judge
+    status: queued
+    reasoning_hint: high
+    objective: "Final audit: do all five spec-014 acceptance criteria hold, is the upstream PR open, is the bead closed, did the fix avoid regressing spec 013?"
+    inputs:
+      - "All done task receipts T001..T006"
+      - "specs/014-pi-agent-memset-stall/code-verify.md"
+      - "thoughts/shared/handoffs/<timestamp>-pi-agent-memset-stall.md"
+      - "Output of: cass status && launchctl list | grep cass"
+      - "Spot-check: 3 random claude_code conversations + 3 random codex conversations remain queryable after the fix"
+    constraints:
+      - "Reject completion if any acceptance criterion is unverified."
+      - "Reject completion if the launchd watcher is not running on the post-fix binary."
+      - "Reject completion if the upstream PR was not opened."
+      - "Reject completion if claude_code/codex spot-checks fail (spec 013 regression)."
+    expected_output:
+      - "complete | not_complete"
+      - "full_outcome_complete: true | false"
+      - "missing evidence (if not_complete)"
+      - "next task (if not_complete)"
+    receipt: null
+
+checks:
+  dirty_fingerprint: unknown
+  last_verification:
+    result: unknown
+    task: null
+    commands: []

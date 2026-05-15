@@ -1,0 +1,49 @@
+{
+  "approval_target_sha": "05ba881b3d3513a2c83d4d1ebd4d90d2ead1e912",
+  "baseline_sha": "05ba881b3d3513a2c83d4d1ebd4d90d2ead1e912",
+  "chunk_map": [
+    {
+      "header": "## Group A \u2014 Phase 1: Profile and localise",
+      "line": 15,
+      "ordinal": 0
+    },
+    {
+      "header": "## Group B \u2014 Caller-preservation analysis",
+      "line": 23,
+      "ordinal": 1
+    },
+    {
+      "header": "## Group C \u2014 Implement chosen candidate",
+      "line": 29,
+      "ordinal": 2
+    },
+    {
+      "header": "## Group D \u2014 Regression test",
+      "line": 47,
+      "ordinal": 3
+    },
+    {
+      "header": "## Group E \u2014 Full-corpus verification on user's machine",
+      "line": 56,
+      "ordinal": 4
+    },
+    {
+      "header": "## Group F \u2014 Implementation provenance",
+      "line": 97,
+      "ordinal": 5
+    }
+  ],
+  "closeout_surface": [],
+  "created_at": "2026-05-15T17:02:08Z",
+  "findings": [],
+  "proof_manifest": [],
+  "rounds": [],
+  "schema_version": 1,
+  "state_fingerprint": {
+    "baseline_sha": "05ba881b3d3513a2c83d4d1ebd4d90d2ead1e912",
+    "chunk_count": 6,
+    "spec_relpath": "specs/014-pi-agent-memset-stall"
+  },
+  "updated_at": "2026-05-15T17:02:08Z",
+  "validator_capability": "read-only"
+}

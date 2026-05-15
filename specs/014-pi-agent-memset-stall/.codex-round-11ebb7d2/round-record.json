@@ -1,0 +1,21 @@
+{
+  "baseline_sha": "05ba881b3d3513a2c83d4d1ebd4d90d2ead1e912",
+  "checkpoint_sessions": [
+    "019e2c74-79eb-7820-a5ff-ee734aa40dc3"
+  ],
+  "codex_session_id": "019e2c74-79eb-7820-a5ff-ee734aa40dc3",
+  "command": "codex-review",
+  "halt_detected_at": null,
+  "halt_marker_line": null,
+  "parent_round": null,
+  "phase": "default",
+  "review_id": "11ebb7d2",
+  "round_state": "closed-success",
+  "schema_version": 1,
+  "spec_path": "specs/014-pi-agent-memset-stall",
+  "staging_path": "/Users/dalecarman/dev/coding_agent_session_search/specs/014-pi-agent-memset-stall/.codex-round-w_0jc3ma-11ebb7d2-staging/output.md",
+  "start_timestamp": "2026-05-15T16:36:22.559089Z",
+  "surfaceable_path": "/Users/dalecarman/dev/coding_agent_session_search/specs/014-pi-agent-memset-stall/.codex-round-11ebb7d2/output.md",
+  "temp_file_family": "codex-review-*-11ebb7d2.md",
+  "trust_level": "full"
+}
