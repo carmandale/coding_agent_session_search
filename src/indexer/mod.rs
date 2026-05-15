@@ -15762,6 +15762,64 @@ fn should_inject_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool
         .is_some_and(|min| min > 0 && convs.len() >= min)
 }
 
+/// Append scratch-build skip records and parser-skip records to the watch ingest
+/// quarantine file. Spec 015 Acceptance #1 requires per-path records for all
+/// files that don't make it into the DB. Both reason values share the same file
+/// as the existing OOM-quarantine path (`record_watch_poison_conversation`).
+fn write_streaming_quarantine_records(
+    path: &Path,
+    scratch_skips: &[scratch_root::ScratchBuildSkip],
+    parser_skipped_paths: &[PathBuf],
+) -> Result<()> {
+    if scratch_skips.is_empty() && parser_skipped_paths.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("creating watch ingest quarantine directory {}", parent.display())
+        })?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening watch ingest quarantine file {}", path.display()))?;
+
+    let now_ms = FrankenStorage::now_millis();
+    for skip in scratch_skips {
+        let record = serde_json::json!({
+            "recorded_at_ms": now_ms,
+            "reason": "scratch_build_failure",
+            "agent_slug": "pi_agent",
+            "source_path": skip.source_path.display().to_string(),
+            "io_error": skip.error_message,
+        });
+        writeln!(file, "{record}").with_context(|| {
+            format!(
+                "writing scratch_build_failure record for {}",
+                skip.source_path.display()
+            )
+        })?;
+    }
+    for parser_path in parser_skipped_paths {
+        let record = serde_json::json!({
+            "recorded_at_ms": now_ms,
+            "reason": "parser_skip",
+            "agent_slug": "pi_agent",
+            "source_path": parser_path.display().to_string(),
+        });
+        writeln!(file, "{record}").with_context(|| {
+            format!(
+                "writing parser_skip record for {}",
+                parser_path.display()
+            )
+        })?;
+    }
+    file.sync_all()
+        .with_context(|| format!("syncing watch ingest quarantine file {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(not(test))]
 fn should_inject_watch_ingest_test_oom(_convs: &[NormalizedConversation]) -> bool {
     false
@@ -16243,6 +16301,312 @@ fn reindex_paths_with_semantic_delta(
             std::slice::from_ref(&root),
             since_ts,
         );
+
+        // Spec 015 streaming watch-once branch (pi-agent only).
+        // Short-circuit on kind/mode BEFORE calling discover_source_files so
+        // claude/codex/opencode don't pay for a discovery call they don't need.
+        if explicit_watch_once && kind.slug() == "pi_agent" {
+            let discovered = conn.discover_source_files(&ctx).unwrap_or_default();
+            if !discovered.is_empty() {
+                let original_sessions_root =
+                    scratch_root::derive_pi_sessions_root(&root.path);
+                let workdir = opts
+                    .data_dir
+                    .join("scratch")
+                    .join("watch-once-streaming");
+                let scan_batch_limits = scratch_root::ScanBatchLimits::from_env();
+                let buffer_max_messages = std::env::var("CASS_WATCH_BUFFER_MAX_MESSAGES")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|n| *n > 0)
+                    .unwrap_or(8_192);
+                let buffer_max_conversations =
+                    std::cmp::max(scan_batch_limits.max_files, 1);
+
+                if let Some(p) = &opts.progress {
+                    p.total
+                        .fetch_add(discovered.len(), Ordering::Relaxed);
+                    p.phase.store(2, Ordering::Relaxed);
+                }
+                tracing::warn!(
+                    ?kind,
+                    scan_root = %root.path.display(),
+                    discovered_files = discovered.len(),
+                    since_ts,
+                    "watch_once_streaming_scan_start"
+                );
+
+                let streaming_start = Instant::now();
+                let ingest_chunk_size = watch_ingest_chunk_size();
+                let capture_semantic_delta = semantic_delta.is_some();
+
+                let mut emitted_source_files: std::collections::HashSet<PathBuf> =
+                    std::collections::HashSet::new();
+                let mut emitted_conversations: usize = 0;
+                let mut ingest_success_conversations: usize = 0;
+                let mut quarantined_oom: usize = 0;
+                let mut streaming_inserted_messages: usize = 0;
+                let mut scratch_skips: Vec<scratch_root::ScratchBuildSkip> = Vec::new();
+                let mut buffer: Vec<crate::connectors::NormalizedConversation> = Vec::new();
+                let mut buffer_message_count: usize = 0;
+
+                let storage = storage
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+                let mut t_index_guard = t_index
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
+                if t_index_guard.is_none() {
+                    tracing::info!(
+                        index_path = %index_path.display(),
+                        "opening Tantivy lazily for streaming watch-once"
+                    );
+                    *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
+                }
+                let t_index = t_index_guard
+                    .as_mut()
+                    .expect("lazy watch index must be open before streaming ingest");
+
+                let flush_buffer = |buffer: &mut Vec<crate::connectors::NormalizedConversation>,
+                                    buffer_message_count: &mut usize,
+                                    ingest_success_conversations: &mut usize,
+                                    quarantined_oom: &mut usize,
+                                    streaming_inserted_messages: &mut usize,
+                                    semantic_delta: &mut Option<&mut WatchSemanticDelta>,
+                                    storage: &FrankenStorage,
+                                    t_index: &mut TantivyIndex|
+                 -> Result<()> {
+                    if buffer.is_empty() {
+                        return Ok(());
+                    }
+                    for chunk in buffer.chunks(ingest_chunk_size) {
+                        let outcome = ingest_watch_batch_with_oom_split(
+                            storage,
+                            t_index,
+                            &opts.data_dir,
+                            chunk,
+                            &opts.progress,
+                            !opts.watch,
+                            capture_semantic_delta,
+                        )?;
+                        *streaming_inserted_messages =
+                            streaming_inserted_messages.saturating_add(
+                                outcome.batch_outcome.inserted_messages,
+                            );
+                        let chunk_success = outcome
+                            .processed_conversations
+                            .saturating_sub(outcome.quarantined_conversations);
+                        *ingest_success_conversations =
+                            ingest_success_conversations.saturating_add(chunk_success);
+                        *quarantined_oom =
+                            quarantined_oom.saturating_add(outcome.quarantined_conversations);
+                        if let Some(delta) = semantic_delta.as_deref_mut() {
+                            delta.extend_from_batch(
+                                outcome.batch_outcome.semantic_delta_inputs,
+                                outcome.batch_outcome.semantic_delta_max_message_id,
+                            );
+                        }
+                        t_index.commit()?;
+                        persist::with_ephemeral_writer(
+                            storage,
+                            false,
+                            "updating watch last_indexed_at",
+                            |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
+                        )?;
+                    }
+                    buffer.clear();
+                    *buffer_message_count = 0;
+                    Ok(())
+                };
+
+                for file_batch in
+                    scratch_root::chunk_by_files_and_bytes(&discovered, scan_batch_limits)
+                {
+                    let (scratch_guard, batch_skips) = scratch_root::build_scratch_root(
+                        file_batch,
+                        &workdir,
+                        &original_sessions_root,
+                    )?;
+                    scratch_skips.extend(batch_skips);
+                    let scratch_sessions_root = scratch_guard.path().join("sessions");
+                    let scratch_root_handle = ScanRoot::local(scratch_guard.path().to_path_buf());
+                    let scratch_ctx = crate::connectors::ScanContext::with_roots(
+                        opts.data_dir.clone(),
+                        vec![scratch_root_handle.clone()],
+                        since_ts,
+                    );
+
+                    let scratch_convs = match conn.scan(&scratch_ctx) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!(
+                                "watch-once streaming scan failed at batch {}: {}",
+                                scratch_guard.path().display(),
+                                e
+                            );
+                            // Drop scratch (RAII) and skip this batch.
+                            continue;
+                        }
+                    };
+
+                    for mut conv in scratch_convs {
+                        scratch_root::remap_source_path_field(
+                            &mut conv.source_path,
+                            &scratch_sessions_root,
+                            &original_sessions_root,
+                        );
+                        inject_provenance(&mut conv, &root.origin);
+                        apply_workspace_rewrite(&mut conv, &root);
+                        compact_large_connector_extras("", &mut conv);
+                        attach_raw_mirror_capture(&opts.data_dir, &mut conv);
+                        emitted_source_files.insert(conv.source_path.clone());
+                        emitted_conversations += 1;
+                        buffer_message_count =
+                            buffer_message_count.saturating_add(conv.messages.len());
+                        buffer.push(conv);
+
+                        // Mid-batch flush when buffer limits fire.
+                        if buffer.len() >= buffer_max_conversations
+                            || buffer_message_count >= buffer_max_messages
+                        {
+                            flush_buffer(
+                                &mut buffer,
+                                &mut buffer_message_count,
+                                &mut ingest_success_conversations,
+                                &mut quarantined_oom,
+                                &mut streaming_inserted_messages,
+                                &mut semantic_delta.as_deref_mut(),
+                                &storage,
+                                t_index,
+                            )?;
+                        }
+                    }
+
+                    // MANDATORY end-of-batch flush so the working set drops
+                    // before the next scratch root materialises.
+                    flush_buffer(
+                        &mut buffer,
+                        &mut buffer_message_count,
+                        &mut ingest_success_conversations,
+                        &mut quarantined_oom,
+                        &mut streaming_inserted_messages,
+                        &mut semantic_delta.as_deref_mut(),
+                        &storage,
+                        t_index,
+                    )?;
+
+                    drop(scratch_guard); // RAII cleanup of scratch tree
+                }
+
+                // Drop locks before writing the quarantine receipt.
+                drop(t_index_guard);
+                drop(storage);
+
+                // Compute reconciliation + write skip records to quarantine.
+                let discovered_paths: std::collections::HashSet<PathBuf> = discovered
+                    .iter()
+                    .map(|d| d.source_path.clone())
+                    .collect();
+                let scratch_skipped_paths: std::collections::HashSet<PathBuf> = scratch_skips
+                    .iter()
+                    .map(|s| s.source_path.clone())
+                    .collect();
+                let parser_skipped_paths: Vec<PathBuf> = discovered_paths
+                    .iter()
+                    .filter(|p| {
+                        !emitted_source_files.contains(*p)
+                            && !scratch_skipped_paths.contains(*p)
+                    })
+                    .cloned()
+                    .collect();
+
+                let quarantine_path = opts
+                    .data_dir
+                    .join("quarantine")
+                    .join("watch_ingest_poison.jsonl");
+                if !scratch_skips.is_empty() || !parser_skipped_paths.is_empty() {
+                    if let Err(e) = write_streaming_quarantine_records(
+                        &quarantine_path,
+                        &scratch_skips,
+                        &parser_skipped_paths,
+                    ) {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to write streaming watch-once quarantine records"
+                        );
+                    }
+                }
+
+                let scan_ms = streaming_start.elapsed().as_millis() as u64;
+                let index_ms = scan_ms; // streaming interleaves scan + persist; collapse into one duration
+
+                if let Some(p) = &opts.progress
+                    && let Ok(mut stats) = p.stats.lock()
+                {
+                    let connector_name = kind.slug().to_string();
+                    let total_emitted = emitted_conversations;
+                    stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
+                    stats.index_ms = stats.index_ms.saturating_add(index_ms);
+                    stats.total_conversations =
+                        stats.total_conversations.saturating_add(total_emitted);
+                    stats.total_messages = stats
+                        .total_messages
+                        .saturating_add(streaming_inserted_messages);
+                    stats.connectors.push(ConnectorStats {
+                        name: connector_name.clone(),
+                        conversations: total_emitted,
+                        messages: streaming_inserted_messages,
+                        scan_ms,
+                        error: None,
+                    });
+                    if !stats
+                        .agents_discovered
+                        .iter()
+                        .any(|name| name == &connector_name)
+                    {
+                        stats.agents_discovered.push(connector_name);
+                    }
+                }
+
+                if quarantined_oom > 0 || !scratch_skips.is_empty() {
+                    tracing::warn!(
+                        ?kind,
+                        quarantined_oom,
+                        scratch_build_skips = scratch_skips.len(),
+                        parser_skip_records = parser_skipped_paths.len(),
+                        "watch-once streaming run completed with skips"
+                    );
+                }
+
+                let parse_unaccounted = discovered.len()
+                    .saturating_sub(emitted_source_files.len())
+                    .saturating_sub(scratch_skips.len());
+                let ingest_unaccounted = emitted_conversations
+                    .saturating_sub(ingest_success_conversations)
+                    .saturating_sub(quarantined_oom);
+                tracing::warn!(
+                    ?kind,
+                    discovered_files = discovered.len(),
+                    emitted_source_files = emitted_source_files.len(),
+                    parser_skip_records = parser_skipped_paths.len(),
+                    scratch_build_skips = scratch_skips.len(),
+                    emitted_conversations,
+                    ingest_success_conversations,
+                    quarantined_oom,
+                    parse_unaccounted_files = parse_unaccounted,
+                    ingest_unaccounted_conversations = ingest_unaccounted,
+                    "watch_once_streaming_receipt"
+                );
+
+                // Match bulk path's total_indexed accounting: count rows that hit
+                // the persist path (success + OOM-quarantined, where OOM-quarantined
+                // is already inside processed_conversations per `:15656`).
+                total_indexed = total_indexed
+                    .saturating_add(ingest_success_conversations + quarantined_oom);
+
+                continue;
+            }
+        }
 
         // SCAN PHASE: IO-heavy, no locks held
         let scan_start = Instant::now();
