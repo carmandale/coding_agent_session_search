@@ -89,6 +89,8 @@ const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 const PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT: usize = 256;
 const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
+const WATCH_PREEMPTIVE_LEXICAL_DEFER_DB_BYTES_DEFAULT: u64 = 2_u64 * 1024 * 1024 * 1024;
+const DEFERRED_LEXICAL_REFRESH_MARKER: &str = "lexical-refresh-needed.json";
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
 
@@ -512,6 +514,16 @@ pub struct IndexingStats {
     /// Automatic lexical repair/catch-up performed before normal indexing work.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lexical_repair: Option<LexicalRepairStats>,
+    /// Conversations persisted while deferring inline lexical maintenance after an OOM.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub lexical_deferred_conversations: usize,
+    /// Conversations quarantined after OOM bisection could not persist them.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub quarantined_conversations: usize,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -10786,6 +10798,10 @@ pub fn run_index(
         );
     }
 
+    if !targeted_watch_once_only_run {
+        mark_deferred_lexical_refresh_resolved(&opts.data_dir)?;
+    }
+
     reset_progress_to_idle(opts.progress.as_ref());
 
     if opts.watch || opts.watch_once_paths.is_some() {
@@ -12772,6 +12788,7 @@ static LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct LexicalPublishInjectedRenameFailureGuard {
     previous: Option<LexicalPublishInjectedRenameFailure>,
 }
@@ -12788,6 +12805,7 @@ impl Drop for LexicalPublishInjectedRenameFailureGuard {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn inject_lexical_publish_rename_failure_once(
     site: LexicalPublishRenameSite,
     raw_os_error: i32,
@@ -15619,6 +15637,55 @@ fn ingest_batch_with_semantic_delta(
     defer_checkpoints: bool,
     semantic_delta: Option<&mut WatchSemanticDelta>,
 ) -> Result<persist::PersistBatchOutcome> {
+    ingest_batch_with_semantic_delta_inner(
+        storage,
+        t_index,
+        data_dir,
+        convs,
+        progress,
+        lexical_strategy,
+        defer_checkpoints,
+        semantic_delta,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_batch_with_semantic_delta_deferred_lexical(
+    storage: &FrankenStorage,
+    t_index: Option<&mut TantivyIndex>,
+    data_dir: &Path,
+    convs: &[NormalizedConversation],
+    progress: &Option<Arc<IndexingProgress>>,
+    lexical_strategy: LexicalPopulationStrategy,
+    defer_checkpoints: bool,
+    semantic_delta: Option<&mut WatchSemanticDelta>,
+) -> Result<persist::PersistBatchOutcome> {
+    ingest_batch_with_semantic_delta_inner(
+        storage,
+        t_index,
+        data_dir,
+        convs,
+        progress,
+        lexical_strategy,
+        defer_checkpoints,
+        semantic_delta,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_batch_with_semantic_delta_inner(
+    storage: &FrankenStorage,
+    t_index: Option<&mut TantivyIndex>,
+    data_dir: &Path,
+    convs: &[NormalizedConversation],
+    progress: &Option<Arc<IndexingProgress>>,
+    lexical_strategy: LexicalPopulationStrategy,
+    defer_checkpoints: bool,
+    semantic_delta: Option<&mut WatchSemanticDelta>,
+    force_defer_lexical_updates: bool,
+) -> Result<persist::PersistBatchOutcome> {
     let trace_span = robot_trace_ingest_start(
         "ingest_batch_with_semantic_delta",
         convs,
@@ -15626,22 +15693,24 @@ fn ingest_batch_with_semantic_delta(
         defer_checkpoints,
     );
     let batch_result = if semantic_delta.is_some() {
-        persist::persist_conversations_batched_with_semantic_delta_and_raw_mirror_links(
+        persist::persist_conversations_batched_with_semantic_delta_and_raw_mirror_links_inner(
             storage,
             t_index,
             data_dir,
             convs,
             lexical_strategy,
             defer_checkpoints,
+            force_defer_lexical_updates,
         )
     } else {
-        persist::persist_conversations_batched_with_raw_mirror_links(
+        persist::persist_conversations_batched_with_raw_mirror_links_inner(
             storage,
             t_index,
             data_dir,
             convs,
             lexical_strategy,
             defer_checkpoints,
+            force_defer_lexical_updates,
         )
     };
     let batch_outcome = match batch_result {
@@ -15671,6 +15740,7 @@ struct WatchIngestBatchOutcome {
     batch_outcome: persist::PersistBatchOutcome,
     processed_conversations: usize,
     quarantined_conversations: usize,
+    lexical_deferred_conversations: usize,
     max_payload_watermark_ms: Option<i64>,
 }
 
@@ -15683,6 +15753,9 @@ impl WatchIngestBatchOutcome {
         self.quarantined_conversations = self
             .quarantined_conversations
             .saturating_add(other.quarantined_conversations);
+        self.lexical_deferred_conversations = self
+            .lexical_deferred_conversations
+            .saturating_add(other.lexical_deferred_conversations);
         if let Some(ts) = other.max_payload_watermark_ms {
             self.max_payload_watermark_ms = Some(
                 self.max_payload_watermark_ms
@@ -15701,8 +15774,88 @@ fn ingest_watch_batch_with_oom_split(
     progress: &Option<Arc<IndexingProgress>>,
     defer_checkpoints: bool,
     capture_semantic_delta: bool,
+    preemptively_defer_lexical_updates: bool,
 ) -> Result<WatchIngestBatchOutcome> {
     debug_assert!(!convs.is_empty());
+
+    if preemptively_defer_lexical_updates {
+        let deferred_result = {
+            let mut semantic_delta = WatchSemanticDelta::default();
+            ingest_batch_with_semantic_delta_deferred_lexical(
+                storage,
+                Some(t_index),
+                data_dir,
+                convs,
+                progress,
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                defer_checkpoints,
+                capture_semantic_delta.then_some(&mut semantic_delta),
+            )
+        };
+        return match deferred_result {
+            Ok(batch_outcome) => Ok(WatchIngestBatchOutcome {
+                batch_outcome,
+                processed_conversations: convs.len(),
+                quarantined_conversations: 0,
+                lexical_deferred_conversations: convs.len(),
+                max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
+            }),
+            Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
+                let split_at = convs.len() / 2;
+                tracing::warn!(
+                    conversations = convs.len(),
+                    left = split_at,
+                    right = convs.len().saturating_sub(split_at),
+                    error = %error,
+                    "watch ingest deferred-lexical batch ran out of memory; retrying as smaller batches"
+                );
+                let mut merged = ingest_watch_batch_with_oom_split(
+                    storage,
+                    t_index,
+                    data_dir,
+                    &convs[..split_at],
+                    progress,
+                    defer_checkpoints,
+                    capture_semantic_delta,
+                    true,
+                )?;
+                let right = ingest_watch_batch_with_oom_split(
+                    storage,
+                    t_index,
+                    data_dir,
+                    &convs[split_at..],
+                    progress,
+                    defer_checkpoints,
+                    capture_semantic_delta,
+                    true,
+                )?;
+                merged.merge(right);
+                Ok(merged)
+            }
+            Err(error) if error_is_out_of_memory(&error) => {
+                let conv = &convs[0];
+                record_watch_poison_conversation(data_dir, conv, &error)?;
+                if let Some(progress) = progress {
+                    progress.current.fetch_add(1, Ordering::Relaxed);
+                }
+                tracing::warn!(
+                    agent = %conv.agent_slug,
+                    external_id = conv.external_id.as_deref().unwrap_or(""),
+                    source_path = %conv.source_path.display(),
+                    error = %error,
+                    "single watch conversation ran out of memory even with lexical updates preemptively deferred; quarantined and advancing watch progress"
+                );
+                Ok(WatchIngestBatchOutcome {
+                    batch_outcome: persist::PersistBatchOutcome::default(),
+                    processed_conversations: 1,
+                    quarantined_conversations: 1,
+                    lexical_deferred_conversations: 0,
+                    max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
+                })
+            }
+            Err(error) => Err(error),
+        };
+    }
 
     let batch_result = if should_inject_watch_ingest_test_oom(convs) {
         Err(anyhow::anyhow!("out of memory"))
@@ -15725,6 +15878,7 @@ fn ingest_watch_batch_with_oom_split(
             batch_outcome,
             processed_conversations: convs.len(),
             quarantined_conversations: 0,
+            lexical_deferred_conversations: 0,
             max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
         }),
         Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
@@ -15744,6 +15898,7 @@ fn ingest_watch_batch_with_oom_split(
                 progress,
                 defer_checkpoints,
                 capture_semantic_delta,
+                false,
             )?;
             let right = ingest_watch_batch_with_oom_split(
                 storage,
@@ -15753,12 +15908,55 @@ fn ingest_watch_batch_with_oom_split(
                 progress,
                 defer_checkpoints,
                 capture_semantic_delta,
+                false,
             )?;
             merged.merge(right);
             Ok(merged)
         }
         Err(error) if error_is_out_of_memory(&error) => {
             let conv = &convs[0];
+            let retry_result = {
+                let mut semantic_delta = WatchSemanticDelta::default();
+                ingest_batch_with_semantic_delta_deferred_lexical(
+                    storage,
+                    Some(t_index),
+                    data_dir,
+                    convs,
+                    progress,
+                    LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                    defer_checkpoints,
+                    capture_semantic_delta.then_some(&mut semantic_delta),
+                )
+            };
+            match retry_result {
+                Ok(batch_outcome) => {
+                    tracing::warn!(
+                        agent = %conv.agent_slug,
+                        external_id = conv.external_id.as_deref().unwrap_or(""),
+                        source_path = %conv.source_path.display(),
+                        error = %error,
+                        "single watch conversation ran out of memory during lexical maintenance; persisted canonical DB rows with lexical updates deferred"
+                    );
+                    return Ok(WatchIngestBatchOutcome {
+                        batch_outcome,
+                        processed_conversations: 1,
+                        quarantined_conversations: 0,
+                        lexical_deferred_conversations: 1,
+                        max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
+                    });
+                }
+                Err(retry_error) if error_is_out_of_memory(&retry_error) => {
+                    tracing::warn!(
+                        agent = %conv.agent_slug,
+                        external_id = conv.external_id.as_deref().unwrap_or(""),
+                        source_path = %conv.source_path.display(),
+                        original_error = %error,
+                        retry_error = %retry_error,
+                        "single watch conversation still ran out of memory with lexical updates deferred"
+                    );
+                }
+                Err(retry_error) => return Err(retry_error),
+            }
             record_watch_poison_conversation(data_dir, conv, &error)?;
             if let Some(progress) = progress {
                 progress.current.fetch_add(1, Ordering::Relaxed);
@@ -15774,6 +15972,7 @@ fn ingest_watch_batch_with_oom_split(
                 batch_outcome: persist::PersistBatchOutcome::default(),
                 processed_conversations: 1,
                 quarantined_conversations: 1,
+                lexical_deferred_conversations: 0,
                 max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
             })
         }
@@ -15880,6 +16079,26 @@ fn should_inject_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool
 
 #[cfg(not(test))]
 fn should_inject_watch_ingest_test_oom(_convs: &[NormalizedConversation]) -> bool {
+    false
+}
+
+#[cfg(test)]
+fn should_inject_watch_lexical_test_oom(
+    convs: &[NormalizedConversation],
+    force_defer_lexical_updates: bool,
+) -> bool {
+    !force_defer_lexical_updates
+        && dotenvy::var("CASS_TEST_WATCH_LEXICAL_OOM_MIN_CONVS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|min| min > 0 && convs.len() >= min)
+}
+
+#[cfg(not(test))]
+fn should_inject_watch_lexical_test_oom(
+    _convs: &[NormalizedConversation],
+    _force_defer_lexical_updates: bool,
+) -> bool {
     false
 }
 
@@ -16013,6 +16232,69 @@ fn watch_ingest_chunk_size() -> usize {
         Some(value) => value,
         None => WATCH_INGEST_DEFAULT_CHUNK_SIZE,
     }
+}
+
+fn watch_preemptive_lexical_defer_db_bytes() -> Option<u64> {
+    match env_u64("CASS_WATCH_PREEMPTIVE_LEXICAL_DEFER_DB_BYTES") {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => Some(WATCH_PREEMPTIVE_LEXICAL_DEFER_DB_BYTES_DEFAULT),
+    }
+}
+
+fn should_preemptively_defer_watch_lexical_updates(db_path: &Path) -> bool {
+    let Some(threshold_bytes) = watch_preemptive_lexical_defer_db_bytes() else {
+        return false;
+    };
+    fs::metadata(db_path)
+        .map(|metadata| metadata.len() >= threshold_bytes)
+        .unwrap_or(false)
+}
+
+pub(crate) fn deferred_lexical_refresh_needed(data_dir: &Path) -> bool {
+    let marker_path = data_dir.join(DEFERRED_LEXICAL_REFRESH_MARKER);
+    match fs::read_to_string(&marker_path) {
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|json| {
+                json.get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .map(|state| state == "pending")
+            .unwrap_or(true),
+        Err(_) => marker_path.exists(),
+    }
+}
+
+fn mark_deferred_lexical_refresh_needed(data_dir: &Path, conversations: usize) -> Result<()> {
+    let payload = serde_json::json!({
+        "state": "pending",
+        "reason": "watch_lexical_updates_deferred",
+        "updated_at_ms": FrankenStorage::now_millis(),
+        "conversations": conversations,
+    });
+    fs::write(
+        data_dir.join(DEFERRED_LEXICAL_REFRESH_MARKER),
+        serde_json::to_vec_pretty(&payload)?,
+    )?;
+    Ok(())
+}
+
+fn mark_deferred_lexical_refresh_resolved(data_dir: &Path) -> Result<()> {
+    if !data_dir.join(DEFERRED_LEXICAL_REFRESH_MARKER).exists() {
+        return Ok(());
+    }
+    let payload = serde_json::json!({
+        "state": "resolved",
+        "reason": "authoritative_lexical_refresh_completed",
+        "updated_at_ms": FrankenStorage::now_millis(),
+    });
+    fs::write(
+        data_dir.join(DEFERRED_LEXICAL_REFRESH_MARKER),
+        serde_json::to_vec_pretty(&payload)?,
+    )?;
+    Ok(())
 }
 
 fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Result<()>>(
@@ -16301,14 +16583,31 @@ fn reindex_paths_with_semantic_delta(
             .watch_once_paths
             .as_ref()
             .is_some_and(|paths| !paths.is_empty());
-        let lexical_strategy_reason = if explicit_watch_once {
-            "watch_once_targeted_reindex_applies_inline_lexical_updates_for_changed_paths"
+        let preemptively_defer_lexical_updates =
+            should_preemptively_defer_watch_lexical_updates(&opts.db_path);
+        let (lexical_strategy, lexical_strategy_reason) = if preemptively_defer_lexical_updates {
+            (
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                if explicit_watch_once {
+                    "watch_once_targeted_reindex_defers_inline_lexical_updates_for_large_db"
+                } else {
+                    "watch_reindex_defers_inline_lexical_updates_for_large_db"
+                },
+            )
+        } else if explicit_watch_once {
+            (
+                LexicalPopulationStrategy::IncrementalInline,
+                "watch_once_targeted_reindex_applies_inline_lexical_updates_for_changed_paths",
+            )
         } else {
-            "watch_reindex_applies_inline_lexical_updates_for_changed_paths"
+            (
+                LexicalPopulationStrategy::IncrementalInline,
+                "watch_reindex_applies_inline_lexical_updates_for_changed_paths",
+            )
         };
         record_lexical_population_strategy_if_unset(
             opts.progress.as_ref(),
-            LexicalPopulationStrategy::IncrementalInline,
+            lexical_strategy,
             lexical_strategy_reason,
         );
         if explicit_watch_once && !force_full && semantic_delta.is_none() {
@@ -16422,6 +16721,7 @@ fn reindex_paths_with_semantic_delta(
         let mut inserted_messages = 0usize;
         let mut processed_conversations = 0usize;
         let mut quarantined_conversations = 0usize;
+        let mut lexical_deferred_conversations = 0usize;
         {
             let storage = storage
                 .lock()
@@ -16446,6 +16746,7 @@ fn reindex_paths_with_semantic_delta(
                 watch_ingest_chunk_size()
             };
             let capture_semantic_delta = semantic_delta.is_some();
+            let mut deferred_lexical_seen = false;
             for chunk in convs.chunks(ingest_chunk_size) {
                 let chunk_outcome = ingest_watch_batch_with_oom_split(
                     &storage,
@@ -16455,6 +16756,7 @@ fn reindex_paths_with_semantic_delta(
                     &opts.progress,
                     !opts.watch,
                     capture_semantic_delta,
+                    preemptively_defer_lexical_updates,
                 )?;
                 inserted_messages =
                     inserted_messages.saturating_add(chunk_outcome.batch_outcome.inserted_messages);
@@ -16462,6 +16764,10 @@ fn reindex_paths_with_semantic_delta(
                     processed_conversations.saturating_add(chunk_outcome.processed_conversations);
                 quarantined_conversations = quarantined_conversations
                     .saturating_add(chunk_outcome.quarantined_conversations);
+                lexical_deferred_conversations = lexical_deferred_conversations
+                    .saturating_add(chunk_outcome.lexical_deferred_conversations);
+                deferred_lexical_seen =
+                    deferred_lexical_seen || chunk_outcome.lexical_deferred_conversations > 0;
                 if let Some(delta) = semantic_delta.as_deref_mut() {
                     delta.extend_from_batch(
                         chunk_outcome.batch_outcome.semantic_delta_inputs,
@@ -16479,7 +16785,13 @@ fn reindex_paths_with_semantic_delta(
                     &storage,
                     false,
                     "updating watch last_indexed_at",
-                    |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
+                    |writer| {
+                        if deferred_lexical_seen {
+                            writer.set_last_indexed_at(0)
+                        } else {
+                            writer.set_last_indexed_at(FrankenStorage::now_millis())
+                        }
+                    },
                 )?;
 
                 if !explicit_watch_once
@@ -16495,6 +16807,9 @@ fn reindex_paths_with_semantic_delta(
                 }
             }
         }
+        if lexical_deferred_conversations > 0 {
+            mark_deferred_lexical_refresh_needed(&opts.data_dir, lexical_deferred_conversations)?;
+        }
         let index_ms = index_start.elapsed().as_millis() as u64;
 
         if let Some(p) = &opts.progress
@@ -16508,6 +16823,12 @@ fn reindex_paths_with_semantic_delta(
             stats.index_ms = stats.index_ms.saturating_add(index_ms);
             stats.total_conversations = stats.total_conversations.saturating_add(conv_count);
             stats.total_messages = stats.total_messages.saturating_add(inserted_messages);
+            stats.lexical_deferred_conversations = stats
+                .lexical_deferred_conversations
+                .saturating_add(lexical_deferred_conversations);
+            stats.quarantined_conversations = stats
+                .quarantined_conversations
+                .saturating_add(quarantined_conversations);
             stats.connectors.push(ConnectorStats {
                 name: connector_name.clone(),
                 conversations: conv_count,
@@ -16529,6 +16850,13 @@ fn reindex_paths_with_semantic_delta(
                 ?kind,
                 quarantined_conversations,
                 "watch ingest skipped poison conversations after OOM bisection"
+            );
+        }
+        if lexical_deferred_conversations > 0 {
+            tracing::warn!(
+                ?kind,
+                lexical_deferred_conversations,
+                "watch ingest persisted conversations with lexical updates deferred after OOM"
             );
         }
 
@@ -19111,6 +19439,7 @@ pub mod persist {
             defer_checkpoints,
             false,
             None,
+            false,
         )
     }
 
@@ -19122,6 +19451,26 @@ pub mod persist {
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
     ) -> Result<PersistBatchOutcome> {
+        persist_conversations_batched_with_raw_mirror_links_inner(
+            storage,
+            t_index,
+            data_dir,
+            convs,
+            lexical_strategy,
+            defer_checkpoints,
+            false,
+        )
+    }
+
+    pub(super) fn persist_conversations_batched_with_raw_mirror_links_inner(
+        storage: &FrankenStorage,
+        t_index: Option<&mut TantivyIndex>,
+        data_dir: &Path,
+        convs: &[NormalizedConversation],
+        lexical_strategy: LexicalPopulationStrategy,
+        defer_checkpoints: bool,
+        force_defer_lexical_updates: bool,
+    ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
             t_index,
@@ -19130,16 +19479,18 @@ pub mod persist {
             defer_checkpoints,
             false,
             Some(data_dir),
+            force_defer_lexical_updates,
         )
     }
 
-    pub(super) fn persist_conversations_batched_with_semantic_delta_and_raw_mirror_links(
+    pub(super) fn persist_conversations_batched_with_semantic_delta_and_raw_mirror_links_inner(
         storage: &FrankenStorage,
         t_index: Option<&mut TantivyIndex>,
         data_dir: &Path,
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
+        force_defer_lexical_updates: bool,
     ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
@@ -19149,9 +19500,11 @@ pub mod persist {
             defer_checkpoints,
             true,
             Some(data_dir),
+            force_defer_lexical_updates,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn persist_conversations_batched_inner(
         storage: &FrankenStorage,
         mut t_index: Option<&mut TantivyIndex>,
@@ -19160,11 +19513,13 @@ pub mod persist {
         defer_checkpoints: bool,
         capture_semantic_delta: bool,
         raw_mirror_data_dir: Option<&Path>,
+        force_defer_lexical_updates: bool,
     ) -> Result<PersistBatchOutcome> {
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
         }
-        if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
+        if !force_defer_lexical_updates
+            && lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
             && t_index.is_none()
         {
             anyhow::bail!(
@@ -19172,8 +19527,12 @@ pub mod persist {
                 lexical_strategy.as_str()
             );
         }
+        if super::should_inject_watch_lexical_test_oom(convs, force_defer_lexical_updates) {
+            anyhow::bail!("out of memory");
+        }
 
-        let begin_concurrent_enabled = begin_concurrent_writes_enabled();
+        let begin_concurrent_enabled =
+            begin_concurrent_writes_enabled() && !force_defer_lexical_updates;
         let duplicate_keys_present =
             begin_concurrent_enabled && duplicate_conversation_keys_present(convs);
 
@@ -19280,13 +19639,19 @@ pub mod persist {
                 for start in (0..refs.len()).step_by(chunk_size) {
                     let end = (start + chunk_size).min(refs.len());
                     let chunk_refs = &refs[start..end];
-                    outcomes.extend(writer.insert_conversations_batched(chunk_refs)?);
+                    if force_defer_lexical_updates {
+                        outcomes.extend(
+                            writer.insert_conversations_batched_deferred_lexical(chunk_refs)?,
+                        );
+                    } else {
+                        outcomes.extend(writer.insert_conversations_batched(chunk_refs)?);
+                    }
                 }
 
                 Ok(outcomes)
             },
         )?;
-        let defer_lexical_updates = defer_lexical_updates_enabled();
+        let defer_lexical_updates = force_defer_lexical_updates || defer_lexical_updates_enabled();
         let mut batch_outcome = PersistBatchOutcome::default();
         record_persisted_raw_mirror_db_links(raw_mirror_data_dir, convs, &outcomes);
         if !defer_lexical_updates {
@@ -19500,6 +19865,62 @@ pub mod persist {
         fn defer_lexical_updates_flag_parsing() {
             let _guard = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
             assert!(defer_lexical_updates_enabled());
+        }
+
+        #[test]
+        #[serial]
+        fn force_deferred_lexical_persist_skips_post_write_tantivy_update() {
+            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("force-deferred-lexical.db");
+            let storage = create_franken_db(&db_path);
+            let convs = vec![NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: Some("force-deferred-1".into()),
+                title: Some("Force deferred lexical".into()),
+                workspace: Some(std::path::PathBuf::from("/tmp/force-deferred")),
+                source_path: std::path::PathBuf::from("/tmp/force-deferred/session.jsonl"),
+                started_at: Some(1_779_031_082_000),
+                ended_at: Some(1_779_031_083_000),
+                metadata: serde_json::json!({}),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".into(),
+                    author: Some("tester".into()),
+                    created_at: Some(1_779_031_082_100),
+                    content: "force deferred lexical should not touch tantivy".into(),
+                    extra: serde_json::json!({}),
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                }],
+            }];
+
+            let outcome = persist_conversations_batched_inner(
+                &storage,
+                None,
+                &convs,
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+                false,
+                None,
+                true,
+            )
+            .expect("forced lexical deferral should persist without a Tantivy writer");
+
+            assert_eq!(outcome.inserted_conversations, 1);
+            assert_eq!(outcome.inserted_messages, 1);
+            let conversation_count: i64 = storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            let message_count: i64 = storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(conversation_count, 1);
+            assert_eq!(message_count, 1);
         }
 
         #[test]
@@ -34035,6 +34456,205 @@ mod tests {
         } else {
             unsafe { std::env::remove_var("XDG_DATA_HOME") };
         }
+    }
+
+    #[test]
+    #[serial]
+    fn watch_once_single_conversation_lexical_oom_retries_with_deferred_lexical() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch_once_lexical_oom");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let session_path = amp_dir.join("thread-lexical-oom.json");
+        std::fs::write(
+            &session_path,
+            r#"{"id":"thread-lexical-oom","messages":[{"role":"user","text":"lexical oom retry proof","createdAt":1779027592740}]}"#,
+        )
+        .unwrap();
+        let _oom_guard = set_env("CASS_TEST_WATCH_LEXICAL_OOM_MIN_CONVS", "1");
+        let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+
+        let progress = Arc::new(super::IndexingProgress::default());
+        let opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: Some(progress.clone()),
+            watch_once_paths: Some(vec![session_path.clone()]),
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![session_path],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 1);
+        assert_eq!(progress.current.load(Ordering::Relaxed), 1);
+        let storage_guard = storage.lock().unwrap();
+        let conversation_rows: i64 = storage_guard
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let message_rows: i64 = storage_guard
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(conversation_rows, 1);
+        assert_eq!(message_rows, 1);
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "lexical-only OOM should not poison a conversation that can be persisted with lexical updates deferred"
+        );
+        let stats = progress.stats.lock().unwrap();
+        assert_eq!(stats.lexical_deferred_conversations, 1);
+        assert_eq!(stats.quarantined_conversations, 0);
+        assert_eq!(stats.total_messages, 1);
+        assert!(deferred_lexical_refresh_needed(&data_dir));
+        assert_eq!(
+            storage_guard.get_last_indexed_at().unwrap(),
+            Some(0),
+            "deferred lexical updates must leave readiness stale until an authoritative lexical refresh runs"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn watch_once_large_db_preemptively_defers_lexical_before_oom() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch_once_preemptive_lexical_defer");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let session_path = amp_dir.join("thread-preemptive-lexical-defer.json");
+        std::fs::write(
+            &session_path,
+            r#"{"id":"thread-preemptive-lexical-defer","messages":[{"role":"user","text":"preemptive lexical defer proof","createdAt":1779031504767}]}"#,
+        )
+        .unwrap();
+        let _oom_guard = set_env("CASS_TEST_WATCH_LEXICAL_OOM_MIN_CONVS", "1");
+        let _threshold_guard = set_env("CASS_WATCH_PREEMPTIVE_LEXICAL_DEFER_DB_BYTES", "1");
+        let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+
+        let progress = Arc::new(super::IndexingProgress::default());
+        let opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: Some(progress.clone()),
+            watch_once_paths: Some(vec![session_path.clone()]),
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![session_path],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 1);
+        assert_eq!(progress.current.load(Ordering::Relaxed), 1);
+        let storage_guard = storage.lock().unwrap();
+        let conversation_rows: i64 = storage_guard
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let message_rows: i64 = storage_guard
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(conversation_rows, 1);
+        assert_eq!(message_rows, 1);
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "large DB preemptive lexical deferral should avoid poisoning before an inline lexical OOM"
+        );
+        let stats = progress.stats.lock().unwrap();
+        assert_eq!(
+            stats.lexical_strategy_reason.as_deref(),
+            Some("watch_once_targeted_reindex_defers_inline_lexical_updates_for_large_db")
+        );
+        assert_eq!(stats.lexical_deferred_conversations, 1);
+        assert_eq!(stats.quarantined_conversations, 0);
+        assert_eq!(stats.total_messages, 1);
+        assert!(deferred_lexical_refresh_needed(&data_dir));
+        assert_eq!(
+            storage_guard.get_last_indexed_at().unwrap(),
+            Some(0),
+            "preemptive lexical deferral must not report the lexical index as freshly updated"
+        );
+    }
+
+    #[test]
+    fn deferred_lexical_refresh_marker_round_trips_pending_and_resolved() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+
+        assert!(!deferred_lexical_refresh_needed(data_dir));
+        mark_deferred_lexical_refresh_needed(data_dir, 3).unwrap();
+        assert!(deferred_lexical_refresh_needed(data_dir));
+        mark_deferred_lexical_refresh_resolved(data_dir).unwrap();
+        assert!(!deferred_lexical_refresh_needed(data_dir));
     }
 
     #[test]

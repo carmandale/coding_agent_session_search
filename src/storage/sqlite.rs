@@ -10070,13 +10070,29 @@ impl FrankenStorage {
         &self,
         conversations: &[(i64, Option<i64>, &Conversation)],
     ) -> Result<Vec<InsertOutcome>> {
+        self.insert_conversations_batched_inner(conversations, false)
+    }
+
+    pub fn insert_conversations_batched_deferred_lexical(
+        &self,
+        conversations: &[(i64, Option<i64>, &Conversation)],
+    ) -> Result<Vec<InsertOutcome>> {
+        self.insert_conversations_batched_inner(conversations, true)
+    }
+
+    fn insert_conversations_batched_inner(
+        &self,
+        conversations: &[(i64, Option<i64>, &Conversation)],
+        force_defer_lexical_updates: bool,
+    ) -> Result<Vec<InsertOutcome>> {
         if conversations.is_empty() {
             return Ok(Vec::new());
         }
 
         self.ensure_sources_for_batch(conversations)?;
 
-        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
+        let defer_lexical_updates =
+            force_defer_lexical_updates || defer_storage_lexical_updates_enabled();
         let defer_analytics_updates = defer_analytics_updates_enabled();
 
         let pricing_table = PricingTable::franken_load(&self.conn).unwrap_or_else(|e| {

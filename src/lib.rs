@@ -11519,7 +11519,11 @@ fn state_meta_json_inner(
 
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
     let lexical_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
-    if last_indexed_at.is_none() && lexical_index_initialized {
+    let deferred_lexical_refresh_pending =
+        crate::indexer::deferred_lexical_refresh_needed(data_dir);
+    if deferred_lexical_refresh_pending {
+        last_indexed_at = Some(0);
+    } else if last_indexed_at.is_none() && lexical_index_initialized {
         last_indexed_at = crate::search::tantivy::searchable_index_modified_time(&index_path)
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);

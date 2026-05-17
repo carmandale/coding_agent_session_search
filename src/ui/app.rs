@@ -12667,7 +12667,6 @@ impl CassApp {
         let prev_visible = self.help_visible_height.get() as usize;
         let title = if prev_content > prev_visible && prev_visible > 0 {
             let max_scroll = prev_content.saturating_sub(prev_visible);
-            #[allow(clippy::manual_checked_ops)]
             let pct = if max_scroll == 0 {
                 100
             } else {
