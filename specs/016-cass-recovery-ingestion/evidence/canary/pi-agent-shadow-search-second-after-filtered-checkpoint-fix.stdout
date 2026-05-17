@@ -1,0 +1,455 @@
+{
+  "query": "ATT21_COL_CFP_SceneMachine_EndCard.psd",
+  "limit": 5,
+  "offset": 0,
+  "count": 5,
+  "total_matches": 30,
+  "hits": [
+    {
+      "source_path": "/Users/dalecarman/.pi/agent/sessions/--Users-dalecarman-dev-dropbox-cli--/2026-04-01T08-29-10-484Z_8e2e91b7-b93d-42ce-9545-f99d648c6abc.jsonl",
+      "line_number": 97,
+      "agent": "pi_agent"
+    },
+    {
+      "source_path": "/Users/dalecarman/.pi/agent/sessions/--Users-dalecarman-Groove Jones Dropbox-Dale Carman-Projects-dev-hsbc--/2026-03-20T18-01-27-792Z_e584e986-49fa-4bf6-8b41-c9f6f486b678.jsonl",
+      "line_number": 126,
+      "agent": "pi_agent"
+    },
+    {
+      "source_path": "/Users/dalecarman/.pi/agent/sessions/--Users-dalecarman-Groove Jones Dropbox-Dale Carman-Projects-dev-operator--/2026-03-23T14-24-21-872Z_23e4b434-1ccf-4289-aa09-64817369e68e.jsonl",
+      "line_number": 132,
+      "agent": "pi_agent"
+    },
+    {
+      "source_path": "/Users/dalecarman/.pi/agent/sessions/--Users-dalecarman-Groove Jones Dropbox-Dale Carman-Projects-dev-automated_plan_reviser_pro--/2026-01-13T17-20-50-871Z_e9c4391d-3748-41b3-9ef0-de167139aca4.jsonl",
+      "line_number": 310,
+      "agent": "pi_agent"
+    },
+    {
+      "source_path": "/Users/dalecarman/.pi/agent/sessions/--Users-dalecarman-dev-dropbox-cli--/2026-04-01T08-29-10-484Z_8e2e91b7-b93d-42ce-9545-f99d648c6abc.jsonl",
+      "line_number": 100,
+      "agent": "pi_agent"
+    }
+  ],
+  "max_tokens": null,
+  "request_id": null,
+  "cursor": null,
+  "hits_clamped": false,
+  "_meta": {
+    "elapsed_ms": 7301,
+    "search_mode": "lexical",
+    "requested_search_mode": "lexical",
+    "mode_defaulted": false,
+    "fallback_tier": null,
+    "fallback_reason": null,
+    "semantic_refinement": false,
+    "wildcard_fallback": false,
+    "cache_stats": {
+      "hits": 0,
+      "misses": 0,
+      "shortfall": 0,
+      "prewarm_scheduled": 0,
+      "prewarm_skipped_pressure": 0
+    },
+    "timing": {
+      "search_ms": 7,
+      "rerank_ms": 0,
+      "other_ms": 7294
+    },
+    "tokens_estimated": 279,
+    "max_tokens": null,
+    "request_id": null,
+    "next_cursor": "eyJvZmZzZXQiOjUsImxpbWl0Ijo1fQ==",
+    "hits_clamped": false,
+    "query_plan": {
+      "schema_version": "1",
+      "planner_id": "query_cost.v1",
+      "phases": [
+        {
+          "phase": "lexical",
+          "planned": true,
+          "realized": true,
+          "budget": {
+            "limit": 5,
+            "offset": 0,
+            "max_tokens": null,
+            "timeout_ms": 120000
+          },
+          "reason": "lexical phase realized for the selected search mode"
+        },
+        {
+          "phase": "semantic",
+          "planned": false,
+          "realized": false,
+          "budget": {
+            "limit": 5,
+            "offset": 0,
+            "max_tokens": null,
+            "timeout_ms": 120000
+          },
+          "reason": "semantic phase not planned for lexical mode"
+        },
+        {
+          "phase": "hydration",
+          "planned": true,
+          "realized": true,
+          "budget": {
+            "limit": 5,
+            "offset": 0,
+            "max_tokens": null,
+            "timeout_ms": 120000
+          },
+          "reason": "hydrated 5 result(s) for 30 total match(es)"
+        },
+        {
+          "phase": "output",
+          "planned": true,
+          "realized": true,
+          "budget": {
+            "limit": 5,
+            "offset": 0,
+            "max_tokens": null,
+            "timeout_ms": 120000
+          },
+          "reason": "projection minimal emitted 5 hit(s)"
+        },
+        {
+          "phase": "cursor",
+          "planned": true,
+          "realized": true,
+          "budget": {
+            "limit": 5,
+            "offset": 0,
+            "max_tokens": null,
+            "timeout_ms": null
+          },
+          "reason": "first page preserved continuity by emitting next_cursor"
+        }
+      ],
+      "budget_exhaustion": {
+        "kind": "cursor_page",
+        "reason": "result window ended before the full match set; continue with next_cursor"
+      },
+      "result_identity": {
+        "input_cursor_present": false,
+        "next_cursor_present": true,
+        "cursor_continuation": true,
+        "offset": 0,
+        "limit": 5,
+        "returned_count": 5,
+        "total_matches": 30,
+        "continuity_key": "offset:0:limit:5:returned:5:total:30",
+        "reason": "first page preserved continuity by emitting next_cursor"
+      },
+      "cache": {
+        "eligible": true,
+        "hits": 0,
+        "misses": 0,
+        "shortfall": 0,
+        "reason": "cache eligible; no cache event was reported"
+      },
+      "summary": "lexical mode realized with 5 returned / 30 total match(es), projection=minimal, query_chars=38"
+    },
+    "cursor_manifest": {
+      "schema_version": 1,
+      "has_more": true,
+      "count_precision": "exact",
+      "count_reason": "search backend returned an exact total without an extra recount",
+      "continuation_safe": true,
+      "continuation_reason": "cursor offset advances by emitted hits; reuse the same query, filters, mode, and fields",
+      "input_cursor_present": false,
+      "next_cursor_present": true,
+      "offset": 0,
+      "next_offset": 5,
+      "requested_limit": 5,
+      "realized_limit": 5,
+      "returned_count": 5,
+      "search_page_count": 5,
+      "total_matches": 30,
+      "field_mask": {
+        "requested": [
+          "minimal"
+        ],
+        "resolved": [
+          "source_path",
+          "line_number",
+          "agent"
+        ],
+        "projection": "minimal"
+      },
+      "token_budget": {
+        "max_tokens": null,
+        "tokens_estimated": 279,
+        "hits_clamped": false
+      },
+      "cache_generation": {
+        "reader_generation": 1,
+        "reloads": 0,
+        "reload_ms_total": 0,
+        "policy": "lru",
+        "ghost_entries": 0,
+        "admission_rejects": 0
+      },
+      "index_generation": {
+        "lexical_shard_generation": "1",
+        "freshness": {
+          "exists": true,
+          "status": "stale",
+          "reason": "lexical index is older than the stale threshold",
+          "fresh": false,
+          "last_indexed_at": "2026-05-16T20:40:45.732+00:00",
+          "age_seconds": 2816,
+          "stale": true,
+          "stale_threshold_seconds": 1800,
+          "rebuilding": false,
+          "pending_sessions": 0
+        },
+        "stale": true,
+        "rebuilding": false,
+        "pending_sessions": 0
+      },
+      "semantic_fallback": {
+        "requested_search_mode": "lexical",
+        "realized_search_mode": "lexical",
+        "fallback_tier": null,
+        "fallback_reason": null,
+        "semantic_refinement": false
+      }
+    },
+    "explanation_cards": [],
+    "state": {
+      "index": {
+        "exists": true,
+        "status": "stale",
+        "reason": "lexical index is older than the stale threshold",
+        "fresh": false,
+        "last_indexed_at": "2026-05-16T20:40:45.732+00:00",
+        "age_seconds": 2816,
+        "stale": true,
+        "stale_threshold_seconds": 1800,
+        "rebuilding": false,
+        "activity_at": null,
+        "documents": null,
+        "empty_with_messages": false,
+        "fingerprint": {
+          "current_db_fingerprint": null,
+          "checkpoint_fingerprint": "content-v1:11697:11702:1231897",
+          "matches_current_db_fingerprint": null
+        },
+        "checkpoint": {
+          "present": true,
+          "completed": true,
+          "db_matches": true,
+          "schema_matches": true,
+          "page_size_matches": true,
+          "page_size_compatible": true
+        }
+      },
+      "database": {
+        "exists": true,
+        "opened": true,
+        "conversations": null,
+        "messages": null,
+        "open_error": null,
+        "open_retryable": false,
+        "counts_skipped": true,
+        "open_skipped": false
+      },
+      "pending": {
+        "sessions": 0,
+        "watch_active": false,
+        "orphaned": false
+      },
+      "rebuild": {
+        "active": false,
+        "orphaned": false,
+        "pid": null,
+        "mode": null,
+        "job_id": null,
+        "job_kind": null,
+        "phase": null,
+        "started_at": null,
+        "updated_at": null,
+        "processed_conversations": null,
+        "total_conversations": null,
+        "indexed_docs": null,
+        "pipeline": {
+          "workers": 2,
+          "available_parallelism": 16,
+          "reserved_cores": 2,
+          "tantivy_writer_threads": 2,
+          "staged_shard_builders": 1,
+          "staged_merge_workers": 1,
+          "controller_mode": "auto",
+          "controller_restore_clear_samples": 3,
+          "controller_restore_hold_ms": 5000,
+          "pipeline_max_message_bytes_in_flight": 67108864,
+          "page_prep_workers": 1,
+          "page_size": 1024,
+          "steady_batch_fetch_conversations": 512,
+          "startup_batch_fetch_conversations": 32,
+          "steady_commit_every_conversations": 10000,
+          "startup_commit_every_conversations": 2048,
+          "steady_commit_every_messages": 800000,
+          "startup_commit_every_messages": 800000,
+          "steady_commit_every_message_bytes": 67108864,
+          "startup_commit_every_message_bytes": 33554432,
+          "pipeline_channel_size": 1,
+          "controller_loadavg_high_watermark_1m": null,
+          "controller_loadavg_low_watermark_1m": null,
+          "runtime": null
+        }
+      },
+      "semantic": {
+        "status": "missing",
+        "availability": "needs_consent",
+        "summary": "consent required for model download",
+        "available": false,
+        "can_search": false,
+        "fallback_mode": "lexical",
+        "preferred_backend": "fastembed",
+        "embedder_id": "minilm-384",
+        "vector_index_path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search-spec016-shadow-20260516T2025Z/vector_index/index-minilm-384.fsvi",
+        "model_dir": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search-spec016-shadow-20260516T2025Z/models/all-MiniLM-L6-v2",
+        "hnsw_path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search-spec016-shadow-20260516T2025Z/vector_index/hnsw-minilm-384.chsw",
+        "hnsw_ready": false,
+        "progressive_ready": false,
+        "hint": "Run 'cass models install' and then 'cass index --semantic'; lexical search remains available without the model",
+        "fast_tier": {
+          "present": false,
+          "ready": false,
+          "current_db_matches": null,
+          "conversation_count": null,
+          "doc_count": null,
+          "embedder_id": null,
+          "model_revision": null,
+          "completed_at": null,
+          "size_bytes": null
+        },
+        "quality_tier": {
+          "present": false,
+          "ready": false,
+          "current_db_matches": null,
+          "conversation_count": null,
+          "doc_count": null,
+          "embedder_id": null,
+          "model_revision": null,
+          "completed_at": null,
+          "size_bytes": null
+        },
+        "backlog": {
+          "total_conversations": 0,
+          "fast_tier_processed": 0,
+          "fast_tier_remaining": 0,
+          "quality_tier_processed": 0,
+          "quality_tier_remaining": 0,
+          "pending_work": false,
+          "current_db_matches": null,
+          "computed_at": null
+        },
+        "checkpoint": {
+          "active": false,
+          "tier": null,
+          "current_db_matches": null,
+          "completed": null,
+          "conversations_processed": null,
+          "total_conversations": null,
+          "progress_pct": null,
+          "docs_embedded": null,
+          "last_offset": null,
+          "saved_at": null
+        }
+      },
+      "policy_registry": {
+        "schema_version": "1",
+        "controllers": [
+          {
+            "controller_id": "lexical_rebuild_pipeline",
+            "policy_id": "lexical_rebuild.pipeline.v1",
+            "policy_version": "pipeline_settings_v1",
+            "status": "active",
+            "fallback_state": "not_needed",
+            "conservative_fallback": false,
+            "decision_reason": "pipeline settings active",
+            "inputs": {
+              "controller_loadavg_high_watermark_1m": "null",
+              "controller_loadavg_low_watermark_1m": "null",
+              "controller_mode": "auto",
+              "controller_restore_clear_samples": "3",
+              "controller_restore_hold_ms": "5000",
+              "page_prep_workers": "1",
+              "pipeline_channel_size": "1",
+              "pipeline_max_message_bytes_in_flight": "67108864",
+              "staged_merge_workers": "1",
+              "staged_shard_builders": "1"
+            }
+          },
+          {
+            "controller_id": "semantic_search",
+            "policy_id": "semantic.hybrid_preferred.v1",
+            "policy_version": "semantic_schema_1+chunking_1",
+            "status": "fallback",
+            "fallback_state": "conservative",
+            "conservative_fallback": true,
+            "decision_reason": "semantic unavailable; lexical fallback remains active",
+            "inputs": {
+              "chunk_timeout_seconds": "120",
+              "chunking_strategy_version": "1",
+              "download_policy": "opt_in",
+              "fast_dimension": "256",
+              "fast_tier_embedder": "hash",
+              "idle_delay_seconds": "30",
+              "max_backfill_rss_mb": "256",
+              "max_backfill_threads": "1",
+              "max_model_size_mb": "300",
+              "max_refinement_docs": "100",
+              "min_free_disk_mb": "200",
+              "mode": "hybrid_preferred",
+              "quality_dimension": "384",
+              "quality_tier_embedder": "minilm",
+              "quality_weight": "0.7",
+              "reranker": "ms-marco-minilm",
+              "semantic_available": "false",
+              "semantic_budget_mb": "500",
+              "semantic_fallback_mode": "lexical",
+              "semantic_schema_version": "1"
+            }
+          }
+        ]
+      },
+      "_meta": {
+        "timestamp": "2026-05-16T21:27:41+00:00",
+        "data_dir": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search-spec016-shadow-20260516T2025Z",
+        "db_path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search-spec016-shadow-20260516T2025Z/agent_search.db"
+      },
+      "index_freshness": {
+        "exists": true,
+        "status": "stale",
+        "reason": "lexical index is older than the stale threshold",
+        "fresh": false,
+        "last_indexed_at": "2026-05-16T20:40:45.732+00:00",
+        "age_seconds": 2816,
+        "stale": true,
+        "stale_threshold_seconds": 1800,
+        "rebuilding": false,
+        "pending_sessions": 0
+      },
+      "_warning": "Index may be stale (age: 2816 seconds; pending sessions: 0). Run `cass index --full` or enable watch mode for fresh results."
+    },
+    "index_freshness": {
+      "exists": true,
+      "status": "stale",
+      "reason": "lexical index is older than the stale threshold",
+      "fresh": false,
+      "last_indexed_at": "2026-05-16T20:40:45.732+00:00",
+      "age_seconds": 2816,
+      "stale": true,
+      "stale_threshold_seconds": 1800,
+      "rebuilding": false,
+      "pending_sessions": 0
+    },
+    "timeout_ms": 120000,
+    "timed_out": false
+  },
+  "_warning": "Index may be stale (age: 2816 seconds; pending sessions: 0). Run `cass index --full` or enable watch mode for fresh results."
+}

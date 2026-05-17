@@ -1,0 +1,8 @@
+{
+  "success": false,
+  "error": "index failed: sqlite3 exited with status exit status: 1 for dropping derived fts_messages before frankensqlite open: Error: in prepare, vtable constructor failed: fts_messages",
+  "elapsed_ms": 110,
+  "code": 9,
+  "kind": "index",
+  "retryable": true
+}

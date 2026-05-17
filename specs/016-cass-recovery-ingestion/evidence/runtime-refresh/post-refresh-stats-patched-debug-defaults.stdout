@@ -1,0 +1,105 @@
+{
+  "conversations": 9659,
+  "messages": 903268,
+  "by_agent": [
+    {
+      "agent": "codex",
+      "count": 5712
+    },
+    {
+      "agent": "claude_code",
+      "count": 2574
+    },
+    {
+      "agent": "opencode",
+      "count": 976
+    },
+    {
+      "agent": "cursor",
+      "count": 228
+    },
+    {
+      "agent": "factory",
+      "count": 66
+    },
+    {
+      "agent": "pi_agent",
+      "count": 38
+    },
+    {
+      "agent": "amp",
+      "count": 33
+    },
+    {
+      "agent": "gemini",
+      "count": 31
+    },
+    {
+      "agent": "hermes",
+      "count": 1
+    }
+  ],
+  "top_workspaces": [
+    {
+      "workspace": "/Users/dalecarman/Groove Jones Dropbox/Dale Carman/Projects/dev/orchestrator",
+      "count": 1087
+    },
+    {
+      "workspace": "/Users/dalecarman/.agent-config",
+      "count": 766
+    },
+    {
+      "workspace": "/Users/dalecarman/Groove Jones Dropbox/Dale Carman/Projects/dev/groovetech-media-server",
+      "count": 664
+    },
+    {
+      "workspace": "/private/var/folders/2j/3tf17x5d7pj10gdjbp1ydpf40000gn/T",
+      "count": 659
+    },
+    {
+      "workspace": "/Users/dalecarman/Groove Jones Dropbox/Dale Carman/Projects/dev/groovetech-media-player",
+      "count": 532
+    },
+    {
+      "workspace": "/Users/dalecarman/Groove Jones Dropbox/Dale Carman/Projects/dev/PfizerOutdoCancerV2",
+      "count": 496
+    },
+    {
+      "workspace": "/Users/dalecarman/Groove Jones Dropbox/Dale Carman/Projects/dac-wiki",
+      "count": 362
+    },
+    {
+      "workspace": "/Users/dalecarman/dev/hsbc",
+      "count": 308
+    },
+    {
+      "workspace": "/Users/dalecarman/clawdbot",
+      "count": 275
+    },
+    {
+      "workspace": "/Users/dalecarman/dev/operator",
+      "count": 227
+    }
+  ],
+  "date_range": {
+    "oldest": "2025-09-15T18:31:07.309+00:00",
+    "newest": "2026-05-15T18:07:13.676+00:00"
+  },
+  "raw_mirror": {
+    "initialized": true,
+    "root_path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search/raw-mirror/v1",
+    "total_storage_bytes": 31494183651,
+    "manifest_count": 149925,
+    "manifest_bytes": 239519316,
+    "unique_blob_count": 136162,
+    "total_blob_bytes": 31254191385,
+    "largest_blob_bytes": 2570897520,
+    "missing_blob_count": 0,
+    "invalid_manifest_count": 0,
+    "oldest_capture_at_ms": 1778625817296,
+    "newest_capture_at_ms": 1778881345743,
+    "oldest_source_mtime_ms": 1724883214480,
+    "newest_source_mtime_ms": 1778881345690
+  },
+  "db_path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search/agent_search.db"
+}

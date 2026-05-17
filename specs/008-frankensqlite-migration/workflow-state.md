@@ -1,0 +1,7 @@
+2026-03-27 05:36 | unknown | /issue | spec.md, log.md recorded
+2026-03-27 10:26 | pi/claude-sonnet-4-6 | /shape | shaping-transcript.md recorded
+2026-03-27 11:03 | pi/claude-sonnet-4-6 | /shape | shaping-transcript.md recorded
+2026-03-27 11:44 | pi/claude-sonnet-4-6 | /plan | plan.md, tasks.md recorded
+2026-03-27 12:19 | codex/gpt-5.3-codex | /codex-review | codex-review.md recorded (rounds: 5)
+2026-03-27 13:30 | pi/claude-sonnet-4-6 | /implement | implement-receipt.md recorded
+2026-03-29 04:48 | codex/gpt-5.3-codex | /code-verify | code-verify.md recorded | implement-receipt.md sentinel restored (rounds: 3)

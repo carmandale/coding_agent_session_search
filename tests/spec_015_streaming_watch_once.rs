@@ -25,8 +25,8 @@ use tempfile::TempDir;
 
 use coding_agent_search::connectors::{Connector, ScanContext, pi_agent::PiAgentConnector};
 use coding_agent_search::indexer::scratch_root::{
-    build_scratch_root, chunk_by_files_and_bytes, derive_pi_sessions_root,
-    remap_source_path_field, ScanBatchLimits,
+    ScanBatchLimits, build_scratch_root, chunk_by_files_and_bytes, derive_pi_sessions_root,
+    remap_source_path_field,
 };
 use serial_test::serial;
 
@@ -82,17 +82,17 @@ fn spec_015_external_id_invariant_under_scratch_root() {
         std::env::set_var("PI_CODING_AGENT_DIR", &original);
     }
     let conn = PiAgentConnector::new();
-    let ctx = ScanContext::with_roots(
-        original.clone(),
-        Vec::new(),
-        None,
-    );
+    let ctx = ScanContext::with_roots(original.clone(), Vec::new(), None);
     let original_convs = conn.scan(&ctx).expect("original scan");
     let original_eids: Vec<String> = original_convs
         .iter()
         .filter_map(|c| c.external_id.clone())
         .collect();
-    assert_eq!(original_eids.len(), 6, "expected 6 conversations from original scan");
+    assert_eq!(
+        original_eids.len(),
+        6,
+        "expected 6 conversations from original scan"
+    );
 
     // Build a scratch root mirroring the canonical layout.
     let workdir = dir.path().join("scratch");
@@ -104,25 +104,32 @@ fn spec_015_external_id_invariant_under_scratch_root() {
         max_bytes: u64::MAX,
     };
     let batches = chunk_by_files_and_bytes(&discovered, limits);
-    assert_eq!(batches.len(), 1, "expected single batch for 6 files under generous limits");
+    assert_eq!(
+        batches.len(),
+        1,
+        "expected single batch for 6 files under generous limits"
+    );
     let (guard, skips) = build_scratch_root(batches[0], &workdir, &original_sessions).unwrap();
-    assert!(skips.is_empty(), "expected no scratch skips on clean fixture");
+    assert!(
+        skips.is_empty(),
+        "expected no scratch skips on clean fixture"
+    );
 
     // Re-scan via the scratch root.
     unsafe {
         std::env::set_var("PI_CODING_AGENT_DIR", guard.path());
     }
-    let scratch_ctx = ScanContext::with_roots(
-        original.clone(),
-        Vec::new(),
-        None,
-    );
+    let scratch_ctx = ScanContext::with_roots(original.clone(), Vec::new(), None);
     let scratch_convs = conn.scan(&scratch_ctx).expect("scratch scan");
     let scratch_eids: Vec<String> = scratch_convs
         .iter()
         .filter_map(|c| c.external_id.clone())
         .collect();
-    assert_eq!(scratch_eids.len(), 6, "expected 6 conversations from scratch scan");
+    assert_eq!(
+        scratch_eids.len(),
+        6,
+        "expected 6 conversations from scratch scan"
+    );
 
     // The external_id sets MUST match (sorted, since scan order may differ).
     let mut a = original_eids;
@@ -158,7 +165,10 @@ fn spec_015_scratch_layout_mirrors_canonical_pi_shape() {
     let ctx = ScanContext::with_roots(original.clone(), Vec::new(), None);
     let discovered = conn.discover_source_files(&ctx).expect("discover");
 
-    let limits = ScanBatchLimits { max_files: 100, max_bytes: u64::MAX };
+    let limits = ScanBatchLimits {
+        max_files: 100,
+        max_bytes: u64::MAX,
+    };
     let batches = chunk_by_files_and_bytes(&discovered, limits);
     let (guard, skips) = build_scratch_root(batches[0], &workdir, &original_sessions).unwrap();
     assert!(skips.is_empty());
@@ -201,7 +211,10 @@ fn spec_015_remap_source_path_restores_canonical_path_after_scratch_scan() {
     let conn = PiAgentConnector::new();
     let ctx = ScanContext::with_roots(original.clone(), Vec::new(), None);
     let discovered = conn.discover_source_files(&ctx).expect("discover");
-    let limits = ScanBatchLimits { max_files: 10, max_bytes: u64::MAX };
+    let limits = ScanBatchLimits {
+        max_files: 10,
+        max_bytes: u64::MAX,
+    };
     let batches = chunk_by_files_and_bytes(&discovered, limits);
     let (guard, _skips) = build_scratch_root(batches[0], &workdir, &original_sessions).unwrap();
     let scratch_sessions = guard.path().join("sessions");

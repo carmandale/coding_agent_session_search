@@ -1,0 +1,707 @@
+# GoalBuddy v2 state.yaml
+# Board truth for cass session ingestion recovery.
+
+version: 2
+
+goal:
+  title: "Recover cass session ingestion and watcher"
+  slug: "cass-session-ingestion-recovery"
+  kind: recovery
+  tranche: "Drive specs/016-cass-recovery-ingestion through the Dale Codex workflow until upstream sync, priority-agent ingestion/searchability, and watcher operation are proven live."
+  status: active
+  intake:
+    original_request: "be in sync with upstream. process all sessions and allow them to be searchable... then set up a watcher"
+    interpreted_outcome: "cass is deliberately upstream-synced, Pi Agent/Claude Code/Codex histories are searchable, and com.cass.index-watch keeps future sessions indexed."
+    input_shape: recovery
+    audience: "Dale Carman as cass user/operator"
+    authority: requested
+    proof_type: metric
+    completion_proof: "git upstream ancestor proof or blocker; cass DB/search reconciliation for Pi Agent, Claude Code, and Codex; launchctl and new-session watcher proof."
+    likely_misfire: "Treating spec artifacts, partial commits, or healthy lexical status as success while Pi remains at 36 rows or the watcher remains unloaded."
+    blind_spots_considered:
+      - "Spec 015 owns only a Pi watch-once slice; this board owns the product-level recovery."
+      - "cass health can be healthy while com.cass.index-watch is absent."
+      - "Semantic search is optional and missing semantic assets must not block lexical proof."
+      - "Upstream sync may require reconciling 19 local commits with 12 upstream commits."
+      - "OpenCode and factory are bonus coverage unless they block priority-agent indexing."
+    existing_plan_facts:
+      - "$issue completed: specs/016-cass-recovery-ingestion/spec.md exists with bead coding_agent_session_search-1vxuf."
+      - "Formal shaping is deliberately queued next because this is repeated-failure recovery work."
+      - "Issue-time upstream baseline: HEAD b807ef175dcdeeb48b912a22913fbcd68fb86cb8, upstream/main c5d7be3b585a38546759cb5331401b9ad1ac06ba, ahead/behind 19/12."
+      - "Issue-time cass stats: 9657 conversations, 903256 messages, codex 5712, claude_code 2574, pi_agent 36."
+      - "Issue-time raw counts: Pi 2076 jsonl, Claude 2557 jsonl, Codex 4187 jsonl."
+      - "Issue-time launchd state: com.cass.index-watch absent; health-watchdog and sync-to-mini loaded."
+
+rules:
+  pm_owns_state: true
+  one_active_task: true
+  max_write_workers: 1
+  no_implementation_without_worker_or_pm_task: true
+  no_completion_without_judge_or_pm_audit: true
+  planning_is_not_completion: true
+  queued_required_worker_blocks_completion: true
+  continuous_until_full_outcome: true
+  missing_input_or_credentials_do_not_stop_goal: true
+  preserve_and_validate_existing_plan: true
+  intake_misfire_must_be_audited: true
+  slice_policy:
+    max_consecutive_tiny_tasks: 2
+    prefer_vertical_slices: true
+    judge_picks_largest_safe_slice: true
+    worker_completes_whole_slice: true
+
+agents:
+  scout: installed
+  worker: installed
+  judge: installed
+
+visual_board:
+  selected: local
+  local:
+    status: live
+    url: "http://goalbuddy.localhost:41737/cass-session-ingestion-recovery/"
+    command: "npx goalbuddy board /Users/dalecarman/dev/coding_agent_session_search/docs/goals/cass-session-ingestion-recovery"
+  github_projects:
+    status: not_requested
+    url: null
+    command: "npx goalbuddy extend github-projects"
+    missing: []
+
+workflow:
+  profile: dale_codex
+  sequence:
+    - command: "$issue"
+      purpose: "Create or confirm the bead-backed spec."
+      when: "Already completed for specs/016-cass-recovery-ingestion/."
+    - command: "$codex-shape"
+      purpose: "Shape the recovery route across upstream sync, ingestion, searchability, and watcher proof."
+      when: "Run next because this is repeated-failure recovery work."
+    - command: "$codex-plan"
+      purpose: "Create plan.md, tasks.md, planning transcript, and plan provenance."
+      when: "Run after shaping selects the route."
+    - command: "$codex-review"
+      purpose: "Get a fresh independent Codex approval of the plan."
+      when: "Always run after $codex-plan and before $codex-implement."
+    - command: "$codex-implement"
+      purpose: "Implement the approved plan with scoped writes and verification."
+      when: "Run after $codex-review approves."
+    - command: "$code-verify"
+      purpose: "Run independent post-implementation Codex verification against live acceptance."
+      when: "Run after $codex-implement records implement-receipt.md."
+    - command: "$finalize"
+      purpose: "Close the bead, create final handoff, commit, and push verified fork work."
+      when: "Run only after $code-verify approval."
+
+active_task: T008
+
+tasks:
+  - id: T001
+    type: pm
+    assignee: PM
+    status: done
+    reasoning_hint: medium
+    objective: "Run $issue for the recovery and create a bead-backed spec."
+    inputs:
+      - "User request from 2026-05-16"
+      - "Live ground evidence from cass health/stats/git/launchctl"
+    constraints:
+      - "Do not create plan.md or tasks.md."
+      - "Record provenance with gate.sh."
+    expected_output:
+      - "specs/016-cass-recovery-ingestion/spec.md"
+      - "bead coding_agent_session_search-1vxuf"
+    receipt:
+      result: done
+      command: "$issue"
+      summary: "Created bead coding_agent_session_search-1vxuf and spec specs/016-cass-recovery-ingestion/spec.md. Formal shaping is queued next because the work is repeated-failure recovery."
+      artifacts:
+        - "specs/016-cass-recovery-ingestion/spec.md"
+        - "specs/016-cass-recovery-ingestion/log.md"
+      next_command: "/codex-shape specs/016-cass-recovery-ingestion/"
+  - id: T002
+    type: pm
+    assignee: PM
+    status: done
+    reasoning_hint: high
+    objective: "Run $codex-shape for specs/016-cass-recovery-ingestion/ and select the recovery route that can satisfy the live upstream, ingestion, searchability, and watcher acceptance criteria."
+    inputs:
+      - "specs/016-cass-recovery-ingestion/spec.md"
+      - "specs/015-watch-once-streaming-scan/"
+      - "docs/goals/watch-once-streaming-scan/state.yaml"
+      - "current git upstream/origin/HEAD state"
+      - "cass health --json"
+      - "cass stats --json"
+      - "launchctl list evidence for cass jobs"
+    constraints:
+      - "Do not implement."
+      - "Do not treat spec 015 completion as the product outcome."
+      - "Enumerate requirements, candidate shapes, fit table, risks, and selected shape."
+      - "Keep lexical proof required and semantic proof optional."
+    expected_output:
+      - "specs/016-cass-recovery-ingestion/shaping-transcript.md"
+      - "Selected recovery shape"
+      - "Next command: /codex-plan specs/016-cass-recovery-ingestion/"
+    receipt:
+      result: done
+      command: "$codex-shape"
+      summary: "Selected Shape E: Priority-Scoped Manifest Recovery. Shaping challenged requirements, candidate shapes, fit check, breadboard, and terminal selection. Terminal review revised once for the R4 sampling floor, R8 verification floor, and exact threshold gate; the rerun returned VERDICT: APPROVED."
+      artifacts:
+        - "specs/016-cass-recovery-ingestion/spec.md"
+        - "specs/016-cass-recovery-ingestion/shaping-transcript.md"
+        - "specs/016-cass-recovery-ingestion/workflow-state.md"
+        - "specs/016-cass-recovery-ingestion/log.md"
+      commands:
+        - command: "codex-review-exec Phase D terminal review"
+          status: pass
+          evidence: "VERDICT: APPROVED in /tmp/codex-shape-review-c3c97350.md"
+        - command: "/Users/dalecarman/.agent-config/scripts/gate.sh record shape specs/016-cass-recovery-ingestion/"
+          status: pass
+          evidence: "shape:complete:v1 recorded in shaping-transcript.md; workflow-state.md updated"
+        - command: "/Users/dalecarman/.agent-config/scripts/gate.sh verify shape specs/016-cass-recovery-ingestion/"
+          status: warning
+          evidence: "Failed because no pre-shape gate timestamp/snapshot existed, so pre-existing spec.md was treated as a shape-created forbidden file. No post-hoc baseline was fabricated."
+      next_command: "/codex-plan specs/016-cass-recovery-ingestion/"
+  - id: T003
+    type: pm
+    assignee: PM
+    status: done
+    reasoning_hint: high
+    objective: "Run $codex-plan for the shaped recovery spec and create plan.md, tasks.md, planning transcript, and provenance."
+    inputs:
+      - "T002 receipt"
+      - "specs/016-cass-recovery-ingestion/spec.md"
+      - "specs/016-cass-recovery-ingestion/shaping-transcript.md"
+    constraints:
+      - "Plan must include live proof commands for upstream, priority-agent reconciliation, searchability, and watcher operation."
+      - "Plan must explicitly route or supersede spec 015."
+    expected_output:
+      - "specs/016-cass-recovery-ingestion/plan.md"
+      - "specs/016-cass-recovery-ingestion/tasks.md"
+      - "specs/016-cass-recovery-ingestion/planning-transcript.md"
+    receipt:
+      result: done
+      command: "$codex-plan"
+      summary: "Created plan.md, tasks.md, and planning-transcript.md for spec 016. Phase A challenge passed, Phase B review approved after revision, north-star halted repeatedly on useful scope issues and then returned BOOTSTRAP with BANANA/BLOAT/AMBIGUOUS all none, final delta review returned VERDICT: APPROVED, and gate.sh verify plan passed."
+      artifacts:
+        - "specs/016-cass-recovery-ingestion/plan.md"
+        - "specs/016-cass-recovery-ingestion/tasks.md"
+        - "specs/016-cass-recovery-ingestion/planning-transcript.md"
+        - "specs/016-cass-recovery-ingestion/artifacts/boundary-B-b807ef17-b3c5942f.md"
+      commands:
+        - command: "codex-review-exec Phase A/Phase B/final delta review"
+          status: pass
+          evidence: "Final delta review VERDICT: APPROVED in /tmp/codex-plan-review-6853697e.md and planning-transcript.md"
+        - command: "plan-north-star.sh check --phase B"
+          status: pass
+          evidence: "Outcome BOOTSTRAP with BANANA/BLOAT/AMBIGUOUS none; snapshot boundary-B-b807ef17-b3c5942f.md recorded"
+        - command: "/Users/dalecarman/.agent-config/scripts/gate.sh verify plan specs/016-cass-recovery-ingestion/"
+          status: pass
+          evidence: "CLEAN — all gate_creates artifacts present, no anti-fabrication violations"
+      next_command: "/codex-review specs/016-cass-recovery-ingestion/"
+  - id: T004
+    type: pm
+    assignee: PM
+    status: done
+    reasoning_hint: high
+    objective: "Run $codex-review after $codex-plan and iterate until Codex approves the plan."
+    inputs:
+      - "T003 receipt"
+      - "specs/016-cass-recovery-ingestion/plan.md"
+      - "specs/016-cass-recovery-ingestion/tasks.md"
+    constraints:
+      - "Never skip this gate."
+      - "Review must challenge whether the plan can satisfy live product acceptance, not just artifact completeness."
+    expected_output:
+      - "specs/016-cass-recovery-ingestion/codex-review.md with VERDICT: APPROVED"
+    receipt:
+      result: done
+      command: "$codex-review"
+      summary: "Persisted final Codex review for the approved spec 016 plan. The final delta review returned VERDICT: APPROVED after north-star revisions, and gate.sh verify codex-review passed after establishing the required baseline."
+      artifacts:
+        - "specs/016-cass-recovery-ingestion/codex-review.md"
+        - "specs/016-cass-recovery-ingestion/workflow-state.md"
+      commands:
+        - command: "codex-review-exec --session 019e30e2-5375-7d82-ba42-5b546d6b123f"
+          status: pass
+          evidence: "VERDICT: APPROVED"
+        - command: "/Users/dalecarman/.agent-config/scripts/gate.sh verify codex-review specs/016-cass-recovery-ingestion/"
+          status: pass
+          evidence: "CLEAN — all gate_creates artifacts present, no anti-fabrication violations"
+      next_command: "/codex-implement specs/016-cass-recovery-ingestion/"
+  - id: T005
+    type: pm
+    assignee: PM
+    status: blocked
+    reasoning_hint: high
+    objective: "Run $codex-implement after review approval and complete the approved recovery implementation."
+    inputs:
+      - "T004 receipt"
+      - "specs/016-cass-recovery-ingestion/tasks.md"
+    constraints:
+      - "Respect task-defined write scope."
+      - "Stop and re-align if the route requires destructive cleanup, upstream push, semantic model download, or broad frankensqlite architecture work."
+    expected_output:
+      - "specs/016-cass-recovery-ingestion/implement-receipt.md"
+      - "Working cass state moved toward live acceptance"
+    receipt:
+      result: blocked
+      command: "$codex-implement"
+      summary: "Implementation reached a verified shadow recovery state but cannot safely promote live cass or advance to code-verify without explicit operator authorization. Shadow archive integrity is ok and lexical searches are proven for pi_agent, claude_code, codex, opencode, and factory. Live DB/index promotion, durable frankensqlite pin, watcher reload, branch/commit resolution, code-verify, finalize, and push remain incomplete."
+      artifacts:
+        - "specs/016-cass-recovery-ingestion/implement-receipt.md"
+        - "specs/016-cass-recovery-ingestion/completion-audit.md"
+        - "specs/016-cass-recovery-ingestion/evidence/live-promotion-runbook.md"
+        - "specs/016-cass-recovery-ingestion/evidence/runtime-preflight/t6-current-route-preflight.md"
+        - "specs/016-cass-recovery-ingestion/evidence/runtime-refresh/t7-stale-refresh-stop.md"
+        - "specs/016-cass-recovery-ingestion/evidence/canary/t8-canary-selection-readiness.md"
+        - "specs/016-cass-recovery-ingestion/evidence/reconciliation/t11-shadow-reconciliation-preflight.md"
+        - "specs/016-cass-recovery-ingestion/evidence/reconciliation/t12-chipbot-classification-followup.md"
+        - "specs/016-cass-recovery-ingestion/evidence/recovery-runs/t10-nonpriority-exclusion-not-triggered.md"
+        - "specs/016-cass-recovery-ingestion/evidence/frankensqlite-fix-proof.md"
+        - "specs/016-cass-recovery-ingestion/evidence/upstream-blocker.md"
+        - "specs/016-cass-recovery-ingestion/evidence/upstream-working-tree-overlap.md"
+        - "specs/016-cass-recovery-ingestion/evidence/upstream-reconciliation-map.md"
+        - "specs/016-cass-recovery-ingestion/evidence/release-candidate-shadow-proof.md"
+        - "specs/016-cass-recovery-ingestion/evidence/final-checkpoint-restart-proof.md"
+        - "specs/016-cass-recovery-ingestion/evidence/ubs-warning-inventory.md"
+        - "specs/019-ubs-warning-policy-closeout/spec.md"
+        - "specs/019-ubs-warning-policy-closeout/research.md"
+        - "specs/018-health-watchdog-command-surface/evidence/local-command-surface-proof.md"
+        - "specs/016-cass-recovery-ingestion/evidence/spec015-routing.md"
+        - "specs/016-cass-recovery-ingestion/evidence/evidence-hygiene.md"
+        - "specs/016-cass-recovery-ingestion/evidence/continuation-audit-20260517T040610Z.md"
+        - "specs/016-cass-recovery-ingestion/evidence/continuation-audit-20260517T041533Z.md"
+        - "specs/016-cass-recovery-ingestion/evidence/continuation-audit-20260517T042428Z.md"
+        - "specs/016-cass-recovery-ingestion/tasks.md"
+        - "thoughts/shared/handoffs/current.md"
+      commands:
+        - command: "sqlite3 \"$SHADOW/agent_search.db\" \"PRAGMA integrity_check; ...\""
+          status: pass
+          evidence: "ok; pi_agent=2076, claude_code=2574, codex=5713, opencode=976, factory=66, messages=1238935"
+        - command: "/tmp/cass-check-target/debug/cass health --json --stale-threshold 1800 --data-dir \"$SHADOW\""
+          status: pass
+          evidence: "healthy=true; index.status=ready; checkpoint.completed=true"
+        - command: "/tmp/cass-check-target/debug/cass search ... --agent pi_agent|claude_code|codex|opencode|factory --mode lexical --robot --robot-meta"
+          status: pass
+          evidence: "all five canaries returned lexical hits from expected agents"
+        - command: "$HOME/.cargo/bin/cargo fmt --check; cargo check --all-targets; cargo clippy --all-targets -- -D warnings; focused tests; cargo build --bin cass"
+          status: pass
+          evidence: "compiler and focused recovery tests passed with CARGO_TARGET_DIR=/tmp/cass-check-target"
+        - command: "env CARGO_TARGET_DIR=/tmp/cass-release-target $HOME/.cargo/bin/cargo build --release --bin cass"
+          status: pass
+          evidence: "release candidate built at /tmp/cass-release-target/release/cass; latest sha256 a5a139ca503f0f04f2b0baba06e20b16bd7003a7e7d78306cacf94d56eaca9c2"
+        - command: "/tmp/cass-release-target/release/cass health/search --data-dir \"$SHADOW\""
+          status: pass
+          evidence: "2026-05-17T04:00:58Z: release candidate searched shadow archive successfully for pi_agent=30, claude_code=37, codex=10, opencode=2484, factory=21 matches; 86400s health threshold reported healthy ready checkpoint"
+        - command: "git diff --name-only -- '*.rs' Cargo.toml Cargo.lock | tr '\\n' '\\0' | xargs -0 ubs"
+          status: pass
+          evidence: "Current changed-file UBS preflight now passes with 0 critical, 20733 warning, and 11159 info findings across 10 Rust files; CI fail-on-warning policy remains a warning-baseline caveat"
+        - command: "xargs ubs --ci --fail-on-warning --format=json --report-json=/tmp/spec016-ubs-ci-report.json < /tmp/spec016-ubs-files.txt"
+          status: blocked
+          evidence: "2026-05-17T01:27:00Z: CI-shaped UBS exits 1 because warning inventory is merge-blocking; evidence/ubs-warning-inventory.md records warning classes and no policy/config baseline was added"
+        - command: "git fetch upstream main; git merge-tree --write-tree HEAD upstream/main"
+          status: blocked
+          evidence: "latest upstream/main=1f20bd576f2e77a5197783c637fcc771ab9e1867; ahead/behind=19 24; merge-tree exit 0 tree 26ec8190e7ef955f263cac17f79eaef43ead9cfb; incorporation still requires branch/commit authorization"
+        - command: "cargo fmt -p fsqlite-pager -p fsqlite-wal --check; cargo test -p fsqlite-wal test_append_recovers_after_external_zero_byte_truncate; cargo test -p fsqlite-pager freelist"
+          status: pass
+          evidence: "frankensqlite local focused proof passed; pager freelist tests 23 passed"
+        - command: "read-only continuation audit: live sqlite quick_check/counts, launchctl print/list, git fetch upstream main"
+          status: blocked
+          evidence: "2026-05-16T23:18:54Z: upstream remains 19 ahead/17 behind; live quick_check still reports freelist errors; live pi_agent=1077; com.cass.index-watch absent; health-watchdog last exit code 2"
+        - command: "ps -axo pid,state,rss,%cpu,etime,command | rg 'cass index|cass search|cass health|cass doctor|cass watchdog|/tmp/cass-check-target|/tmp/cass-release-target|target/(debug|release)/cass'"
+          status: pass
+          evidence: "2026-05-16T23:20:47Z: no active cass worker matched beyond the ps/rg probe itself"
+        - command: "read-only durable dependency refresh for /Users/dalecarman/dev/spec014-frankensqlite-fix and CASS Cargo.toml/Cargo.lock"
+          status: blocked
+          evidence: "2026-05-16T23:23:03Z: sibling branch fix/fts5-vtab-snapshot-via-delta-journal has dirty pager/WAL files; CASS still uses local ../spec014-frankensqlite-fix patch over eba969 fsqlite pins"
+        - command: "df -h live/shadow; du -sh live/shadow DB/index paths; ls -ld/lh live/shadow paths"
+          status: pass
+          evidence: "2026-05-16T23:24:29Z: target volume has 175Gi free; live dir=165G; shadow dir=13G; shadow DB=7.9G; shadow index=3.7G; re-check df before promotion"
+        - command: "read Codex connector/test fixtures and update approval-gated watcher proof plan"
+          status: pass
+          evidence: "2026-05-16T23:25:44Z: runbook now prefers creating a new synthetic connector-compatible Codex JSONL under ~/.codex/sessions/YYYY/MM/DD for marker proof, with real-session append only as fallback"
+        - command: "plutil -p com.cass.index-watch.plist; installed/release cass index --help; shasum installed/release binaries"
+          status: pass
+          evidence: "2026-05-16T23:26:49Z: plist points to /Users/dalecarman/.local/bin/cass index --watch; installed and release-candidate binaries expose --watch/--watch-once/--watch-interval"
+        - command: "release-candidate scratch proof for synthetic Codex watcher marker JSONL"
+          status: pass
+          evidence: "2026-05-16T23:27:50Z: /tmp/cass-release-target/release/cass indexed scratch synthetic Codex file into /tmp/cass-spec016-synth-proof-20260516T232750Z/data; conversations=1 messages=2; lexical search total_matches=2 for marker SPEC016_SYNTH_FORMAT_PROOF_20260516T232750Z"
+        - command: "extract approval-gated bash blocks from live-promotion-runbook.md and run zsh -n"
+          status: pass
+          evidence: "2026-05-16T23:29:00Z: shell blocks extracted to /tmp/spec016-runbook-shell-blocks.sh; zsh -n passed; no live commands executed"
+        - command: "git diff --check; rg trailing blanks over goal/spec artifacts"
+          status: pass
+          evidence: "2026-05-16T23:29:59Z: git diff --check passed; trailing-space scan only matched preserved generated vmmap summary evidence, left unchanged"
+        - command: "runbook tool availability and path/hash preflight"
+          status: pass
+          evidence: "2026-05-16T23:30:42Z: sqlite3, jq, launchctl, plutil, rg, shasum, date, mkdir, cp, mv, ls present; com.cass.index-watch plist lints OK; installed/release binary paths and hashes verified"
+        - command: "read-only tail/count of ~/Library/Logs/cass-index-watch.log and cass-watchdog.log"
+          status: blocked
+          evidence: "2026-05-16T23:31:54Z: index-watch log has 184 OOM-related watcher entries and last timestamp 2026-05-15T23:27:13Z; watchdog log has 448 'Could not parse arguments' entries"
+        - command: "release-candidate scratch proof for synthetic Codex marker through index --watch-once"
+          status: pass
+          evidence: "2026-05-16T23:33:14Z: /tmp/cass-release-target/release/cass index --watch-once processed /tmp/cass-spec016-watchonce-proof-20260516T233309Z/.codex/sessions/2026/05/16/rollout-spec016-watchonce-20260516T233309Z.jsonl; conversations=1 messages=2; lexical search total_matches=2 for marker SPEC016_WATCHONCE_FORMAT_PROOF_20260516T233309Z"
+        - command: "refresh completion-audit.md with approval-readiness evidence"
+          status: blocked
+          evidence: "2026-05-16T23:34:20Z: completion audit now includes readiness evidence through synthetic watch-once proof while retaining full_outcome_complete=false"
+        - command: "path permission preflight for live data, shadow data, binary, LaunchAgents, and Logs paths"
+          status: pass
+          evidence: "2026-05-16T23:35:19Z: required live/shadow/bin/LaunchAgents/Logs paths exist and are readable/writable/searchable as needed for approved promotion"
+        - command: "refresh completion-audit.md with path-permission preflight"
+          status: blocked
+          evidence: "2026-05-16T23:36:13Z: completion audit now includes path-permission preflight while retaining full_outcome_complete=false"
+        - command: "refresh implement-receipt.md with approval-readiness proof"
+          status: blocked
+          evidence: "2026-05-16T23:37:24Z: implement receipt now includes approval-readiness proof through path/tool/synthetic-watch-once/log checks while retaining result=blocked"
+        - command: "current live completion audit rerun"
+          status: blocked
+          evidence: "2026-05-16T23:38:36Z: live DB still malformed; live pi_agent=1077; com.cass.index-watch absent; health-watchdog exit=2; upstream remains 19 ahead/17 behind; active_task=T005 blocked"
+        - command: "refresh thoughts/shared/handoffs/current.md"
+          status: blocked
+          evidence: "2026-05-16T23:39:31Z: current handoff now summarizes spec 016 live blockers, readiness proof, approval gate, and next steps"
+        - command: "add no-delete restore shape to live-promotion-runbook.md"
+          status: blocked
+          evidence: "2026-05-16T23:40:58Z: runbook now preserves failed promoted artifacts with FAILED-SPEC016 suffixes and restores PRE-SPEC016 DB/index/binary backups by timestamped moves"
+        - command: "rerun live-promotion-runbook.md shell syntax check after restore-shape addition"
+          status: pass
+          evidence: "2026-05-16T23:42:08Z: approval-gated shell blocks re-extracted to /tmp/spec016-runbook-shell-blocks.sh; zsh -n passed"
+        - command: "sync restore-shape note into handoff, completion audit, and implement receipt"
+          status: blocked
+          evidence: "2026-05-16T23:42:54Z: first-read surfaces now mention the no-delete restore shape; live outcome remains blocked"
+        - command: "refresh bead coding_agent_session_search-1vxuf notes"
+          status: blocked
+          evidence: "2026-05-16T23:44:07Z: bead notes now summarize current blocked live state, readiness proof runbook, no-delete restore shape, and required approval phrase"
+        - command: "check installed/release cass watchdog run command surface"
+          status: blocked
+          evidence: "2026-05-16T23:45:59Z: installed and release-candidate cass both return exit=2 'Could not parse arguments' for watchdog run --help; health-watchdog will remain a nonblocking follow-up after index-watch proof"
+        - command: "sync health-watchdog command-surface finding into handoff, completion audit, and implement receipt"
+          status: blocked
+          evidence: "2026-05-16T23:46:56Z: first-read surfaces now state release candidate will not repair health-watchdog; index-watch proof remains the required watcher outcome"
+        - command: "add implementation status addendum to tasks.md"
+          status: blocked
+          evidence: "2026-05-16T23:48:10Z: tasks.md now clarifies T005 is blocked at live approval and points to current receipt/audit/runbook/handoff"
+        - command: "read-only continuation audit rerun: git upstream, live sqlite quick_check/counts, launchctl state, capacity, and release-candidate hash"
+          status: blocked
+          evidence: "2026-05-16T23:51:25Z: upstream still 19 ahead/17 behind; live quick_check still reports freelist errors; live pi_agent=1077; com.cass.index-watch absent; health-watchdog exit=2; target volume has 174Gi free; release candidate hash unchanged"
+        - command: "refresh bead coding_agent_session_search-1vxuf note after latest audit"
+          status: blocked
+          evidence: "2026-05-16T23:54:05Z: bead note now matches T005 blocked state, latest 174Gi capacity rerun, approval-ready runbook, and required approval phrase; br sync --flush-only exported cleanly"
+        - command: "/Users/dalecarman/.agent-config/scripts/gate.sh record implement specs/016-cass-recovery-ingestion/"
+          status: blocked
+          evidence: "2026-05-16T23:57:45Z: gate refused to mint implement:complete:v1 because 25 unchecked tasks remained before T25/T26 were completed; no sentinel was written"
+        - command: "write spec 015 routing evidence"
+          status: blocked
+          evidence: "2026-05-16T23:59:31Z: evidence/spec015-routing.md records spec 015 as subordinate Pi watch-once evidence, not the product-level completion owner; spec 015 remains active on its own board and should not be closed from this blocked recovery state"
+        - command: "mark T25 complete in tasks.md"
+          status: pass
+          evidence: "2026-05-17T00:00:52Z: T25 checked off because evidence/spec015-routing.md exists and GoalBuddy/audit/handoff surfaces now route spec 015 as subordinate evidence"
+        - command: "run evidence hygiene pass and mark T26 complete"
+          status: pass
+          evidence: "2026-05-17T00:02:48Z: evidence/evidence-hygiene.md records secret-scan result, oversized/local-path evidence inventory, safe probe strings, commit-ready summary artifacts, and raw telemetry paths to keep local unless verifier replay needs them"
+        - command: "rerun implement gate after T25/T26 completion"
+          status: blocked
+          evidence: "2026-05-17T00:04:58Z: gate refused to mint implement:complete:v1 because 23 unchecked tasks remain; no sentinel was written, and T28 remains unchecked"
+        - command: "fix and verify final-close checkpoint regression"
+          status: pass
+          evidence: "2026-05-17T00:18:20Z: close_storage_after_index now uses PRAGMA wal_checkpoint(RESTART); exact failing test passed; cargo test checkpoint --lib passed 58/58; fmt/check/clippy passed; refreshed release candidate sha256=077674c65899936a79885d24cf141e1ac05632e5bd201958a1a6a992fda20594; shadow canaries passed"
+        - command: "ubs src/indexer/mod.rs"
+          status: pass
+          evidence: "2026-05-17T00:45:59Z: focused indexer UBS criticals are cleared: 0 critical, 5962 warnings, 2052 info"
+        - command: "git diff --name-only -- '*.rs' Cargo.toml Cargo.lock | tr '\\n' '\\0' | xargs -0 ubs --format=json --jsonl-summary-only"
+          status: pass
+          evidence: "2026-05-17T03:45:22Z: current changed-file UBS local preflight passes after CLI test critical cleanup: 0 critical, 20733 warnings, 11159 info, 10 Rust files; CI fail-on-warning policy remains a warning-baseline caveat"
+        - command: "read-only continuation audit rerun: git upstream, live sqlite quick_check/counts, launchctl state, process state, and release-candidate hash"
+          status: blocked
+          evidence: "2026-05-17T01:29:00Z: upstream advanced to e337b9f428e12ea5a0d5b37129d3abb0dea48ab8 and is now 19 ahead/19 behind; merge-tree exit 0 tree 124403bc99be2effce1bbc9bc9cc39d330639ef6; live quick_check still reports freelist errors; live pi_agent=1077; com.cass.index-watch absent; health-watchdog exit=2"
+        - command: "read-only T6 route preflight: installed cass status/health/doctor and process scan"
+          status: pass
+          evidence: "2026-05-17T01:40:00Z: route policy exists; cass status exits 0 unhealthy/stale with no active rebuild/watch/doctor repair; cass health exits 1 unhealthy/stale; no cass writer processes matched; read-only doctor stalled at 4m37s/11.7GB RSS and was stopped with SIGTERM"
+        - command: "T7 stale-index refresh attempt and paired verification"
+          status: blocked
+          evidence: "2026-05-17T01:46:14Z: live refresh exited 143 after SIGTERM, reached about 30640864 KB RSS, stdout/stderr were empty, paired status/health verification still reported unhealthy stale incomplete checkpoint; evidence/runtime-refresh/t7-stale-refresh-stop.md says not to retry against the malformed live archive"
+        - command: "T10 non-priority connector exclusion audit"
+          status: pass
+          evidence: "2026-05-17T01:56:00Z: no non-priority connector blocked priority recovery, no sources agents exclude command was used, and cass sources agents list --json returned disabled_agents=[] total=0"
+        - command: "T8 priority canary identity preselection"
+          status: blocked
+          evidence: "2026-05-17T01:58:00Z: selected Claude Code, Codex, and Pi Agent source paths/strings are present in frozen manifests and source files, but live watch-once, DB source_path, and lexical search proof remain approval-gated"
+        - command: "T11 shadow reconciliation preflight"
+          status: blocked
+          evidence: "2026-05-17T02:03:00Z: shadow preflight found claude_code matched 2413/2425 manifest paths, codex matched 5675/5868, pi_agent matched 2076/4174 with all 2098 missing under --clawdbot-chip--; duplicate non-null provenance keys are 0 for all three; live reconciliation still required after promotion"
+        - command: "T12 chipbot symlink classification follow-up"
+          status: blocked
+          evidence: "2026-05-17T02:12:37Z: --clawdbot-chip-- is a 2098-file symlink to ~/.clawdbot/agents/main/sessions; current pinned FAD pi_agent ignores UUID-only filenames and clawdbot expects top-level role/content JSONL; scratch chipbot index produced 0 rows while a normal Pi control produced 1 row; created coding_agent_session_search-2d37b / specs/017-chipbot-symlink-indexing/"
+        - command: "read-only continuation audit rerun: git upstream, live sqlite quick_check/counts, launchctl state, and process state"
+          status: blocked
+          evidence: "2026-05-17T02:20:32Z: upstream advanced to 485ff1052b48e8d731a9ca9da03ba1d3dd170a82 and is now 19 ahead/22 behind; merge-tree exit 0 tree b0ef9f483fefce743323ab78b857b704dfaa5b13; live quick_check still reports freelist errors; live pi_agent=1077; com.cass.index-watch absent; health-watchdog exit=2; no cass worker processes matched"
+        - command: "read-only continuation audit rerun: upstream, live sqlite, launchctl, processes, capacity"
+          status: blocked
+          evidence: "2026-05-17T02:45:30Z: upstream remained 485ff1052b48e8d731a9ca9da03ba1d3dd170a82 at 19 ahead/22 behind; merge-tree b0ef9f483fefce743323ab78b857b704dfaa5b13; live quick_check still reports freelist errors; live pi_agent=1077; com.cass.index-watch absent; health-watchdog exit=2 runs=339; no cass worker processes matched; target free space 171Gi; evidence/continuation-audit-20260517T024530Z.md"
+        - command: "read-only continuation audit rerun: upstream, live sqlite, launchctl, processes, capacity, release hash, dependency pin"
+          status: blocked
+          evidence: "2026-05-17T02:54:54Z: upstream remained 485ff1052b48e8d731a9ca9da03ba1d3dd170a82 at 19 ahead/22 behind; merge-tree b0ef9f483fefce743323ab78b857b704dfaa5b13; live quick_check still reports freelist errors; live pi_agent=1077; com.cass.index-watch absent; health-watchdog exit=2 runs=340; no cass worker processes matched; target free space 171Gi; release candidate hash 423e2e4c2920ec74a38a5cb4af1f00de362a4a82e493d342b4891179f4955ada; local frankensqlite patch remains dirty; evidence/continuation-audit-20260517T025454Z.md"
+        - command: "write short operator approval packet"
+          status: blocked
+          evidence: "2026-05-17T03:02:00Z: evidence/operator-approval-packet.md now gives the exact approval phrase, authorized scope, non-authorized actions, blockers, and pointer to live-promotion-runbook.md; no live mutation executed"
+        - command: "read-only continuation audit rerun: upstream, live sqlite, launchctl, processes, capacity, release hash"
+          status: blocked
+          evidence: "2026-05-17T03:09:46Z: upstream remained 485ff1052b48e8d731a9ca9da03ba1d3dd170a82 at 19 ahead/22 behind; branch=dac/main; merge-tree b0ef9f483fefce743323ab78b857b704dfaa5b13; live quick_check still reports freelist errors; live pi_agent=1077; com.cass.index-watch absent; health-watchdog exit=2 runs=341; no cass worker processes matched; target free space 171Gi; release candidate hash 423e2e4c2920ec74a38a5cb4af1f00de362a4a82e493d342b4891179f4955ada; evidence/continuation-audit-20260517T030946Z.md"
+        - command: "read-only dependency audit: frankensqlite local patch and cargo graph"
+          status: blocked
+          evidence: "2026-05-17T02:48:44Z: CASS still has an active [patch] to ../spec014-frankensqlite-fix; cargo tree resolves fsqlite/fsqlite-types 0.1.3 from that local path; sibling branch fix/fts5-vtab-snapshot-via-delta-journal at f298dfa has dirty crates/fsqlite-pager/src/pager.rs and crates/fsqlite-wal/src/wal.rs; evidence/dependency-audit-20260517T024844Z.md"
+        - command: "create health-watchdog command-surface regression follow-up issue"
+          status: pass
+          evidence: "2026-05-17T02:25:00Z: created coding_agent_session_search-2gif2 / specs/018-health-watchdog-command-surface/ because closed spec 007 implemented `cass watchdog run`, but current installed/release binaries return exit 2 `Could not parse arguments`; gate.sh record/verify issue passed"
+        - command: "local health-watchdog command-surface repair and verifier"
+          status: blocked
+          evidence: "2026-05-17T04:00:58Z: src/watchdog.rs is wired into CLI/capabilities/robot docs; debug and release cass watchdog run --help exit 0; affected CLI/golden/stats tests, cargo check, fmt, clippy, release build, and shadow canaries pass; tests/cli_robot.rs panic! UBS critical inventory is cleared; no install or launchd smoke was run, so spec018 remains incomplete"
+        - command: "create UBS warning-policy closeout follow-up issue"
+          status: pass
+          evidence: "2026-05-17T02:34:00Z: created coding_agent_session_search-2v7tv / specs/019-ubs-warning-policy-closeout/ because local changed-file UBS criticals are clear but the CI-shaped ubs --ci --fail-on-warning command exits 1 on warning inventory; gate.sh record/verify issue passed"
+        - command: "UBS comparison and per-file warning distribution research"
+          status: blocked
+          evidence: "2026-05-17T02:40:00Z: specs/019 research shows UBS --comparison reports delta warning=0 but still exits 1 under --fail-on-warning; warning distribution is broad across src/indexer/mod.rs, src/lib.rs, src/storage/sqlite.rs, and src/ui/app.rs, so T20 remains unchecked"
+        - command: "UBS policy decision artifact for spec 019"
+          status: blocked
+          evidence: "2026-05-17T03:15:34Z: specs/019-ubs-warning-policy-closeout/policy-decision.md rejects hidden baselines, broad ignores, or workflow weakening; for spec 016 closeout the narrow non-live route is final-review acceptance that the warning-only inventory is outside the live recovery gate, otherwise T20 stays unchecked"
+        - command: "tests/cli_robot.rs UBS critical cleanup"
+          status: pass
+          evidence: "2026-05-17T03:45:56Z: replaced existing assertion-helper panic! macros with std::panic::panic_any; rg finds no panic! in tests/cli_robot.rs; ubs tests/cli_robot.rs exits 0 with critical=0 warning=1585 info=410; spec018 touched-set UBS exits 0 with critical=0 warning=1694 info=557"
+        - command: "/Users/dalecarman/.agent-config/scripts/gate.sh record implement specs/016-cass-recovery-ingestion/"
+          status: blocked
+          evidence: "2026-05-17T01:56:00Z: gate refused to mint implement:complete:v1 because 19 unchecked tasks remain after T10 checkoff; no sentinel was written, and T28 remains unchecked"
+        - command: "rebuild release candidate and rerun shadow canaries after UBS panic-marker cleanup"
+          status: pass
+          evidence: "2026-05-17T04:00:58Z: release candidate sha256=a5a139ca503f0f04f2b0baba06e20b16bd7003a7e7d78306cacf94d56eaca9c2; release watchdog run --help exits 0; shadow canaries passed for pi_agent=30, claude_code=37, codex=10, opencode=2484, factory=21"
+        - command: "read-only continuation audit rerun: upstream, live sqlite, launchctl, processes, capacity, release hash, watchdog help"
+          status: blocked
+          evidence: "2026-05-17T04:06:10Z: upstream advanced to 5156af7ecbfe3aa757a838ebfd6444d55f647896 and is now 19 ahead/23 behind; branch=dac/main; merge-tree 95ec000ced664cc83a1d1f8fd8b4d54c7cd3330d; live quick_check still reports freelist errors; live pi_agent=1077; com.cass.index-watch absent; health-watchdog exit=2 runs=347; no cass worker processes matched; target free space 151Gi; installed watchdog help exits 2 while release exits 0; evidence/continuation-audit-20260517T040610Z.md"
+        - command: "read-only continuation audit rerun: upstream, live sqlite, launchctl, processes, capacity, release hash, watchdog help"
+          status: blocked
+          evidence: "2026-05-17T04:15:33Z: upstream unchanged at 5156af7ecbfe3aa757a838ebfd6444d55f647896 and still 19 ahead/23 behind; branch=dac/main; merge-tree 95ec000ced664cc83a1d1f8fd8b4d54c7cd3330d; live quick_check still reports freelist errors; live pi_agent=1077; com.cass.index-watch absent; health-watchdog exit=2 runs=348; no cass worker processes matched; target free space 151Gi; installed watchdog help exits 2 while release exits 0; evidence/continuation-audit-20260517T041533Z.md"
+        - command: "read-only continuation audit rerun: upstream, live sqlite command shape, and launchctl state"
+          status: blocked
+          evidence: "2026-05-17T04:24:28Z: upstream unchanged at 5156af7ecbfe3aa757a838ebfd6444d55f647896 and still 19 ahead/23 behind; encoded SQLite mode=ro URI quick_check still reports freelist errors; live pi_agent=1077; com.cass.index-watch absent; health-watchdog exit=2 runs=348; sqlite3 -readonly path open failed with SQLite code 14, so live-promotion-runbook.md now uses the encoded URI shape; evidence/continuation-audit-20260517T042428Z.md"
+      blockers:
+        - "Need explicit approval to promote verified shadow DB/index over malformed live cass archive with timestamped backups."
+        - "Need durable frankensqlite branch/commit/pin resolution; current cass Cargo.toml uses local ../spec014-frankensqlite-fix patch."
+        - "Need explicit branch/commit authorization because current branch is dac/main, not main."
+        - "Current upstream/main is fetched at 1f20bd576f2e77a5197783c637fcc771ab9e1867; merge-tree is clean but incorporation still requires branch/commit authorization."
+        - "Uncommitted recovery changes overlap upstream changes; upstream deletes src/indexer/scratch_root.rs and tests/spec_015_streaming_watch_once.rs while this recovery modifies them."
+        - "Fetched upstream lacks several recovery-critical local symbols including scratch_root, pi_watch_once_defers_inline_lexical, park_zero_byte_wal_before_franken_open, and expected_lexical_indexed_docs_for_checkpoint_refresh."
+        - "Need live watcher reload and 120-second new-session marker proof after promotion."
+        - "Bonus chipbot symlink sessions are not indexed by current pinned connector behavior; follow-up tracked as coding_agent_session_search-2d37b / specs/017-chipbot-symlink-indexing/ and does not complete spec 016 T11/T12."
+        - "Health-watchdog command-surface regression is repaired in local source/debug and approval-gated release candidate proof under specs/018-health-watchdog-command-surface/evidence/local-command-surface-proof.md, but remains live-incomplete until install and launchd smoke prove com.cass.health-watchdog no longer exits with argument-parse failure."
+        - "UBS warning-policy closeout is tracked as coding_agent_session_search-2v7tv / specs/019-ubs-warning-policy-closeout/; tests/cli_robot.rs criticals are cleared, but policy-decision.md rejects hidden baselines, broad ignores, or workflow weakening, so T20 remains unchecked while the CI-shaped fail-on-warning command exits 1 on warnings unless final review accepts the warning-only inventory or a reviewed cleanup/policy route is selected."
+      next_command: "Await explicit operator approval, then continue T005 live promotion and watcher proof."
+  - id: T006
+    type: pm
+    assignee: PM
+    status: queued
+    reasoning_hint: high
+    objective: "Run $code-verify after implementation and independently verify the live acceptance criteria."
+    inputs:
+      - "T005 receipt"
+      - "specs/016-cass-recovery-ingestion/spec.md"
+      - "specs/016-cass-recovery-ingestion/implement-receipt.md"
+    constraints:
+      - "Reject if Pi remains under-indexed without accounted skips."
+      - "Reject if com.cass.index-watch is not loaded and proven by new-session ingestion."
+      - "Reject if upstream state is unresolved without a concrete blocker."
+    expected_output:
+      - "specs/016-cass-recovery-ingestion/code-verify.md with VERDICT: APPROVED"
+      - "Live proof for upstream, priority-agent searchability, and watcher operation"
+    receipt: null
+  - id: T007
+    type: pm
+    assignee: PM
+    status: queued
+    reasoning_hint: medium
+    objective: "Run $finalize after code verification approval to close the bead, create handoff, commit, and push verified fork work."
+    inputs:
+      - "T006 receipt"
+      - "specs/016-cass-recovery-ingestion/code-verify.md"
+    constraints:
+      - "Stage by explicit path only."
+      - "Do not include unrelated dirty files."
+      - "Push to origin only."
+    expected_output:
+      - "bead coding_agent_session_search-1vxuf closed"
+      - "handoff under thoughts/shared/handoffs/"
+      - "verified commit pushed to origin"
+    receipt: null
+  - id: T008
+    type: pm
+    assignee: PM
+    status: active
+    reasoning_hint: medium
+    objective: "Maintain the approval-gated recovery board in a valid, truthful state while T005 is blocked on explicit live-mutation authorization."
+    inputs:
+      - "T005 blocked receipt"
+      - "docs/goals/cass-session-ingestion-recovery/state.yaml"
+      - "specs/016-cass-recovery-ingestion/evidence/live-promotion-runbook.md"
+      - "specs/016-cass-recovery-ingestion/evidence/continuation-audit-20260517T070035Z.md"
+      - "specs/016-cass-recovery-ingestion/evidence/operator-approval-packet.md"
+      - "specs/016-cass-recovery-ingestion/evidence/goalbuddy-board-maintenance-20260517T0433Z.md"
+    constraints:
+      - "Do not promote live DB/index, install binaries, reload launchd jobs, mutate session roots, commit, push, or resolve the frankensqlite branch/pin."
+      - "Keep T005 blocked until Dale gives the exact approval phrase."
+      - "Use only read-only validation and board/artifact maintenance."
+    expected_output:
+      - "GoalBuddy checker passes while the live recovery remains honestly blocked."
+      - "The next actionable unblock remains the explicit approval phrase."
+    receipt:
+      result: ongoing
+      command: "$goal T008 maintenance"
+      summary: "T008 keeps the approval-gated recovery board valid while T005 is blocked. Latest read-only audit is evidence/continuation-audit-20260517T070035Z.md; GoalBuddy checker/prompt/board surfaces pass; first-read summaries now point to current runs=364 health-watchdog evidence. The live recovery remains incomplete until Dale gives the exact approval phrase."
+      artifacts:
+        - "docs/goals/cass-session-ingestion-recovery/state.yaml"
+        - "specs/016-cass-recovery-ingestion/evidence/continuation-audit-20260517T070035Z.md"
+        - "specs/016-cass-recovery-ingestion/evidence/operator-approval-packet.md"
+        - "specs/016-cass-recovery-ingestion/completion-audit.md"
+        - "thoughts/shared/handoffs/current.md"
+      commands:
+        - command: "node /Users/dalecarman/.codex/plugins/cache/goalbuddy/goalbuddy/0.3.6/skills/goalbuddy/scripts/check-goal-state.mjs docs/goals/cass-session-ingestion-recovery/state.yaml"
+          status: pass
+          evidence: "active_task=T008, errors=[], warnings=[]"
+        - command: "npx goalbuddy prompt /Users/dalecarman/dev/coding_agent_session_search/docs/goals/cass-session-ingestion-recovery --json"
+          status: pass
+          evidence: "selected task T008 with metadata.warnings=[]"
+        - command: "curl -fsS http://goalbuddy.localhost:41737/cass-session-ingestion-recovery/api/board"
+          status: pass
+          evidence: "board API exposes .goal.activeTask=T008 and active=[T008]"
+      next_command: "Await exact approval phrase, then resume T005 live promotion; otherwise continue T008 read-only maintenance only."
+  - id: T999
+    type: judge
+    assignee: Judge
+    status: queued
+    reasoning_hint: high
+    objective: "Audit whether the full original cass recovery outcome is complete."
+    inputs:
+      - "All task receipts"
+      - "Final live verification"
+      - "Current git state"
+    constraints:
+      - "Do not implement."
+      - "Reject completion if required PM tasks are queued or active."
+      - "Reject completion if the proof only shows artifacts rather than live cass state."
+    expected_output:
+      - "complete | not_complete"
+      - "full_outcome_complete: true | false"
+      - "missing evidence"
+      - "next task if not complete"
+    receipt: null
+
+checks:
+  dirty_fingerprint: unknown
+  last_verification:
+    result: blocked
+    task: T005
+    commands:
+      - "cargo fmt/check/clippy/focused tests/build: pass"
+      - "shadow DB/search proof: pass"
+      - "UBS changed-file scan: local pass with 0 critical, 20733 warnings, 11159 info across 10 Rust files; CI fail-on-warning warning-baseline caveat remains"
+      - "UBS warning inventory recorded in specs/016-cass-recovery-ingestion/evidence/ubs-warning-inventory.md; CI-shaped command still exits 1 on warnings"
+      - "UBS warning-policy closeout follow-up issue/spec created at 2026-05-17T02:34:00Z: coding_agent_session_search-2v7tv / specs/019-ubs-warning-policy-closeout/"
+      - "UBS warning-policy research recorded at specs/019-ubs-warning-policy-closeout/research.md; comparison baseline alone is not a drop-in CI fix"
+      - "UBS policy decision recorded at specs/019-ubs-warning-policy-closeout/policy-decision.md; do not close T20 by hidden baseline, broad ignore, or workflow weakening"
+      - "UBS tool-surface audit recorded at 2026-05-17T02:59:14Z: ubs has --comparison but no fail-on-new-warning/fail-on-delta mode, so a baseline route needs reviewed CI wrapper/policy work"
+      - "spec018 health-watchdog command-surface repair recorded at 2026-05-17T04:00:58Z: debug and release cass watchdog run --help exit 0, Rust verifier passes, and tests/cli_robot.rs UBS criticals are clear; installed binary and launchd remain unchanged"
+      - "live promotion/watcher/branch closeout: blocked pending explicit approval"
+      - "completion audit: full_outcome_complete=false"
+      - "upstream refreshed to 1f20bd576f2e77a5197783c637fcc771ab9e1867; branch-policy blocker remains"
+      - "continuation audit refreshed live blockers at 2026-05-17T02:45:30Z; upstream unchanged at 19 ahead/22 behind, live DB still malformed, index-watch absent, health-watchdog exit=2, target free space 171Gi"
+      - "continuation audit refreshed live blockers at 2026-05-17T02:54:54Z; upstream unchanged at 19 ahead/22 behind, live DB still malformed, index-watch absent, health-watchdog exit=2 after 340 runs, target free space 171Gi, release hash unchanged, local frankensqlite patch still dirty"
+      - "operator approval packet added at specs/016-cass-recovery-ingestion/evidence/operator-approval-packet.md"
+      - "approval-gated promotion pre-move guard now verifies live DB/index, shadow DB/index, live destination writability, and release candidate command surface before any live artifact moves"
+      - "approval-gated promotion/install now verify PRE-SPEC016 backup destinations are unused before preserving live artifacts"
+      - "approval-gated runtime install now compares rebuilt release hash to the pre-promotion archive-proof release hash when present for the same approved attempt"
+      - "approval-gated promotion now rechecks shadow DB integrity, exact counts, and release-candidate shadow health before any live artifact moves"
+      - "approval-gated watcher proof now verifies installed cass.real equals the tested release candidate and exposes the installed watchdog command surface before bootstrapping index-watch"
+      - "approval-gated watcher marker proof now requires a search hit/result from the synthetic Codex source_path created by that proof attempt"
+      - "approval-gated restore now verifies PRE-SPEC016 DB/index backups exist and FAILED-SPEC016 destinations are unused before bootout or failed-artifact preservation"
+      - "continuation audit refreshed at 2026-05-17T06:07:21Z: upstream still 19/24, live DB still malformed, live pi_agent=1077, live health unhealthy/stale/watch_active=false, index-watch absent, health-watchdog runs=359 exit=2"
+      - "continuation audit refreshed at 2026-05-17T06:23:15Z: upstream still 19/24, live DB still malformed, live pi_agent=1077, live health unhealthy/stale/watch_active=false, index-watch absent, health-watchdog runs=360 exit=2, release hash unchanged, installed cass.real still differs, GoalBuddy active_task remains T008"
+      - "first-read T008 summaries refreshed at 2026-05-17T06:26:32Z so completion-audit.md, operator-approval-packet.md, and handoffs/current.md use the latest health-watchdog runs=360 evidence instead of older runs=356 text"
+      - "continuation audit refreshed at 2026-05-17T07:00:35Z: upstream still 19/24, live DB still malformed, live pi_agent=1077, live health unhealthy/stale/watch_active=false, index-watch absent, health-watchdog runs=364 exit=2, release hash unchanged, installed cass.real still differs, GoalBuddy active_task remains T008"
+      - "first-read T008 summaries refreshed at 2026-05-17T07:00:35Z so completion-audit.md, operator-approval-packet.md, and handoffs/current.md use the latest health-watchdog runs=364 evidence"
+      - "dependency audit refreshed at 2026-05-17T02:48:44Z; CASS still resolves frankensqlite through dirty local ../spec014-frankensqlite-fix patch"
+      - "upstream working-tree overlap recorded; spec 015 file deletions require reconciliation"
+      - "upstream reconciliation map recorded for recovery-critical symbols"
+      - "frankensqlite focused proof refreshed and passing"
+      - "release candidate rebuilt at 2026-05-17T04:00:58Z but not installed"
+      - "release candidate shadow search proof passed with watchdog command surface included"
+      - "continuation audit refreshed live blockers at 2026-05-16T23:18:54Z"
+      - "pre-approval process refresh found no active cass workers at 2026-05-16T23:20:47Z"
+      - "durable dependency blocker refreshed at 2026-05-16T23:23:03Z"
+      - "promotion capacity preflight recorded at 2026-05-16T23:24:29Z"
+      - "watcher proof plan updated to synthetic Codex session at 2026-05-16T23:25:44Z"
+      - "watcher runtime readiness recorded at 2026-05-16T23:26:49Z"
+      - "synthetic Codex proof format validated in scratch data dir at 2026-05-16T23:27:50Z"
+      - "runbook shell syntax preflight passed at 2026-05-16T23:29:00Z"
+      - "artifact hygiene check recorded at 2026-05-16T23:29:59Z"
+      - "runbook tool availability preflight recorded at 2026-05-16T23:30:42Z"
+      - "watcher log failure context refreshed at 2026-05-16T23:31:54Z"
+      - "synthetic Codex watch-once proof validated in scratch data dir at 2026-05-16T23:33:14Z"
+      - "completion audit refreshed with approval-readiness evidence at 2026-05-16T23:34:20Z"
+      - "path permission preflight recorded at 2026-05-16T23:35:19Z"
+      - "completion audit refreshed with path-permission evidence at 2026-05-16T23:36:13Z"
+      - "implement receipt refreshed with approval-readiness proof at 2026-05-16T23:37:24Z"
+      - "current-state audit rerun recorded at 2026-05-16T23:38:36Z"
+      - "shared handoff refreshed at 2026-05-16T23:39:31Z"
+      - "approval-gated restore shape added at 2026-05-16T23:40:58Z"
+      - "runbook shell syntax rechecked after restore shape at 2026-05-16T23:42:08Z"
+      - "restore shape synced into first-read surfaces at 2026-05-16T23:42:54Z"
+      - "bead note refreshed with current approval-gated state at 2026-05-16T23:44:07Z"
+      - "health-watchdog command-surface blocker confirmed at 2026-05-16T23:45:59Z"
+      - "health-watchdog command-surface finding synced into first-read surfaces at 2026-05-16T23:46:56Z"
+      - "health-watchdog command-surface regression follow-up issue/spec created at 2026-05-17T02:25:00Z"
+      - "health-watchdog command-surface source/debug/release proof recorded at specs/018-health-watchdog-command-surface/evidence/local-command-surface-proof.md; install and launchd smoke pending"
+      - "tasks.md status addendum added at 2026-05-16T23:48:10Z"
+      - "final-close checkpoint regression fixed and focused checkpoint verification passed at 2026-05-17T00:18:20Z"
+      - "release candidate refreshed to sha256 a5a139ca503f0f04f2b0baba06e20b16bd7003a7e7d78306cacf94d56eaca9c2"
+      - "T19 completed; T20 remains unchecked for CI warning-baseline policy, but local changed-file UBS criticals are cleared"
+      - "continuation audit refreshed live blockers at 2026-05-17T01:29:00Z; upstream is now 19 ahead/19 behind"
+      - "T6 route preflight completed at 2026-05-17T01:40:00Z; no active writer found, installed status/health unhealthy/stale, read-only doctor stalled and was stopped"
+      - "T7 stale-index refresh stop consolidated at 2026-05-17T01:46:14Z; live refresh exited 143 after SIGTERM, hit about 30640864 KB RSS, and paired verification still reported stale incomplete checkpoint"
+      - "T10 non-priority connector exclusion path closed as not triggered at 2026-05-17T01:56:00Z; disabled_agents=[] total=0"
+      - "T8 canary identities preselected at 2026-05-17T01:58:00Z; live proof still approval-gated"
+      - "T11 shadow reconciliation preflight recorded at 2026-05-17T02:03:00Z; live reconciliation still required"
+      - "implement gate rerun after T10 checkoff still refused completion with 19 unchecked tasks"
+      - "release shadow proof refreshed at 2026-05-17T04:00:58Z with latest hash a5a139ca503f0f04f2b0baba06e20b16bd7003a7e7d78306cacf94d56eaca9c2"
+      - "continuation audit refreshed live blockers at 2026-05-17T04:06:10Z; upstream advanced to 19 ahead/23 behind, live DB still malformed, index-watch absent, health-watchdog exit=2 after 347 runs, target free space 151Gi, installed watchdog help still fails while release passes"
+      - "continuation audit refreshed live blockers at 2026-05-17T04:15:33Z; upstream unchanged at 19 ahead/23 behind, live DB still malformed, index-watch absent, health-watchdog exit=2 after 348 runs, target free space 151Gi, installed watchdog help still fails while release passes"
+      - "continuation audit refreshed live SQLite command shape at 2026-05-17T04:24:28Z; sqlite3 -readonly path open fails with SQLite code 14, encoded mode=ro URI works and still proves live DB malformed"
+      - "GoalBuddy checker initially failed because T005 was blocked while the continuous goal had no active task; T008 is now active as the PM maintenance/approval-boundary task and check-goal-state passes"
+      - "T008 reference integrity maintenance recorded at 2026-05-17T04:33Z; no missing first-read recovery evidence artifacts found, and check-goal-state/YAML/runbook-shell/git-diff checks pass"
+      - "operator approval packet refreshed at 2026-05-17T04:34:29Z to mention the corrected encoded SQLite mode=ro probe and active T008 board-maintenance state"
+      - "live-promotion-runbook.md historical health-watchdog note clarified at 2026-05-17T04:36Z so the 2026-05-16T23:45 interpretation is explicitly superseded by the repaired 2026-05-17T04:15 release candidate"
+      - "live GoalBuddy board API verified at 2026-05-17T04:38Z and clarified at 2026-05-17T04:46Z; http://goalbuddy.localhost:41737/cass-session-ingestion-recovery/api/board exposes .goal.activeTask=T008, task T008 active, and total=9 tasks"
+      - "GoalBuddy prompt surface verified at 2026-05-17T04:40Z; relative npx goal path fails from the package directory, while the absolute goal path selects active T008 with metadata.warnings=[]"
+      - "completion audit checklist refreshed at 2026-05-17T04:45:42Z in specs/016-cass-recovery-ingestion/evidence/continuation-audit-20260517T044542Z.md; live outcome remains incomplete because upstream is still 19/23, live DB is malformed/stale, live pi_agent=1077, index-watch is absent, health-watchdog exits 2, installed binary is not repaired, and code-verify/finalize are not done"
+      - "T008 validation refreshed at 2026-05-17T04:49Z: check-goal-state, YAML/frontmatter parse, runbook shell zsh -n, git diff --check, absolute goalbuddy prompt, board API .goal.activeTask, br sync --flush-only, and touched-file trailing-space scan all pass"
+      - "approval runbook safety audit recorded at 2026-05-17T04:50:57Z in specs/016-cass-recovery-ingestion/evidence/runbook-safety-audit-20260517T045057Z.md; no active delete/reset/clean/force-push command found, and the only launchctl bootout is approval-gated restore handling"
+      - "approval-gated restore shape tightened at 2026-05-17T04:52:33Z to preserve failed promoted agent_search.db-shm and agent_search.db-wal sidecars before restoring PRE-SPEC016 sidecars; live outcome remains approval-blocked"
+      - "T008 reference integrity follow-up recorded at 2026-05-17T04:54:16Z: 86 repo-relative references checked across 8 active surfaces; no missing first-read recovery evidence artifact found, only expected absent code-verify.md and parser/prose shorthand false positives"
+      - "approval-gated watcher proof hardened at 2026-05-17T04:55:37Z: synthetic Codex marker write now checks target absence and uses noclobber so a rerun cannot overwrite an existing session artifact"
+      - "approval runbook pre-watcher health threshold corrected at 2026-05-17T04:57:15Z: shadow proof exits 1 with stale-threshold 1800 but exits 0 healthy with 86400, so pre-watcher archive verification now uses 86400 and final freshness remains tied to watcher marker proof"
+      - "approval runbook pre-install archive verification corrected at 2026-05-17T04:59:40Z: release candidate hash differs from installed cass.real and installed watchdog help still exits 2, so pre-install health/search verification now uses /tmp/cass-release-target/release/cass"
+      - "approval-gated watcher proof timeout guard added at 2026-05-17T05:01:29Z: the 120s marker-search loop now exits 1 if the marker never becomes searchable, preventing false success"
+      - "approval runbook explicit data-dir guard added at 2026-05-17T05:02:54Z: pre-install archive health/search and post-install watcher marker search now pass --data-dir \"$LIVE_DIR\" so proof targets the promoted live archive directly"
+      - "approval-gated watcher process proof hardened at 2026-05-17T05:04:45Z: process check now excludes the probe itself and asserts a non-empty cass index --watch process result"
+      - "continuation audit refreshed at 2026-05-17T05:09:27Z: upstream advanced to 1f20bd576f2e77a5197783c637fcc771ab9e1867 and is now 19 ahead/24 behind; live DB remains malformed, live pi_agent=1077, com.cass.index-watch absent, health-watchdog exit=2 runs=353, shadow remains healthy, target free space 150Gi; no live CASS mutation"
+      - "approval runbook pre-promotion process guard hardened at 2026-05-17T05:18:12Z: promotion now exits 1 if com.cass.index-watch is loaded or a non-probe CASS index/search/doctor/health process is active, preventing DB/index moves while CASS may have live files open"
+      - "approval runbook runtime install/restore guard hardened at 2026-05-17T05:21:01Z: install now verifies release and installed binary executability before/after moving cass.real, and restore can recover the PRE-SPEC016 binary even if no failed replacement binary exists"
+      - "approval runbook watcher-process proof hardened at 2026-05-17T05:22:40Z: watcher proof now waits up to 30 seconds for a non-probe cass index --watch process after launchd bootstrap, then prints launchctl state and exits 1 if absent"
+      - "approval runbook restore guard hardened at 2026-05-17T05:24:27Z: restore now preserves failed DB/index/watch artifacts only when present and still restores PRE-SPEC016 backups if a failed replacement was never created"
+      - "approval runbook pre-watcher archive proof hardened at 2026-05-17T05:26:27Z: before watcher startup, promoted live archive must match shadow counts for pi_agent, claude_code, codex, opencode, factory, messages and all five proven lexical canaries must return hits under --data-dir \"$LIVE_DIR\""
+      - "approval runbook post-watcher proof hardened at 2026-05-17T05:28:13Z: after marker search, installed live health must be healthy/ready/checkpoint-complete/watch_active=true at 1800s threshold and index-watch log tail must show marker or watcher ingest/scan evidence"
+      - "approval runbook attempt-token guard added at 2026-05-17T05:33:19Z: promotion, runtime install, watcher proof, and restore now require one shared SPEC016_TS token so PRE-SPEC016/FAILED-SPEC016 suffixes stay aligned across the approved attempt"
+      - "approval runbook upstream/branch proof added at 2026-05-17T05:33:19Z: after live proof, the runbook fetches upstream/origin and fails closed before commit/push unless upstream/main is an ancestor of final HEAD and the dac/main branch target is resolved"
+      - "continuation audit refreshed at 2026-05-17T05:38:53Z: upstream remains 1f20bd576f2e77a5197783c637fcc771ab9e1867 at 19 ahead/24 behind; live DB remains malformed, live pi_agent=1077, com.cass.index-watch absent, health-watchdog exit=2 runs=356, shadow remains healthy, target free space 150Gi; GoalBuddy surfaces still show active T008; no live CASS mutation"
+      - "approval runbook runtime install hash guard added at 2026-05-17T05:42:52Z: the install block now captures release and post-copy cass.real hashes and requires exact equality before continuing to version/capabilities proof"
+      - "approval runbook durable dependency proof guard added at 2026-05-17T05:45:13Z: before release build, the runbook now fails if the sibling frankensqlite checkout is dirty/unpushed or if CASS still resolves fsqlite/fsqlite-types through the local ../spec014-frankensqlite-fix path patch"
+      - "approval runbook durable dependency proof tightened at 2026-05-17T05:48:16Z: the proof now fetches sibling carmandale/origin remotes before remote-containment checks and its grep catches the frankensqlite patch header itself, not only local path entries"
+      - "approval runbook watcher-proof evidence persistence added at 2026-05-17T05:50:25Z: eventual live watcher proof now saves launchctl output, process proof, marker search JSON, post-watcher health JSON, log tail, marker, and synthetic source path under specs/016-cass-recovery-ingestion/evidence/watcher-proof/"
+      - "approval runbook attempt-token ordering fixed at 2026-05-17T05:52:55Z: SPEC016_TS is now initialized immediately after approval and before durable dependency proof, promotion, install, watcher, restore, and branch/upstream blocks"
+      - "approval runbook capacity guard added at 2026-05-17T05:55:20Z: before moving live artifacts, promotion now records shadow DB/index copy footprint and live-volume free space and exits if available space is not greater than the copy footprint"

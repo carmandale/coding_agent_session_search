@@ -1,0 +1,1 @@
+./target/debug/cass search frankensqlite --agent opencode --mode lexical --robot --fields minimal --robot-meta --limit 3 --timeout 120000 --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search-spec016-shadow-20260516T2025Z'

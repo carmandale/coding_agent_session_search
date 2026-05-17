@@ -1,0 +1,19 @@
+ .github/workflows/ci.yml                 |  98 ++++--
+ Cargo.lock                               |  42 +--
+ Cargo.toml                               |   6 +-
+ README.md                                |   7 +-
+ RELEASE_TODO.md                          | 195 +++++++++++
+ build.rs                                 |   6 +-
+ install.ps1                              |  13 +-
+ install.sh                               |  69 ++--
+ src/indexer/mod.rs                       | 325 +++++++++++++++++-
+ src/lib.rs                               | 565 ++++++++++++++++++++++++++++++-
+ src/storage/sqlite.rs                    | 343 ++++++++++++++-----
+ tests/ci_workflow_validates_ubs_gate.rs  |  12 +-
+ tests/cli_dispatch_coverage.rs           |  58 ++--
+ tests/cli_index.rs                       | 103 ++++++
+ tests/e2e_health.rs                      | 113 ++++---
+ tests/e2e_pages.rs                       |   3 +-
+ tests/frankensqlite_concurrent_stress.rs |  58 ++--
+ tests/pages_fts.rs                       |   7 +-
+ 18 files changed, 1735 insertions(+), 288 deletions(-)

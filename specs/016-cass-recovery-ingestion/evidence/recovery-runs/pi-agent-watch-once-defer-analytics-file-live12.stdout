@@ -1,0 +1,8 @@
+{
+  "success": false,
+  "error": "index failed: listing lexical rebuild conversations after id 1772 through planned shard 20 upper bound 1895: listing conversations for lexical rebuild after id 1772 through id 1895: WAL file is corrupt: WAL file too small for header during rebuild: read 0, need 32",
+  "elapsed_ms": 52459,
+  "code": 9,
+  "kind": "index",
+  "retryable": true
+}

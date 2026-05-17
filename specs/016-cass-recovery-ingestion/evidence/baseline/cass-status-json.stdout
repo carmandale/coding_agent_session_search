@@ -1,0 +1,631 @@
+{
+  "status": "unhealthy",
+  "healthy": false,
+  "initialized": true,
+  "explanation": null,
+  "data_dir": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search",
+  "index": {
+    "exists": true,
+    "status": "stale",
+    "reason": "lexical index is older than the stale threshold",
+    "fresh": false,
+    "last_indexed_at": "2026-05-16T01:38:42.935+00:00",
+    "age_seconds": 44003,
+    "stale": true,
+    "stale_threshold_seconds": 1800,
+    "rebuilding": false,
+    "activity_at": null,
+    "documents": null,
+    "empty_with_messages": false,
+    "fingerprint": {
+      "current_db_fingerprint": null,
+      "checkpoint_fingerprint": "content-v1:9657:9657:903256",
+      "matches_current_db_fingerprint": null
+    },
+    "checkpoint": {
+      "present": true,
+      "completed": true,
+      "db_matches": true,
+      "schema_matches": true,
+      "page_size_matches": true,
+      "page_size_compatible": true
+    }
+  },
+  "database": {
+    "exists": true,
+    "opened": true,
+    "conversations": null,
+    "messages": null,
+    "path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search/agent_search.db",
+    "open_error": null,
+    "open_retryable": false,
+    "counts_skipped": true,
+    "open_skipped": true
+  },
+  "pending": {
+    "sessions": 0,
+    "watch_active": false,
+    "orphaned": false
+  },
+  "rebuild": {
+    "active": false,
+    "orphaned": false,
+    "pid": null,
+    "mode": null,
+    "job_id": null,
+    "job_kind": null,
+    "phase": null,
+    "started_at": null,
+    "updated_at": null,
+    "processed_conversations": null,
+    "total_conversations": null,
+    "indexed_docs": null,
+    "pipeline": {
+      "workers": 14,
+      "available_parallelism": 16,
+      "reserved_cores": 2,
+      "tantivy_writer_threads": 14,
+      "staged_shard_builders": 8,
+      "staged_merge_workers": 3,
+      "controller_mode": "auto",
+      "controller_restore_clear_samples": 3,
+      "controller_restore_hold_ms": 5000,
+      "pipeline_max_message_bytes_in_flight": 536870912,
+      "page_prep_workers": 7,
+      "page_size": 1024,
+      "steady_batch_fetch_conversations": 1024,
+      "startup_batch_fetch_conversations": 32,
+      "steady_commit_every_conversations": 10000,
+      "startup_commit_every_conversations": 2048,
+      "steady_commit_every_messages": 800000,
+      "startup_commit_every_messages": 800000,
+      "steady_commit_every_message_bytes": 536870912,
+      "startup_commit_every_message_bytes": 134217728,
+      "pipeline_channel_size": 4,
+      "controller_loadavg_high_watermark_1m": null,
+      "controller_loadavg_low_watermark_1m": null,
+      "runtime": null
+    }
+  },
+  "rebuild_progress": {
+    "active": false,
+    "mode": null,
+    "phase": null,
+    "processed_conversations": null,
+    "total_conversations": null,
+    "remaining_conversations": null,
+    "completion_ratio": null,
+    "indexed_docs": null,
+    "runtime_available": false,
+    "queue_depth": null,
+    "queue_capacity": null,
+    "queue_headroom": null,
+    "pending_batch_conversations": null,
+    "pending_batch_message_bytes": null,
+    "inflight_message_bytes": null,
+    "max_message_bytes_in_flight": null,
+    "inflight_message_bytes_headroom": null,
+    "controller_mode": null,
+    "controller_reason": null,
+    "updated_at": null
+  },
+  "semantic": {
+    "status": "missing",
+    "availability": "needs_consent",
+    "summary": "consent required for model download",
+    "available": false,
+    "can_search": false,
+    "fallback_mode": "lexical",
+    "preferred_backend": "fastembed",
+    "embedder_id": "minilm-384",
+    "vector_index_path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search/vector_index/index-minilm-384.fsvi",
+    "model_dir": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search/models/all-MiniLM-L6-v2",
+    "hnsw_path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search/vector_index/hnsw-minilm-384.chsw",
+    "hnsw_ready": false,
+    "progressive_ready": false,
+    "hint": "Run 'cass models install' and then 'cass index --semantic'; lexical search remains available without the model",
+    "fast_tier": {
+      "present": false,
+      "ready": false,
+      "current_db_matches": null,
+      "conversation_count": null,
+      "doc_count": null,
+      "embedder_id": null,
+      "model_revision": null,
+      "completed_at": null,
+      "size_bytes": null
+    },
+    "quality_tier": {
+      "present": false,
+      "ready": false,
+      "current_db_matches": null,
+      "conversation_count": null,
+      "doc_count": null,
+      "embedder_id": null,
+      "model_revision": null,
+      "completed_at": null,
+      "size_bytes": null
+    },
+    "backlog": {
+      "total_conversations": 0,
+      "fast_tier_processed": 0,
+      "fast_tier_remaining": 0,
+      "quality_tier_processed": 0,
+      "quality_tier_remaining": 0,
+      "pending_work": false,
+      "current_db_matches": null,
+      "computed_at": null
+    },
+    "checkpoint": {
+      "active": false,
+      "tier": null,
+      "current_db_matches": null,
+      "completed": null,
+      "conversations_processed": null,
+      "total_conversations": null,
+      "progress_pct": null,
+      "docs_embedded": null,
+      "last_offset": null,
+      "saved_at": null
+    }
+  },
+  "policy_registry": {
+    "schema_version": "1",
+    "controllers": [
+      {
+        "controller_id": "lexical_rebuild_pipeline",
+        "policy_id": "lexical_rebuild.pipeline.v1",
+        "policy_version": "pipeline_settings_v1",
+        "status": "active",
+        "fallback_state": "not_needed",
+        "conservative_fallback": false,
+        "decision_reason": "pipeline settings active",
+        "inputs": {
+          "controller_loadavg_high_watermark_1m": "null",
+          "controller_loadavg_low_watermark_1m": "null",
+          "controller_mode": "auto",
+          "controller_restore_clear_samples": "3",
+          "controller_restore_hold_ms": "5000",
+          "page_prep_workers": "7",
+          "pipeline_channel_size": "4",
+          "pipeline_max_message_bytes_in_flight": "536870912",
+          "staged_merge_workers": "3",
+          "staged_shard_builders": "8"
+        }
+      },
+      {
+        "controller_id": "semantic_search",
+        "policy_id": "semantic.hybrid_preferred.v1",
+        "policy_version": "semantic_schema_1+chunking_1",
+        "status": "fallback",
+        "fallback_state": "conservative",
+        "conservative_fallback": true,
+        "decision_reason": "semantic unavailable; lexical fallback remains active",
+        "inputs": {
+          "chunk_timeout_seconds": "120",
+          "chunking_strategy_version": "1",
+          "download_policy": "opt_in",
+          "fast_dimension": "256",
+          "fast_tier_embedder": "hash",
+          "idle_delay_seconds": "30",
+          "max_backfill_rss_mb": "256",
+          "max_backfill_threads": "1",
+          "max_model_size_mb": "300",
+          "max_refinement_docs": "100",
+          "min_free_disk_mb": "200",
+          "mode": "hybrid_preferred",
+          "quality_dimension": "384",
+          "quality_tier_embedder": "minilm",
+          "quality_weight": "0.7",
+          "reranker": "ms-marco-minilm",
+          "semantic_available": "false",
+          "semantic_budget_mb": "500",
+          "semantic_fallback_mode": "lexical",
+          "semantic_schema_version": "1"
+        }
+      }
+    ]
+  },
+  "topology_budget": {
+    "schema_version": "1",
+    "topology": {
+      "source": "fallback",
+      "topology_class": "unknown",
+      "logical_cpus": 16,
+      "physical_cores": 16,
+      "sockets": 1,
+      "numa_nodes": 1,
+      "llc_groups": 1,
+      "smt_threads_per_core": 1,
+      "memory_total_bytes": null,
+      "memory_available_bytes": null
+    },
+    "reserved_core_policy": {
+      "reserved_cores": 2,
+      "policy": "current conservative default",
+      "reason": "topology could not be derived, so cass preserves existing worker and RAM defaults"
+    },
+    "advisory_budgets": {
+      "shard_builders": 8,
+      "merge_workers": 3,
+      "page_prep_workers": 7,
+      "semantic_batchers": 1,
+      "cache_cap_bytes": 67108864,
+      "max_inflight_bytes": 536870912
+    },
+    "current_defaults": {
+      "available_parallelism": 16,
+      "reserved_cores": 2,
+      "shard_builders": 8,
+      "merge_workers": 3,
+      "page_prep_workers": 7,
+      "cache_cap_bytes": 67108864,
+      "max_inflight_bytes": 536870912
+    },
+    "fallback_active": true,
+    "decision_reason": "using conservative defaults: linux sysfs topology is unavailable on this platform",
+    "proof_notes": [
+      "fallback is intentionally isomorphic to current defaults for live rebuild budgets",
+      "no /sys-derived CPU locality assumptions are made in fallback mode"
+    ]
+  },
+  "doctor_summary": {
+    "schema_version": 2,
+    "surface": "status-summary",
+    "mode": "read-only-check",
+    "status": "skipped",
+    "outcome_kind": "no_op",
+    "health_class": "degraded-derived-assets",
+    "risk_level": "unknown",
+    "asset_class": "canonical_archive_db",
+    "fallback_mode": "lexical",
+    "authority_status": "read_only",
+    "coverage_delta": {
+      "status": "unknown",
+      "archive_conversation_count": null,
+      "visible_source_conversation_count": null,
+      "raw_mirror_manifest_count": null,
+      "db_projection_only_count": null,
+      "missing_current_source_count": null,
+      "conversation_delta": null,
+      "message_delta": null,
+      "semantic_vector_delta": null,
+      "derived_asset_delta": null
+    },
+    "blocked_reasons": [],
+    "plan_fingerprint": null,
+    "receipt_path": null,
+    "event_log_path": null,
+    "artifact_manifest_path": null,
+    "recommended_action": "Run 'cass doctor check --json' to refresh archive coverage and repair readiness.",
+    "redaction_status": "redacted",
+    "contract_provenance": "runtime",
+    "operation_outcome": {
+      "kind": "ok-read-only-diagnosed",
+      "reason": "health/status used bounded readiness evidence and recommends doctor check for full archive coverage",
+      "action_taken": "reported bounded health/status doctor summary without mutating archive data",
+      "action_not_taken": "did not run deep doctor collectors, source sync, rebuild, model verification, or filesystem-wide repair work",
+      "safe_to_retry": true,
+      "requires_override": false,
+      "data_loss_risk": "unknown",
+      "next_command": "cass doctor check --json",
+      "artifact_manifest_path": null,
+      "exit_code_kind": "success"
+    },
+    "doctor_available": true,
+    "safe_auto_run_eligible": false,
+    "last_receipt_path": null,
+    "failure_marker_path": null,
+    "repair_previously_failed": false,
+    "active_repair": {
+      "active": false,
+      "active_index_maintenance": false,
+      "repair_blocked_reason": null
+    },
+    "repair_recommended": false,
+    "repair_blocked_reason": null,
+    "doctor_check_recommended": true,
+    "archive_coverage_state": "not_checked",
+    "source_mirror_state": "not_checked",
+    "remote_source_sync": {
+      "schema_version": 1,
+      "status": "ok",
+      "source": "status-inline-local-config",
+      "checked": true,
+      "archive_checked": false,
+      "live_remote_probe_attempted": false,
+      "remote_source_state": "not_configured",
+      "sync_staleness": "not_configured",
+      "local_mirror_state": "not_configured",
+      "configured_remote_source_count": 0,
+      "archive_remote_conversation_count": null,
+      "sync_gap_count": 0,
+      "highest_gap_severity": "none",
+      "recommended_action": "none",
+      "recommended_sync_commands": [],
+      "notes": [
+        "remote_source_sync is read-only and local-only: it reads sources.toml, sync_status.json, local mirror directories, and archive provenance rows only.",
+        "Missing or stale remote sync state is a freshness gap, not proof that archived cass conversations are lost.",
+        "Doctor never opens SSH sessions or mutates provider session logs while building this report.",
+        "status-inline-local-config checked remote source config, sync status, and local cass mirrors without live SSH probes or provider log mutation"
+      ]
+    },
+    "sole_copy_conversation_count": 0,
+    "cleanup_reclaimable_bytes": 0,
+    "quarantine_summary": {
+      "failed_seed_bundle_count": 0,
+      "retained_publish_backup_count": 1,
+      "retained_publish_backup_retention_limit": 1,
+      "lexical_generation_count": 1,
+      "lexical_generation_build_state_counts": {
+        "building": 0,
+        "built": 0,
+        "failed": 0,
+        "scratch": 0,
+        "validated": 1,
+        "validating": 0
+      },
+      "lexical_generation_publish_state_counts": {
+        "published": 1,
+        "quarantined": 0,
+        "staged": 0,
+        "superseded": 0
+      },
+      "lexical_quarantined_generation_count": 0,
+      "lexical_quarantined_shard_count": 0,
+      "total_retained_bytes": 1276117832,
+      "gc_eligible_asset_count": 0,
+      "gc_eligible_bytes": 0,
+      "inspection_required_asset_count": 0,
+      "inspection_required_bytes": 0,
+      "cleanup_dry_run_generation_count": 1,
+      "cleanup_dry_run_reclaim_candidate_count": 0,
+      "cleanup_dry_run_reclaimable_bytes": 0,
+      "cleanup_dry_run_retained_bytes": 0,
+      "cleanup_dry_run_protected_generation_count": 0,
+      "cleanup_dry_run_active_generation_count": 0,
+      "cleanup_dry_run_inspection_required_count": 0,
+      "cleanup_dry_run_approval_fingerprint": "cleanup-v1-da99602537876871f72bb1573fbfa15e1b967863d8fffaf488e4fae35cd44445",
+      "cleanup_apply_allowed": false
+    },
+    "coverage_source": {
+      "status": "not_checked",
+      "source": "status-fast-state",
+      "confidence_tier": "unchecked",
+      "generated_at": "2026-05-16T13:52:05+00:00",
+      "stale_after_seconds": 0,
+      "source_report_id": null,
+      "recommended_action": "Run cass doctor check --json for current archive coverage; health/status did not run deep collectors."
+    },
+    "health_status": "unhealthy",
+    "db_exists": true
+  },
+  "remote_source_sync": {
+    "schema_version": 1,
+    "status": "ok",
+    "source": "status-inline-local-config",
+    "checked": true,
+    "archive_checked": false,
+    "live_remote_probe_attempted": false,
+    "remote_source_state": "not_configured",
+    "sync_staleness": "not_configured",
+    "local_mirror_state": "not_configured",
+    "configured_remote_source_count": 0,
+    "archive_remote_conversation_count": null,
+    "sync_gap_count": 0,
+    "highest_gap_severity": "none",
+    "recommended_action": "none",
+    "recommended_sync_commands": [],
+    "notes": [
+      "remote_source_sync is read-only and local-only: it reads sources.toml, sync_status.json, local mirror directories, and archive provenance rows only.",
+      "Missing or stale remote sync state is a freshness gap, not proof that archived cass conversations are lost.",
+      "Doctor never opens SSH sessions or mutates provider session logs while building this report.",
+      "status-inline-local-config checked remote source config, sync status, and local cass mirrors without live SSH probes or provider log mutation"
+    ]
+  },
+  "coverage_risk": {
+    "schema_version": 1,
+    "status": "unchecked_fast_health",
+    "confidence_tier": "unchecked",
+    "archive_conversation_count": 0,
+    "missing_current_source_count": 0,
+    "db_without_raw_mirror_count": 0,
+    "db_projection_only_count": 0,
+    "mirror_without_db_link_count": 0,
+    "current_source_newer_than_archive_count": 0,
+    "raw_mirror_db_link_count": 0,
+    "sole_copy_warning_count": 0,
+    "recommended_action": "Run 'cass doctor --json' for source coverage and sole-copy analysis."
+  },
+  "quarantine": {
+    "summary": {
+      "failed_seed_bundle_count": 0,
+      "retained_publish_backup_count": 1,
+      "retained_publish_backup_retention_limit": 1,
+      "lexical_generation_count": 1,
+      "lexical_generation_build_state_counts": {
+        "building": 0,
+        "built": 0,
+        "failed": 0,
+        "scratch": 0,
+        "validated": 1,
+        "validating": 0
+      },
+      "lexical_generation_publish_state_counts": {
+        "published": 1,
+        "quarantined": 0,
+        "staged": 0,
+        "superseded": 0
+      },
+      "lexical_quarantined_generation_count": 0,
+      "lexical_quarantined_shard_count": 0,
+      "total_retained_bytes": 1276117832,
+      "gc_eligible_asset_count": 0,
+      "gc_eligible_bytes": 0,
+      "inspection_required_asset_count": 0,
+      "inspection_required_bytes": 0,
+      "cleanup_dry_run_generation_count": 1,
+      "cleanup_dry_run_reclaim_candidate_count": 0,
+      "cleanup_dry_run_reclaimable_bytes": 0,
+      "cleanup_dry_run_retained_bytes": 0,
+      "cleanup_dry_run_protected_generation_count": 0,
+      "cleanup_dry_run_active_generation_count": 0,
+      "cleanup_dry_run_inspection_required_count": 0,
+      "cleanup_dry_run_approval_fingerprint": "cleanup-v1-da99602537876871f72bb1573fbfa15e1b967863d8fffaf488e4fae35cd44445",
+      "cleanup_apply_allowed": false
+    },
+    "quarantined_artifacts": [],
+    "failed_seed_bundle_files": [],
+    "retained_publish_backups": [
+      {
+        "asset_class": "retained_publish_backup",
+        "safety_classification": "derived_reclaimable",
+        "derived": true,
+        "precious": false,
+        "auto_delete_allowed": true,
+        "safe_to_gc_allowed": true,
+        "path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search/index/.lexical-publish-backups/.v7.published-bak.35438.1778895522981381000.9",
+        "size_bytes": 1276117832,
+        "age_seconds": 44002,
+        "last_read_at_ms": 1778895523489,
+        "safe_to_gc": false,
+        "gc_reason": "retained lexical publish backup is still protected by retention cap (1)"
+      }
+    ],
+    "lexical_generations": [],
+    "lexical_cleanup_dry_run": {
+      "dry_run": true,
+      "approval_fingerprint": "cleanup-v1-da99602537876871f72bb1573fbfa15e1b967863d8fffaf488e4fae35cd44445",
+      "generation_count": 1,
+      "total_artifact_bytes": 0,
+      "total_reclaimable_bytes": 0,
+      "total_retained_bytes": 0,
+      "reclaim_candidates": [],
+      "reclaimable_generation_ids": [],
+      "fully_retained_generation_ids": [
+        "gen-0000019e2e6f8c8a-content-v1:9657:"
+      ],
+      "protected_generation_ids": [],
+      "protected_retained_bytes": 0,
+      "quarantined_generation_ids": [],
+      "active_generation_ids": [],
+      "disposition_counts": {
+        "current_published": 1
+      },
+      "generation_disposition_summaries": {
+        "current_published": {
+          "generation_count": 1,
+          "artifact_bytes": 0,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 0
+        }
+      },
+      "inspection_items": [],
+      "inspection_required_generation_ids": [],
+      "inspection_required_count": 0,
+      "inspection_required_retained_bytes": 0,
+      "shard_disposition_summaries": {},
+      "inventories": [
+        {
+          "generation_id": "gen-0000019e2e6f8c8a-content-v1:9657:",
+          "build_state": "validated",
+          "publish_state": "published",
+          "disposition": "current_published",
+          "reason": "current published lexical generation is never reclaimable",
+          "retain_until_ms": null,
+          "retention_reason": "current published lexical generation has no retention expiry",
+          "artifact_bytes": 0,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 0,
+          "shards": []
+        }
+      ]
+    },
+    "lexical_cleanup_apply_gate": {
+      "apply_allowed": false,
+      "dry_run": true,
+      "explicit_operator_approval": false,
+      "approval_fingerprint": "cleanup-v1-da99602537876871f72bb1573fbfa15e1b967863d8fffaf488e4fae35cd44445",
+      "provided_approval_fingerprint": null,
+      "approval_fingerprint_status": "not_requested",
+      "approval_fingerprint_matches": false,
+      "generation_count": 1,
+      "total_artifact_bytes": 0,
+      "total_retained_bytes": 0,
+      "candidate_count": 0,
+      "reclaimable_bytes": 0,
+      "disposition_counts": {
+        "current_published": 1
+      },
+      "generation_disposition_summaries": {
+        "current_published": {
+          "generation_count": 1,
+          "artifact_bytes": 0,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 0
+        }
+      },
+      "shard_disposition_summaries": {},
+      "candidate_previews": [],
+      "reclaimable_generation_ids": [],
+      "fully_retained_generation_ids": [
+        "gen-0000019e2e6f8c8a-content-v1:9657:"
+      ],
+      "quarantined_generation_ids": [],
+      "blocker_codes": [
+        "no_reclaimable_candidates",
+        "operator_approval_required"
+      ],
+      "blocked_reasons": [
+        "no reclaimable cleanup candidates",
+        "destructive cleanup requires explicit operator approval after dry-run"
+      ],
+      "active_generation_ids": [],
+      "protected_generation_ids": [],
+      "protected_retained_bytes": 0,
+      "inspection_previews": [],
+      "inspection_required_count": 0,
+      "inspection_required_retained_bytes": 0,
+      "inspection_required_generation_ids": []
+    },
+    "warnings": []
+  },
+  "recommended_action": "Run 'cass index' to refresh the index",
+  "recommended_commands": [
+    {
+      "id": "refresh-lexical-index",
+      "command": "cass index --json --no-progress-events --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search'",
+      "purpose": "Index newly discovered sessions without a full rebuild.",
+      "safety": "writes-cass-archive-and-derived-index",
+      "run_when": "Run when the index is stale or pending.sessions is nonzero.",
+      "success_signal": "success=true, then pending.sessions=0 and index.fresh=true",
+      "parse_fields": [
+        "success",
+        "conversations",
+        "messages",
+        "error"
+      ],
+      "retry_after_ms": null
+    },
+    {
+      "id": "verify-refresh",
+      "command": "cass health --json --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search'",
+      "purpose": "Confirm the refresh cleared the readiness blocker.",
+      "safety": "read-only",
+      "run_when": "Run after refresh-lexical-index finishes.",
+      "success_signal": "healthy=true or recommended_commands changes to the next blocker",
+      "parse_fields": [
+        "status",
+        "healthy",
+        "state.index",
+        "recommended_commands"
+      ],
+      "retry_after_ms": null
+    }
+  ],
+  "_meta": {
+    "timestamp": "2026-05-16T13:52:05+00:00",
+    "data_dir": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search",
+    "db_path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search/agent_search.db"
+  }
+}

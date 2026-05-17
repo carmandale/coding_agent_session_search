@@ -1,0 +1,1 @@
+kill -TERM 36610 after vmmap showed 22.2G physical footprint during watch_once optimize path

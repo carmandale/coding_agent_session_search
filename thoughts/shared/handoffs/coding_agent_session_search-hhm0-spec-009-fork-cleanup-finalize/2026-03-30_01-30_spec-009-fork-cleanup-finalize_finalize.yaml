@@ -1,0 +1,60 @@
+---
+schema_version: "1.0.0"
+mode: finalize
+date: 2026-03-30T01:30:11.580Z
+session: "coding_agent_session_search-hhm0-spec-009-fork-cleanup-finalize"
+outcome: "SUCCEEDED"
+primary_bead: "coding_agent_session_search-hhm0"
+---
+
+goal: "Implement, Codex-review, and Codex-verify spec 009 fork cleanup, then record the closure artifacts."
+now: "Spec 009 is implemented and code-verified, the approval artifacts are committed and pushed on feat/007-watchdog-subcommand, and only unrelated .pi messenger noise remains dirty in the worktree."
+
+final_solutions:
+  - "Detached Codebuff from the live connector registry while preserving tolerant watch-state loading so removed connector keys no longer break scans."
+  - "Restored Crush through the local wrapper plus adapter-backed FAD path and aligned the fork to the newer FAD main revision required by the approved plan."
+  - "Kept the generic `cass doctor` reconciliation flow intact and added a helper-backed regression proving live-factory enumeration excludes detached Codebuff rows while retaining active connectors like Crush."
+  - "Closed the verification gap Codex found by adding behavioral regressions for real SQLite-backed Crush scanning and doctor reconciliation, then re-submitted until Codex approved the implementation."
+
+final_decisions:
+  - "Kept `src/connectors/codebuff.rs` on disk because this repo requires explicit written permission before file deletion; runtime detachment was the allowed cleanup."
+  - "Used checkout-local verification (`target/debug/cass` and rustup cargo) instead of trusting PATH-installed binaries after the plan review exposed toolchain and binary drift."
+  - "Treated stale shaping assumptions about doctor/shim removal as already satisfied and preserved the existing doctor reconciliation behavior rather than removing working code."
+  - "Recorded Codex review and code-verify receipts directly in the spec lane so the implementation, approval, and provenance trail stay together."
+
+artifacts_produced:
+  - "specs/009-fork-cleanup/spec.md, plan.md, tasks.md, codex-review.md, implement-receipt.md, code-verify.md"
+  - "specs/009-fork-cleanup/log.md and workflow-state.md with review, implement, and verification provenance"
+  - "src/connectors/crush.rs, src/connectors/fad_adapter.rs, src/connectors/mod.rs, src/indexer/mod.rs, src/lib.rs"
+  - "Commits: 3ea3a663, 0e831163, 6abb13be, 3a36836d"
+
+done_this_session:
+  - "Implemented the approved spec 009 fork cleanup on feat/007-watchdog-subcommand"
+  - "Ran Codex plan review to approval and wrote back the approved spec artifacts"
+  - "Ran implementation verification: cargo fmt/check/clippy/test plus checkout-local watchdog smoke"
+  - "Resolved Codex code-verify round-1 findings with new behavioral regressions and obtained round-2 approval"
+  - "Recorded finalize-ready closure state and pushed the verification receipts to origin"
+
+files:
+  - "specs/009-fork-cleanup/spec.md"
+  - "specs/009-fork-cleanup/plan.md"
+  - "specs/009-fork-cleanup/tasks.md"
+  - "specs/009-fork-cleanup/codex-review.md"
+  - "specs/009-fork-cleanup/implement-receipt.md"
+  - "specs/009-fork-cleanup/code-verify.md"
+  - "src/connectors/crush.rs"
+  - "src/connectors/fad_adapter.rs"
+  - "src/connectors/mod.rs"
+  - "src/indexer/mod.rs"
+  - "src/lib.rs"
+
+test:
+  new: 2
+  total: 1180
+  pass: 1180
+  fail: 0
+
+git:
+  branch: "feat/007-watchdog-subcommand"
+  commit: "3a36836d718e5a79b19e211dd1ba4d52a34f3c4a"
+  remote: "https://github.com/carmandale/coding_agent_session_search.git"

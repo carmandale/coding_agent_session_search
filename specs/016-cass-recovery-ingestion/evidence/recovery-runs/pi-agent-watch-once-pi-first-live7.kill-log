@@ -1,0 +1,1 @@
+sent SIGTERM to 92960 at 2026-05-16T16:58:10Z after live7 reached high RSS before Pi ingest; prior sample showed frankensqlite Connection::open rehydrating fts_messages before cass targeted ingest

@@ -1,0 +1,78 @@
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121    448   00:00 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 3924272   00:30 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 4289808   01:00 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 4378160   01:30 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 4551456   02:00 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 9949504   02:30 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 10318304   03:00 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 12552480   03:30 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 11942976   04:00 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 12815424   04:30 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 13404352   05:00 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 13682320   05:31 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 13996576   06:01 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 14453744   06:31 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 14681520   07:01 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 14828832   07:31 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 15072192   08:01 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 15053488   08:31 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 15177200   09:01 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 15372288   09:31 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 15493360   10:01 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 15615680   10:31 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 15742416   11:01 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 15672464   11:31 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 15870528   12:01 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 16200368   12:31 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 16118560   13:02 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 16210528   13:32 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 16323824   14:02 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 16467344   14:32 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 16627472   15:02 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 16759472   15:32 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 16853104   16:02 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 17010928   16:32 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 17321808   17:02 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 17606528   17:32 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 17417856   18:02 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 17546112   18:32 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID    RSS ELAPSED COMMAND
+31134 31121 17076848   19:02 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search

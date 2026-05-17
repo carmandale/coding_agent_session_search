@@ -1,0 +1,20 @@
+  PID  PPID  %CPU %MEM    RSS ELAPSED STAT COMMAND
+35450 35423   0.0  0.0    256   00:00 RN   ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID  %CPU %MEM    RSS ELAPSED STAT COMMAND
+35450 35423 100.0  2.7 3573184   00:30 RN   ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID  %CPU %MEM    RSS ELAPSED STAT COMMAND
+35450 35423  99.4  2.9 3924176   01:00 RN   ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID  %CPU %MEM    RSS ELAPSED STAT COMMAND
+35450 35423  98.7  4.3 5834288   01:30 RN   ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID  %CPU %MEM    RSS ELAPSED STAT COMMAND
+35450 35423  99.5  4.7 6269648   02:00 RN   ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID  %CPU %MEM    RSS ELAPSED STAT COMMAND
+35450 35423  82.5 10.5 14040032   02:30 RN   ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID  %CPU %MEM    RSS ELAPSED STAT COMMAND
+35450 35423 100.0 17.6 23660848   03:00 RN   ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID  %CPU %MEM    RSS ELAPSED STAT COMMAND
+35450 35423  99.8 18.0 24123312   03:30 RN   ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID  %CPU %MEM    RSS ELAPSED STAT COMMAND
+35450 35423  94.6 18.0 24124688   04:00 RN   ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+  PID  PPID  %CPU %MEM    RSS ELAPSED STAT COMMAND
+35450 35423  59.4 18.0 24124688   04:30 RN   ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search

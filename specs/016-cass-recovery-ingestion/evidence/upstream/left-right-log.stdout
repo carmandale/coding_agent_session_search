@@ -1,0 +1,35 @@
+> 66e5039e (upstream/main, upstream/HEAD) ci(ubs): gate on changed-file regressions
+> 0908484a test(doctor): pin mutation action wire format
+> 48bda2ac fix(index): surface disabled connector exclusions
+> 1612d039 fts: stream-based rebuild + pass-15/16/17 doctor cleanup_apply work
+> c5d7be3b fix(indexer): preserve watermarks with scan exclusions
+> 66d5d679 fix(indexer): unblock large streaming source scans
+< b807ef17 (HEAD -> dac/main, origin/dac/main) test(spec-015): integration tests for streaming watch-once + Group D close
+< 4710be32 feat(indexer): wire spec 015 streaming watch-once branch (Group B + C-partial)
+< a3c102e5 feat(indexer): add scratch-root helpers for spec 015 Group A
+< d9f08a3c fix(daemon): gate test_resource_monitor_creation to linux
+< a25b0056 spec(015): /codex-review APPROVED after 4 rounds
+< 09ce0094 spec(015): /codex-plan complete — Route 5 streaming watch-once
+< 52e96656 spec(014): PR #90 fix correct but insufficient for cass workload
+< 8fc1076b spec(014): upstream frankensqlite PR opened (#90)
+< 3e087b8b spec(014): D1 prep — fsqlite delta-journal patch ready for upstream PR
+< 94aafec8 spec(014): record contentless-table side-finding as separate bead
+< 459bc7a4 spec(014): profile evidence puts memset stall in frankensqlite_ext_fts5
+> b87c048a (upstream/master) fix(tests): reuse prepared inserts in health fixture
+> 102bb565 fix(tests): parameterize audit-flagged SQL fixtures
+> dba13843 fix(installer): reject non-exe payloads on Windows
+> c476ec8a fix(installer): reject exe payloads off Windows
+> 0887801e fix(installer): prefer legacy exe on Windows POSIX shells
+> 08fc30b2 fix(installer): prefer platform binary after extraction
+> cc1d46d0 fix(installer): install exe basename on Windows POSIX shells
+> 08c489e3 fix(installer): support legacy Windows exe in POSIX installer
+> 4c8a6c36 fix(installer): prefer canonical Windows binary name
+> 5dcaffde fix(installer): avoid eager zip entry type binding
+< 05ba881b spec(013): record root cause + fix landed in e429eaa8
+< e429eaab fix(indexer): chunk watch-once ingest even when explicit_watch_once is set
+< faf77885 spec(013): findings from 2026-05-14 recovery session
+< 47db795f Merge remote-tracking branch 'upstream/main' into dac/main
+< f9645f11 impl(013): Group A complete (recovery operational baseline)
+< a7d09255 review(013): /codex-review APPROVED after 5 rounds
+< ed590b9b plan(013): cass rebuild stall — APPROVED plan + tasks via /codex-plan
+< 16d0a17d spec(013): cass full-rebuild stalls on raw-mirror archive copy

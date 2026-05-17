@@ -1,0 +1,30 @@
+{
+  "success": true,
+  "elapsed_ms": 1162554,
+  "full": false,
+  "force_rebuild": false,
+  "entrypoint": {
+    "kind": "incremental",
+    "full": false,
+    "force_rebuild": false,
+    "watch": false,
+    "watch_once_path_count": 0,
+    "semantic": false,
+    "build_hnsw": false,
+    "migration_state": "tin8o_entrypoint_observed"
+  },
+  "data_dir": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search",
+  "db_path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search/agent_search.db",
+  "conversations": 9659,
+  "messages": 902851,
+  "indexing_stats": {
+    "scan_ms": 0,
+    "index_ms": 0,
+    "connectors": [],
+    "agents_discovered": [],
+    "total_conversations": 9659,
+    "total_messages": 902851,
+    "lexical_strategy": "deferred_authoritative_db_rebuild",
+    "lexical_strategy_reason": "readonly_fast_resume_incomplete_nonresumable_lexical_rebuild"
+  }
+}

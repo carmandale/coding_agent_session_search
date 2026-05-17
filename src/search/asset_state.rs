@@ -1963,6 +1963,7 @@ mod tests {
         let checkpoint = LexicalRebuildCheckpoint {
             db_path: db_path.display().to_string(),
             total_conversations: 10,
+            total_messages: 100,
             storage_fingerprint: "before".to_string(),
             committed_offset: 10,
             committed_conversation_id: Some(10),
@@ -2016,6 +2017,7 @@ mod tests {
         let checkpoint = LexicalRebuildCheckpoint {
             db_path: other_db_path.display().to_string(),
             total_conversations: 10,
+            total_messages: 100,
             storage_fingerprint: "old-db-fingerprint".to_string(),
             committed_offset: 10,
             committed_conversation_id: Some(10),
@@ -2096,6 +2098,7 @@ mod tests {
         let checkpoint = LexicalRebuildCheckpoint {
             db_path: db_path.display().to_string(),
             total_conversations: 10,
+            total_messages: 20,
             storage_fingerprint: "before".to_string(),
             committed_offset: 4,
             committed_conversation_id: Some(4),
@@ -2156,6 +2159,7 @@ mod tests {
         let checkpoint = LexicalRebuildCheckpoint {
             db_path: db_path.display().to_string(),
             total_conversations: 10,
+            total_messages: 20,
             storage_fingerprint: "before".to_string(),
             committed_offset: 4,
             committed_conversation_id: Some(4),
@@ -2205,6 +2209,7 @@ mod tests {
         let checkpoint = LexicalRebuildCheckpoint {
             db_path: db_path.display().to_string(),
             total_conversations: 10,
+            total_messages: 20,
             storage_fingerprint: "before".to_string(),
             committed_offset: 4,
             committed_conversation_id: Some(4),
@@ -2256,6 +2261,7 @@ mod tests {
         let checkpoint = LexicalRebuildCheckpoint {
             db_path: db_path.display().to_string(),
             total_conversations: 10,
+            total_messages: 20,
             storage_fingerprint: "before".to_string(),
             committed_offset: 4,
             committed_conversation_id: Some(4),

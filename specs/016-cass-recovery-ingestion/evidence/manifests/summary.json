@@ -1,0 +1,36 @@
+{
+  "agents": {
+    "claude_code": {
+      "count": 2425,
+      "newest_mtime_ms": 1778939419213,
+      "oldest_mtime_ms": 1768568490662,
+      "output": "specs/016-cass-recovery-ingestion/evidence/manifests/claude_code.jsonl",
+      "patterns": [
+        "/Users/dalecarman/.claude/projects/**/*.jsonl"
+      ],
+      "total_bytes": 1196559197
+    },
+    "codex": {
+      "count": 5868,
+      "newest_mtime_ms": 1778939678930,
+      "oldest_mtime_ms": 1744842922636,
+      "output": "specs/016-cass-recovery-ingestion/evidence/manifests/codex.jsonl",
+      "patterns": [
+        "/Users/dalecarman/.codex/sessions/**/rollout-*.jsonl",
+        "/Users/dalecarman/.codex/sessions/**/rollout-*.json"
+      ],
+      "total_bytes": 14296483670
+    },
+    "pi_agent": {
+      "count": 4174,
+      "newest_mtime_ms": 1778868493900,
+      "oldest_mtime_ms": 1764764271848,
+      "output": "specs/016-cass-recovery-ingestion/evidence/manifests/pi_agent.jsonl",
+      "patterns": [
+        "/Users/dalecarman/.pi/agent/sessions/**/*.jsonl"
+      ],
+      "total_bytes": 1948847388
+    }
+  },
+  "generated_at": "2026-05-16T13:54:38.803407+00:00"
+}

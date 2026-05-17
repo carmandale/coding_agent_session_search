@@ -1,0 +1,1 @@
+CASS_TANTIVY_MAX_WRITER_THREADS=1 ./target/debug/cass index --watch-once '/Users/dalecarman/.pi/agent/sessions/--Users-dalecarman-.clawdis-workspace--' --json --no-progress-events --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search'

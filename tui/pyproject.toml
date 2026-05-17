@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cass-tui"
+version = "0.1.0"
+description = "Terminal UI for viewing coding agent sessions by agent"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Dale Carman", email = "dale@groovejones.com" }
+]
+dependencies = [
+    "textual>=0.40.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+cass-tui = "cass_tui.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cass_tui"]

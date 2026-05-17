@@ -1,0 +1,5 @@
+2026-05-16T14:53:05Z
+RSS crossed route-policy hard ceiling during search; sending TERM to cass PID 25835
+  PID  PPID    RSS ELAPSED COMMAND
+25835 25824 42157984   06:28 ./target/debug/cass search ATT21_COL_CFP_SceneMachine_EndCard.psd --agent pi_agent --mode lexical --robot --fields minimal --robot-meta --limit 10 --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+kill_exit=0

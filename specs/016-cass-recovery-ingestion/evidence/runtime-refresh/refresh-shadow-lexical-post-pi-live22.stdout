@@ -1,0 +1,8 @@
+{
+  "success": false,
+  "error": "index failed: out of memory",
+  "elapsed_ms": 1321057,
+  "code": 9,
+  "kind": "index",
+  "retryable": true
+}

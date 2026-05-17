@@ -1,0 +1,63 @@
+gui/501/com.cass.health-watchdog = {
+	active count = 0
+	path = /Users/dalecarman/Library/LaunchAgents/com.cass.health-watchdog.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /Users/dalecarman/.local/bin/cass
+	BTM uuid = F10B6BD9-9796-4A0E-91E5-F3DFFC55A2EB
+	arguments = {
+		/Users/dalecarman/.local/bin/cass
+		watchdog
+		run
+	}
+
+	stdout path = /Users/dalecarman/Library/Logs/cass-watchdog.log
+	stderr path = /Users/dalecarman/Library/Logs/cass-watchdog.log
+	inherited environment = {
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.5TRhwYW5tx/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.cass.health-watchdog
+	}
+
+	domain = gui/501 [100024]
+	asid = 100024
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 261
+	last exit code = 2
+
+	resource coalition = {
+		ID = 2105
+		type = resource
+		state = active
+		active count = 1
+		name = com.cass.health-watchdog
+	}
+
+	jetsam coalition = {
+		ID = 2106
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.cass.health-watchdog
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	run interval = 600 seconds
+
+	properties = inferred program | managed LWCR | has LWCR
+}

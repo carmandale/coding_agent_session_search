@@ -1,0 +1,1 @@
+./target/debug/cass index --watch-once "/Users/dalecarman/.pi/agent/sessions" --json --robot-trace-ingest --no-progress-events --data-dir "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search"

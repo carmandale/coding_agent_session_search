@@ -1,0 +1,49 @@
+{
+  "approval_target_sha": "a25b00562b1c1dd640e924e08697c25e248e3dc3",
+  "baseline_sha": "a25b00562b1c1dd640e924e08697c25e248e3dc3",
+  "chunk_map": [
+    {
+      "header": "## Group A \u2014 Helpers and scratch-root infrastructure",
+      "line": 14,
+      "ordinal": 0
+    },
+    {
+      "header": "## Group B \u2014 Watch-once streaming branch",
+      "line": 21,
+      "ordinal": 1
+    },
+    {
+      "header": "## Group C \u2014 Run receipt and reconciliation",
+      "line": 28,
+      "ordinal": 2
+    },
+    {
+      "header": "## Group D \u2014 Regression tests",
+      "line": 43,
+      "ordinal": 3
+    },
+    {
+      "header": "## Group E \u2014 Full-corpus verification on user's machine",
+      "line": 54,
+      "ordinal": 4
+    },
+    {
+      "header": "## Group F \u2014 Implementation provenance",
+      "line": 69,
+      "ordinal": 5
+    }
+  ],
+  "closeout_surface": [],
+  "created_at": "2026-05-15T23:00:11Z",
+  "findings": [],
+  "proof_manifest": [],
+  "rounds": [],
+  "schema_version": 1,
+  "state_fingerprint": {
+    "baseline_sha": "a25b00562b1c1dd640e924e08697c25e248e3dc3",
+    "chunk_count": 6,
+    "spec_relpath": "specs/015-watch-once-streaming-scan"
+  },
+  "updated_at": "2026-05-15T23:00:11Z",
+  "validator_capability": "read-only"
+}

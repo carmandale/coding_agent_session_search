@@ -1,0 +1,5 @@
+2026-05-16T14:32:41Z
+RSS crossed route-policy hard ceiling; sending TERM to cass PID 53432
+  PID  PPID    RSS ELAPSED COMMAND
+53432 53408 27311728   04:15 ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions/--Users-dalecarman-.clawdis-workspace-- --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+kill_exit=0

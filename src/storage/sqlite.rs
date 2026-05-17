@@ -173,6 +173,12 @@ impl LazyFrankenDb {
                 path: self.path.clone(),
                 source: frankensqlite::FrankenError::Internal(err.to_string()),
             })?;
+            park_zero_byte_wal_before_franken_open(&self.path, "lazy open").map_err(|err| {
+                LazyDbError::FrankenOpenFailed {
+                    path: self.path.clone(),
+                    source: frankensqlite::FrankenError::Internal(err.to_string()),
+                }
+            })?;
             let conn =
                 FrankenConnection::open(self.path.to_string_lossy().into_owned()).map_err(|e| {
                     LazyDbError::FrankenOpenFailed {
@@ -221,6 +227,12 @@ impl LazyFrankenDb {
                             return;
                         }
                     };
+                if let Err(err) =
+                    park_zero_byte_wal_before_franken_open(&path_for_guard, "lazy timed open")
+                {
+                    let _ = tx.send(Err(frankensqlite::FrankenError::Internal(err.to_string())));
+                    return;
+                }
                 let _ =
                     tx.send(FrankenConnection::open(path_owned).map(SendFrankenConnection::new));
             });
@@ -267,6 +279,237 @@ static MESSAGE_LOOKUP_EXACT_IDX_PROBES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_BOUNDED_QUERIES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_FULL_SCAN_QUERIES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_ROWS_MATERIALIZED: AtomicU64 = AtomicU64::new(0);
+
+fn wal_sidecar_path(db_path: &Path) -> PathBuf {
+    let mut wal_path = db_path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    PathBuf::from(wal_path)
+}
+
+fn unique_zero_byte_wal_park_path(wal_path: &Path) -> Result<PathBuf> {
+    let parent = wal_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = wal_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "database-wal".to_string());
+    let pid = std::process::id();
+    let epoch_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for attempt in 0..1000 {
+        let candidate = parent.join(format!(
+            "{file_name}.empty-{pid}-{epoch_nanos}-{attempt}.bak"
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    bail!(
+        "could not allocate unique parked zero-byte WAL path near {}",
+        wal_path.display()
+    )
+}
+
+pub(crate) fn park_zero_byte_wal_before_franken_open(
+    db_path: &Path,
+    context: &str,
+) -> Result<Option<PathBuf>> {
+    if db_path == Path::new(":memory:") {
+        return Ok(None);
+    }
+
+    let wal_path = wal_sidecar_path(db_path);
+    let metadata = match fs::symlink_metadata(&wal_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "inspecting WAL sidecar before frankensqlite open for {context}: {}",
+                    wal_path.display()
+                )
+            });
+        }
+    };
+
+    if !metadata.is_file() || metadata.len() != 0 {
+        return Ok(None);
+    }
+
+    let parked_path = unique_zero_byte_wal_park_path(&wal_path)?;
+    fs::rename(&wal_path, &parked_path).with_context(|| {
+        format!(
+            "parking zero-byte WAL sidecar before frankensqlite open for {context}: {} -> {}",
+            wal_path.display(),
+            parked_path.display()
+        )
+    })?;
+    tracing::warn!(
+        db_path = %db_path.display(),
+        wal_path = %wal_path.display(),
+        parked_path = %parked_path.display(),
+        context,
+        "parked zero-byte WAL sidecar before frankensqlite open"
+    );
+    Ok(Some(parked_path))
+}
+
+fn sqlite3_batch_output(db_path: &Path, sql: &str, context: &str) -> Result<String> {
+    let output = Command::new("sqlite3")
+        .arg("-batch")
+        .arg("-noheader")
+        .arg("-cmd")
+        .arg(".timeout 30000")
+        .arg(db_path)
+        .arg(sql)
+        .output()
+        .with_context(|| format!("launching sqlite3 for {context}: {}", db_path.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "sqlite3 exited with status {} for {context}: {}",
+            output.status,
+            stderr
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn sqlite3_scalar_i64(db_path: &Path, sql: &str, context: &str) -> Result<Option<i64>> {
+    let output = sqlite3_batch_output(db_path, sql, context)?;
+    if output.is_empty() {
+        return Ok(None);
+    }
+    let first = output.lines().next().unwrap_or_default().trim();
+    if first.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(first.parse::<i64>().with_context(|| {
+        format!("parsing sqlite3 scalar for {context}: {first:?}")
+    })?))
+}
+
+pub(crate) fn quarantine_derived_fts_messages_before_franken_open(
+    db_path: &Path,
+    context: &str,
+) -> Result<bool> {
+    if db_path == Path::new(":memory:") || !db_path.exists() {
+        return Ok(false);
+    }
+
+    let meta_tables = sqlite3_scalar_i64(
+        db_path,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta';",
+        "probing cass meta table before derived FTS drop",
+    )?
+    .unwrap_or(0);
+    if meta_tables == 0 {
+        return Ok(false);
+    }
+
+    let schema_version = sqlite3_scalar_i64(
+        db_path,
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'schema_version';",
+        "probing cass schema version before derived FTS drop",
+    )?;
+    if !matches!(schema_version, Some(version) if version >= 14) {
+        return Ok(false);
+    }
+
+    let derived_fts_tables = sqlite3_scalar_i64(
+        db_path,
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type = 'table' \
+           AND name = 'fts_messages' \
+           AND UPPER(COALESCE(sql, '')) LIKE 'CREATE VIRTUAL TABLE%USING FTS5%';",
+        "probing derived fts_messages before frankensqlite open",
+    )?
+    .unwrap_or(0);
+    if derived_fts_tables == 0 {
+        return Ok(false);
+    }
+
+    let rootpage = sqlite3_scalar_i64(
+        db_path,
+        "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages';",
+        "probing derived fts_messages rootpage before frankensqlite open",
+    )?
+    .unwrap_or(0);
+
+    if rootpage > 0 {
+        let epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let quarantine_name = format!("cass_quarantined_fts_messages_{epoch_ms}_{rootpage}");
+        let quarantine_sql = format!(
+            "\
+            PRAGMA busy_timeout = 30000;\
+            BEGIN IMMEDIATE;\
+            PRAGMA writable_schema = ON;\
+            UPDATE sqlite_master \
+               SET name = '{quarantine_name}', \
+                   tbl_name = '{quarantine_name}', \
+                   sql = 'CREATE TABLE {quarantine_name}(content, title, agent, workspace, source_path, created_at)' \
+             WHERE type = 'table' AND name = 'fts_messages';\
+            PRAGMA writable_schema = OFF;\
+            COMMIT;\
+            PRAGMA wal_checkpoint(FULL);\
+            "
+        );
+        sqlite3_batch_output(
+            db_path,
+            &quarantine_sql,
+            "quarantining materialized derived fts_messages before frankensqlite open",
+        )?;
+        tracing::warn!(
+            db_path = %db_path.display(),
+            context,
+            schema_version = schema_version.unwrap_or_default(),
+            rootpage,
+            quarantine_name,
+            "quarantined materialized derived fts_messages before frankensqlite open"
+        );
+    } else {
+        let drop_sql = "\
+            PRAGMA busy_timeout = 30000;\
+            BEGIN IMMEDIATE;\
+            DROP TABLE IF EXISTS fts_messages;\
+            COMMIT;\
+            PRAGMA wal_checkpoint(FULL);\
+        ";
+        sqlite3_batch_output(
+            db_path,
+            drop_sql,
+            "dropping derived fts_messages before frankensqlite open",
+        )?;
+        tracing::warn!(
+            db_path = %db_path.display(),
+            context,
+            schema_version = schema_version.unwrap_or_default(),
+            "dropped derived fts_messages before frankensqlite open"
+        );
+    }
+
+    let remaining = sqlite3_scalar_i64(
+        db_path,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages';",
+        "verifying derived fts_messages is absent after pre-open repair",
+    )?
+    .unwrap_or(0);
+    if remaining != 0 {
+        bail!(
+            "derived fts_messages pre-open repair did not remove the live schema row; remaining rows: {remaining}"
+        );
+    }
+
+    Ok(true)
+}
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct MessageLookupTraceCounters {
@@ -617,6 +860,7 @@ pub(crate) fn open_franken_raw_connection_with_timeout(
     let mut backoff = Duration::from_millis(4);
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
+        park_zero_byte_wal_before_franken_open(path, "raw timed open")?;
         match FrankenConnection::open(&path_str)
             .with_context(|| format!("opening raw frankensqlite db at {}", path.display()))
         {
@@ -651,6 +895,7 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
     let mut backoff = Duration::from_millis(4);
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
+        park_zero_byte_wal_before_franken_open(path, "raw timed readonly open")?;
         match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| {
                 format!(
@@ -782,6 +1027,7 @@ impl FrankenConnectionManager {
     pub fn new(db_path: impl Into<PathBuf>, config: ConnectionManagerConfig) -> Result<Self> {
         let db_path = db_path.into();
         let path_str = db_path.to_string_lossy().to_string();
+        park_zero_byte_wal_before_franken_open(&db_path, "connection manager reader pool open")?;
 
         let reader_count = config.reader_count.max(1);
         let mut readers = Vec::with_capacity(reader_count);
@@ -839,6 +1085,12 @@ impl FrankenConnectionManager {
             .recv()
             .map_err(|_| anyhow!("writer token channel closed"))?;
         let path_str = self.db_path.to_string_lossy().to_string();
+        if let Err(err) =
+            park_zero_byte_wal_before_franken_open(&self.db_path, "connection manager writer open")
+        {
+            let _ = self.writer_tokens.0.send(());
+            return Err(err);
+        }
         let conn = match FrankenConnection::open(&path_str) {
             Ok(c) => c,
             Err(e) => {
@@ -871,6 +1123,13 @@ impl FrankenConnectionManager {
             .recv()
             .map_err(|_| anyhow!("writer token channel closed"))?;
         let path_str = self.db_path.to_string_lossy().to_string();
+        if let Err(err) = park_zero_byte_wal_before_franken_open(
+            &self.db_path,
+            "connection manager concurrent writer open",
+        ) {
+            let _ = self.writer_tokens.0.send(());
+            return Err(err);
+        }
         let conn = match FrankenConnection::open(&path_str) {
             Ok(c) => c,
             Err(e) => {
@@ -3470,6 +3729,7 @@ impl FrankenStorage {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard =
             acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
+        park_zero_byte_wal_before_franken_open(path, "canonical storage open")?;
         let conn = FrankenConnection::open(&path_str)
             .with_context(|| format!("opening frankensqlite db at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
@@ -3507,6 +3767,7 @@ impl FrankenStorage {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard =
             acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
+        park_zero_byte_wal_before_franken_open(path, "canonical writer open")?;
         let conn = FrankenConnection::open(&path_str)
             .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
         let storage = Self::new_with_shared_caches(
@@ -3723,6 +3984,7 @@ impl FrankenStorage {
     pub fn open_readonly_with_doctor_lock_timeout(path: &Path, timeout: Duration) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
+        park_zero_byte_wal_before_franken_open(path, "canonical readonly open")?;
         let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening frankensqlite db readonly at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
@@ -6197,17 +6459,46 @@ fn collect_append_only_tail_messages<'a>(
     }
 
     let mut split_idx = None;
+    let mut expected_prefix_idx = 0_i64;
     let mut prev_idx = None;
     for (pos, msg) in conv.messages.iter().enumerate() {
-        if prev_idx.is_some_and(|prev| msg.idx < prev) {
+        if prev_idx.is_some_and(|prev| msg.idx <= prev) {
             return None;
         }
         prev_idx = Some(msg.idx);
-        if split_idx.is_none() && msg.idx > existing_max_idx {
+        if msg.idx <= existing_max_idx {
+            if msg.idx != expected_prefix_idx {
+                return None;
+            }
+            if msg
+                .created_at
+                .is_some_and(|created_at| created_at > existing_max_created_at)
+            {
+                return None;
+            }
+            expected_prefix_idx = expected_prefix_idx.checked_add(1)?;
+            continue;
+        }
+
+        if expected_prefix_idx <= existing_max_idx {
+            return None;
+        }
+        if split_idx.is_none() {
             split_idx = Some(pos);
+            break;
         }
     }
-    let split_idx = split_idx?;
+    let Some(split_idx) = split_idx else {
+        if expected_prefix_idx <= existing_max_idx {
+            return None;
+        }
+        return Some(ExistingConversationNewMessages {
+            messages: Vec::new(),
+            new_chars: 0,
+            idx_collision_count: 0,
+            first_collision_idx: None,
+        });
+    };
 
     let mut seen_tail_idx = HashSet::new();
     let mut seen_tail_replay = HashSet::new();
@@ -8425,11 +8716,34 @@ impl FrankenStorage {
         workspace_id: Option<i64>,
         conv: &Conversation,
     ) -> Result<InsertOutcome> {
+        self.insert_conversation_tree_with_fts_mode(
+            agent_id,
+            workspace_id,
+            conv,
+            defer_storage_lexical_updates_enabled(),
+        )
+    }
+
+    pub(crate) fn insert_conversation_tree_defer_fts(
+        &self,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        conv: &Conversation,
+    ) -> Result<InsertOutcome> {
+        self.insert_conversation_tree_with_fts_mode(agent_id, workspace_id, conv, true)
+    }
+
+    fn insert_conversation_tree_with_fts_mode(
+        &self,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        conv: &Conversation,
+        defer_lexical_updates: bool,
+    ) -> Result<InsertOutcome> {
         let normalized_conv = normalized_conversation_for_storage(conv);
         let conv = normalized_conv.as_ref();
         self.ensure_source_for_conversation(conv)?;
-        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
-        let defer_analytics_updates = defer_analytics_updates_enabled();
+        let defer_analytics_updates = should_defer_analytics_updates(defer_lexical_updates);
         let conversation_key = conversation_merge_key(agent_id, conv);
         let mut tx = self.conn.transaction()?;
         let existing = franken_find_existing_conversation_with_tail_by_key(
@@ -8679,7 +8993,7 @@ impl FrankenStorage {
         profile.source_duration += source_start.elapsed();
 
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
-        let defer_analytics_updates = defer_analytics_updates_enabled();
+        let defer_analytics_updates = should_defer_analytics_updates(defer_lexical_updates);
         let conversation_key = conversation_merge_key(agent_id, conv);
 
         let tx_open_start = Instant::now();
@@ -8859,7 +9173,7 @@ impl FrankenStorage {
         profile.source_duration += source_start.elapsed();
 
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
-        let defer_analytics_updates = defer_analytics_updates_enabled();
+        let defer_analytics_updates = should_defer_analytics_updates(defer_lexical_updates);
         let conversation_key = conversation_merge_key(agent_id, conv);
 
         let tx_open_start = Instant::now();
@@ -9981,14 +10295,31 @@ impl FrankenStorage {
         &self,
         conversations: &[(i64, Option<i64>, &Conversation)],
     ) -> Result<Vec<InsertOutcome>> {
+        self.insert_conversations_batched_with_fts_mode(
+            conversations,
+            defer_storage_lexical_updates_enabled(),
+        )
+    }
+
+    pub(crate) fn insert_conversations_batched_defer_fts(
+        &self,
+        conversations: &[(i64, Option<i64>, &Conversation)],
+    ) -> Result<Vec<InsertOutcome>> {
+        self.insert_conversations_batched_with_fts_mode(conversations, true)
+    }
+
+    fn insert_conversations_batched_with_fts_mode(
+        &self,
+        conversations: &[(i64, Option<i64>, &Conversation)],
+        defer_lexical_updates: bool,
+    ) -> Result<Vec<InsertOutcome>> {
         if conversations.is_empty() {
             return Ok(Vec::new());
         }
 
         self.ensure_sources_for_batch(conversations)?;
 
-        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
-        let defer_analytics_updates = defer_analytics_updates_enabled();
+        let defer_analytics_updates = should_defer_analytics_updates(defer_lexical_updates);
 
         let pricing_table = PricingTable::franken_load(&self.conn).unwrap_or_else(|e| {
             tracing::warn!(target: "cass::analytics::pricing", error = %e, "failed to load pricing table");
@@ -10037,43 +10368,70 @@ impl FrankenStorage {
             let mut session_count_delta = 1_i64;
             let conversation_key = conversation_merge_key(agent_id, conv);
 
-            let existing_conv_id = if let Some(existing_id) =
+            let existing_conversation = if let Some(existing_id) =
                 pending_conversation_ids.get(&conversation_key)
             {
-                Some(*existing_id)
+                Some(ExistingConversationWithTail {
+                    id: *existing_id,
+                    tail_state: franken_existing_conversation_append_tail_state(&tx, *existing_id)?,
+                })
             } else {
-                let existing_id =
-                    franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))?;
-                if let Some(existing_id) = existing_id {
-                    pending_conversation_ids.insert(conversation_key.clone(), existing_id);
+                let existing = franken_find_existing_conversation_with_tail_by_key(
+                    &tx,
+                    &conversation_key,
+                    Some(conv),
+                )?;
+                if let Some(existing) = existing {
+                    pending_conversation_ids.insert(conversation_key.clone(), existing.id);
+                    Some(existing)
+                } else {
+                    None
                 }
-                existing_id
             };
 
-            let conv_id = if let Some(existing_id) = existing_conv_id {
+            let conv_id = if let Some(existing) = existing_conversation {
                 session_count_delta = 0;
-                let ExistingMessageLookup {
-                    by_idx: mut existing_messages,
-                    replay: mut existing_replay_fingerprints,
-                } = franken_existing_message_lookup_with_pending(
-                    &tx,
-                    existing_id,
-                    &conv.messages,
-                    &mut pending_message_fingerprints,
-                    &mut pending_message_replay_fingerprints,
-                )?;
+                let existing_id = existing.id;
+                let append_plan = existing.tail_state.as_ref().and_then(|state| {
+                    collect_append_only_tail_messages(
+                        conv,
+                        state.last_message_idx,
+                        state.last_message_created_at,
+                    )
+                });
+                let (new_message_plan, pending_lookup_update) = if let Some(append_plan) =
+                    append_plan
+                {
+                    (append_plan, None)
+                } else {
+                    let ExistingMessageLookup {
+                        by_idx: mut existing_messages,
+                        replay: mut existing_replay_fingerprints,
+                    } = franken_existing_message_lookup_with_pending(
+                        &tx,
+                        existing_id,
+                        &conv.messages,
+                        &mut pending_message_fingerprints,
+                        &mut pending_message_replay_fingerprints,
+                    )?;
+                    let new_message_plan = collect_new_messages_for_existing_conversation(
+                        existing_id,
+                        conv,
+                        &mut existing_messages,
+                        &mut existing_replay_fingerprints,
+                        "skipping replay-equivalent recovered message with shifted idx during batched merge",
+                    );
+                    (
+                        new_message_plan,
+                        Some((existing_messages, existing_replay_fingerprints)),
+                    )
+                };
                 let ExistingConversationNewMessages {
                     messages: new_messages,
                     new_chars,
                     idx_collision_count,
                     first_collision_idx,
-                } = collect_new_messages_for_existing_conversation(
-                    existing_id,
-                    conv,
-                    &mut existing_messages,
-                    &mut existing_replay_fingerprints,
-                    "skipping replay-equivalent recovered message with shifted idx during batched merge",
-                );
+                } = new_message_plan;
                 let (inserted_last_idx, inserted_last_created_at) =
                     borrowed_messages_tail_state(&new_messages);
                 let inserted_message_ids =
@@ -10130,9 +10488,13 @@ impl FrankenStorage {
                     )?;
                 }
 
-                pending_message_fingerprints.insert(existing_id, existing_messages);
-                pending_message_replay_fingerprints
-                    .insert(existing_id, existing_replay_fingerprints);
+                if let Some((existing_messages, existing_replay_fingerprints)) =
+                    pending_lookup_update
+                {
+                    pending_message_fingerprints.insert(existing_id, existing_messages);
+                    pending_message_replay_fingerprints
+                        .insert(existing_id, existing_replay_fingerprints);
+                }
 
                 existing_id
             } else {
@@ -10191,28 +10553,49 @@ impl FrankenStorage {
                     ConversationInsertStatus::Existing(existing_id) => {
                         session_count_delta = 0;
                         pending_conversation_ids.insert(conversation_key.clone(), existing_id);
-                        let ExistingMessageLookup {
-                            by_idx: mut existing_messages,
-                            replay: mut existing_replay_fingerprints,
-                        } = franken_existing_message_lookup_with_pending(
-                            &tx,
-                            existing_id,
-                            &conv.messages,
-                            &mut pending_message_fingerprints,
-                            &mut pending_message_replay_fingerprints,
-                        )?;
+                        let append_plan =
+                            franken_existing_conversation_append_tail_state(&tx, existing_id)?
+                                .as_ref()
+                                .and_then(|state| {
+                                    collect_append_only_tail_messages(
+                                        conv,
+                                        state.last_message_idx,
+                                        state.last_message_created_at,
+                                    )
+                                });
+                        let (new_message_plan, pending_lookup_update) = if let Some(append_plan) =
+                            append_plan
+                        {
+                            (append_plan, None)
+                        } else {
+                            let ExistingMessageLookup {
+                                by_idx: mut existing_messages,
+                                replay: mut existing_replay_fingerprints,
+                            } = franken_existing_message_lookup_with_pending(
+                                &tx,
+                                existing_id,
+                                &conv.messages,
+                                &mut pending_message_fingerprints,
+                                &mut pending_message_replay_fingerprints,
+                            )?;
+                            let new_message_plan = collect_new_messages_for_existing_conversation(
+                                existing_id,
+                                conv,
+                                &mut existing_messages,
+                                &mut existing_replay_fingerprints,
+                                "skipping replay-equivalent recovered message with shifted idx after duplicate conversation recovery",
+                            );
+                            (
+                                new_message_plan,
+                                Some((existing_messages, existing_replay_fingerprints)),
+                            )
+                        };
                         let ExistingConversationNewMessages {
                             messages: new_messages,
                             new_chars,
                             idx_collision_count,
                             first_collision_idx,
-                        } = collect_new_messages_for_existing_conversation(
-                            existing_id,
-                            conv,
-                            &mut existing_messages,
-                            &mut existing_replay_fingerprints,
-                            "skipping replay-equivalent recovered message with shifted idx after duplicate conversation recovery",
-                        );
+                        } = new_message_plan;
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let inserted_message_ids =
@@ -10271,9 +10654,13 @@ impl FrankenStorage {
                             )?;
                         }
 
-                        pending_message_fingerprints.insert(existing_id, existing_messages);
-                        pending_message_replay_fingerprints
-                            .insert(existing_id, existing_replay_fingerprints);
+                        if let Some((existing_messages, existing_replay_fingerprints)) =
+                            pending_lookup_update
+                        {
+                            pending_message_fingerprints.insert(existing_id, existing_messages);
+                            pending_message_replay_fingerprints
+                                .insert(existing_id, existing_replay_fingerprints);
+                        }
 
                         existing_id
                     }
@@ -10824,6 +11211,10 @@ fn defer_storage_lexical_updates_enabled() -> bool {
 
 fn defer_analytics_updates_enabled() -> bool {
     env_flag_enabled("CASS_DEFER_ANALYTICS_UPDATES")
+}
+
+fn should_defer_analytics_updates(defer_lexical_updates: bool) -> bool {
+    defer_lexical_updates || defer_analytics_updates_enabled()
 }
 
 enum ConversationInsertStatus {
@@ -11762,50 +12153,53 @@ fn franken_existing_message_lookup(
 
     let mut indexed_by_idx = HashMap::with_capacity(incoming_messages.len());
     let mut indexed_replay = HashSet::with_capacity(incoming_messages.len());
-    let mut exact_idx_match = true;
-    for msg in incoming_messages {
-        record_message_lookup_exact_idx_probe();
-        let Some((role, author, created_at, content)) = tx
-            .query_row_map(
-                "SELECT role, author, created_at, content
-                 FROM messages INDEXED BY sqlite_autoindex_messages_1
-                 WHERE conversation_id = ?1 AND idx = ?2
-                 LIMIT 1",
-                fparams![conversation_id, msg.idx],
-                |row| {
-                    Ok((
-                        row.get_typed::<String>(0)?,
-                        row.get_typed::<Option<String>>(1)?,
-                        row.get_typed::<Option<i64>>(2)?,
-                        row.get_typed::<String>(3)?,
-                    ))
-                },
-            )
-            .optional()?
-        else {
-            exact_idx_match = false;
-            break;
-        };
-        let role = role_from_str(&role);
-        let content_hash = *blake3::hash(content.as_bytes()).as_bytes();
-        let fingerprint = MessageMergeFingerprint {
-            idx: msg.idx,
-            created_at,
-            role: role.clone(),
-            author: author.clone(),
-            content_hash,
-        };
-        if fingerprint != message_merge_fingerprint(msg) {
-            exact_idx_match = false;
-            break;
+    let mut exact_idx_match =
+        requires_full_scan && incoming_messages.len() <= existing_message_exact_probe_limit();
+    if exact_idx_match {
+        for msg in incoming_messages {
+            record_message_lookup_exact_idx_probe();
+            let Some((role, author, created_at, content)) = tx
+                .query_row_map(
+                    "SELECT role, author, created_at, content
+                     FROM messages INDEXED BY sqlite_autoindex_messages_1
+                     WHERE conversation_id = ?1 AND idx = ?2
+                     LIMIT 1",
+                    fparams![conversation_id, msg.idx],
+                    |row| {
+                        Ok((
+                            row.get_typed::<String>(0)?,
+                            row.get_typed::<Option<String>>(1)?,
+                            row.get_typed::<Option<i64>>(2)?,
+                            row.get_typed::<String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?
+            else {
+                exact_idx_match = false;
+                break;
+            };
+            let role = role_from_str(&role);
+            let content_hash = *blake3::hash(content.as_bytes()).as_bytes();
+            let fingerprint = MessageMergeFingerprint {
+                idx: msg.idx,
+                created_at,
+                role: role.clone(),
+                author: author.clone(),
+                content_hash,
+            };
+            if fingerprint != message_merge_fingerprint(msg) {
+                exact_idx_match = false;
+                break;
+            }
+            indexed_by_idx.insert(msg.idx, fingerprint);
+            indexed_replay.insert(MessageReplayFingerprint {
+                created_at,
+                role,
+                author,
+                content_hash,
+            });
         }
-        indexed_by_idx.insert(msg.idx, fingerprint);
-        indexed_replay.insert(MessageReplayFingerprint {
-            created_at,
-            role,
-            author,
-            content_hash,
-        });
     }
 
     if exact_idx_match {
@@ -14248,6 +14642,10 @@ fn rebuild_batch_size_env(var: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn existing_message_exact_probe_limit() -> usize {
+    rebuild_batch_size_env("CASS_EXISTING_MESSAGE_EXACT_PROBE_LIMIT", 32)
+}
+
 fn is_out_of_memory_error(err: &impl std::fmt::Display) -> bool {
     err.to_string()
         .to_ascii_lowercase()
@@ -14474,6 +14872,160 @@ mod tests {
             "pid={}\n",
             current.saturating_add(1)
         )));
+    }
+
+    #[test]
+    fn park_zero_byte_wal_before_franken_open_renames_empty_wal() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        fs::write(&db_path, b"placeholder db").unwrap();
+        let wal_path = wal_sidecar_path(&db_path);
+        fs::write(&wal_path, b"").unwrap();
+
+        let parked = park_zero_byte_wal_before_franken_open(&db_path, "unit test")
+            .unwrap()
+            .expect("empty WAL should be parked");
+
+        assert!(!wal_path.exists(), "live zero-byte WAL sidecar was parked");
+        assert!(
+            parked.exists(),
+            "parked zero-byte WAL sidecar should remain available"
+        );
+        assert_eq!(fs::metadata(&parked).unwrap().len(), 0);
+        assert!(
+            park_zero_byte_wal_before_franken_open(&db_path, "unit test")
+                .unwrap()
+                .is_none(),
+            "second pass should be idempotent after the WAL is parked"
+        );
+    }
+
+    #[test]
+    fn park_zero_byte_wal_before_franken_open_keeps_nonempty_wal_in_place() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        fs::write(&db_path, b"placeholder db").unwrap();
+        let wal_path = wal_sidecar_path(&db_path);
+        fs::write(&wal_path, b"not empty").unwrap();
+
+        assert!(
+            park_zero_byte_wal_before_franken_open(&db_path, "unit test")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(&wal_path).unwrap(), b"not empty");
+    }
+
+    #[test]
+    fn quarantine_derived_fts_messages_before_franken_open_drops_stock_fts() {
+        if Command::new("sqlite3").arg("-version").output().is_err() {
+            eprintln!("skipping: sqlite3 binary not found");
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        sqlite3_batch_output(
+            &db_path,
+            "\
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);\
+            INSERT INTO meta(key, value) VALUES('schema_version', '20');\
+            CREATE TABLE messages(id INTEGER PRIMARY KEY, content TEXT NOT NULL);\
+            INSERT INTO messages(id, content) VALUES(1, 'alpha');\
+            CREATE VIRTUAL TABLE fts_messages USING fts5(content, content='');\
+            INSERT INTO fts_messages(rowid, content) VALUES(1, 'alpha');\
+            ",
+            "seeding derived FTS drop unit test",
+        )
+        .unwrap();
+
+        assert!(
+            quarantine_derived_fts_messages_before_franken_open(&db_path, "unit test").unwrap(),
+            "first pass should drop the derived FTS table"
+        );
+
+        let fts_count = sqlite3_scalar_i64(
+            &db_path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages';",
+            "counting fts_messages after derived drop unit test",
+        )
+        .unwrap()
+        .unwrap();
+        let canonical_count = sqlite3_scalar_i64(
+            &db_path,
+            "SELECT COUNT(*) FROM messages;",
+            "counting canonical messages after derived drop unit test",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(fts_count, 0);
+        assert_eq!(canonical_count, 1);
+        assert!(
+            !quarantine_derived_fts_messages_before_franken_open(&db_path, "unit test").unwrap(),
+            "second pass should be idempotent"
+        );
+    }
+
+    #[test]
+    fn quarantine_derived_fts_messages_before_franken_open_renames_materialized_fts() {
+        if Command::new("sqlite3").arg("-version").output().is_err() {
+            eprintln!("skipping: sqlite3 binary not found");
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        sqlite3_batch_output(
+            &db_path,
+            "\
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);\
+            INSERT INTO meta(key, value) VALUES('schema_version', '20');\
+            CREATE TABLE messages(id INTEGER PRIMARY KEY, content TEXT NOT NULL);\
+            INSERT INTO messages(id, content) VALUES(1, 'alpha');\
+            CREATE TABLE fts_messages(content, title, agent, workspace, source_path, created_at);\
+            INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) \
+            VALUES(7, 'alpha', 'title', 'pi_agent', '/tmp', '/tmp/session.jsonl', 123);\
+            PRAGMA writable_schema = ON;\
+            UPDATE sqlite_master \
+               SET sql = 'CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content = '''', tokenize = ''porter'')' \
+             WHERE type = 'table' AND name = 'fts_messages';\
+            PRAGMA writable_schema = OFF;\
+            ",
+            "seeding materialized derived FTS quarantine unit test",
+        )
+        .unwrap();
+
+        assert!(
+            quarantine_derived_fts_messages_before_franken_open(&db_path, "unit test").unwrap(),
+            "first pass should quarantine the materialized FTS table"
+        );
+
+        let fts_count = sqlite3_scalar_i64(
+            &db_path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages';",
+            "counting fts_messages after materialized quarantine unit test",
+        )
+        .unwrap()
+        .unwrap();
+        let quarantine_count = sqlite3_scalar_i64(
+            &db_path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'cass_quarantined_fts_messages_%';",
+            "counting quarantined materialized fts after unit test",
+        )
+        .unwrap()
+        .unwrap();
+        let canonical_count = sqlite3_scalar_i64(
+            &db_path,
+            "SELECT COUNT(*) FROM messages;",
+            "counting canonical messages after materialized quarantine unit test",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(fts_count, 0);
+        assert_eq!(quarantine_count, 1);
+        assert_eq!(canonical_count, 1);
     }
 
     #[test]
@@ -15522,12 +16074,12 @@ mod tests {
         match result {
             Err(MigrationError::Database(_)) | Err(MigrationError::Io(_)) => {}
             Err(MigrationError::RebuildRequired { reason, .. }) => {
-                panic!("should not rebuild non-database path: {reason}")
+                std::panic::panic_any(format!("should not rebuild non-database path: {reason}"))
             }
-            Err(MigrationError::Other(msg)) => {
-                panic!("should preserve underlying open error, got Other: {msg}")
-            }
-            Ok(_) => panic!("directory path must not open as a database"),
+            Err(MigrationError::Other(msg)) => std::panic::panic_any(format!(
+                "should preserve underlying open error, got Other: {msg}"
+            )),
+            Ok(_) => std::panic::panic_any("directory path must not open as a database"),
         }
 
         assert!(
@@ -16617,6 +17169,73 @@ mod tests {
 
         assert_eq!(message_count, conv.messages.len() as i64);
         assert_eq!(fts_count, conv.messages.len() as i64);
+    }
+
+    #[test]
+    fn insert_conversation_tree_defer_fts_keeps_canonical_rows_without_fallback_fts() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .ensure_search_fallback_fts_consistency()
+            .expect("ensure FTS consistency before insert");
+
+        let agent = Agent {
+            id: None,
+            slug: "pi_agent".into(),
+            name: "Pi Agent".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conv = Conversation {
+            id: None,
+            agent_slug: "pi_agent".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("defer-fts-tree".into()),
+            title: Some("Defer FTS Tree".into()),
+            source_path: PathBuf::from("/tmp/defer-fts-tree.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "deferred fallback fts canonical message".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let outcome = storage
+            .insert_conversation_tree_defer_fts(agent_id, None, &conv)
+            .unwrap();
+        assert_eq!(outcome.inserted_indices, vec![0]);
+
+        let message_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let fts_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+
+        assert_eq!(message_count, 1);
+        assert_eq!(fts_count, 0);
     }
 
     fn make_profiled_storage_remote_conversation(
@@ -17778,7 +18397,9 @@ mod tests {
                 assert_eq!(existing_id, inserted_id);
             }
             ConversationInsertStatus::Inserted(new_id) => {
-                panic!("expected existing conversation id, got freshly inserted {new_id}");
+                std::panic::panic_any(format!(
+                    "expected existing conversation id, got freshly inserted {new_id}"
+                ));
             }
         }
 
@@ -18043,9 +18664,12 @@ mod tests {
         let first = storage
             .insert_conversations_batched(&[(agent_id, None, &conversation)])
             .unwrap();
-        let second = storage
-            .insert_conversations_batched(&[(agent_id, None, &conversation)])
-            .unwrap();
+        let previous_trace_enabled = set_message_lookup_trace_enabled(true);
+        let lookup_before = message_lookup_trace_snapshot();
+        let second = storage.insert_conversations_batched(&[(agent_id, None, &conversation)]);
+        let lookup_delta = message_lookup_trace_snapshot().saturating_sub(lookup_before);
+        set_message_lookup_trace_enabled(previous_trace_enabled);
+        let second = second.unwrap();
 
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
@@ -18055,6 +18679,22 @@ mod tests {
             "full reprocessing of a large conversation must not attempt duplicate idx inserts"
         );
         assert_eq!(first[0].conversation_id, second[0].conversation_id);
+        assert_eq!(
+            lookup_delta.exact_idx_probes, 0,
+            "large reprocesses must skip per-message exact probes and use bounded lookup"
+        );
+        assert_eq!(
+            lookup_delta.bounded_lookup_queries, 0,
+            "tail-covered large reprocesses should not materialize message rows"
+        );
+        assert_eq!(
+            lookup_delta.full_scan_queries, 0,
+            "tail-covered large reprocesses must not full-scan message rows"
+        );
+        assert_eq!(
+            lookup_delta.rows_materialized, 0,
+            "tail-covered large reprocesses should be decided from cached tail state"
+        );
 
         let conversation_count: i64 = storage
             .conn
@@ -18071,6 +18711,78 @@ mod tests {
 
         assert_eq!(conversation_count, 1);
         assert_eq!(message_count, MESSAGE_COUNT);
+
+        const SMALL_MESSAGE_COUNT: i64 = 24;
+        let small_messages: Vec<Message> = (0..SMALL_MESSAGE_COUNT)
+            .map(|idx| Message {
+                id: None,
+                idx,
+                role: if idx % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Agent
+                },
+                author: None,
+                created_at: Some(1_700_000_100_000 + idx),
+                content: format!("small message {idx}"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            })
+            .collect();
+        let small_conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("small-created-at-reprocess-session".into()),
+            title: Some("Small Created At Reprocess Session".into()),
+            source_path: PathBuf::from("/tmp/small-created-at-reprocess-session.jsonl"),
+            started_at: Some(1_700_000_100_000),
+            ended_at: Some(1_700_000_100_000 + SMALL_MESSAGE_COUNT - 1),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: small_messages,
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let first_small = storage
+            .insert_conversations_batched(&[(agent_id, None, &small_conversation)])
+            .unwrap();
+        let previous_trace_enabled = set_message_lookup_trace_enabled(true);
+        let lookup_before = message_lookup_trace_snapshot();
+        let second_small =
+            storage.insert_conversations_batched(&[(agent_id, None, &small_conversation)]);
+        let lookup_delta = message_lookup_trace_snapshot().saturating_sub(lookup_before);
+        set_message_lookup_trace_enabled(previous_trace_enabled);
+        let second_small = second_small.unwrap();
+
+        assert_eq!(first_small.len(), 1);
+        assert_eq!(second_small.len(), 1);
+        assert_eq!(
+            first_small[0].inserted_indices.len(),
+            SMALL_MESSAGE_COUNT as usize
+        );
+        assert!(second_small[0].inserted_indices.is_empty());
+        assert_eq!(
+            first_small[0].conversation_id,
+            second_small[0].conversation_id
+        );
+        assert_eq!(
+            lookup_delta.exact_idx_probes, 0,
+            "created-at-bounded reprocesses should not use per-message exact probes"
+        );
+        assert_eq!(
+            lookup_delta.bounded_lookup_queries, 0,
+            "tail-covered created-at reprocesses should not materialize message rows"
+        );
+        assert_eq!(
+            lookup_delta.full_scan_queries, 0,
+            "tail-covered created-at reprocesses must not full-scan message rows"
+        );
+        assert_eq!(
+            lookup_delta.rows_materialized, 0,
+            "tail-covered created-at reprocesses should be decided from cached tail state"
+        );
     }
 
     #[test]

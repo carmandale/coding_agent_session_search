@@ -1,0 +1,21 @@
+{"event":"ingest_batch","ts_ms":1778969861583,"batch_n":1,"stage":"ingest_batch_with_semantic_delta","status":"ok","batch_conversations":1,"batch_msgs":7133,"inserted_conversations":1,"inserted_messages":7130,"wall_ms":6348,"lexical_strategy":"incremental_inline","defer_checkpoints":true,"lookups_against_global":0,"lookup_trace":{"exact_idx_probes":0,"bounded_lookup_queries":0,"full_scan_queries":0,"rows_materialized":0}}
+real 36.12
+user 31.53
+sys 1.03
+          4910530560  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              307931  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                1420  voluntary context switches
+               12315  involuntary context switches
+        436374014167  instructions retired
+        128321174746  cycles elapsed
+          4839329824  peak memory footprint

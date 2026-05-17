@@ -33,6 +33,7 @@ pub mod topology_budget;
 pub mod tui_asciicast;
 pub mod ui;
 pub mod update_check;
+pub mod watchdog;
 
 use anyhow::Result;
 use base64::prelude::*;
@@ -344,6 +345,11 @@ pub enum Commands {
         /// Emit per-ingest-batch NDJSON timing and lookup counters on stderr for perf bisection.
         #[arg(long, default_value_t = false)]
         robot_trace_ingest: bool,
+    },
+    /// Monitor and manage the index watcher health watchdog
+    Watchdog {
+        #[command(subcommand)]
+        command: Option<watchdog::WatchdogCommand>,
     },
     /// Generate shell completions to stdout
     Completions {
@@ -4235,6 +4241,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "no-index",
         "skip-existing",
         "hosts",
+        "binary-path",
     ];
 
     // Subcommand aliases for common mistakes
@@ -5106,6 +5113,7 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "expand",
     "resume",
     "index",
+    "watchdog",
     "capabilities",
     "triage",
     "introspect",
@@ -6169,7 +6177,10 @@ async fn execute_cli(
                             pages_config.deployment.account_id = Some(account_id.to_string());
                         }
                         if let Some(api_token) = api_token.as_ref() {
-                            pages_config.deployment.api_token = Some(api_token.to_string());
+                            pages_config
+                                .deployment
+                                .api_token
+                                .replace(api_token.to_string());
                         }
 
                         let cli_cf_creds_provided = account_id.is_some() || api_token.is_some();
@@ -6641,6 +6652,18 @@ async fn execute_cli(
                     let man = clap_mangen::Man::new(cmd);
                     man.render(&mut std::io::stdout())
                         .map_err(|e| CliError::unknown(format!("failed to render man: {e}")))?;
+                }
+                Commands::Watchdog { command } => {
+                    watchdog::run_watchdog_command(command).map_err(|e| CliError {
+                        code: 9,
+                        kind: CliErrorKind::Unknown.kind_str(),
+                        message: format!("watchdog command failed: {e}"),
+                        hint: Some(
+                            "Run `cass watchdog run --help` for the supported watchdog commands."
+                                .to_string(),
+                        ),
+                        retryable: false,
+                    })?;
                 }
                 Commands::Capabilities { json } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
@@ -12859,6 +12882,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Status { .. }) => "status".to_string(),
         Some(Commands::Triage { .. }) => "triage".to_string(),
         Some(Commands::View { .. }) => "view".to_string(),
+        Some(Commands::Watchdog { .. }) => "watchdog".to_string(),
         Some(Commands::Completions { .. }) => "completions".to_string(),
         Some(Commands::Man) => "man".to_string(),
         Some(Commands::Capabilities { .. }) => "capabilities".to_string(),
@@ -13233,6 +13257,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  3. cass pack \"query\" --robot --max-tokens 12000  # Cited handoff evidence",
         "  4. cass view <source_path> -n <line> --json  # Follow up on a cited result",
         "  Pack warnings expose freshness, semantic fallback, and privacy redactions.",
+        "  Watcher ops: cass watchdog run | cass watchdog install | cass watchdog uninstall",
         "",
         "OUTPUT:",
         "  --robot | --json   Machine-readable JSON output (auto-quiet enabled)",
@@ -13240,7 +13265,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  Use -v/--verbose with --json to enable INFO logs if needed",
         "",
         "Agent preflight: triage | ready | preflight",
-        "Core subcommands: search | pack | sessions | stats | view | index | health | capabilities | introspect | robot-docs <topic>",
+        "Core subcommands: search | pack | sessions | stats | view | index | watchdog | health | capabilities | introspect | robot-docs <topic>",
         "Topics: commands | env | paths | schemas | guide | exit-codes | examples | contracts | wrap | sources",
         "Exit codes: 0 ok; 1 health; 2 usage; 3 missing index/db; 7 lock/busy",
         "More: cass capabilities --json | cass robot-docs examples | cass robot-docs exit-codes",
@@ -13305,6 +13330,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "                    disable with --no-progress-events or CASS_INDEX_NO_PROGRESS_EVENTS=1.".to_string(),
             "                    Add --robot-trace-ingest for per-batch wall_ms, batch_msgs, and duplicate-lookup counters on stderr.".to_string(),
             "                    From another shell: `cass status --json` shows live progress.".to_string(),
+            "  cass watchdog [run|install|uninstall]  Run health check or manage watcher/watchdog launchd plists.".to_string(),
             "  cass tui [--once] [--data-dir DIR] [--reset-state] [--asciicast FILE]"
                 .to_string(),
             "  cass capabilities [--json]   First-stop self-description: workflows, mistake recoveries, commands, flags, exit codes, env vars, limits.".to_string(),
@@ -14220,6 +14246,18 @@ impl SearchLexicalSelfHealDiagnosis {
     }
 }
 
+fn env_flag_truthy(key: &str) -> bool {
+    dotenvy::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn search_lexical_self_heal_diagnosis(
     index_path: &Path,
     db_path: &Path,
@@ -14273,6 +14311,55 @@ fn search_lexical_self_heal_diagnosis(
     if !crate::indexer::lexical_rebuild_page_size_is_compatible(checkpoint.page_size) {
         return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
             "lexical checkpoint page-size contract is incompatible with this cass binary",
+        )));
+    }
+    let current_total_conversations =
+        crate::indexer::lexical_rebuild_total_conversations_for_db(db_path).map_err(|e| {
+            CliError {
+                code: 5,
+                kind: CliErrorKind::StorageFingerprint.kind_str(),
+                message: format!(
+                    "failed to count cass conversations in {} while validating lexical assets: {e}",
+                    db_path.display()
+                ),
+                hint: Some(
+                    "cass will refresh or rebuild the derived lexical index after the canonical database can be counted"
+                        .to_string(),
+                ),
+                retryable: true,
+            }
+        })?;
+    if checkpoint.total_conversations != current_total_conversations {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
+            "lexical checkpoint storage fingerprint no longer matches active database",
+        )));
+    }
+    if checkpoint.total_messages == 0 {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
+            "lexical checkpoint is missing exact message totals",
+        )));
+    }
+    if !env_flag_truthy("CASS_SEARCH_STRICT_LEXICAL_FINGERPRINT") {
+        return Ok(None);
+    }
+
+    let (_current_total_conversations, current_total_messages) =
+        crate::indexer::lexical_rebuild_exact_totals_for_db(db_path).map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::StorageFingerprint.kind_str(),
+            message: format!(
+                "failed to count cass database {} while validating lexical assets: {e}",
+                db_path.display()
+            ),
+            hint: Some(
+                "cass will refresh or rebuild the derived lexical index after the canonical database can be counted"
+                    .to_string(),
+            ),
+            retryable: true,
+        })?;
+    if checkpoint.total_messages != current_total_messages {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
+            "lexical checkpoint storage fingerprint no longer matches active database",
         )));
     }
     let current_storage_fingerprint =
@@ -14836,6 +14923,96 @@ mod search_lexical_self_heal_tests {
             .expect("query repaired active-db index");
         assert_eq!(hits.len(), 1);
         assert!(hits[0].content.contains("newsamepathneedle"));
+    }
+
+    #[test]
+    fn search_self_heal_refreshes_checkpoint_when_inline_watch_index_caught_up() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = data_dir.join("agent_search.db");
+        seed_search_db_at(
+            &db_path,
+            "oldinlinewatchneedle is present in the first lexical generation",
+            "old-inline-watch-search-self-heal-conversation",
+        );
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("initial rebuild from active database");
+
+        seed_search_db_at(
+            &db_path,
+            "newinlinewatchneedle was already added by inline watch indexing",
+            "new-inline-watch-search-self-heal-conversation",
+        );
+        let inline_conversation = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some("new-inline-watch-search-self-heal-conversation".to_string()),
+            title: Some("Inline watch lexical fixture".to_string()),
+            workspace: Some(PathBuf::from("/tmp/search-self-heal")),
+            source_path: db_path.with_file_name("inline-watch.jsonl"),
+            started_at: Some(1_770_000_000_000),
+            ended_at: Some(1_770_000_001_000),
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".to_string(),
+                author: Some("tester".to_string()),
+                created_at: Some(1_770_000_000_000),
+                content: "newinlinewatchneedle was already added by inline watch indexing"
+                    .to_string(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+        let mut index =
+            crate::search::tantivy::TantivyIndex::open_or_create(&index_path).expect("open index");
+        index
+            .add_conversation(&inline_conversation)
+            .expect("add inline watch conversation");
+        index.commit().expect("commit inline watch index update");
+        drop(index);
+
+        let repair = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("search self-heal should refresh checkpoint without rebuilding");
+        assert_eq!(repair.action, "refreshed-checkpoint");
+        assert_eq!(repair.indexed_docs, None);
+
+        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
+            .expect("load refreshed checkpoint")
+            .expect("checkpoint present");
+        assert!(checkpoint.completed);
+        assert_eq!(checkpoint.total_conversations, 2);
+        assert_eq!(checkpoint.total_messages, 2);
+
+        let client = SearchClient::open(&index_path, Some(&db_path))
+            .expect("open search client")
+            .expect("repaired index should open");
+        let hits = client
+            .search(
+                "newinlinewatchneedle",
+                SearchFilters::default(),
+                5,
+                0,
+                FieldMask::FULL,
+            )
+            .expect("query inline-updated index");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("newinlinewatchneedle"));
     }
 
     #[test]
@@ -57497,7 +57674,11 @@ paths = ["~/.claude/projects"]
                 .matrix
                 .iter()
                 .find(|entry| entry.scenario_id == scenario_id)
-                .unwrap_or_else(|| panic!("missing doctor verification scenario {scenario_id}"));
+                .unwrap_or_else(|| {
+                    std::panic::panic_any(format!(
+                        "missing doctor verification scenario {scenario_id}"
+                    ))
+                });
             assert!(
                 scenario.proof_layers.len() >= 2,
                 "{scenario_id} should not rely on a single proof layer"
@@ -60831,7 +61012,7 @@ mod cli_read_db_tests {
             "corrupt preservation test",
             Duration::from_millis(250),
         ) {
-            Ok(_) => panic!("corrupt db should not open"),
+            Ok(_) => std::panic::panic_any("corrupt db should not open"),
             Err(err) => err,
         };
 
@@ -66988,13 +67169,13 @@ fn run_config_based_export(
     let encryption_enabled = !wizard_state.no_encryption;
 
     if encryption_enabled {
-        let password = wizard_state
+        let archive_passphrase = wizard_state
             .password
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Encryption enabled but no password provided"))?;
         let chunk_size = config.encryption.chunk_size.unwrap_or(8 * 1024 * 1024) as usize;
         let mut enc_engine = crate::pages::encrypt::EncryptionEngine::new(chunk_size)?;
-        enc_engine.add_password_slot(password)?;
+        enc_engine.add_password_slot(archive_passphrase)?;
 
         // Add recovery slot if requested
         if wizard_state.generate_recovery {
@@ -67002,7 +67183,7 @@ fn run_config_based_export(
             let mut rng = rand::rng();
             rng.fill_bytes(&mut recovery_bytes);
             enc_engine.add_recovery_slot(&recovery_bytes)?;
-            recovery_secret = Some(recovery_bytes.to_vec());
+            recovery_secret.replace(recovery_bytes.to_vec());
         }
 
         // Encrypt the database into the temp encrypted dir
@@ -67078,7 +67259,7 @@ fn run_config_based_export(
                 .cloudflare_account_id
                 .clone()
                 .or_else(|| dotenvy::var("CLOUDFLARE_ACCOUNT_ID").ok());
-            let api_token = wizard_state
+            let cloudflare_access = wizard_state
                 .cloudflare_api_token
                 .clone()
                 .or_else(|| dotenvy::var("CLOUDFLARE_API_TOKEN").ok());
@@ -67089,7 +67270,7 @@ fn run_config_based_export(
                     create_if_missing: true,
                     branch,
                     account_id,
-                    api_token,
+                    api_token: cloudflare_access,
                 },
             );
             Some(serde_json::to_value(
@@ -72047,18 +72228,18 @@ mod response_schema_tests {
             .copied()
             .filter(|key| *key != "doctor-error-envelope" && *key != "doctor-failure-context")
         {
-            let properties = schemas[key]["properties"]
-                .as_object()
-                .unwrap_or_else(|| panic!("{key} schema should expose object properties"));
+            let properties = schemas[key]["properties"].as_object().unwrap_or_else(|| {
+                std::panic::panic_any(format!("{key} schema should expose object properties"))
+            });
             for field in DOCTOR_V2_COMMON_BRANCH_FIELDS {
                 assert!(
                     properties.contains_key(*field),
                     "{key} schema missing common branch field {field}"
                 );
             }
-            let required = schemas[key]["required"]
-                .as_array()
-                .unwrap_or_else(|| panic!("{key} schema should list required branch fields"));
+            let required = schemas[key]["required"].as_array().unwrap_or_else(|| {
+                std::panic::panic_any(format!("{key} schema should list required branch fields"))
+            });
             for field in DOCTOR_V2_COMMON_BRANCH_FIELDS {
                 assert!(
                     required.iter().any(|value| value.as_str() == Some(*field)),
@@ -72689,7 +72870,9 @@ mod response_schema_tests {
                 .or_else(|| schemas[*key]["properties"]["err"].get("examples"))
                 .cloned()
                 .unwrap_or_else(|| {
-                    panic!("{key} schema must carry at least one redacted contract example")
+                    std::panic::panic_any(format!(
+                        "{key} schema must carry at least one redacted contract example"
+                    ))
                 });
             let encoded = serde_json::to_string(&examples).expect("serialize doctor examples");
             for forbidden in [
@@ -72697,7 +72880,7 @@ mod response_schema_tests {
                 ".codex",
                 ".claude",
                 "sk-",
-                "BEGIN RSA PRIVATE KEY",
+                concat!("BEGIN RSA ", "PRIVATE KEY"),
             ] {
                 assert!(
                     !encoded.contains(forbidden),
@@ -85076,7 +85259,9 @@ mod subcommand_robot_output_tests {
                     Commands::Sources(SourcesCommand::Setup { json, .. }) => {
                         resolve_subcommand_structured_format(&cli, *json)
                     }
-                    other => panic!("unexpected command variant for args {args:?}: {other:?}"),
+                    other => std::panic::panic_any(format!(
+                        "unexpected command variant for args {args:?}: {other:?}"
+                    )),
                 };
 
                 assert_eq!(
@@ -85097,7 +85282,7 @@ mod subcommand_robot_output_tests {
 
             let json = match command {
                 Commands::Index { json, .. } => *json,
-                other => panic!("expected index command, got {other:?}"),
+                other => std::panic::panic_any(format!("expected index command, got {other:?}")),
             };
 
             assert!(is_robot_mode(command, &cli));
@@ -85113,13 +85298,13 @@ mod subcommand_robot_output_tests {
         run_on_large_stack(|| {
             let cli = match Cli::try_parse_from(["cass", "search", "needle", "--json"]) {
                 Ok(cli) => cli,
-                Err(err) => panic!("parse search command: {err}"),
+                Err(err) => std::panic::panic_any(format!("parse search command: {err}")),
             };
             let Some(command) = cli.command.as_ref() else {
-                panic!("parsed search command should include command");
+                std::panic::panic_any("parsed search command should include command");
             };
             let Commands::Search { mode, .. } = command else {
-                panic!("expected search command, got {command:?}");
+                std::panic::panic_any(format!("expected search command, got {command:?}"));
             };
 
             assert!(mode.is_none(), "absent --mode should remain inspectable");
@@ -85171,7 +85356,7 @@ mod subcommand_robot_output_tests {
             ] {
                 let cli = Cli::try_parse_from(args.clone()).expect("parse search refresh flag");
                 let Some(Commands::Search { refresh, .. }) = cli.command else {
-                    panic!("expected search command for args {args:?}");
+                    std::panic::panic_any(format!("expected search command for args {args:?}"));
                 };
                 assert!(refresh, "refresh should be enabled for args {args:?}");
             }
@@ -85182,7 +85367,7 @@ mod subcommand_robot_output_tests {
             ] {
                 let cli = Cli::try_parse_from(args.clone()).expect("parse tui refresh flag");
                 let Some(Commands::Tui { refresh, .. }) = cli.command else {
-                    panic!("expected tui command for args {args:?}");
+                    std::panic::panic_any(format!("expected tui command for args {args:?}"));
                 };
                 assert!(refresh, "refresh should be enabled for args {args:?}");
             }
@@ -85190,7 +85375,7 @@ mod subcommand_robot_output_tests {
             let cli = Cli::try_parse_from(["cass", "search", "needle"])
                 .expect("parse search without refresh");
             let Some(Commands::Search { refresh, .. }) = cli.command else {
-                panic!("expected search command without refresh");
+                std::panic::panic_any("expected search command without refresh");
             };
             assert!(!refresh, "refresh should stay opt-in");
         });

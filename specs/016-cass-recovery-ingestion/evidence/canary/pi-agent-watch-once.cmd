@@ -1,0 +1,1 @@
+cass index --watch-once '/Users/dalecarman/.pi/agent/sessions/--Users-dalecarman-.clawdis-workspace--/2025-12-14T23-13-12-368Z_3235b4b5-776d-4d7d-8b06-e36a322f3a4b.jsonl' --json --no-progress-events --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search'

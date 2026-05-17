@@ -1,0 +1,14 @@
+git-fetch-upstream-main	0	git fetch upstream main
+git-fetch-origin	0	git fetch origin
+git-rev-parse-head	0	git rev-parse HEAD
+git-rev-parse-upstream-main	0	git rev-parse upstream/main
+git-merge-base	0	git merge-base HEAD upstream/main
+git-ahead-behind	0	git rev-list --left-right --count HEAD...upstream/main
+git-status-branch	0	git status --short --branch
+cass-health-json	1	cass health --json
+cass-status-json	0	cass status --json
+cass-stats-json	0	cass stats --json
+cass-sources-agents-list-json	0	cass sources agents list --json
+which-cass	0	which cass
+cass-version	0	cass --version
+cass-sha256	0	shasum -a 256 /Users/dalecarman/.local/bin/cass

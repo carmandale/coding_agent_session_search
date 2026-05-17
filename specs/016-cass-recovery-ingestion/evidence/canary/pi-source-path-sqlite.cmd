@@ -1,0 +1,1 @@
+sqlite3 /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search/agent_search.db SELECT c.id, a.name, c.source_path FROM conversations c JOIN agents a ON a.id=c.agent_id WHERE c.source_path = '/Users/dalecarman/.pi/agent/sessions/--Users-dalecarman-.clawdis-workspace--/2025-12-14T23-13-12-368Z_3235b4b5-776d-4d7d-8b06-e36a322f3a4b.jsonl' LIMIT 5;

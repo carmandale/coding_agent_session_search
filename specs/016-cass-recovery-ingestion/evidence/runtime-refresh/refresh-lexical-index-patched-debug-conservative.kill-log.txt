@@ -1,0 +1,5 @@
+2026-05-16T15:18:24Z
+conservative refresh stopped making progress; status progress timestamp stale and sample shows run_index sleeping with worker threads parked; sending TERM to cass PID 81873
+  PID  PPID  %CPU %MEM    RSS ELAPSED STAT COMMAND
+81873 81861   0.0 13.0 17511392   16:56 S    ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+kill_exit=0

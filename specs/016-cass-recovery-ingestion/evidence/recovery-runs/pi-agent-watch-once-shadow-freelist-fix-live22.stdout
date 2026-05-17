@@ -1,0 +1,39 @@
+{
+  "success": true,
+  "elapsed_ms": 868276,
+  "full": false,
+  "force_rebuild": false,
+  "entrypoint": {
+    "kind": "watch_once",
+    "full": false,
+    "force_rebuild": false,
+    "watch": false,
+    "watch_once_path_count": 1,
+    "semantic": false,
+    "build_hnsw": false,
+    "migration_state": "tin8o_entrypoint_observed"
+  },
+  "data_dir": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search-spec016-shadow-20260516T2025Z",
+  "db_path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search-spec016-shadow-20260516T2025Z/agent_search.db",
+  "conversations": 999,
+  "messages": 176078,
+  "indexing_stats": {
+    "scan_ms": 789364,
+    "index_ms": 789364,
+    "connectors": [
+      {
+        "name": "pi_agent",
+        "conversations": 999,
+        "messages": 176078,
+        "scan_ms": 789364
+      }
+    ],
+    "agents_discovered": [
+      "pi_agent"
+    ],
+    "total_conversations": 999,
+    "total_messages": 176078,
+    "lexical_strategy": "deferred_authoritative_db_rebuild",
+    "lexical_strategy_reason": "pi_watch_once_persists_db_first_then_rebuilds_lexical_from_canonical_rows"
+  }
+}

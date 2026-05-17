@@ -1,0 +1,160 @@
+2026-05-15T21:34:41.859432Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3016
+2026-05-15T21:34:41.859445Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3017
+2026-05-15T21:34:41.859516Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3018
+2026-05-15T21:34:41.859531Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3019
+2026-05-15T21:34:41.859561Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3020
+2026-05-15T21:34:41.859780Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3021
+2026-05-15T21:34:41.859806Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3022
+2026-05-15T21:34:41.859820Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3023
+2026-05-15T21:34:41.859882Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3024
+2026-05-15T21:34:41.859982Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3025
+2026-05-15T21:34:41.860012Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3026
+2026-05-15T21:34:41.860026Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3027
+2026-05-15T21:34:41.860216Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3028
+2026-05-15T21:34:41.860230Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3029
+2026-05-15T21:34:41.860296Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3030
+2026-05-15T21:34:41.860310Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3031
+2026-05-15T21:34:41.860418Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3032
+2026-05-15T21:34:41.860617Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3033
+2026-05-15T21:34:41.860639Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3034
+2026-05-15T21:34:41.860654Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3035
+2026-05-15T21:34:41.860720Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3036
+2026-05-15T21:34:41.860799Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3037
+2026-05-15T21:34:41.860827Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3038
+2026-05-15T21:34:41.860841Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3039
+2026-05-15T21:34:41.861018Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3040
+2026-05-15T21:34:41.861033Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3041
+2026-05-15T21:34:41.861095Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3042
+2026-05-15T21:34:41.861110Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3043
+2026-05-15T21:34:41.861141Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3044
+2026-05-15T21:34:41.861186Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3045
+2026-05-15T21:34:41.861214Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3046
+2026-05-15T21:34:41.861229Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3047
+2026-05-15T21:34:41.861389Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3048
+2026-05-15T21:34:41.861413Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3049
+2026-05-15T21:34:41.861428Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3050
+2026-05-15T21:34:41.861489Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3051
+2026-05-15T21:34:41.861504Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3052
+2026-05-15T21:34:41.861536Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3053
+2026-05-15T21:34:41.861736Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3054
+2026-05-15T21:34:41.861760Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3055
+2026-05-15T21:34:41.861777Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3056
+2026-05-15T21:34:41.861839Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3057
+2026-05-15T21:34:41.861921Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3058
+2026-05-15T21:34:41.861953Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3059
+2026-05-15T21:34:41.861967Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3060
+2026-05-15T21:34:41.862161Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3061
+2026-05-15T21:34:41.862177Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3062
+2026-05-15T21:34:41.862240Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3063
+2026-05-15T21:34:41.862256Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3064
+2026-05-15T21:34:41.862294Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3065
+2026-05-15T21:34:41.862342Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3066
+2026-05-15T21:34:41.862375Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3067
+2026-05-15T21:34:41.862391Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3068
+2026-05-15T21:34:41.862561Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3069
+2026-05-15T21:34:41.862586Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3070
+2026-05-15T21:34:41.862601Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3071
+2026-05-15T21:34:41.862732Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3072
+2026-05-15T21:34:41.862755Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3073
+2026-05-15T21:34:41.862791Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3074
+2026-05-15T21:34:41.862989Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3075
+2026-05-15T21:34:41.863011Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3076
+2026-05-15T21:34:41.863025Z  INFO redact memo eviction evict_reason=CapacityLru live_entries=4096 evictions_capacity=3077
+2026-05-15T21:38:34.971187Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=claude_code external_id="projects/-Users-dalecarman-dev-quickbooks/a5066562-e3d3-4aad-ad27-90c850fb3e0f.jsonl" source_path=/Users/dalecarman/.claude/projects/-Users-dalecarman-dev-quickbooks/a5066562-e3d3-4aad-ad27-90c850fb3e0f.jsonl error=out of memory
+2026-05-15T21:41:51.975650Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=claude_code external_id="projects/-Users-dalecarman-dev-coding-agent-session-search/99e9ea57-9a8c-4c58-865d-3c602858313e.jsonl" source_path=/Users/dalecarman/.claude/projects/-Users-dalecarman-dev-coding-agent-session-search/99e9ea57-9a8c-4c58-865d-3c602858313e.jsonl error=out of memory
+2026-05-15T21:41:51.976129Z  INFO Preparing commit
+2026-05-15T21:41:51.976500Z  INFO Prepared commit 2517
+2026-05-15T21:41:51.976511Z  INFO committing 2517
+2026-05-15T21:41:51.976533Z  INFO save metas
+2026-05-15T21:41:51.987530Z  INFO Running garbage collection
+2026-05-15T21:41:51.987549Z  INFO Garbage collect
+2026-05-15T21:41:52.009664Z  WARN watch ingest skipped poison conversations after OOM bisection kind=Claude quarantined_conversations=8
+2026-05-15T21:41:52.023602Z  INFO starting cass-compatible segment merge segments=9
+2026-05-15T21:41:52.023629Z  INFO Starting merge  - [Seg("4a27f0ea"), Seg("b503a42e"), Seg("d084301c"), Seg("5a5e7c7b"), Seg("39ea8f66"), Seg("cee0522c"), Seg("671665f7"), Seg("26ec3cfd"), Seg("7d9fc595")]
+2026-05-15T21:42:08.146472Z  INFO End merge Some(Tracked(InnerSegmentMeta { segment_id: Seg("60bba224"), max_doc: 902839, deletes: None, include_temp_doc_store: true }))
+2026-05-15T21:42:08.146513Z  INFO save metas
+2026-05-15T21:42:08.156525Z  INFO Running garbage collection
+2026-05-15T21:42:08.156543Z  INFO Garbage collect
+2026-05-15T21:42:08.157095Z  INFO Deleted "39ea8f662e5d452f82af9da1fb5a3bb5.fieldnorm"
+2026-05-15T21:42:08.157396Z  INFO Deleted "671665f739fc4f66808d629855ebffd0.term"
+2026-05-15T21:42:08.157628Z  INFO Deleted "26ec3cfdb5f44f3b9c58cb0f2dbe1d3a.pos"
+2026-05-15T21:42:08.162584Z  INFO Deleted "5a5e7c7beeac423cb6414adce7993c15.pos"
+2026-05-15T21:42:08.169244Z  INFO Deleted "d084301c0a2d4ac48cac68426b7fb6d7.idx"
+2026-05-15T21:42:08.170530Z  INFO Deleted "5a5e7c7beeac423cb6414adce7993c15.term"
+2026-05-15T21:42:08.170959Z  INFO Deleted "4a27f0eac6234f928736e510a54b6fef.fast"
+2026-05-15T21:42:08.171295Z  INFO Deleted "671665f739fc4f66808d629855ebffd0.store"
+2026-05-15T21:42:08.171459Z  INFO Deleted "7d9fc595571845c7a5b2d729644e66bd.fieldnorm"
+2026-05-15T21:42:08.171528Z  INFO Deleted "7d9fc595571845c7a5b2d729644e66bd.idx"
+2026-05-15T21:42:08.174551Z  INFO Deleted "39ea8f662e5d452f82af9da1fb5a3bb5.pos"
+2026-05-15T21:42:08.175492Z  INFO Deleted "39ea8f662e5d452f82af9da1fb5a3bb5.term"
+2026-05-15T21:42:08.175745Z  INFO Deleted "b503a42ebac54a7397e0050d9f2dd276.fast"
+2026-05-15T21:42:08.176056Z  INFO Deleted "671665f739fc4f66808d629855ebffd0.pos"
+2026-05-15T21:42:08.180216Z  INFO Deleted "d084301c0a2d4ac48cac68426b7fb6d7.pos"
+2026-05-15T21:42:08.182350Z  INFO Deleted "b503a42ebac54a7397e0050d9f2dd276.store"
+2026-05-15T21:42:08.182455Z  INFO Deleted "26ec3cfdb5f44f3b9c58cb0f2dbe1d3a.fast"
+2026-05-15T21:42:08.182765Z  INFO Deleted "b503a42ebac54a7397e0050d9f2dd276.fieldnorm"
+2026-05-15T21:42:08.183023Z  INFO Deleted "5a5e7c7beeac423cb6414adce7993c15.fast"
+2026-05-15T21:42:08.183427Z  INFO Deleted "671665f739fc4f66808d629855ebffd0.fieldnorm"
+2026-05-15T21:42:08.191517Z  INFO Deleted "b503a42ebac54a7397e0050d9f2dd276.idx"
+2026-05-15T21:42:08.198187Z  INFO Deleted "b503a42ebac54a7397e0050d9f2dd276.pos"
+2026-05-15T21:42:08.198440Z  INFO Deleted "7d9fc595571845c7a5b2d729644e66bd.pos"
+2026-05-15T21:42:08.199114Z  INFO Deleted "cee0522c5d934d7390b43a8e4f230e03.store"
+2026-05-15T21:42:08.199334Z  INFO Deleted "d084301c0a2d4ac48cac68426b7fb6d7.fieldnorm"
+2026-05-15T21:42:08.203230Z  INFO Deleted "4a27f0eac6234f928736e510a54b6fef.store"
+2026-05-15T21:42:08.203734Z  INFO Deleted "26ec3cfdb5f44f3b9c58cb0f2dbe1d3a.fieldnorm"
+2026-05-15T21:42:08.204620Z  INFO Deleted "5a5e7c7beeac423cb6414adce7993c15.store"
+2026-05-15T21:42:08.212771Z  INFO Deleted "4a27f0eac6234f928736e510a54b6fef.pos"
+2026-05-15T21:42:08.217532Z  INFO Deleted "5a5e7c7beeac423cb6414adce7993c15.idx"
+2026-05-15T21:42:08.219309Z  INFO Deleted "cee0522c5d934d7390b43a8e4f230e03.idx"
+2026-05-15T21:42:08.219984Z  INFO Deleted "671665f739fc4f66808d629855ebffd0.idx"
+2026-05-15T21:42:08.220218Z  INFO Deleted "26ec3cfdb5f44f3b9c58cb0f2dbe1d3a.idx"
+2026-05-15T21:42:08.220500Z  INFO Deleted "26ec3cfdb5f44f3b9c58cb0f2dbe1d3a.store"
+2026-05-15T21:42:08.220771Z  INFO Deleted "39ea8f662e5d452f82af9da1fb5a3bb5.fast"
+2026-05-15T21:42:08.221255Z  INFO Deleted "39ea8f662e5d452f82af9da1fb5a3bb5.store"
+2026-05-15T21:42:08.221611Z  INFO Deleted "5a5e7c7beeac423cb6414adce7993c15.fieldnorm"
+2026-05-15T21:42:08.222026Z  INFO Deleted "cee0522c5d934d7390b43a8e4f230e03.fast"
+2026-05-15T21:42:08.222263Z  INFO Deleted "d084301c0a2d4ac48cac68426b7fb6d7.fast"
+2026-05-15T21:42:08.223526Z  INFO Deleted "d084301c0a2d4ac48cac68426b7fb6d7.store"
+2026-05-15T21:42:08.224642Z  INFO Deleted "d084301c0a2d4ac48cac68426b7fb6d7.term"
+2026-05-15T21:42:08.224851Z  INFO Deleted "26ec3cfdb5f44f3b9c58cb0f2dbe1d3a.term"
+2026-05-15T21:42:08.225334Z  INFO Deleted "cee0522c5d934d7390b43a8e4f230e03.term"
+2026-05-15T21:42:08.225537Z  INFO Deleted "671665f739fc4f66808d629855ebffd0.fast"
+2026-05-15T21:42:08.292905Z  INFO Deleted "4a27f0eac6234f928736e510a54b6fef.idx"
+2026-05-15T21:42:08.293926Z  INFO Deleted "7d9fc595571845c7a5b2d729644e66bd.fast"
+2026-05-15T21:42:08.299677Z  INFO Deleted "cee0522c5d934d7390b43a8e4f230e03.pos"
+2026-05-15T21:42:08.300050Z  INFO Deleted "cee0522c5d934d7390b43a8e4f230e03.fieldnorm"
+2026-05-15T21:42:08.302870Z  INFO Deleted "39ea8f662e5d452f82af9da1fb5a3bb5.idx"
+2026-05-15T21:42:08.303146Z  INFO Deleted "7d9fc595571845c7a5b2d729644e66bd.store"
+2026-05-15T21:42:08.305102Z  INFO Deleted "4a27f0eac6234f928736e510a54b6fef.term"
+2026-05-15T21:42:08.305559Z  INFO Deleted "4a27f0eac6234f928736e510a54b6fef.fieldnorm"
+2026-05-15T21:42:08.305689Z  INFO Deleted "7d9fc595571845c7a5b2d729644e66bd.term"
+2026-05-15T21:42:08.307677Z  INFO Deleted "b503a42ebac54a7397e0050d9f2dd276.term"
+Scanning for agents...
+  Scanned 42/42 connectors
+2026-05-15T21:42:25.756278Z  INFO watch_scan kind=Codex conversations=93 since_ts=1778858236367
+Indexing conversations...
+2026-05-15T22:18:20.787460Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=32 left=16 right=16 error=out of memory
+2026-05-15T22:34:50.691624Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=16 left=8 right=8 error=out of memory
+2026-05-15T22:42:35.983360Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=8 left=4 right=4 error=out of memory
+2026-05-15T22:46:39.476652Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=4 left=2 right=2 error=out of memory
+2026-05-15T22:48:45.887394Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=2 left=1 right=1 error=out of memory
+2026-05-15T22:50:04.987632Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=codex external_id="2026/05/15/rollout-2026-05-15T10-22-13-019e2c3b-2410-72d0-beee-099a9d95c961" source_path=/Users/dalecarman/.codex/sessions/2026/05/15/rollout-2026-05-15T10-22-13-019e2c3b-2410-72d0-beee-099a9d95c961.jsonl error=out of memory
+2026-05-15T22:50:58.017733Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=codex external_id="2026/05/15/rollout-2026-05-15T10-47-09-019e2c51-f726-7751-8631-2cddaa26b794" source_path=/Users/dalecarman/.codex/sessions/2026/05/15/rollout-2026-05-15T10-47-09-019e2c51-f726-7751-8631-2cddaa26b794.jsonl error=out of memory
+2026-05-15T22:52:38.521501Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=2 left=1 right=1 error=out of memory
+2026-05-15T22:53:34.680350Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=codex external_id="2026/05/15/rollout-2026-05-15T10-30-28-019e2c42-aea9-7c80-a6eb-af45e069c91b" source_path=/Users/dalecarman/.codex/sessions/2026/05/15/rollout-2026-05-15T10-30-28-019e2c42-aea9-7c80-a6eb-af45e069c91b.jsonl error=out of memory
+2026-05-15T22:54:15.977511Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=codex external_id="2026/05/15/rollout-2026-05-15T11-01-22-019e2c5e-fb05-7de2-91ba-5ec0aa208b38" source_path=/Users/dalecarman/.codex/sessions/2026/05/15/rollout-2026-05-15T11-01-22-019e2c5e-fb05-7de2-91ba-5ec0aa208b38.jsonl error=out of memory
+2026-05-15T22:57:46.676564Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=4 left=2 right=2 error=out of memory
+2026-05-15T22:59:32.784370Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=2 left=1 right=1 error=out of memory
+2026-05-15T23:00:29.238836Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=codex external_id="2026/05/15/rollout-2026-05-15T10-52-56-019e2c57-40c9-77a0-bb8b-cba50582877d" source_path=/Users/dalecarman/.codex/sessions/2026/05/15/rollout-2026-05-15T10-52-56-019e2c57-40c9-77a0-bb8b-cba50582877d.jsonl error=out of memory
+2026-05-15T23:01:18.014236Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=codex external_id="2026/05/15/rollout-2026-05-15T10-58-31-019e2c5c-5dc5-7160-8ca9-6d10d909f9c3" source_path=/Users/dalecarman/.codex/sessions/2026/05/15/rollout-2026-05-15T10-58-31-019e2c5c-5dc5-7160-8ca9-6d10d909f9c3.jsonl error=out of memory
+2026-05-15T23:02:55.131179Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=2 left=1 right=1 error=out of memory
+2026-05-15T23:03:49.449534Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=codex external_id="2026/05/15/rollout-2026-05-15T11-02-38-019e2c60-229c-7113-b0f1-1821547eca55" source_path=/Users/dalecarman/.codex/sessions/2026/05/15/rollout-2026-05-15T11-02-38-019e2c60-229c-7113-b0f1-1821547eca55.jsonl error=out of memory
+2026-05-15T23:04:37.266591Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=codex external_id="2026/05/15/rollout-2026-05-15T11-10-35-019e2c67-6904-7f01-86aa-c9566a1f3433" source_path=/Users/dalecarman/.codex/sessions/2026/05/15/rollout-2026-05-15T11-10-35-019e2c67-6904-7f01-86aa-c9566a1f3433.jsonl error=out of memory
+2026-05-15T23:14:47.222425Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=8 left=4 right=4 error=out of memory
+2026-05-15T23:18:56.434959Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=4 left=2 right=2 error=out of memory
+2026-05-15T23:21:50.573078Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=2 left=1 right=1 error=out of memory
+2026-05-15T23:22:42.973129Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=codex external_id="2026/05/15/rollout-2026-05-15T11-13-13-019e2c69-d30a-7242-816e-57c14b877738" source_path=/Users/dalecarman/.codex/sessions/2026/05/15/rollout-2026-05-15T11-13-13-019e2c69-d30a-7242-816e-57c14b877738.jsonl error=out of memory
+2026-05-15T23:24:37.176024Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=codex external_id="2026/05/15/rollout-2026-05-15T10-52-04-019e2c56-76b4-7793-b904-47e1e1a77f1a" source_path=/Users/dalecarman/.codex/sessions/2026/05/15/rollout-2026-05-15T10-52-04-019e2c56-76b4-7793-b904-47e1e1a77f1a.jsonl error=out of memory
+2026-05-15T23:25:54.743777Z  WARN watch ingest batch ran out of memory; retrying as smaller batches conversations=2 left=1 right=1 error=out of memory
+2026-05-15T23:26:33.070223Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=codex external_id="2026/05/15/rollout-2026-05-15T11-18-36-019e2c6e-c2f5-7671-88a4-015fa312753a" source_path=/Users/dalecarman/.codex/sessions/2026/05/15/rollout-2026-05-15T11-18-36-019e2c6e-c2f5-7671-88a4-015fa312753a.jsonl error=out of memory
+2026-05-15T23:27:13.316918Z  WARN single watch conversation ran out of memory; quarantined and advancing watch progress agent=codex external_id="2026/05/15/rollout-2026-05-15T11-21-20-019e2c71-42fe-7071-a374-d3bab2ee34da" source_path=/Users/dalecarman/.codex/sessions/2026/05/15/rollout-2026-05-15T11-21-20-019e2c71-42fe-7071-a374-d3bab2ee34da.jsonl error=out of memory

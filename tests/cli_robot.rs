@@ -77,7 +77,9 @@ fn recommended_command<'a>(json: &'a Value, id: &str) -> &'a Value {
                 .iter()
                 .find(|command| command["id"].as_str() == Some(id))
         })
-        .unwrap_or_else(|| panic!("missing recommended command {id}: {json}"))
+        .unwrap_or_else(|| {
+            std::panic::panic_any(format!("missing recommended command {id}: {json}"))
+        })
 }
 
 fn assert_not_initialized_recommended_commands(json: &Value, data_dir: &Path) {
@@ -289,6 +291,7 @@ fn capabilities_are_self_describing_for_agents() {
         "health",
         "introspect",
         "robot-docs",
+        "watchdog",
     ] {
         assert!(
             commands.iter().any(|command| command["name"] == expected),
@@ -602,6 +605,18 @@ fn capabilities_are_self_describing_for_agents() {
             && recovery["canonical"] == "cass search auth --agent codex --json"
             && recovery["accepted"] == true),
         "capabilities should advertise provider alias recovery"
+    );
+}
+
+#[test]
+fn watchdog_run_help_dispatches() {
+    let mut cmd = base_cmd();
+    cmd.args(["watchdog", "run", "--help"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Run a one-shot health check"),
+        "watchdog run help should come from the watchdog subcommand, got: {stdout}"
     );
 }
 
@@ -2158,11 +2173,13 @@ fn read_fixture(name: &str) -> Value {
 
 fn read_robot_json_golden(name: &str) -> Value {
     let path = Path::new("tests/golden/robot").join(name);
-    let body = fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("golden {} readable: {err}", path.display()));
+    let body = fs::read_to_string(&path).unwrap_or_else(|err| {
+        std::panic::panic_any(format!("golden {} readable: {err}", path.display()))
+    });
     let body = body.replace("[VERSION]", env!("CARGO_PKG_VERSION"));
-    serde_json::from_str(&body)
-        .unwrap_or_else(|err| panic!("golden {} valid json: {err}", path.display()))
+    serde_json::from_str(&body).unwrap_or_else(|err| {
+        std::panic::panic_any(format!("golden {} valid json: {err}", path.display()))
+    })
 }
 
 #[test]
@@ -2198,11 +2215,13 @@ fn swarm_status_fixture_outputs_match_goldens() {
             serde_json::from_slice(&output.stdout).expect("valid swarm status json");
         let golden_path =
             Path::new("tests/golden/swarm_status").join(format!("{fixture_id}.json.golden"));
-        let expected: Value = serde_json::from_str(
-            &fs::read_to_string(&golden_path)
-                .unwrap_or_else(|err| panic!("read {}: {err}", golden_path.display())),
-        )
-        .unwrap_or_else(|err| panic!("parse {}: {err}", golden_path.display()));
+        let expected: Value =
+            serde_json::from_str(&fs::read_to_string(&golden_path).unwrap_or_else(|err| {
+                std::panic::panic_any(format!("read {}: {err}", golden_path.display()))
+            }))
+            .unwrap_or_else(|err| {
+                std::panic::panic_any(format!("parse {}: {err}", golden_path.display()))
+            });
         assert_eq!(actual, expected, "{fixture_id} swarm status golden drifted");
     }
 }
@@ -6582,12 +6601,12 @@ fn introspect_response_schemas_advertise_doctor_v2_surfaces() {
         "doctor-status-summary",
         "doctor-health-summary",
     ] {
-        let schema = schemas
-            .get(key)
-            .unwrap_or_else(|| panic!("introspect response_schemas missing {key}"));
-        let properties = schema["properties"]
-            .as_object()
-            .unwrap_or_else(|| panic!("{key} schema should expose object properties"));
+        let schema = schemas.get(key).unwrap_or_else(|| {
+            std::panic::panic_any(format!("introspect response_schemas missing {key}"))
+        });
+        let properties = schema["properties"].as_object().unwrap_or_else(|| {
+            std::panic::panic_any(format!("{key} schema should expose object properties"))
+        });
         for field in [
             "status",
             "outcome_kind",
@@ -7286,10 +7305,10 @@ fn search_with_intact_db_but_wiped_lexical_degrades_with_truthful_warning() {
          stderr: {stderr}"
     );
     let _: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
-        panic!(
+        std::panic::panic_any(format!(
             "stdout must be valid JSON in degraded mode; got parse error {err}; \
              stdout: {stdout}"
-        )
+        ))
     });
 }
 
@@ -7396,14 +7415,24 @@ fn search_explicit_semantic_mode_errors_when_embedder_absent() {
         .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
-        .unwrap_or_else(|| panic!("stderr should contain a JSON error line; got: {stderr}"));
+        .unwrap_or_else(|| {
+            std::panic::panic_any(format!(
+                "stderr should contain a JSON error line; got: {stderr}"
+            ))
+        });
     let payload: Value = serde_json::from_str(last_line.trim()).unwrap_or_else(|err| {
-        panic!("error envelope must be valid JSON: {err}; line: {last_line}")
+        std::panic::panic_any(format!(
+            "error envelope must be valid JSON: {err}; line: {last_line}"
+        ))
     });
     let err = payload
         .get("error")
         .and_then(|e| e.as_object())
-        .unwrap_or_else(|| panic!("payload must contain an `error` object; got: {payload}"));
+        .unwrap_or_else(|| {
+            std::panic::panic_any(format!(
+                "payload must contain an `error` object; got: {payload}"
+            ))
+        });
 
     // Invariant 2: kebab-case kind + numeric code from src/lib.rs Exit
     // Codes table. Pinning both the kind AND the code catches a
@@ -7434,10 +7463,11 @@ fn search_explicit_semantic_mode_errors_when_embedder_absent() {
     // behavior when the operator does not explicitly request semantic-only
     // search, so the recovery is to drop the semantic-only request or build
     // the semantic assets.
-    let hint = err
-        .get("hint")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("error must include a `hint` operator can act on; got: {err:?}"));
+    let hint = err.get("hint").and_then(Value::as_str).unwrap_or_else(|| {
+        std::panic::panic_any(format!(
+            "error must include a `hint` operator can act on; got: {err:?}"
+        ))
+    });
     let hint_lower = hint.to_lowercase();
     let legacy_lexical_hint = concat!("--mode ", "lexical");
     assert!(
@@ -7454,7 +7484,11 @@ fn search_explicit_semantic_mode_errors_when_embedder_absent() {
     let message = err
         .get("message")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("error must include a non-null message; got: {err:?}"));
+        .unwrap_or_else(|| {
+            std::panic::panic_any(format!(
+                "error must include a non-null message; got: {err:?}"
+            ))
+        });
     assert!(
         !message.is_empty(),
         "error message must be a non-empty diagnostic string; got: {err:?}"
@@ -7505,12 +7539,20 @@ fn search_hits_as_keys(payload: &Value) -> Vec<(String, i64)> {
             let path = h
                 .get("source_path")
                 .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("hit.source_path must be a non-null string; hit: {h}"))
+                .unwrap_or_else(|| {
+                    std::panic::panic_any(format!(
+                        "hit.source_path must be a non-null string; hit: {h}"
+                    ))
+                })
                 .to_string();
             let line = h
                 .get("line_number")
                 .and_then(Value::as_i64)
-                .unwrap_or_else(|| panic!("hit.line_number must be a non-null integer; hit: {h}"));
+                .unwrap_or_else(|| {
+                    std::panic::panic_any(format!(
+                        "hit.line_number must be a non-null integer; hit: {h}"
+                    ))
+                });
             (path, line)
         })
         .collect()
@@ -7530,8 +7572,11 @@ fn run_search_returning_payload(
         "cass search invocation must succeed (args={args:?}); stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|err| panic!("search stdout must be valid JSON: {err}; stdout: {stdout}"))
+    serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+        std::panic::panic_any(format!(
+            "search stdout must be valid JSON: {err}; stdout: {stdout}"
+        ))
+    })
 }
 
 /// Common setup: seed 3 Codex rollouts, run cass index --full, return
@@ -7819,12 +7864,16 @@ fn stats_by_agent_counts_sum_to_total_conversations() {
         String::from_utf8_lossy(&stats_out.stderr)
     );
     let stats: Value = serde_json::from_slice(&stats_out.stdout)
-        .unwrap_or_else(|err| panic!("stats JSON parse failed: {err}"));
+        .unwrap_or_else(|err| std::panic::panic_any(format!("stats JSON parse failed: {err}")));
 
     let total = stats
         .get("conversations")
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| panic!("stats.conversations must be a non-null u64; stats: {stats}"));
+        .unwrap_or_else(|| {
+            std::panic::panic_any(format!(
+                "stats.conversations must be a non-null u64; stats: {stats}"
+            ))
+        });
     assert!(
         total >= 1,
         "precondition: seeded corpus must produce at least 1 conversation; \
@@ -7834,13 +7883,19 @@ fn stats_by_agent_counts_sum_to_total_conversations() {
     let by_agent = stats
         .get("by_agent")
         .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("stats.by_agent must be an array; stats: {stats}"));
+        .unwrap_or_else(|| {
+            std::panic::panic_any(format!("stats.by_agent must be an array; stats: {stats}"))
+        });
     let mut agent_sum: u64 = 0;
     for entry in by_agent {
         let agent = entry
             .get("agent")
             .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("by_agent entry must have non-null `agent`; entry: {entry}"));
+            .unwrap_or_else(|| {
+                std::panic::panic_any(format!(
+                    "by_agent entry must have non-null `agent`; entry: {entry}"
+                ))
+            });
         assert!(
             !agent.is_empty(),
             "by_agent.agent must be non-empty; entry: {entry}"
@@ -7849,11 +7904,13 @@ fn stats_by_agent_counts_sum_to_total_conversations() {
             .get("count")
             .and_then(Value::as_u64)
             .unwrap_or_else(|| {
-                panic!("by_agent entry must have non-null u64 `count`; entry: {entry}")
+                std::panic::panic_any(format!(
+                    "by_agent entry must have non-null u64 `count`; entry: {entry}"
+                ))
             });
-        agent_sum = agent_sum
-            .checked_add(count)
-            .unwrap_or_else(|| panic!("by_agent count overflow; accumulated {agent_sum}"));
+        agent_sum = agent_sum.checked_add(count).unwrap_or_else(|| {
+            std::panic::panic_any(format!("by_agent count overflow; accumulated {agent_sum}"))
+        });
     }
 
     assert_eq!(
@@ -7890,25 +7947,33 @@ fn stats_date_range_oldest_is_not_after_newest() {
         .arg(&data_dir);
     let stats_out = stats_cmd.output().expect("run cass stats");
     let stats: Value = serde_json::from_slice(&stats_out.stdout)
-        .unwrap_or_else(|err| panic!("stats JSON parse failed: {err}"));
+        .unwrap_or_else(|err| std::panic::panic_any(format!("stats JSON parse failed: {err}")));
 
     // date_range may be absent if no messages have timestamps — but
     // with seeded rollouts it must be present AND ordered.
     let date_range = stats
         .get("date_range")
         .and_then(Value::as_object)
-        .unwrap_or_else(|| panic!("stats.date_range must be an object; stats: {stats}"));
+        .unwrap_or_else(|| {
+            std::panic::panic_any(format!(
+                "stats.date_range must be an object; stats: {stats}"
+            ))
+        });
     let oldest = date_range
         .get("oldest")
         .and_then(Value::as_str)
         .unwrap_or_else(|| {
-            panic!("stats.date_range.oldest must be a string on a seeded corpus; stats: {stats}")
+            std::panic::panic_any(format!(
+                "stats.date_range.oldest must be a string on a seeded corpus; stats: {stats}"
+            ))
         });
     let newest = date_range
         .get("newest")
         .and_then(Value::as_str)
         .unwrap_or_else(|| {
-            panic!("stats.date_range.newest must be a string on a seeded corpus; stats: {stats}")
+            std::panic::panic_any(format!(
+                "stats.date_range.newest must be a string on a seeded corpus; stats: {stats}"
+            ))
         });
 
     // Lexicographic string compare is safe for RFC3339 timestamps
@@ -7918,10 +7983,12 @@ fn stats_date_range_oldest_is_not_after_newest() {
         oldest <= newest,
         "date_range.oldest must lex-sort <= newest; oldest={oldest:?} newest={newest:?}"
     );
-    let oldest_dt = chrono::DateTime::parse_from_rfc3339(oldest)
-        .unwrap_or_else(|err| panic!("oldest must be RFC3339: {err}; value: {oldest:?}"));
-    let newest_dt = chrono::DateTime::parse_from_rfc3339(newest)
-        .unwrap_or_else(|err| panic!("newest must be RFC3339: {err}; value: {newest:?}"));
+    let oldest_dt = chrono::DateTime::parse_from_rfc3339(oldest).unwrap_or_else(|err| {
+        std::panic::panic_any(format!("oldest must be RFC3339: {err}; value: {oldest:?}"))
+    });
+    let newest_dt = chrono::DateTime::parse_from_rfc3339(newest).unwrap_or_else(|err| {
+        std::panic::panic_any(format!("newest must be RFC3339: {err}; value: {newest:?}"))
+    });
     assert!(
         oldest_dt <= newest_dt,
         "date_range parsed ordering must hold: {oldest_dt} <= {newest_dt}"
@@ -7961,7 +8028,7 @@ fn stats_on_empty_indexed_db_reports_zeroes_and_empty_by_agent() {
         String::from_utf8_lossy(&stats_out.stderr)
     );
     let stats: Value = serde_json::from_slice(&stats_out.stdout)
-        .unwrap_or_else(|err| panic!("stats JSON parse failed: {err}"));
+        .unwrap_or_else(|err| std::panic::panic_any(format!("stats JSON parse failed: {err}")));
 
     assert_eq!(
         stats.get("conversations").and_then(Value::as_u64),
@@ -7976,7 +8043,9 @@ fn stats_on_empty_indexed_db_reports_zeroes_and_empty_by_agent() {
     let by_agent = stats
         .get("by_agent")
         .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("stats.by_agent must be an array; stats: {stats}"));
+        .unwrap_or_else(|| {
+            std::panic::panic_any(format!("stats.by_agent must be an array; stats: {stats}"))
+        });
     assert!(
         by_agent.is_empty(),
         "empty indexed DB must produce empty by_agent[]; got {} entries: {by_agent:?}",

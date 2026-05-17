@@ -26,6 +26,7 @@ WORKFLOW:
   3. cass pack "query" --robot --max-tokens 12000  # Cited handoff evidence
   4. cass view <source_path> -n <line> --json  # Follow up on a cited result
   Pack warnings expose freshness, semantic fallback, and privacy redactions.
+  Watcher ops: cass watchdog run | cass watchdog install | cass watchdog uninstall
 
 OUTPUT:
   --robot | --json   Machine-readable JSON output (auto-quiet enabled)
@@ -33,7 +34,7 @@ OUTPUT:
   Use -v/--verbose with --json to enable INFO logs if needed
 
 Agent preflight: triage | ready | preflight
-Core subcommands: search | pack | sessions | stats | view | index | health | capabilities | introspect | robot-docs <topic>
+Core subcommands: search | pack | sessions | stats | view | index | watchdog | health | capabilities | introspect | robot-docs <topic>
 Topics: commands | env | paths | schemas | guide | exit-codes | examples | contracts | wrap | sources
 Exit codes: 0 ok; 1 health; 2 usage; 3 missing index/db; 7 lock/busy
 More: cass capabilities --json | cass robot-docs examples | cass robot-docs exit-codes

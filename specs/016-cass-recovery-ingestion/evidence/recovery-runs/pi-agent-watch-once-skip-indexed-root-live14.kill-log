@@ -1,0 +1,1 @@
+sent SIGTERM to cass watch-once processes [68596 68617] at 2026-05-16T19:17:52Z after sample showed per-file freshness query autocommit/freelist overhead before first ingest

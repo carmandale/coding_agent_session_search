@@ -1,0 +1,14 @@
+{
+  "claude_code": {
+    "path": "/Users/dalecarman/.claude/projects/-Users-dalecarman-dev-quickbooks/a5066562-e3d3-4aad-ad27-90c850fb3e0f.jsonl",
+    "query": "codex-implement-chunk-9-spec039-t5t6-r1.md"
+  },
+  "codex": {
+    "path": "/Users/dalecarman/.codex/sessions/2026/05/16/rollout-2026-05-16T08-42-53-019e3106-8e85-7343-8a7c-0eac5cb6f39a.jsonl",
+    "query": "cass-session-ingestion-recovery"
+  },
+  "pi_agent": {
+    "path": "/Users/dalecarman/.pi/agent/sessions/--Users-dalecarman-.clawdis-workspace--/2025-12-14T23-13-12-368Z_3235b4b5-776d-4d7d-8b06-e36a322f3a4b.jsonl",
+    "query": "ATT21_COL_CFP_SceneMachine_EndCard.psd"
+  }
+}

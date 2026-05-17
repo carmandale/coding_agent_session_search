@@ -1,0 +1,1 @@
+cass health --json

@@ -1,0 +1,44 @@
+---
+schema_version: "1.0.0"
+mode: finalize
+date: 2026-04-04T09:12:38.905Z
+session: "coding_agent_session_search-1e57-spec-012-upstream-sync-finalize"
+outcome: "SUCCEEDED"
+primary_bead: "coding_agent_session_search-1e57"
+---
+
+goal: "Finalize Spec 012 implementation/verification artifacts and close the session with an auditable handoff."
+now: "Code verification is approved for baseline 441959c8 to end 96a7d466, artifact checksums are frozen, and the session is ready for closure."
+
+final_solutions:
+  - "Completed scoped code-verify window on sync/012 with baseline 441959c8 and end 96a7d466; final Codex verdict APPROVED."
+  - "Closed verification evidence gaps by adding explicit watch-entry ordering test and aligning receipt/test artifacts to actual logs and counts."
+  - "Added code-verify artifact freeze manifest with SHA-256 checksums for all referenced /tmp/codeverify-* logs."
+
+final_decisions:
+  - "Treat runtime soak artifacts as provenance-only for this finalize window; code-verify scope is strictly baseline_sha..end_sha."
+  - "Keep canonical upstream-vs-fork src allowlist explicit while separately documenting verification-window deltas (connectors/mod + e2e comment)."
+  - "Use targeted behavior tests plus full-suite parity (unchanged fail surface) as T11 acceptance evidence."
+
+artifacts_produced:
+  - "specs/012-upstream-sync-query-tui/code-verify.md"
+  - "specs/012-upstream-sync-query-tui/codex-review.md"
+  - "specs/012-upstream-sync-query-tui/implement-receipt.md"
+  - "specs/012-upstream-sync-query-tui/code-verify-artifact-manifest.md"
+  - "specs/012-upstream-sync-query-tui/log.md"
+  - "thoughts/shared/handoffs/coding_agent_session_search-1e57-spec-012-upstream-sync-finalize/2026-04-04_09-12_spec-012-upstream-sync-finalize_finalize.yaml"
+
+files:
+  - "specs/012-upstream-sync-query-tui/*"
+  - "thoughts/shared/handoffs/coding_agent_session_search-1e57-spec-012-upstream-sync-finalize/*"
+
+test:
+  - "cargo check --all-targets (PASS)"
+  - "cargo clippy --all-targets -- -D warnings (PASS)"
+  - "targeted risk-path suite (7 tests PASS)"
+  - "cargo test --lib baseline parity unchanged: 3459 passed; 88 failed; 3 ignored"
+
+git:
+  branch: "sync/012"
+  commit: "96a7d46638d6b9d47186e01744541ebf487f8e17"
+  remote: "https://github.com/carmandale/coding_agent_session_search.git"

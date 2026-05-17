@@ -1,0 +1,1 @@
+CASS_WATCH_SCAN_BATCH_FILES=8 CASS_WATCH_SCAN_BATCH_BYTES=16777216 CASS_WATCH_BUFFER_MAX_MESSAGES=4096 CASS_WATCH_INGEST_CHUNK_SIZE=4 ./target/debug/cass index --watch-once "/Users/dalecarman/.pi/agent/sessions" --json --robot-trace-ingest --no-progress-events --data-dir "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search"

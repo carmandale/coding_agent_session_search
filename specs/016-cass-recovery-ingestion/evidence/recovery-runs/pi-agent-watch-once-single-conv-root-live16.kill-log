@@ -1,0 +1,4 @@
+killed 2026-05-16T19:25:40Z reason=RSS exceeded 16GB with CASS_WATCH_INGEST_CHUNK_SIZE=1 before DB movement
+  PID ELAPSED    RSS  %CPU COMMAND
+  340   00:59 17894784  94.7 ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --robot-trace-ingest --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+pi_agent|46|3598

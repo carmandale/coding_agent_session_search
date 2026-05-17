@@ -1,0 +1,4 @@
+killed 2026-05-16T19:23:46Z reason=RSS exceeded 15GB before ingest trace or DB movement
+  PID ELAPSED    RSS  %CPU COMMAND
+93164   00:54 17789392  95.1 ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --robot-trace-ingest --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+pi_agent|44|3285

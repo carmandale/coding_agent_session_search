@@ -1,0 +1,1 @@
+sent SIGTERM to 84269 at 2026-05-16T18:54:31Z after trace showed exact probes still slow for small created-at-bounded reprocess batches before Pi count changed

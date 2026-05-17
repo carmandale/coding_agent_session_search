@@ -1,0 +1,5 @@
+2026-05-16T15:00:49Z
+RSS crossed route-policy hard ceiling during patched refresh; sending TERM to cass PID 63666
+  PID  PPID    RSS ELAPSED COMMAND
+63666 63655 36387952   04:10 ./target/debug/cass index --json --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+kill_exit=0

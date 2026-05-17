@@ -1,0 +1,84 @@
+---
+schema_version: "1.0.0"
+mode: finalize
+date: 2026-03-08T09:01:25.018Z
+session: "coding_agent_session_search-2gxp-004-doctor-reconciliation"
+outcome: "SUCCEEDED"
+primary_bead: "coding_agent_session_search-2gxp"
+---
+
+goal: "Implement spec 004: disk-vs-DB reconciliation check in cass doctor"
+now: "All 23 tasks complete across 3 phases. Feature fully implemented, tested, and verified end-to-end on feat/doctor-reconciliation-v2 branch (based on fix/index-gaps)."
+
+done_this_session:
+  - "Added count_disk_files() (required) and reconciliation_notes() (default None) to Connector trait"
+  - "Implemented count_disk_files() for all 12 connectors, each mirroring its scan() file-selection logic"
+  - "Cursor returns None (SQLite DBs not comparable to conversation count)"
+  - "Added --reconciliation-threshold CLI arg (default 10) to Doctor command"
+  - "Added reconciliation check block in run_doctor() with read-only DB connection"
+  - "Reuses get_connector_factories() registry — no hardcoded connector list"
+  - "JSON output: reconciliation object with balanced, elapsed_ms, threshold, per-connector connectors array"
+  - "Human output: reconciliation check with per-connector detail for gaps/skips"
+  - "Reconciliation is diagnostic-only — does NOT affect exit code"
+
+final_solutions:
+  - problem: "Need per-connector disk file counting without duplicating scan logic"
+    solution: "Each connector's count_disk_files() mirrors its scan() file-selection logic (same WalkDir patterns, same extensions, same helpers like find_chat_files/session_files)"
+  - problem: "Some connectors (Cursor) use SQLite where file count != conversation count"
+    solution: "count_disk_files() returns Option<usize>; None means non-comparable. Status becomes 'skip' with reconciliation_notes() explaining why"
+  - problem: "Factory key 'claude' differs from DB agent_slug 'claude_code'"
+    solution: "Slug mapping HashMap in reconciliation block: ('claude' -> 'claude_code')"
+  - problem: "Need to detect both missing files AND orphaned DB entries"
+    solution: "Signed i64 delta (disk - db). Positive = un-indexed files, negative = orphaned DB entries"
+
+final_decisions:
+  - decision: "Built on fix/index-gaps branch, not main"
+    rationale: "main moved connectors to external franken_agent_detection crate (can't modify trait there) and doesn't compile on rustc 1.88"
+  - decision: "count_disk_files() is a required trait method, not optional"
+    rationale: "Compile-time enforcement ensures every new connector must implement it"
+  - decision: "Reconciliation does not affect exit code"
+    rationale: "Per spec: deltas are expected (filtered sessions, empty files, etc.) and should not cause CI failures"
+
+artifacts_produced:
+  - "src/connectors/mod.rs — Connector trait extension"
+  - "src/connectors/{claude_code,gemini,factory,codex,pi_agent,chatgpt,aider,amp,cline,codebuff,opencode,cursor}.rs — count_disk_files() implementations"
+  - "src/lib.rs — CLI arg, run_doctor() reconciliation block, JSON/human output"
+  - "specs/004-doctor-reconciliation/tasks.md — all 23 tasks checked off"
+  - "specs/004-doctor-reconciliation/log.md — implementation log"
+
+next:
+  - "Merge feat/doctor-reconciliation-v2 into fix/index-gaps (or directly into main when main compiles)"
+  - "Consider adding aider connector's full workspace scan (currently bounded to CWD + env override)"
+  - "OpenCode has 990 disk files vs 0 DB entries — may need indexing or connector fix"
+  - "ChatGPT has 38 disk files vs 0 DB entries — same as OpenCode"
+
+test:
+  passed: "1151 lib tests, cargo check/clippy/fmt all clean"
+  skipped: "3 pre-existing integration test failures (2 opencode, 1 pi_agent) — not caused by this work"
+  verification: "Live cass doctor --json shows reconciliation data for all connectors; --reconciliation-threshold works; reconciliation completes in ~350ms"
+
+files:
+  - "src/connectors/mod.rs"
+  - "src/connectors/claude_code.rs"
+  - "src/connectors/gemini.rs"
+  - "src/connectors/factory.rs"
+  - "src/connectors/codex.rs"
+  - "src/connectors/pi_agent.rs"
+  - "src/connectors/chatgpt.rs"
+  - "src/connectors/aider.rs"
+  - "src/connectors/amp.rs"
+  - "src/connectors/cline.rs"
+  - "src/connectors/codebuff.rs"
+  - "src/connectors/opencode.rs"
+  - "src/connectors/cursor.rs"
+  - "src/lib.rs"
+  - "specs/004-doctor-reconciliation/tasks.md"
+  - "specs/004-doctor-reconciliation/log.md"
+
+git:
+  branch: "feat/doctor-reconciliation-v2"
+  commits:
+    - "2fca14f1 — feat(connectors): add count_disk_files() and reconciliation_notes() to Connector trait"
+    - "4cd355b4 — feat(doctor): add disk-vs-DB reconciliation check"
+    - "5cb2b5f2 — docs: mark all 004-doctor-reconciliation tasks complete"
+  remote: "https://github.com/carmandale/coding_agent_session_search.git"

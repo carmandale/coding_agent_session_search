@@ -329,6 +329,12 @@
       "has_json_output": true
     },
     {
+      "name": "watchdog",
+      "description": "Monitor and manage the index watcher health watchdog",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
       "name": "completions",
       "description": "Generate shell completions to stdout",
       "arguments": [

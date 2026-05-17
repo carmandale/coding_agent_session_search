@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- managed by cass -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cass.index-watch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/dalecarman/.local/bin/cass</string>
+        <string>index</string>
+        <string>--watch</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/dalecarman/Library/Logs/cass-index-watch.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dalecarman/Library/Logs/cass-index-watch.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CASS_FSQLITE_PAGE_CACHE_BUFFERS</key>
+        <string>1048576</string>
+        <key>CASS_FSQLITE_EPROCESS_LAMBDA</key>
+        <string>0</string>
+        <key>CASS_TANTIVY_WRITER_HEAP_BYTES</key>
+        <string>536870912</string>
+        <key>PATH</key>
+        <string>/Users/dalecarman/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>

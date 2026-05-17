@@ -1,0 +1,39 @@
+{
+  "success": true,
+  "elapsed_ms": 32342,
+  "full": false,
+  "force_rebuild": false,
+  "entrypoint": {
+    "kind": "watch_once",
+    "full": false,
+    "force_rebuild": false,
+    "watch": false,
+    "watch_once_path_count": 1,
+    "semantic": false,
+    "build_hnsw": false,
+    "migration_state": "tin8o_entrypoint_observed"
+  },
+  "data_dir": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search-spec016-shadow-20260516T2025Z",
+  "db_path": "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search-spec016-shadow-20260516T2025Z/agent_search.db",
+  "conversations": 1,
+  "messages": 7130,
+  "indexing_stats": {
+    "scan_ms": 2388,
+    "index_ms": 16903,
+    "connectors": [
+      {
+        "name": "codex",
+        "conversations": 1,
+        "messages": 7130,
+        "scan_ms": 2388
+      }
+    ],
+    "agents_discovered": [
+      "codex"
+    ],
+    "total_conversations": 1,
+    "total_messages": 7130,
+    "lexical_strategy": "incremental_inline",
+    "lexical_strategy_reason": "watch_once_targeted_reindex_applies_inline_lexical_updates_for_changed_paths"
+  }
+}

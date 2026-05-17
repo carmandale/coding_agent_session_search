@@ -1,0 +1,1 @@
+CASS_WATCH_SCAN_BATCH_FILES=10 CASS_WATCH_SCAN_BATCH_BYTES=16777216 CASS_WATCH_BUFFER_MAX_MESSAGES=4096 CASS_WATCH_TANTIVY_WRITER_THREADS=1 ./target/debug/cass index --watch-once '/Users/dalecarman/.pi/agent/sessions' --json --no-progress-events --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search'

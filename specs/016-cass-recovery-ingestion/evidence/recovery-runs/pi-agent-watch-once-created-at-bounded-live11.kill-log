@@ -1,0 +1,1 @@
+sent SIGTERM to cass watch-once processes [2994 3019] at 2026-05-16T19:02:32Z after Pi count moved to 39 but larger new Pi batches failed with out-of-memory at commit/analytics candidate

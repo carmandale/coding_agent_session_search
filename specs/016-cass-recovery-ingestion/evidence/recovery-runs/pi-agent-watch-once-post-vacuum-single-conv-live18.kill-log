@@ -1,0 +1,4 @@
+killed 2026-05-16T19:30:34Z reason=RSS exceeded 14GB post-vacuum with chunk_size=1 before DB movement
+  PID ELAPSED    RSS  %CPU COMMAND
+18103   00:39 17646448  89.3 ./target/debug/cass index --watch-once /Users/dalecarman/.pi/agent/sessions --json --robot-trace-ingest --no-progress-events --data-dir /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search
+pi_agent|81|14923

@@ -1,0 +1,83 @@
+---
+schema_version: "1.0.0"
+mode: finalize
+date: 2026-04-01T16:45:41.484Z
+session: "coding_agent_session_search-2n2u-spec-011-upstream-sync-implement-code-verify"
+outcome: "SUCCEEDED"
+primary_bead: "coding_agent_session_search-2n2u"
+---
+
+goal: "Implement spec 011: sync fork to upstream HEAD, deploy cass 0.2.7-gj.1, pass Codex code verification"
+now: "Spec 011 complete and Codex-approved (3 rounds). cass 0.2.7-gj.1 deployed. git diff upstream/main shows 4 src/ files (lib.rs+watchdog.rs+resource.rs+asset_state.rs). Bead 6hbd P1 open for watcher crash loop."
+
+done_this_session:
+  - "Ran gate.sh — passed. Spawned IronUnion (crew-challenger) as navigator."
+  - "Executed T0 preflight, T1-T3 were already staged from prior session."
+  - "T4: cargo check/clippy/fmt all EXIT 0. cargo test --lib: 3104 pass / 55 fail (all in upstream modules, 18/18 watchdog pass)."
+  - "Identified frankensqlite rev issue: 92a9a0fa lacks pragma_table_info; HEAD requires nightly. Chose dd9b457 (stable-safe, pragma_table_info support)."
+  - "T5: cargo build --release (5m43s). Deployed cass 0.2.7-gj.1 to ~/.cargo/bin and ~/.local/bin. Signed with codesign."
+  - "T6: Watcher crash-loop detected — historical salvage fails at source_row_id=7. Created bead 6hbd P1."
+  - "T7: Committed (2783daa8), pushed to feat/007-watchdog-subcommand. Closed bead 2n2u."
+  - "code-verify round 1: REVISE — found lib.rs wiring was NOT committed (was upstream version). Fixed in 3218590a."
+  - "code-verify round 1 fix: Added 2 watchdog CLI dispatch integration tests to tests/cli_dispatch_coverage.rs (956d5c5a)."
+  - "code-verify round 2: REVISE — lib.rs still had formatting drift from prior sessions. Rebuilt from upstream verbatim + 6 surgical sites (0445e82a). Fixed collapsible_match clippy lint."
+  - "code-verify round 3: APPROVED (gpt-5.3-codex). All 6 wiring sites confirmed, compiler gates pass, watchdog 18/18 pass, 2 dispatch tests pass."
+  - "gate.sh record code-verify + gate.sh verify both passed. code-verify.md written to spec dir."
+
+decisions:
+  - "frankensqlite rev dd9b457 chosen over 92a9a0fa (lacks pragma_table_info, 14 test failures) and HEAD 2eb9fb2 (requires nightly). dd9b457 is stable-safe sweet spot."
+  - "FAD rev c5d3273c kept from prior session (builds cleanly; plan said de450843)."
+  - "Added [patch.franken_agent_detection] section to redirect FAD's transitive frankensqlite path dep to git dep."
+  - "Dead files (fad_adapter.rs, codebuff.rs, sessions.rs, message_render.rs) removed via git rm after plan approval confirmed as written permission."
+  - "4 #[allow] annotations added to resource.rs and asset_state.rs for macOS stable clippy compliance."
+  - "src/ diff footprint: 4 files (lib.rs, watchdog.rs, resource.rs, asset_state.rs) — plan estimated 2. Accepted."
+
+findings:
+  - "lib.rs wiring was NOT in the staged version committed at 2783daa8 — the upstream-version (no wiring) was accidentally staged. Fixed in code-verify round 1 (3218590a)."
+  - "lib.rs had formatting drift across 58 hunks vs upstream due to rustfmt version differences. Fixed in code-verify round 2 by rebuilding from upstream verbatim (0445e82a)."
+  - "Watcher crash-loops on historical salvage at source_row_id=7 after frankensqlite upgrade. Pre-existing 11GB backup bundle is incompatible with new FTS5 vtable. Fix: clear historical bundles (bead 6hbd P1)."
+  - "55 upstream test failures are FTS5/analytics incompatibilities between git-rev frankensqlite and upstream's local-path frankensqlite. Cannot fix without frankensqlite dev access."
+  - "Pre-existing zombie watcher processes (PIDs 20997, 24422) in UE state since Mon10AM — unrelated to spec 011."
+  - "Deploy path: watcher plist uses ~/.local/bin/cass, not ~/.cargo/bin/cass. Both paths must be updated."
+
+worked:
+  - "Two-navigator + driver pattern (VividIce + IronUnion) caught the lib.rs staging bug that would have shipped a broken binary"
+  - "Using cargo fmt on the upstream lib.rs before applying wiring sites produced a stable, clean diff"
+  - "frankensqlite rev selection: probe git history for pragma_table_info tests and core_intrinsics feature, find the exact stable-safe window"
+  - "codesign --force --sign - works for macOS gatekeeper quarantine on self-built binaries"
+
+failed:
+  - "git checkout upstream/main -- src/ does NOT delete files absent from upstream (contrary to plan T1.1 claim); must use git rm"
+  - "cargo test --lib has 55 persistent upstream failures that cannot be resolved without frankensqlite dev access"
+  - "R5 (watcher healthy:true within 5min) not met due to historical salvage crash loop"
+
+files:
+  - src/lib.rs
+  - src/watchdog.rs
+  - src/daemon/resource.rs
+  - src/search/asset_state.rs
+  - Cargo.toml
+  - Cargo.lock
+  - rust-toolchain.toml
+  - tests/cli_dispatch_coverage.rs
+  - specs/011-upstream-sync/tasks.md
+  - specs/011-upstream-sync/log.md
+  - specs/011-upstream-sync/implement-receipt.md
+  - specs/011-upstream-sync/code-verify.md
+  - specs/011-upstream-sync/workflow-state.md
+
+test:
+  command: "~/.cargo/bin/cargo test --lib watchdog && ~/.cargo/bin/cargo test --test cli_dispatch_coverage watchdog"
+  result: "PASS — watchdog 18/18, dispatch 2/2. Full suite: 3104 pass / 55 fail (upstream modules only)."
+
+next:
+  - "[6hbd P1] Fix watcher crash loop: stop watcher, clear historical bundles from DB, restart — data operation not code fix"
+  - "[3kt P1] Sessions TUI detail view (deferred from spec 011)"
+  - "[33nb P0] Watcher streaming crash loop: consumer closes before cursor, LockBusy"
+  - "[9hgf P0] Preemptive compaction race condition (~60% failure)"
+  - "Consider merging feat/007-watchdog-subcommand to main"
+
+git:
+  branch: "feat/007-watchdog-subcommand"
+  commit: "64252d0156e298655df987e1ef6ca0cbb66f991b"
+  remote: "https://github.com/carmandale/coding_agent_session_search.git"

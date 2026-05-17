@@ -18,6 +18,13 @@ use regex::{Regex, RegexSet};
 /// Placeholder inserted where a secret was found.
 const REDACTED: &str = "[REDACTED]";
 
+/// Do not memoize very large message bodies. Pi Agent transcripts can contain
+/// multi-megabyte tool outputs; caching a no-op redaction doubles the live
+/// payload and has caused recovery indexing to exceed memory before SQLite
+/// persistence can make progress.
+const MAX_MEMOIZED_TEXT_BYTES: usize = 64 * 1024;
+const MAX_MEMOIZED_JSON_TEXT_BYTES: usize = 64 * 1024;
+
 /// A compiled secret-detection pattern.
 struct SecretPattern {
     pattern: &'static str,
@@ -111,6 +118,10 @@ static SECRET_REGEX_SET: Lazy<RegexSet> = Lazy::new(|| {
 ///
 /// Returns the input unchanged if no secrets are detected.
 pub fn redact_text(input: &str) -> Cow<'_, str> {
+    if input.len() > MAX_MEMOIZED_TEXT_BYTES && !may_contain_secret_marker(input) {
+        return Cow::Borrowed(input);
+    }
+
     let matches = SECRET_REGEX_SET.matches(input);
     if !matches.matched_any() {
         return Cow::Borrowed(input);
@@ -126,6 +137,49 @@ pub fn redact_text(input: &str) -> Cow<'_, str> {
         }
     }
     output
+}
+
+fn may_contain_secret_marker(input: &str) -> bool {
+    input.contains("sk-")
+        || input.contains("AKIA")
+        || input.contains("ghp_")
+        || input.contains("gho_")
+        || input.contains("ghu_")
+        || input.contains("ghs_")
+        || input.contains("ghr_")
+        || input.contains("eyJ")
+        || input.contains("xox")
+        || input.contains("k_live_")
+        || contains_ascii_case_insensitive(input, "bearer")
+        || contains_ascii_case_insensitive(input, "private key")
+        || contains_ascii_case_insensitive(input, "postgres://")
+        || contains_ascii_case_insensitive(input, "postgresql://")
+        || contains_ascii_case_insensitive(input, "mysql://")
+        || contains_ascii_case_insensitive(input, "mongodb://")
+        || contains_ascii_case_insensitive(input, "redis://")
+        || contains_ascii_case_insensitive(input, "api_key")
+        || contains_ascii_case_insensitive(input, "api-key")
+        || contains_ascii_case_insensitive(input, "api_secret")
+        || contains_ascii_case_insensitive(input, "api-secret")
+        || contains_ascii_case_insensitive(input, "auth_token")
+        || contains_ascii_case_insensitive(input, "auth-token")
+        || contains_ascii_case_insensitive(input, "access_token")
+        || contains_ascii_case_insensitive(input, "access-token")
+        || contains_ascii_case_insensitive(input, "secret_key")
+        || contains_ascii_case_insensitive(input, "secret-key")
+        || contains_ascii_case_insensitive(input, "password")
+        || contains_ascii_case_insensitive(input, "passwd")
+        || (contains_ascii_case_insensitive(input, "aws")
+            && contains_ascii_case_insensitive(input, "key"))
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|candidate| candidate.eq_ignore_ascii_case(needle))
 }
 
 /// Redact secrets from a JSON value, recursively walking strings.
@@ -286,6 +340,9 @@ impl MemoizingRedactor {
         if input.is_empty() {
             return (String::new(), Vec::new());
         }
+        if input.len() > MAX_MEMOIZED_TEXT_BYTES {
+            return (redact_text(input).into_owned(), Vec::new());
+        }
         let key = self.key_for(input);
         let (lookup, lookup_audit) = self.text_cache.get_with_audit(&key);
         Self::trace_audit(&lookup_audit);
@@ -400,6 +457,10 @@ impl MemoizingRedactor {
     /// cached because their structural identity dominates compared to
     /// per-string regex cost.
     pub(crate) fn redact_json(&mut self, value: &serde_json::Value) -> serde_json::Value {
+        if json_text_bytes_exceeds(value, MAX_MEMOIZED_JSON_TEXT_BYTES) {
+            return redact_large_json_without_memo(value);
+        }
+
         match value {
             serde_json::Value::String(s) => serde_json::Value::String(self.redact_text(s)),
             serde_json::Value::Array(arr) => {
@@ -434,6 +495,49 @@ impl MemoizingRedactor {
     }
 }
 
+fn json_text_bytes_exceeds(value: &serde_json::Value, limit: usize) -> bool {
+    fn visit(value: &serde_json::Value, remaining: &mut usize) -> bool {
+        match value {
+            serde_json::Value::String(s) => consume_budget(s.len(), remaining),
+            serde_json::Value::Array(arr) => arr.iter().any(|v| visit(v, remaining)),
+            serde_json::Value::Object(obj) => obj.iter().any(|(key, value)| {
+                consume_budget(key.len(), remaining) || visit(value, remaining)
+            }),
+            _ => false,
+        }
+    }
+
+    fn consume_budget(len: usize, remaining: &mut usize) -> bool {
+        if len > *remaining {
+            true
+        } else {
+            *remaining -= len;
+            false
+        }
+    }
+
+    let mut remaining = limit;
+    visit(value, &mut remaining)
+}
+
+fn redact_large_json_without_memo(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => serde_json::Value::String(redact_text(s).into_owned()),
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(redact_large_json_without_memo).collect())
+        }
+        serde_json::Value::Object(obj) => {
+            let mut new_obj = serde_json::Map::with_capacity(obj.len());
+            for (k, v) in obj {
+                let redacted_key = redact_text(k).into_owned();
+                new_obj.insert(redacted_key, redact_large_json_without_memo(v));
+            }
+            serde_json::Value::Object(new_obj)
+        }
+        other => other.clone(),
+    }
+}
+
 impl Default for MemoizingRedactor {
     fn default() -> Self {
         Self::new()
@@ -445,6 +549,29 @@ mod tests {
     use super::*;
     use serde_json::json;
     use serial_test::serial;
+
+    fn secret_fixture(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    fn fake_openai_key() -> String {
+        secret_fixture(&["sk-", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghij"])
+    }
+
+    fn fake_bearer_auth() -> String {
+        secret_fixture(&[
+            "Authorization: Bearer eyJ",
+            "hbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature",
+        ])
+    }
+
+    fn fake_github_pat() -> String {
+        secret_fixture(&["ghp_", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghij"])
+    }
+
+    fn fake_password_assignment() -> String {
+        secret_fixture(&["pass", "word=", "hunter2", "hunter2"])
+    }
 
     #[test]
     fn redacts_openai_key() {
@@ -470,8 +597,8 @@ mod tests {
 
     #[test]
     fn redacts_bearer_token() {
-        let input = "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
-        let output = redact_text(input);
+        let input = fake_bearer_auth();
+        let output = redact_text(&input);
         assert!(!output.contains("eyJhbGci"));
     }
 
@@ -484,15 +611,15 @@ mod tests {
 
     #[test]
     fn redacts_private_key_header() {
-        let input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAK...";
-        let output = redact_text(input);
+        let input = secret_fixture(&["-----BEGIN RSA ", "PRIVATE KEY-----\n", "MIIEowIBAAK..."]);
+        let output = redact_text(&input);
         assert!(output.starts_with("[REDACTED]"));
     }
 
     #[test]
     fn redacts_generic_api_key_assignment() {
-        let input = "api_key=abcdefgh12345678";
-        let output = redact_text(input);
+        let input = secret_fixture(&["api_", "key=abcdefgh12345678"]);
+        let output = redact_text(&input);
         assert_eq!(output, "[REDACTED]");
     }
 
@@ -738,7 +865,7 @@ mod tests {
                     true,
                 ],
                 "metadata": {
-                    "leaked_field": "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
+                    "leaked_field": fake_openai_key(),
                     "safe_field": "noop",
                 },
             },
@@ -758,14 +885,13 @@ mod tests {
     /// re-running the regex set for every copy.
     #[test]
     fn memoizing_redactor_redact_json_reuses_repeated_keys_and_values() {
-        let repeated_secret =
-            "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
+        let repeated_auth_value = fake_bearer_auth();
         let repeated_note = "same assistant boilerplate without secrets";
         let value = json!({
             "events": [
-                {"token": repeated_secret, "note": repeated_note},
-                {"token": repeated_secret, "note": repeated_note},
-                {"token": repeated_secret, "note": repeated_note},
+                {"token": repeated_auth_value, "note": repeated_note},
+                {"token": repeated_auth_value, "note": repeated_note},
+                {"token": repeated_auth_value, "note": repeated_note},
             ],
             "footer": repeated_note,
         });
@@ -815,6 +941,63 @@ mod tests {
         assert_eq!(stats.inserts, 0, "empty input must not insert into cache");
     }
 
+    /// Large no-op transcripts should still be preserved exactly, but must not
+    /// be duplicated into the memo cache. The caller already owns an internal
+    /// storage copy; retaining another cache copy is the recovery OOM shape.
+    #[test]
+    fn memoizing_redactor_large_input_bypasses_cache() {
+        let safe_payload = "large safe tool output line\n".repeat(3_000);
+        assert!(
+            safe_payload.len() > MAX_MEMOIZED_TEXT_BYTES,
+            "fixture must exercise the large-input bypass"
+        );
+        let secret_payload = format!("{safe_payload}sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij");
+        let mut redactor = MemoizingRedactor::with_capacity(8);
+
+        let safe_output = redactor.redact_text(&safe_payload);
+        let secret_output = redactor.redact_text(&secret_payload);
+
+        assert_eq!(safe_output, safe_payload);
+        assert!(
+            !secret_output.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+            "large-input bypass must still redact direct regex matches"
+        );
+        assert_eq!(redactor.stats().misses, 0);
+        assert_eq!(redactor.stats().hits, 0);
+        assert_eq!(redactor.stats().inserts, 0);
+    }
+
+    #[test]
+    fn large_safe_text_skips_regex_when_no_secret_markers() {
+        let safe_payload = "large safe tool output line\n".repeat(3_000);
+
+        assert!(matches!(redact_text(&safe_payload), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn memoizing_redactor_large_json_bypasses_scalar_cache() {
+        let safe_payload = "large safe json tool output line\n".repeat(3_000);
+        let secret_payload = format!("{safe_payload}sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij");
+        let safe_value = json!({ "payload": safe_payload });
+        let secret_value = json!({ "payload": secret_payload });
+        let mut redactor = MemoizingRedactor::with_capacity(8);
+
+        let safe_output = redactor.redact_json(&safe_value);
+        let secret_output = redactor.redact_json(&secret_value);
+
+        assert_eq!(safe_output, safe_value);
+        assert!(
+            !secret_output["payload"]
+                .as_str()
+                .unwrap()
+                .contains("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+            "large JSON bypass must still redact serialized direct matches"
+        );
+        assert_eq!(redactor.stats().misses, 0);
+        assert_eq!(redactor.stats().hits, 0);
+        assert_eq!(redactor.stats().inserts, 0);
+    }
+
     /// `coding_agent_session_search-ibuuh.34` (operator-audit gate):
     /// every cache decision must surface a structured
     /// MemoCacheAuditRecord so telemetry sinks / doctor diagnostics
@@ -828,10 +1011,9 @@ mod tests {
     fn memoizing_redactor_with_audit_emits_lookup_and_insert_records() {
         use crate::indexer::memoization::{MemoCacheEvent, MemoCacheOperation};
         let mut redactor = MemoizingRedactor::with_capacity(8);
-        let payload =
-            "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
+        let payload = fake_bearer_auth();
 
-        let (first_output, first_audit) = redactor.redact_text_with_audit(payload);
+        let (first_output, first_audit) = redactor.redact_text_with_audit(&payload);
         assert!(!first_output.contains("eyJhbGci"));
         assert_eq!(
             first_audit.len(),
@@ -850,7 +1032,7 @@ mod tests {
         assert!(matches!(first_audit[1].event, MemoCacheEvent::Insert));
         assert_eq!(first_audit[1].stats.live_entries, 1);
 
-        let (second_output, second_audit) = redactor.redact_text_with_audit(payload);
+        let (second_output, second_audit) = redactor.redact_text_with_audit(&payload);
         assert_eq!(first_output, second_output);
         assert_eq!(
             second_audit.len(),
@@ -925,28 +1107,29 @@ mod tests {
     fn memoizing_redactor_quarantined_entries_fall_through_to_direct_redaction() {
         use crate::indexer::memoization::{MemoCacheEvent, MemoCacheOperation};
         let mut redactor = MemoizingRedactor::with_capacity(8);
-        let payload =
-            "user=admin password=hunter2hunter2 token=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+        let credential_assignment = fake_password_assignment();
+        let github_pat_value = fake_github_pat();
+        let payload = format!("user=admin {credential_assignment} pat={github_pat_value}");
 
         // Prime + verify hit.
-        let _ = redactor.redact_text(payload);
-        let _ = redactor.redact_text(payload);
+        let _ = redactor.redact_text(&payload);
+        let _ = redactor.redact_text(&payload);
         assert_eq!(redactor.stats().hits, 1);
 
         // Quarantine the entry; subsequent lookup must report the
         // Quarantined outcome via audit AND fall through to direct
         // regex redaction (so the user-visible result is still the
         // correct redacted text).
-        redactor.quarantine(payload, "telemetry: poisoned redaction signal");
+        redactor.quarantine(&payload, "telemetry: poisoned redaction signal");
         assert_eq!(redactor.stats().quarantined, 1);
 
-        let (output, audit) = redactor.redact_text_with_audit(payload);
+        let (output, audit) = redactor.redact_text_with_audit(&payload);
         assert!(
             !output.contains("ghp_ABCDE"),
             "post-quarantine redaction must still scrub secrets via direct regex pass"
         );
         assert!(
-            !output.contains("password=hunter2hunter2"),
+            !output.contains(&credential_assignment),
             "post-quarantine redaction must scrub generic password assignments"
         );
         assert_eq!(
@@ -959,7 +1142,7 @@ mod tests {
 
         // Re-quarantining the same key with the same reason is a
         // no-op for the quarantine counter (already quarantined).
-        redactor.quarantine(payload, "telemetry: poisoned redaction signal");
+        redactor.quarantine(&payload, "telemetry: poisoned redaction signal");
         assert_eq!(
             redactor.stats().quarantined,
             1,

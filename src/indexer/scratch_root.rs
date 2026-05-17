@@ -54,9 +54,17 @@ impl Drop for ScratchRootGuard {
 /// `--watch-once ~/.pi/agent` or `--watch-once ~/.pi/agent/sessions` and have
 /// the scratch tree align with FAD's expectations.
 pub fn derive_pi_sessions_root(scan_root: &Path) -> PathBuf {
+    for ancestor in scan_root.ancestors() {
+        if ancestor.file_name().is_some_and(|name| name == "sessions") {
+            return ancestor.to_path_buf();
+        }
+    }
+
     let candidate = scan_root.join("sessions");
     if candidate.is_dir() {
         candidate
+    } else if scan_root.is_file() {
+        scan_root.parent().unwrap_or(scan_root).to_path_buf()
     } else {
         scan_root.to_path_buf()
     }
@@ -73,9 +81,8 @@ pub fn build_scratch_root(
     workdir: &Path,
     original_sessions_root: &Path,
 ) -> Result<(ScratchRootGuard, Vec<ScratchBuildSkip>)> {
-    std::fs::create_dir_all(workdir).with_context(|| {
-        format!("creating scratch workdir at {}", workdir.display())
-    })?;
+    std::fs::create_dir_all(workdir)
+        .with_context(|| format!("creating scratch workdir at {}", workdir.display()))?;
 
     let scratch_root = tempfile::Builder::new()
         .prefix("watch-once-streaming-")
@@ -86,9 +93,8 @@ pub fn build_scratch_root(
         .keep();
 
     let sessions = scratch_root.join("sessions");
-    std::fs::create_dir_all(&sessions).with_context(|| {
-        format!("creating scratch sessions dir at {}", sessions.display())
-    })?;
+    std::fs::create_dir_all(&sessions)
+        .with_context(|| format!("creating scratch sessions dir at {}", sessions.display()))?;
 
     let mut skips: Vec<ScratchBuildSkip> = Vec::new();
     for src in batch {
@@ -173,10 +179,10 @@ impl ScanBatchLimits {
 /// Group a slice of discovered files into batches no larger than `limits.max_files`
 /// or `limits.max_bytes` (whichever fires first). Bytes drawn from each file's
 /// `size_bytes` field (defaults to 0 if unknown, so files limit still gates).
-pub fn chunk_by_files_and_bytes<'a>(
-    discovered: &'a [DiscoveredSourceFile],
+pub fn chunk_by_files_and_bytes(
+    discovered: &[DiscoveredSourceFile],
     limits: ScanBatchLimits,
-) -> Vec<&'a [DiscoveredSourceFile]> {
+) -> Vec<&[DiscoveredSourceFile]> {
     let mut batches: Vec<&[DiscoveredSourceFile]> = Vec::new();
     if discovered.is_empty() {
         return batches;
@@ -273,8 +279,40 @@ mod tests {
     }
 
     #[test]
+    fn derive_pi_sessions_root_uses_sessions_ancestor_for_explicit_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions = tmp.path().join("agent").join("sessions");
+        let workspace = sessions.join("--Users-dale-project--");
+        fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("2026-01-19T20-14-17-509Z_session-id.jsonl");
+        fs::write(&file, "{}\n").unwrap();
+
+        let result = derive_pi_sessions_root(&file);
+
+        assert_eq!(result, sessions);
+    }
+
+    #[test]
+    fn derive_pi_sessions_root_uses_sessions_ancestor_for_workspace_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions = tmp.path().join("agent").join("sessions");
+        let workspace = sessions.join("--Users-dale-project--");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let result = derive_pi_sessions_root(&workspace);
+
+        assert_eq!(result, sessions);
+    }
+
+    #[test]
     fn chunk_by_files_and_bytes_empty_input() {
-        let result = chunk_by_files_and_bytes(&[], ScanBatchLimits { max_files: 5, max_bytes: 1000 });
+        let result = chunk_by_files_and_bytes(
+            &[],
+            ScanBatchLimits {
+                max_files: 5,
+                max_bytes: 1000,
+            },
+        );
         assert!(result.is_empty());
     }
 
@@ -283,7 +321,13 @@ mod tests {
         let files: Vec<_> = (0..10)
             .map(|i| discovered(PathBuf::from(format!("/x/{i}.jsonl")), Some(10)))
             .collect();
-        let result = chunk_by_files_and_bytes(&files, ScanBatchLimits { max_files: 3, max_bytes: u64::MAX });
+        let result = chunk_by_files_and_bytes(
+            &files,
+            ScanBatchLimits {
+                max_files: 3,
+                max_bytes: u64::MAX,
+            },
+        );
         assert_eq!(result.len(), 4);
         assert_eq!(result[0].len(), 3);
         assert_eq!(result[1].len(), 3);
@@ -296,7 +340,13 @@ mod tests {
         let files: Vec<_> = (0..5)
             .map(|i| discovered(PathBuf::from(format!("/x/{i}.jsonl")), Some(40)))
             .collect();
-        let result = chunk_by_files_and_bytes(&files, ScanBatchLimits { max_files: 1000, max_bytes: 100 });
+        let result = chunk_by_files_and_bytes(
+            &files,
+            ScanBatchLimits {
+                max_files: 1000,
+                max_bytes: 100,
+            },
+        );
         // 40+40 = 80 fits; 40+40+40 = 120 exceeds. So [0,1] / [2,3] / [4]
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].len(), 2);
@@ -312,7 +362,13 @@ mod tests {
             discovered(PathBuf::from("/x/c.jsonl"), Some(10_000)), // exceeds limit by itself
             discovered(PathBuf::from("/x/d.jsonl"), Some(10)),
         ];
-        let result = chunk_by_files_and_bytes(&files, ScanBatchLimits { max_files: 1000, max_bytes: 100 });
+        let result = chunk_by_files_and_bytes(
+            &files,
+            ScanBatchLimits {
+                max_files: 1000,
+                max_bytes: 100,
+            },
+        );
         // a+b together (<100), c alone (>100, degenerate), d alone after
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].len(), 2);
@@ -339,10 +395,7 @@ mod tests {
         let (guard, skips) = build_scratch_root(&batch, &workdir, &orig).unwrap();
         assert!(skips.is_empty());
 
-        let scratch_ws = guard
-            .path()
-            .join("sessions")
-            .join("--Users-test-foo--");
+        let scratch_ws = guard.path().join("sessions").join("--Users-test-foo--");
         assert!(scratch_ws.join("a.jsonl").is_file());
         assert!(scratch_ws.join("b.jsonl").is_file());
         // Hardlink should share inode

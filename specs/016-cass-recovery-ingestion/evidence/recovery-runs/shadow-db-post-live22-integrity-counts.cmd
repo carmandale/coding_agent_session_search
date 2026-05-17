@@ -1,0 +1,1 @@
+sqlite3 "/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search-spec016-shadow-20260516T2025Z/agent_search.db" integrity/count queries

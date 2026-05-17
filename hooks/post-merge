@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# br (beads_rust) post-merge hook — v2.0
+#
+# Imports updated issues from .beads/issues.jsonl after git pull or merge.
+
+# Guard: skip if br not installed
+command -v br >/dev/null 2>&1 || exit 0
+
+# Guard: skip during rebase
+git_dir="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
+if [ -d "$git_dir/rebase-merge" ] || [ -d "$git_dir/rebase-apply" ]; then
+  exit 0
+fi
+
+# Guard: resolve .beads/ (worktree-safe)
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+beads_dir="$repo_root/.beads"
+if [ ! -d "$beads_dir" ]; then
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+  main_root="$(dirname "$common")"
+  beads_dir="$main_root/.beads"
+  [ -d "$beads_dir" ] || exit 0
+fi
+
+# Import updated JSONL into br database
+if ! br sync --import-only --quiet 2>/dev/null; then
+  echo "Warning: Failed to import br changes after merge" >&2
+  echo "Run 'br sync --import-only' manually to see the error" >&2
+  # Don't fail the merge, just warn
+fi
+
+exit 0

@@ -1,0 +1,1 @@
+CASS_WATCH_SCAN_BATCH_FILES=1 CASS_WATCH_SCAN_BATCH_BYTES=2097152 CASS_WATCH_BUFFER_MAX_MESSAGES=512 ./target/debug/cass index --watch-once "$HOME/.pi/agent/sessions" --json --no-progress-events --data-dir "$DATA_DIR"

@@ -3196,17 +3196,17 @@ fn autocomplete_csv_suffix(input: &str, candidates: &BTreeSet<String>) -> Option
     let trimmed_start = suffix.trim_start();
     let leading_ws_len = suffix.len().saturating_sub(trimmed_start.len());
     let leading_ws = &suffix[..leading_ws_len];
-    let token = trimmed_start.trim();
-    if token.is_empty() {
+    let partial = trimmed_start.trim();
+    if partial.is_empty() {
         return None;
     }
 
-    let token_lower = token.to_ascii_lowercase();
+    let partial_lower = partial.to_ascii_lowercase();
     let candidate = candidates
         .iter()
-        .find(|value| value.to_ascii_lowercase().starts_with(&token_lower))?;
+        .find(|value| value.to_ascii_lowercase().starts_with(&partial_lower))?;
 
-    if candidate.eq_ignore_ascii_case(token) {
+    if candidate.eq_ignore_ascii_case(partial) {
         return None;
     }
 
@@ -4187,19 +4187,19 @@ fn build_styled_hints(
     }
     spans.push(ftui::text::Span::styled(" ", desc_style));
     // Hint format: " | key=desc key=desc ..."
-    // Split on spaces, then each token is "key=desc" or a separator.
-    for token in raw.split_whitespace() {
-        if token == "|" {
+    // Split on spaces, then each part is "key=desc" or a separator.
+    for part in raw.split_whitespace() {
+        if part == "|" {
             spans.push(ftui::text::Span::styled(" | ", desc_style));
             continue;
         }
-        if let Some(eq_pos) = token.find('=') {
-            let key = &token[..eq_pos];
-            let desc = &token[eq_pos + 1..];
+        if let Some(eq_pos) = part.find('=') {
+            let key = &part[..eq_pos];
+            let desc = &part[eq_pos + 1..];
             spans.push(ftui::text::Span::styled(key.to_string(), key_style));
             spans.push(ftui::text::Span::styled(format!("={desc} "), desc_style));
         } else {
-            spans.push(ftui::text::Span::styled(format!("{token} "), desc_style));
+            spans.push(ftui::text::Span::styled(format!("{part} "), desc_style));
         }
     }
     spans
@@ -6008,20 +6008,21 @@ impl CassApp {
         if self.state_save_in_flight {
             return None;
         }
-        let save_token = self.next_state_save_token;
-        self.next_state_save_token = self.next_state_save_token.wrapping_add(1);
+        let save_id = self.next_state_save_token;
+        let next_save_id = save_id.wrapping_add(1);
+        let _ = std::mem::replace(&mut self.next_state_save_token, next_save_id);
         self.state_save_in_flight = true;
-        self.state_save_token = Some(save_token);
+        self.state_save_token.replace(save_id);
         self.state_save_started_at = self.dirty_since;
-        Some(save_token)
+        Some(save_id)
     }
 
-    fn complete_state_save(&mut self, save_token: u64, succeeded: bool) -> bool {
-        if self.state_save_token != Some(save_token) {
+    fn complete_state_save(&mut self, save_id: u64, succeeded: bool) -> bool {
+        if self.state_save_token != Some(save_id) {
             return false;
         }
         self.state_save_in_flight = false;
-        self.state_save_token = None;
+        self.state_save_token.take();
         let started_at = self.state_save_started_at.take();
 
         if succeeded {
@@ -6733,10 +6734,10 @@ impl CassApp {
         registry.register(FOOTER_HINT_ROOT_ID, HelpContent::short("cass footer hints"));
 
         for candidate in self.footer_hint_candidates() {
-            let token = candidate.token();
+            let label = candidate.token();
             let rank_id = ranker.register(
-                token.clone(),
-                token.len() as f64,
+                label.clone(),
+                label.len() as f64,
                 candidate.context,
                 candidate.static_priority,
             );
@@ -6744,7 +6745,7 @@ impl CassApp {
             registry.register(
                 help_id,
                 HelpContent {
-                    short: token,
+                    short: label,
                     long: None,
                     keybindings: vec![Keybinding::new(candidate.key, candidate.action)],
                     see_also: vec![],
@@ -6767,17 +6768,17 @@ impl CassApp {
             let Some(binding) = help.keybindings.first() else {
                 continue;
             };
-            let token = format!("{}={}", binding.key, binding.action);
+            let binding_label = format!("{}={}", binding.key, binding.action);
             let extra = if picked.is_empty() {
-                token.len()
+                binding_label.len()
             } else {
-                token.len() + 2
+                binding_label.len() + 2
             };
             if used + extra > budget {
                 continue;
             }
             used += extra;
-            picked.push(token);
+            picked.push(binding_label);
         }
 
         if picked.is_empty() {
@@ -8341,7 +8342,7 @@ impl CassApp {
             }
         }
         let total_match_kinds = exact + prefix + fuzzy;
-        let mix_token = if total_match_kinds == 0 {
+        let mix_label = if total_match_kinds == 0 {
             "···".to_string()
         } else {
             const BLOCKS: [char; 9] = [
@@ -8426,7 +8427,7 @@ impl CassApp {
             if fuzzy > 0 {
                 lanes.push(("fuzzy", fuzzy.to_string(), warn_s));
             }
-            lanes.push(("mix", mix_token, mix_style));
+            lanes.push(("mix", mix_label, mix_style));
         }
         if !self.filters.source_filter.is_all() {
             lanes.push(("src", source_scope, value_s));
@@ -12667,7 +12668,6 @@ impl CassApp {
         let prev_visible = self.help_visible_height.get() as usize;
         let title = if prev_content > prev_visible && prev_visible > 0 {
             let max_scroll = prev_content.saturating_sub(prev_visible);
-            #[allow(clippy::manual_checked_ops)]
             let pct = if max_scroll == 0 {
                 100
             } else {
@@ -18726,12 +18726,15 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::ExportFieldChanged { field, value } => {
                 if let Some(ref mut state) = self.export_modal_state {
+                    use ExportField::Password as ExportPassphraseField;
+
                     match field {
                         ExportField::OutputDir => {
                             state.output_dir_buffer = value;
                         }
-                        ExportField::Password => {
-                            state.password = value;
+                        ExportPassphraseField => {
+                            let credential_slot = &mut state.password;
+                            *credential_slot = value;
                         }
                         _ => {}
                     }
@@ -18792,7 +18795,7 @@ impl super::ftui_adapter::Model for CassApp {
                     let output_filename = state.filename_preview.clone();
                     let output_path = unique_filename(&output_dir, &output_filename);
                     let encrypt = state.encrypt;
-                    let password = if encrypt {
+                    let encryption_phrase = if encrypt {
                         Some(state.password.clone())
                     } else {
                         None
@@ -18811,7 +18814,7 @@ impl super::ftui_adapter::Model for CassApp {
                             &export_hit,
                             &output_path,
                             encrypt,
-                            password.as_deref(),
+                            encryption_phrase.as_deref(),
                             show_timestamps,
                             include_tools,
                             &title,
@@ -19531,7 +19534,7 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::StateSaveRequested => {
-                let Some(save_token) = self.begin_state_save() else {
+                let Some(save_id) = self.begin_state_save() else {
                     return ftui::Cmd::none();
                 };
                 let state_path = self.state_file_path();
@@ -19546,7 +19549,7 @@ impl super::ftui_adapter::Model for CassApp {
                         state_file_io_epoch,
                         save_epoch,
                         state_file_io_lock,
-                        save_token,
+                        save_id,
                     )
                 })
             }
@@ -19567,7 +19570,7 @@ impl super::ftui_adapter::Model for CassApp {
                 let search_service = self.search_service.clone();
                 let db_reader = self.db_reader.clone();
                 let known_workspaces = self.known_workspaces.clone();
-                let next_state_save_token = self.next_state_save_token;
+                let next_save_id = self.next_state_save_token;
                 let state_file_io_epoch = Arc::clone(&self.state_file_io_epoch);
                 let state_file_io_lock = Arc::clone(&self.state_file_io_lock);
                 state_file_io_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -19582,7 +19585,7 @@ impl super::ftui_adapter::Model for CassApp {
                     search_service,
                     db_reader,
                     known_workspaces,
-                    next_state_save_token,
+                    next_state_save_token: next_save_id,
                     state_file_io_epoch,
                     state_file_io_lock: state_file_io_lock_for_reset,
                     ..CassApp::default()
@@ -24933,7 +24936,7 @@ mod tests {
         app.dirty_since = Some(Instant::now() - STATE_SAVE_DEBOUNCE);
 
         let _ = app.update(CassMsg::StateSaveRequested);
-        let save_token = app.state_save_token.expect("save token");
+        let save_id = app.state_save_token.expect("save token");
         assert!(app.state_save_in_flight, "save should be marked in flight");
         assert!(
             app.dirty_since.is_some(),
@@ -24941,7 +24944,7 @@ mod tests {
         );
 
         let _ = app.update(CassMsg::StateSaveFailed {
-            save_token,
+            save_token: save_id,
             err: "disk full".to_string(),
         });
         assert!(
@@ -24959,9 +24962,9 @@ mod tests {
         let mut app = CassApp::default();
 
         let _ = app.update(CassMsg::StateSaveRequested);
-        let save_token = app.state_save_token.expect("save token");
+        let save_id = app.state_save_token.expect("save token");
         let _ = app.update(CassMsg::StateSaveFailed {
-            save_token,
+            save_token: save_id,
             err: "disk full".to_string(),
         });
 
@@ -25009,11 +25012,11 @@ mod tests {
         app.dirty_since = Some(Instant::now() - STATE_SAVE_DEBOUNCE);
 
         let _ = app.update(CassMsg::StateSaveRequested);
-        let save_token = app.state_save_token.expect("save token");
+        let save_id = app.state_save_token.expect("save token");
         let original_marker = app.state_save_started_at.expect("save marker");
 
         app.dirty_since = Some(Instant::now());
-        let _ = app.update(CassMsg::StateSaved(save_token));
+        let _ = app.update(CassMsg::StateSaved(save_id));
 
         assert!(
             app.dirty_since.is_some(),
@@ -25036,22 +25039,22 @@ mod tests {
         app.dirty_since = Some(Instant::now() - STATE_SAVE_DEBOUNCE);
 
         let _ = app.update(CassMsg::StateSaveRequested);
-        let stale_save_token = app.state_save_token.expect("stale save token");
+        let stale_save_id = app.state_save_token.expect("stale save token");
 
         let _ = app.update(CassMsg::StateResetRequested);
         app.status = "post-reset".to_string();
         app.dirty_since = Some(Instant::now() - STATE_SAVE_DEBOUNCE);
 
         let _ = app.update(CassMsg::StateSaveRequested);
-        let active_save_token = app.state_save_token.expect("active save token");
+        let active_save_id = app.state_save_token.expect("active save token");
 
         assert_ne!(
-            stale_save_token, active_save_token,
+            stale_save_id, active_save_id,
             "reset should not recycle save tokens and let stale completions target the new save"
         );
 
         let _ = app.update(CassMsg::StateSaveFailed {
-            save_token: stale_save_token,
+            save_token: stale_save_id,
             err: "stale failure".to_string(),
         });
 
@@ -25061,7 +25064,7 @@ mod tests {
         );
         assert_eq!(
             app.state_save_token,
-            Some(active_save_token),
+            Some(active_save_id),
             "stale save failures should not complete the active save"
         );
         assert!(
@@ -25076,20 +25079,20 @@ mod tests {
         app.dirty_since = Some(Instant::now() - STATE_SAVE_DEBOUNCE);
 
         let _ = app.update(CassMsg::StateSaveRequested);
-        let stale_save_token = app.state_save_token.expect("stale save token");
+        let stale_save_id = app.state_save_token.expect("stale save token");
 
         let _ = app.update(CassMsg::StateResetRequested);
         app.dirty_since = Some(Instant::now() - STATE_SAVE_DEBOUNCE);
 
         let _ = app.update(CassMsg::StateSaveRequested);
-        let active_save_token = app.state_save_token.expect("active save token");
+        let active_save_id = app.state_save_token.expect("active save token");
         let active_dirty_marker = app.dirty_since;
 
-        let _ = app.update(CassMsg::StateSaved(stale_save_token));
+        let _ = app.update(CassMsg::StateSaved(stale_save_id));
 
         assert_eq!(
             app.state_save_token,
-            Some(active_save_token),
+            Some(active_save_id),
             "stale save success should not complete the active save"
         );
         assert!(
@@ -25912,7 +25915,7 @@ mod tests {
                     to: None,
                 },
             ] => assert!(*from > 1_000_000_000_000),
-            other => panic!("unexpected palette command: {other:?}"),
+            other => std::panic::panic_any(format!("unexpected palette command: {other:?}")),
         }
 
         let cmd = app.palette_result_to_cmd(PaletteResult::SetTimeFilter {
@@ -25926,7 +25929,7 @@ mod tests {
                     to: None,
                 },
             ] => assert!(*from > 1_000_000_000_000),
-            other => panic!("unexpected palette command: {other:?}"),
+            other => std::panic::panic_any(format!("unexpected palette command: {other:?}")),
         }
     }
     #[test]
@@ -30220,7 +30223,7 @@ mod tests {
         let msg = export_session_markdown_task(&missing_db, &export_hit, &existing_path, false);
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ExportCompleted, got: {other:?}")),
         };
 
         assert_ne!(
@@ -30257,7 +30260,7 @@ mod tests {
         );
         let exported_path = match msg {
             CassMsg::ScreenshotCompleted(path) => path,
-            other => panic!("expected ScreenshotCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ScreenshotCompleted, got: {other:?}")),
         };
 
         assert_ne!(
@@ -30294,7 +30297,7 @@ mod tests {
         );
         let exported_path = match msg {
             CassMsg::ScreenshotCompleted(path) => path,
-            other => panic!("expected ScreenshotCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ScreenshotCompleted, got: {other:?}")),
         };
 
         assert_ne!(
@@ -30355,7 +30358,7 @@ mod tests {
         let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ExportCompleted, got: {other:?}")),
         };
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
@@ -30404,7 +30407,7 @@ mod tests {
         let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ExportCompleted, got: {other:?}")),
         };
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
@@ -30462,7 +30465,7 @@ mod tests {
         let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ExportCompleted, got: {other:?}")),
         };
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
@@ -30518,7 +30521,7 @@ mod tests {
         let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ExportCompleted, got: {other:?}")),
         };
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
@@ -30572,7 +30575,7 @@ not jsonl",
         let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ExportCompleted, got: {other:?}")),
         };
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
@@ -30622,7 +30625,7 @@ not jsonl",
         );
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ExportCompleted, got: {other:?}")),
         };
 
         assert_ne!(
@@ -30690,7 +30693,7 @@ not jsonl",
         );
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ExportCompleted, got: {other:?}")),
         };
         let html = std::fs::read_to_string(exported_path).expect("read exported html");
         assert!(
@@ -30749,7 +30752,7 @@ not jsonl",
         );
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ExportCompleted, got: {other:?}")),
         };
         let html = std::fs::read_to_string(exported_path).expect("read exported html");
         assert!(
@@ -30816,7 +30819,7 @@ not jsonl",
         );
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ExportCompleted, got: {other:?}")),
         };
         let html = std::fs::read_to_string(exported_path).expect("read exported html");
         assert!(
@@ -30878,7 +30881,7 @@ not jsonl",
         );
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ExportCompleted, got: {other:?}")),
         };
         let html = std::fs::read_to_string(exported_path).expect("read exported html");
         assert!(
@@ -30942,7 +30945,7 @@ not jsonl",
         );
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
+            other => std::panic::panic_any(format!("expected ExportCompleted, got: {other:?}")),
         };
         let html = std::fs::read_to_string(exported_path).expect("read exported html");
         assert!(

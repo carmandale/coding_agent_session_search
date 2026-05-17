@@ -1,0 +1,49 @@
+{
+  "approval_target_sha": "b807ef175dcdeeb48b912a22913fbcd68fb86cb8",
+  "baseline_sha": "b807ef175dcdeeb48b912a22913fbcd68fb86cb8",
+  "chunk_map": [
+    {
+      "header": "## Group A: Freeze Baseline, Route Policy, And Upstream State",
+      "line": 13,
+      "ordinal": 0
+    },
+    {
+      "header": "## Group B: Runtime-First Canary And Priority Recovery",
+      "line": 21,
+      "ordinal": 1
+    },
+    {
+      "header": "## Group C: Identity, Integrity, And Search Proof",
+      "line": 29,
+      "ordinal": 2
+    },
+    {
+      "header": "## Group D: Watcher Runtime Parity",
+      "line": 37,
+      "ordinal": 3
+    },
+    {
+      "header": "## Group E: Watcher Durability And Final Evidence",
+      "line": 47,
+      "ordinal": 4
+    },
+    {
+      "header": "## Group F: Required Verification And Workflow Closeout",
+      "line": 56,
+      "ordinal": 5
+    }
+  ],
+  "closeout_surface": [],
+  "created_at": "2026-05-16T13:49:22Z",
+  "findings": [],
+  "proof_manifest": [],
+  "rounds": [],
+  "schema_version": 1,
+  "state_fingerprint": {
+    "baseline_sha": "b807ef175dcdeeb48b912a22913fbcd68fb86cb8",
+    "chunk_count": 6,
+    "spec_relpath": "specs/016-cass-recovery-ingestion"
+  },
+  "updated_at": "2026-05-16T13:49:22Z",
+  "validator_capability": "read-only"
+}
