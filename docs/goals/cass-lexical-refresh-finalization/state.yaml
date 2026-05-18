@@ -5,7 +5,7 @@ goal:
   slug: "cass-lexical-refresh-finalization"
   kind: recovery
   tranche: "Finish the remaining cass large-corpus refresh recovery loop with issue/spec, patch, live proof, and upstream note if warranted."
-  status: active
+  status: done
   execution_lane: dale_workflow
   intake:
     original_request: "I agree with the next 4 steps you are proposing. $goalbuddy these and get them done"
@@ -47,35 +47,40 @@ goal:
     required_outcome_checks:
       - id: OC1
         description: "Focused issue/spec records the remaining bug and separates it from upstream #239/#240."
-        status: done
+        status: pass
         evidence:
           - "specs/018-lexical-refresh-finalization/spec.md records bead coding_agent_session_search-3135s and distinguishes finalization/streaming refresh from #239/#240."
       - id: OC2
         description: "Code change prevents completed DB-matching lexical refresh state from restarting into a full rebuild solely because marker/status metadata lagged."
-        status: done
+        status: pass
         evidence:
           - "src/indexer/mod.rs adds deferred lexical refresh finalization and completed-checkpoint/Tantivy-doc guardrails."
       - id: OC3
         description: "Focused tests and Rust verification pass."
-        status: done
+        status: pass
         evidence:
           - "cargo test deferred_lexical_refresh -- --nocapture: 2 passed."
           - "cargo test incremental_canonical_lexical_repair_plan -- --nocapture: 4 passed."
           - "cargo test streaming_consumer -- --nocapture: 5 passed after target-scoping test OOM injection."
+          - "cargo test explicit_watch_once -- --nocapture: 6 passed after watch-level OOM injection was scoped to the synthetic test conversation."
+          - "cargo test refresh_searchable_index_modified_time -- --nocapture: 1 passed."
           - "cargo fmt --check, cargo check --all-targets, and cargo clippy --all-targets -- -D warnings all passed."
       - id: OC4
         description: "Live cass proof shows the May 17 search path still works and the refresh marker/status no longer misrepresent the completed state."
-        status: done
+        status: pass
         evidence:
-          - "Installed cass.real hash a175b9bdca22b08ab06b2dc7097b525a0169127ec11653dbda374ec0dcfe6378."
-          - "cass index --json --no-progress-events --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search' succeeded on the final installed binary with quarantined_conversations=3."
-          - "cass health/status --json reported healthy=true, index.status=ready, fresh=true, pending.sessions=0, rebuild.active=false."
-          - "Search probes for `fresh-context independent north-star checker` and `documented triage refresh path still OOMs` returned results."
+          - "Installed cass.real hash 970dc43c643f42806c09a5b830c1a96681d4f06ab6733fd3ad3bdf07d23268af; previous binary backed up at /Users/dalecarman/.local/bin/cass.real.backup-20260518T031236Z."
+          - "cass triage --json recommended the documented refresh command because the index was stale by age only."
+          - "cass index --json --no-progress-events --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search' succeeded on the final installed binary with conversations=40, messages=714, lexical_strategy=incremental_inline, quarantined_conversations=7."
+          - "cass health/status --json reported healthy=true, index.status=ready, fresh=true, pending.sessions=0, rebuild.active=false on the final installed binary."
+          - "Search probes for `fresh-context independent north-star checker`, `documented triage refresh path still OOMs`, and `HSBC scene five hover effects` returned results."
+          - "A 2026-05-18 03:19 refresh of health/status still reported healthy=true, index.status=ready, fresh=true, pending.sessions=0, rebuild.active=false; the HSBC Scene 5 lexical probe returned 3 Codex hits."
       - id: OC5
         description: "Upstream note is posted only if it is concise, true, and useful."
-        status: pending
+        status: pass
         evidence:
-          - "Upstream #239/#240 are closed fixed in 5dac585b; final decision pending after local work is merged with upstream/main."
+          - "Upstream #239/#240 are closed fixed in 5dac585b."
+          - "Posted concise upstream issue #243 for the remaining non-watch single-session streaming OOM quarantine policy: https://github.com/Dicklesworthstone/coding_agent_session_search/issues/243."
 
 rules:
   pm_owns_state: true
@@ -138,13 +143,13 @@ workflow:
       purpose: "Close the bead, create final handoff, commit, and push."
       when: "Run only after $code-verify approval."
 
-active_task: T004
+active_task: null
 
 tasks:
   - id: T001
     type: pm
     assignee: PM
-    status: completed
+    status: done
     reasoning_hint: high
     objective: "Create or claim the focused issue/spec and diagnose the remaining lexical refresh finalization failure against current code and live state."
     inputs:
@@ -161,6 +166,7 @@ tasks:
       - "Root-cause hypothesis with source references"
       - "Patch target and verification plan"
     receipt:
+      result: done
       summary: "Created and claimed focused spec 018 for bead coding_agent_session_search-3135s; diagnosed stale deferred lexical marker plus completed checkpoint as a separate finalization/rebuild-loop issue."
       evidence:
         - "specs/018-lexical-refresh-finalization/spec.md"
@@ -168,11 +174,12 @@ tasks:
   - id: T002
     type: worker
     assignee: Worker
-    status: completed
+    status: done
     reasoning_hint: high
     objective: "Patch the lexical refresh finalization path so completed DB-matching checkpoint state can finalize metadata and resolve the pending marker without restarting the large rebuild."
     allowed_files:
       - "src/indexer/mod.rs"
+      - "src/search/tantivy.rs"
       - "src/lib.rs"
       - "tests/**"
       - "specs/**"
@@ -187,7 +194,30 @@ tasks:
       - "The patch would introduce new rusqlite code."
       - "Verification fails twice with the same unexplained root cause."
     receipt:
+      result: done
       summary: "Patched finalization, deferred lexical refresh rebuild handoff, streaming OOM split/quarantine, and test-only OOM isolation."
+      changed_files:
+        - "src/indexer/mod.rs"
+        - "src/search/tantivy.rs"
+        - "specs/018-lexical-refresh-finalization/log.md"
+        - "docs/goals/cass-lexical-refresh-finalization/state.yaml"
+      commands:
+        - command: "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo test deferred_lexical_refresh -- --nocapture"
+          status: pass
+        - command: "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo test incremental_canonical_lexical_repair_plan -- --nocapture"
+          status: pass
+        - command: "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo test streaming_consumer -- --nocapture"
+          status: pass
+        - command: "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo test explicit_watch_once -- --nocapture"
+          status: pass
+        - command: "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo test refresh_searchable_index_modified_time -- --nocapture"
+          status: pass
+        - command: "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo fmt --check"
+          status: pass
+        - command: "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo check --all-targets"
+          status: pass
+        - command: "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo clippy --all-targets -- -D warnings"
+          status: pass
       evidence:
         - "src/indexer/mod.rs"
         - "src/search/tantivy.rs"
@@ -200,7 +230,7 @@ tasks:
   - id: T003
     type: pm
     assignee: PM
-    status: completed
+    status: done
     reasoning_hint: high
     objective: "Install/promote the verified local binary with backup, run live cass proof, and update status/marker evidence."
     inputs:
@@ -215,17 +245,18 @@ tasks:
       - "search proof for recent May 17 work"
       - "marker state proof"
     receipt:
+      result: done
       summary: "Promoted final release binary and proved the documented live refresh/search path on Dale's real cass data dir."
       evidence:
-        - "Final installed hash: a175b9bdca22b08ab06b2dc7097b525a0169127ec11653dbda374ec0dcfe6378"
-        - "Final backup: /Users/dalecarman/.local/bin/cass.real.backup-20260518T023146Z"
-        - "cass index --json --no-progress-events --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search' -> success=true, elapsed_ms=29945, quarantined_conversations=3"
+        - "Final installed hash: 970dc43c643f42806c09a5b830c1a96681d4f06ab6733fd3ad3bdf07d23268af"
+        - "Final backup: /Users/dalecarman/.local/bin/cass.real.backup-20260518T031236Z"
+        - "cass index --json --no-progress-events --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search' -> success=true, elapsed_ms=32046, conversations=40, messages=714, lexical_strategy=incremental_inline, quarantined_conversations=7"
         - "cass health/status --json -> healthy=true, ready/fresh index, pending.sessions=0, rebuild.active=false"
-        - "Search probes returned results, including a 2026-05-17 Codex hit for `fresh-context independent north-star checker`."
+        - "Search probes returned results for `fresh-context independent north-star checker`, `documented triage refresh path still OOMs`, and `HSBC scene five hover effects`."
   - id: T004
     type: pm
     assignee: PM
-    status: active
+    status: done
     reasoning_hint: medium
     objective: "Post the concise upstream note or issue only if verified evidence is clean, then commit and push the local recovery work."
     inputs:
@@ -239,11 +270,21 @@ tasks:
       - "Upstream URL or explicit no-post rationale"
       - "Commit hash"
       - "Push proof"
-    receipt: null
+    receipt:
+      result: done
+      summary: "Merged upstream/main, posted the concise upstream issue for the remaining non-watch poison-session policy, and prepared the final GoalBuddy/spec receipt commit."
+      evidence:
+        - "Merged upstream/main commit 5dac585b into local main; merge commit af92167d."
+        - "Posted upstream issue #243: https://github.com/Dicklesworthstone/coding_agent_session_search/issues/243."
+        - "Final receipt commit and push proof are recorded in the session final answer after this state file is committed and pushed."
+      residual_notes:
+        - "Seven latest streaming-ingest-out-of-memory Codex sessions are quarantined/skipped and not searchable until a separate upstream/local policy handles them."
+        - "Semantic search remains opt-in/missing; lexical search is healthy and is the recommended current mode."
+        - "Local br close for coding_agent_session_search-3135s succeeded, but br sync --flush-only failed twice because exporting the stale Beads DB would lose 186 issues; no force/export was performed."
   - id: T999
     type: judge
     assignee: Judge
-    status: queued
+    status: done
     reasoning_hint: high
     objective: "Audit whether Dale can use cass for recent and historical sessions without the stale marker/rebuild-loop failure."
     inputs:
@@ -258,7 +299,41 @@ tasks:
       - "full_outcome_complete: true | false"
       - "missing evidence"
       - "next task if not complete"
-    receipt: null
+    receipt:
+      result: done
+      decision: complete
+      full_outcome_complete: true
+      summary: "Cass is usable now for documented lexical search and refresh on Dale's live data dir; the stale marker/rebuild-loop failure is resolved in the installed binary."
+      outcome_checks:
+        - id: OC1
+          status: pass
+          evidence:
+            - "Focused bead/spec exists at specs/018-lexical-refresh-finalization and separates this bug from upstream #239/#240."
+        - id: OC2
+          status: pass
+          evidence:
+            - "Deferred lexical refresh finalization, checkpoint/Tantivy doc guardrails, and streaming OOM split/quarantine behavior are implemented."
+        - id: OC3
+          status: pass
+          evidence:
+            - "Focused tests plus fmt/check/clippy passed."
+        - id: OC4
+          status: pass
+          evidence:
+            - "Live cass health/status are healthy/ready/fresh with pending.sessions=0 and rebuild.active=false; lexical search probes return results."
+        - id: OC5
+          status: pass
+          evidence:
+            - "Upstream issue #243 was posted with concise evidence and without overstating upstream acceptance."
+      evidence:
+        - "cass health/status --json --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search' -> healthy=true, index.status=ready, fresh=true, pending.sessions=0, rebuild.active=false."
+        - "cass search 'HSBC scene five hover effects' --json --mode lexical --fields minimal --limit 5 --data-dir ... -> count=3."
+        - "Installed cass.real hash 970dc43c643f42806c09a5b830c1a96681d4f06ab6733fd3ad3bdf07d23268af."
+      residual_risks:
+        - "Seven poison Codex sessions from the latest refresh are skipped/not searchable until separate policy work handles single-session streaming OOMs."
+        - "Repeated refreshes can append duplicate quarantine records."
+        - "Semantic/hybrid refinement is unavailable until the operator explicitly installs models; lexical fallback is the documented current mode."
+        - "Beads JSONL export is blocked by a pre-existing DB/JSONL mismatch; local bead closure is not exported to .beads/issues.jsonl."
 
 checks:
   dirty_fingerprint: unknown
@@ -270,6 +345,11 @@ checks:
       - "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo check --all-targets"
       - "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo clippy --all-targets -- -D warnings"
       - "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo test streaming_consumer -- --nocapture"
+      - "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo test deferred_lexical_refresh -- --nocapture"
+      - "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo test incremental_canonical_lexical_repair_plan -- --nocapture"
+      - "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo test explicit_watch_once -- --nocapture"
+      - "env CARGO_TARGET_DIR=/tmp/cass-check-target $HOME/.cargo/bin/cargo test refresh_searchable_index_modified_time -- --nocapture"
       - "cass index --json --no-progress-events --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search'"
       - "cass health --json --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search'"
       - "cass status --json --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search'"
+      - "cass search 'HSBC scene five hover effects' --json --mode lexical --fields minimal --limit 5 --data-dir '/Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search'"
