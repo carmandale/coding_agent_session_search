@@ -1901,6 +1901,27 @@ fn should_skip_noop_final_lexical_checkpoint_refresh(
         && initial_checkpoint_status.has_completed_checkpoint
 }
 
+fn should_skip_exact_completed_final_lexical_checkpoint_refresh(
+    exact_completed_lexical_checkpoint: bool,
+    performed_scan: bool,
+    exact_total_counts: Option<(usize, usize)>,
+) -> bool {
+    exact_completed_lexical_checkpoint && !performed_scan && exact_total_counts.is_some()
+}
+
+fn exact_total_counts_for_final_lexical_checkpoint(
+    progress_exact_total_counts: Option<(usize, usize)>,
+    authoritative_rebuild_exact_total_counts: Option<(usize, usize)>,
+    performed_scan: bool,
+    canonical_mutations: CanonicalMutationCounts,
+) -> Option<(usize, usize)> {
+    if performed_scan || canonical_mutations.changed() {
+        authoritative_rebuild_exact_total_counts.filter(|_| !canonical_mutations.changed())
+    } else {
+        authoritative_rebuild_exact_total_counts.or(progress_exact_total_counts)
+    }
+}
+
 fn should_skip_post_full_scan_authoritative_rebuild(
     full_rebuild: bool,
     rebuild_was_required: bool,
@@ -10491,6 +10512,7 @@ pub fn run_index(
             .is_some_and(|paths| !paths.is_empty());
 
     let mut exact_completed_lexical_checkpoint = false;
+    let mut authoritative_rebuild_exact_total_counts: Option<(usize, usize)> = None;
     let mut skipped_noop_full_scan_authoritative_rebuild = false;
     let mut targeted_watch_once_only_run = false;
     let t_index = if resume_lexical_rebuild {
@@ -10531,6 +10553,10 @@ pub fn run_index(
             stats.total_conversations = initial_canonical_sessions_before_salvage;
         }
         if let Some(observed_messages) = rebuild.observed_messages {
+            if rebuild.exact_checkpoint_persisted {
+                authoritative_rebuild_exact_total_counts =
+                    Some((initial_canonical_sessions_before_salvage, observed_messages));
+            }
             record_exact_total_counts_in_progress(
                 opts.progress.as_ref(),
                 initial_canonical_sessions_before_salvage,
@@ -10766,6 +10792,10 @@ pub fn run_index(
                 stats.total_conversations = rebuild_convs;
             }
             if let Some(observed_messages) = rebuild.observed_messages {
+                if rebuild.exact_checkpoint_persisted {
+                    authoritative_rebuild_exact_total_counts =
+                        Some((rebuild_convs, observed_messages));
+                }
                 record_exact_total_counts_in_progress(
                     opts.progress.as_ref(),
                     rebuild_convs,
@@ -10813,6 +10843,10 @@ pub fn run_index(
                 )?;
                 exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
                 if let Some(observed_messages) = rebuild.observed_messages {
+                    if rebuild.exact_checkpoint_persisted {
+                        authoritative_rebuild_exact_total_counts =
+                            Some((rebuild_convs, observed_messages));
+                    }
                     record_exact_total_counts_in_progress(
                         opts.progress.as_ref(),
                         rebuild_convs,
@@ -11006,6 +11040,10 @@ pub fn run_index(
                         // connectors discovered; the DB rebuild is the source of
                         // truth for full-index runs.
                         if let Some(observed_messages) = rebuild.observed_messages {
+                            if rebuild.exact_checkpoint_persisted {
+                                authoritative_rebuild_exact_total_counts =
+                                    Some((rebuild_convs, observed_messages));
+                            }
                             record_exact_total_counts_in_progress(
                                 opts.progress.as_ref(),
                                 rebuild_convs,
@@ -11172,8 +11210,18 @@ pub fn run_index(
             now_ms,
         )?;
     }
-    let exact_total_counts = exact_total_counts_from_progress(opts.progress.as_ref());
-    if exact_completed_lexical_checkpoint && exact_total_counts.is_some() {
+    let progress_exact_total_counts = exact_total_counts_from_progress(opts.progress.as_ref());
+    let exact_total_counts = exact_total_counts_for_final_lexical_checkpoint(
+        progress_exact_total_counts,
+        authoritative_rebuild_exact_total_counts,
+        performed_scan,
+        scan_canonical_mutations,
+    );
+    if should_skip_exact_completed_final_lexical_checkpoint_refresh(
+        exact_completed_lexical_checkpoint,
+        performed_scan,
+        exact_total_counts,
+    ) {
         tracing::info!(
             db_path = %opts.db_path.display(),
             "skipping final lexical checkpoint refresh because the authoritative rebuild already persisted exact completed state"
@@ -39186,6 +39234,76 @@ mod tests {
             exact_counts,
             no_mutations,
         ));
+    }
+
+    #[test]
+    fn exact_completed_checkpoint_skip_does_not_survive_followup_scan() {
+        let exact_counts = Some((10, 99));
+
+        assert!(
+            should_skip_exact_completed_final_lexical_checkpoint_refresh(true, false, exact_counts,)
+        );
+        assert!(
+            !should_skip_exact_completed_final_lexical_checkpoint_refresh(true, true, exact_counts,),
+            "a scan after the authoritative rebuild may commit/GC the live index sidecars, so finalization must refresh the checkpoint"
+        );
+        assert!(
+            !should_skip_exact_completed_final_lexical_checkpoint_refresh(
+                false,
+                false,
+                exact_counts,
+            )
+        );
+        assert!(!should_skip_exact_completed_final_lexical_checkpoint_refresh(true, false, None,));
+    }
+
+    #[test]
+    fn final_checkpoint_refresh_recomputes_counts_after_canonical_mutations() {
+        let exact_counts = Some((10, 99));
+
+        assert_eq!(
+            exact_total_counts_for_final_lexical_checkpoint(
+                exact_counts,
+                None,
+                false,
+                CanonicalMutationCounts::default(),
+            ),
+            exact_counts
+        );
+        assert_eq!(
+            exact_total_counts_for_final_lexical_checkpoint(
+                exact_counts,
+                None,
+                true,
+                CanonicalMutationCounts::default(),
+            ),
+            None,
+            "follow-up scan stats are not authoritative canonical totals for checkpoint refresh"
+        );
+        assert_eq!(
+            exact_total_counts_for_final_lexical_checkpoint(
+                exact_counts,
+                Some((10703, 1055570)),
+                true,
+                CanonicalMutationCounts::default(),
+            ),
+            Some((10703, 1055570)),
+            "authoritative rebuild totals remain valid across a follow-up scan when the scan makes no canonical mutations"
+        );
+        assert_eq!(
+            exact_total_counts_for_final_lexical_checkpoint(
+                exact_counts,
+                Some((10703, 1055570)),
+                false,
+                CanonicalMutationCounts {
+                    inserted_conversations: 1,
+                    inserted_messages: 0,
+                    lexical_deferred_conversations: 0,
+                },
+            ),
+            None,
+            "progress exact counts captured before the follow-up scan are stale after new canonical rows are inserted"
+        );
     }
 
     #[test]
