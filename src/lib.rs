@@ -5918,9 +5918,13 @@ async fn execute_cli(
                         tier_mode,
                     };
 
-                    let effective_format = cli
-                        .robot_format
-                        .unwrap_or_else(|| robot_format_from_env().unwrap_or(RobotFormat::Json));
+                    // Only pass through robot_format when it was explicitly
+                    // requested (CLI flag or env var). Returning `None` here
+                    // lets `run_cli_search` apply its full precedence chain
+                    // (robot_format > --json > env > robot_auto > display),
+                    // so `--display table|lines|markdown` actually wins when
+                    // no structured format was asked for.
+                    let effective_format = cli.robot_format.or_else(robot_format_from_env);
 
                     run_cli_search(
                         &query,
@@ -5929,7 +5933,7 @@ async fn execute_cli(
                         &limit,
                         &offset,
                         &json,
-                        Some(effective_format),
+                        effective_format,
                         robot_meta,
                         fields,
                         max_content_length,
@@ -7088,6 +7092,15 @@ async fn execute_cli(
                 }
                 Commands::Import(subcmd) => {
                     handle_import(subcmd, cli).await?;
+                }
+                #[cfg(unix)]
+                Commands::Daemon {
+                    socket,
+                    idle_timeout,
+                    max_connections,
+                    data_dir,
+                } => {
+                    run_daemon(socket, idle_timeout, max_connections, data_dir)?;
                 }
                 _ => {}
             }
@@ -11740,6 +11753,11 @@ fn state_meta_json_inner(
         &lexical_rebuild_pipeline_json,
     ))
     .unwrap_or(serde_json::Value::Null);
+    let ingest_quarantine_summary =
+        crate::indexer::conversation_ingest_quarantine_summary(data_dir);
+    let quarantined_conversations = ingest_quarantine_summary.quarantined_conversations;
+    let ingest_quarantine_json =
+        serde_json::to_value(&ingest_quarantine_summary).unwrap_or(serde_json::Value::Null);
 
     // Probe the live lexical document count when the DB has messages. Prefer
     // the published generation manifest: status only needs the durable count
@@ -11787,6 +11805,7 @@ fn state_meta_json_inner(
             }),
             "documents": index_doc_count,
             "empty_with_messages": index_empty_with_messages,
+            "quarantined_conversations": quarantined_conversations,
             "fingerprint": {
                 "current_db_fingerprint": lexical.fingerprint.current_db_fingerprint,
                 "checkpoint_fingerprint": lexical.fingerprint.checkpoint_fingerprint,
@@ -11911,6 +11930,7 @@ fn state_meta_json_inner(
                     .and_then(format_timestamp_millis_rfc3339),
             },
         },
+        "ingest_quarantine": ingest_quarantine_json,
         "policy_registry": policy_registry,
         "_meta": {
             "timestamp": ts_str,
@@ -60053,6 +60073,22 @@ fn run_status(
         .and_then(|i| i.get("empty_with_messages"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let quarantined_conversations = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("quarantined_conversations"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let ingest_quarantine_recommended_action = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("recommended_action"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut warnings = Vec::<String>::new();
+    if quarantined_conversations > 0 {
+        warnings.push(format!(
+            "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; search remains usable for the rest of the archive"
+        ));
+    }
 
     let db_available = db_opened || (db_exists && db_open_retryable);
     let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
@@ -60102,6 +60138,8 @@ fn run_status(
         Some(format!(
             "Run 'cass index' to refresh the index{pending_msg}"
         ))
+    } else if quarantined_conversations > 0 {
+        ingest_quarantine_recommended_action
     } else {
         semantic_recommended_action(&state, not_initialized)
     };
@@ -60191,8 +60229,10 @@ fn run_status(
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
+            "health_level": if healthy && quarantined_conversations > 0 { "degraded" } else { status },
             "initialized": !not_initialized,
             "explanation": explanation,
+            "warnings": warnings,
             "data_dir": data_dir.display().to_string(),
             "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
             "database": serde_json::json!({
@@ -60210,6 +60250,7 @@ fn run_status(
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild_progress": rebuild_progress_summary_json(&state),
             "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
+            "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
             "policy_registry": policy_registry,
             "topology_budget": topology_budget,
             "doctor_summary": doctor_summary,
@@ -60332,6 +60373,12 @@ fn run_status(
     if pending_sessions > 0 {
         println!();
         println!("Pending: {pending_sessions} sessions awaiting indexing");
+    }
+    if quarantined_conversations > 0 {
+        println!();
+        println!(
+            "Warning: {quarantined_conversations} conversation(s) quarantined after ingest OOM"
+        );
     }
 
     if let Some(explanation) = &explanation {
@@ -60595,6 +60642,22 @@ fn run_health(
         .and_then(|i| i.get("empty_with_messages"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let quarantined_conversations = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("quarantined_conversations"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let ingest_quarantine_recommended_action = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("recommended_action"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut warnings = Vec::<String>::new();
+    if quarantined_conversations > 0 {
+        warnings.push(format!(
+            "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; lexical search remains usable for non-quarantined sessions"
+        ));
+    }
 
     let db_degraded = db_exists && !db_opened;
     let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
@@ -60624,6 +60687,8 @@ fn run_health(
         Some(cass_not_initialized_recommended_action())
     } else if db_degraded {
         Some("Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.".to_string())
+    } else if healthy && quarantined_conversations > 0 {
+        ingest_quarantine_recommended_action
     } else if !healthy {
         Some("Run 'cass index --full' to rebuild the index/database.".to_string())
     } else {
@@ -60741,8 +60806,10 @@ fn run_health(
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
+            "health_level": if healthy && quarantined_conversations > 0 { "degraded" } else { status },
             "initialized": !not_initialized,
             "explanation": explanation,
+            "warnings": warnings,
             "data_dir": data_dir.display().to_string(),
             "recommended_action": recommended_action,
             "recommended_commands": recommended_commands,
@@ -60770,6 +60837,7 @@ fn run_health(
             "remote_source_sync": remote_source_sync_summary,
             "coverage_risk": coverage_risk,
             "policy_registry": policy_registry,
+            "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
             "responsiveness": responsiveness,
             "parallel_wal_shadow": parallel_wal_shadow,
             // [coding_agent_session_search-yvv7r + waijq] Runtime optimization
@@ -60785,6 +60853,11 @@ fn run_health(
         println!("✓ Healthy ({latency_ms}ms)");
         if pending_sessions > 0 {
             println!("  Note: {pending_sessions} sessions pending reindex");
+        }
+        if quarantined_conversations > 0 {
+            println!(
+                "  Note: {quarantined_conversations} conversation(s) quarantined after ingest OOM"
+            );
         }
     } else if rebuild_active {
         println!("~ Rebuilding ({latency_ms}ms)");
@@ -61348,6 +61421,50 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    fn status_state_surfaces_ingest_quarantine_without_marking_index_corrupt() {
+        let temp = TempDir::new().expect("tempdir");
+        let quarantine_dir = temp.path().join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir).expect("create quarantine dir");
+        std::fs::write(
+            quarantine_dir.join("index_ingest_poison.jsonl"),
+            serde_json::json!({
+                "schema_version": 1,
+                "conversation_id": "tester|/logs/demo.jsonl|/workspace/demo|poison|1|2|1",
+                "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                "first_quarantined_at_ms": 10,
+                "last_attempt_at_ms": 20,
+                "attempt_count": 1,
+                "reason": "index-ingest-out-of-memory",
+                "agent_slug": "tester",
+                "external_id": "poison",
+                "source_path": "/logs/demo.jsonl",
+                "workspace": "/workspace/demo",
+                "started_at": 1,
+                "ended_at": 2,
+                "message_count": 1
+            })
+            .to_string(),
+        )
+        .expect("write quarantine record");
+
+        let db_path = temp.path().join("agent_search.db");
+        let state = state_meta_json_for_status(temp.path(), &db_path, 60);
+
+        assert_eq!(
+            state["index"]["quarantined_conversations"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            state["ingest_quarantine"]["status"],
+            serde_json::json!("degraded")
+        );
+        assert_eq!(
+            state["ingest_quarantine"]["quarantined_conversations"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[test]
     fn refresh_state_database_counts_keeps_large_db_counts_skipped() {
         let (_temp, db_path) = seed_cli_db();
         let mut state = serde_json::json!({
@@ -61512,7 +61629,7 @@ mod cli_read_db_tests {
             "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
             "888888",
         );
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "5");
+        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
         let _shard_builders = set_env("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS", "4");
         let _merge_workers = set_env("CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS", "2");
 
@@ -61544,10 +61661,16 @@ mod cli_read_db_tests {
         );
         assert_eq!(
             pipeline["tantivy_writer_threads"].as_u64(),
-            Some(available_parallelism.min(5))
+            Some(available_parallelism.min(2))
         );
-        assert_eq!(pipeline["staged_shard_builders"].as_u64(), Some(4));
-        assert_eq!(pipeline["staged_merge_workers"].as_u64(), Some(2));
+        assert_eq!(
+            pipeline["staged_shard_builders"].as_u64(),
+            Some(crate::indexer::responsiveness::effective_worker_count(4).max(1) as u64)
+        );
+        assert_eq!(
+            pipeline["staged_merge_workers"].as_u64(),
+            Some(crate::indexer::responsiveness::effective_worker_count(2).max(1) as u64)
+        );
         assert_eq!(
             pipeline["page_size"].as_i64(),
             Some(crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC)
@@ -61579,7 +61702,10 @@ mod cli_read_db_tests {
             Some(61000)
         );
         assert_eq!(pipeline["pipeline_channel_size"].as_u64(), Some(4));
-        assert_eq!(pipeline["page_prep_workers"].as_u64(), Some(6));
+        assert_eq!(
+            pipeline["page_prep_workers"].as_u64(),
+            Some(crate::indexer::responsiveness::effective_worker_count(6).max(1) as u64)
+        );
         assert_eq!(
             pipeline["pipeline_max_message_bytes_in_flight"].as_u64(),
             Some(888888)
@@ -74575,6 +74701,16 @@ fn run_index_with_data(
                 ))
             })
             .unwrap_or((0, 0));
+        let (quarantined_conversations, lexical_update_deferred) = index_progress
+            .stats
+            .lock()
+            .map(|stats| {
+                (
+                    stats.quarantined_conversations,
+                    stats.lexical_update_deferred,
+                )
+            })
+            .unwrap_or_default();
         let mut payload = serde_json::json!({
             "success": true,
             "elapsed_ms": elapsed_ms,
@@ -74585,6 +74721,8 @@ fn run_index_with_data(
             "db_path": db_path.display().to_string(),
             "conversations": conversations,
             "messages": messages,
+            "quarantined_conversations": quarantined_conversations,
+            "lexical_update_deferred": lexical_update_deferred,
         });
 
         // Add structured indexing stats if available (T7.4)
@@ -83798,18 +83936,69 @@ fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
             Ok("snowflake-arctic-s")
         }
         "nomic-embed" | "nomic-embed-768" | "nomic-embed-text-v1.5" => Ok("nomic-embed"),
+        "ms-marco" | "ms-marco-minilm" | "ms-marco-minilm-l-6-v2" | "ms-marco-minilm-l6-v2" => {
+            Ok("ms-marco")
+        }
+        "jina-reranker-turbo" | "jina-reranker-v1-turbo" | "jina-reranker-v1-turbo-en" => {
+            Ok("jina-reranker-turbo")
+        }
         _ => Err(CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
-                "Unknown model '{}'. Supported: all-minilm-l6-v2 (alias minilm), \
-                 snowflake-arctic-s, nomic-embed.",
+                "Unknown model '{}'. Embedders: all-minilm-l6-v2 (alias minilm), \
+                 snowflake-arctic-s, nomic-embed. Rerankers: ms-marco, jina-reranker-turbo.",
                 model_name
             ),
             hint: Some("Use 'cass models status' to see available models".into()),
             retryable: false,
         }),
     }
+}
+
+/// Returns the on-disk model directory for either an embedder or a reranker.
+///
+/// `registry_name` must be a canonical name returned by `resolve_cli_model_name`.
+/// Embedders are routed through `FastEmbedder::model_dir_for`; rerankers use
+/// `<data_dir>/models/<manifest.id>` so install layout matches the directory
+/// `FastEmbedReranker` reads at startup.
+fn resolve_model_install_dir(
+    data_dir: &Path,
+    registry_name: &str,
+) -> CliResult<(PathBuf, crate::search::model_download::ModelManifest)> {
+    use crate::search::fastembed_embedder::FastEmbedder;
+    use crate::search::model_download::ModelManifest;
+
+    if let Some(manifest) = ModelManifest::for_embedder(registry_name) {
+        let model_dir =
+            FastEmbedder::model_dir_for(data_dir, registry_name).ok_or_else(|| CliError {
+                code: 20,
+                kind: CliErrorKind::Model.kind_str(),
+                message: format!(
+                    "no model directory mapping for registered embedder '{}'",
+                    registry_name
+                ),
+                hint: None,
+                retryable: false,
+            })?;
+        return Ok((model_dir, manifest));
+    }
+
+    if let Some(manifest) = ModelManifest::for_reranker(registry_name) {
+        let model_dir = data_dir.join("models").join(&manifest.id);
+        return Ok((model_dir, manifest));
+    }
+
+    Err(CliError {
+        code: 20,
+        kind: CliErrorKind::Model.kind_str(),
+        message: format!(
+            "no manifest registered for model '{}' (neither embedder nor reranker)",
+            registry_name
+        ),
+        hint: None,
+        retryable: false,
+    })
 }
 
 /// Download and install the semantic search model
@@ -83820,33 +84009,15 @@ fn run_models_install(
     skip_confirm: bool,
     data_dir_override: Option<PathBuf>,
 ) -> CliResult<()> {
-    use crate::search::fastembed_embedder::FastEmbedder;
     use crate::search::model_download::{
-        ModelDownloader, ModelManifest, check_model_installed, normalize_mirror_base_url,
+        ModelDownloader, check_model_installed, normalize_mirror_base_url,
     };
     use colored::Colorize;
     use indicatif::{ProgressBar, ProgressStyle};
 
     let registry_name = resolve_cli_model_name(model_name)?;
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let model_dir =
-        FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| CliError {
-            code: 20,
-            kind: CliErrorKind::Model.kind_str(),
-            message: format!(
-                "no model directory mapping for registered embedder '{}'",
-                registry_name
-            ),
-            hint: None,
-            retryable: false,
-        })?;
-    let manifest = ModelManifest::for_embedder(registry_name).ok_or_else(|| CliError {
-        code: 20,
-        kind: CliErrorKind::Model.kind_str(),
-        message: format!("no manifest registered for embedder '{}'", registry_name),
-        hint: None,
-        retryable: false,
-    })?;
+    let (model_dir, manifest) = resolve_model_install_dir(&data_dir, registry_name)?;
     let mirror_base_url = mirror
         .map(normalize_mirror_base_url)
         .transpose()
@@ -84585,22 +84756,11 @@ fn run_models_remove(
     skip_confirm: bool,
     data_dir_override: Option<PathBuf>,
 ) -> CliResult<()> {
-    use crate::search::fastembed_embedder::FastEmbedder;
     use colored::Colorize;
 
     let registry_name = resolve_cli_model_name(model_name)?;
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let model_dir =
-        FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| CliError {
-            code: 20,
-            kind: CliErrorKind::Model.kind_str(),
-            message: format!(
-                "no model directory mapping for registered embedder '{}'",
-                registry_name
-            ),
-            hint: None,
-            retryable: false,
-        })?;
+    let (model_dir, _manifest) = resolve_model_install_dir(&data_dir, registry_name)?;
 
     if !model_dir.is_dir() {
         println!("{} Model is not installed.", "✗".yellow());
@@ -85844,6 +86004,67 @@ mod cli_models_resolution_tests {
                 FastEmbedder::model_dir_for(probe_data_dir, canonical).is_some(),
                 "canonical name {canonical:?} returned by resolve_cli_model_name must have a \
                  FastEmbedder::model_dir_for mapping"
+            );
+        }
+    }
+
+    /// Reranker aliases must round-trip through `resolve_cli_model_name`
+    /// and `resolve_model_install_dir` so `cass models install --model
+    /// ms-marco` actually lands the files where `FastEmbedReranker` looks
+    /// for them. Without this contract the resolver accepts the alias,
+    /// the install path ships the bytes, and the daemon still logs
+    /// "reranker model directory not found" because the manifest `id`
+    /// drifted from the loader's hard-coded directory name.
+    #[test]
+    fn reranker_aliases_resolve_and_install_path_matches_loader_dir() {
+        use crate::search::model_download::ModelManifest;
+        use crate::search::reranker_registry::RERANKERS;
+
+        for (alias, canonical) in [
+            ("ms-marco", "ms-marco"),
+            ("ms-marco-minilm", "ms-marco"),
+            ("ms-marco-minilm-l-6-v2", "ms-marco"),
+            ("ms-marco-minilm-l6-v2", "ms-marco"),
+            ("MS-MARCO", "ms-marco"),
+            ("jina-reranker-turbo", "jina-reranker-turbo"),
+            ("jina-reranker-v1-turbo-en", "jina-reranker-turbo"),
+        ] {
+            assert_eq!(
+                resolve_cli_model_name(alias).expect("reranker alias must resolve"),
+                canonical,
+                "reranker alias {alias:?} must resolve to {canonical:?}"
+            );
+            assert!(
+                ModelManifest::for_reranker(canonical).is_some(),
+                "canonical reranker {canonical:?} must have a ModelManifest registered"
+            );
+        }
+
+        // The install path uses `manifest.id` as the directory name. That
+        // name MUST equal the last path segment of the loader's
+        // `RegisteredReranker::model_dir`, otherwise install delivers
+        // files to one location and the loader reads from another —
+        // the exact bug that left "WARN Failed to load reranker" on
+        // every fresh daemon start (cass#242).
+        let probe = std::path::Path::new("/tmp/cass-reranker-probe");
+        for canonical in ["ms-marco", "jina-reranker-turbo"] {
+            let manifest = ModelManifest::for_reranker(canonical)
+                .unwrap_or_else(|| panic!("{canonical} manifest must be registered"));
+            let registered = RERANKERS
+                .iter()
+                .find(|r| r.name == canonical)
+                .unwrap_or_else(|| panic!("{canonical} must be in RERANKERS"));
+            let loader_dir = registered
+                .model_dir(probe)
+                .unwrap_or_else(|| panic!("{canonical} must have a model_dir"));
+            let loader_dir_name = loader_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_else(|| panic!("{canonical} model_dir must have a final segment"));
+            assert_eq!(
+                manifest.id, loader_dir_name,
+                "{canonical} manifest.id must match the loader's model_dir name so install and \
+                 loader agree on the on-disk directory"
             );
         }
     }

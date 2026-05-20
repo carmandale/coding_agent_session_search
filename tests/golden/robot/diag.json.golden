@@ -1,8 +1,8 @@
 {
   "version": "[VERSION]",
   "platform": {
-    "os": "linux",
-    "arch": "x86_64"
+    "os": "[HOST_OS]",
+    "arch": "[HOST_ARCH]"
   },
   "paths": {
     "data_dir": "[TEST_HOME]/coding-agent-search",
@@ -62,8 +62,8 @@
     },
     {
       "name": "aider",
-      "path": "[REPO]/.aider.chat.history.md",
-      "found": true
+      "path": "(not detected)",
+      "found": false
     },
     {
       "name": "cursor",
