@@ -2541,7 +2541,7 @@
     },
     {
       "name": "swarm",
-      "description": "Read-only swarm operations status",
+      "description": "Read-only swarm operations status, work packets, and coordination lint",
       "arguments": [],
       "has_json_output": false
     },
@@ -4086,6 +4086,9 @@
             "rebuilding": {
               "type": "boolean"
             },
+            "stalled": {
+              "type": "boolean"
+            },
             "activity_at": {
               "type": [
                 "string",
@@ -4100,6 +4103,9 @@
             },
             "empty_with_messages": {
               "type": "boolean"
+            },
+            "quarantined_conversations": {
+              "type": "integer"
             },
             "fingerprint": {
               "type": "object",
@@ -4219,6 +4225,15 @@
               "type": "boolean"
             },
             "progressive_ready": {
+              "type": "boolean"
+            },
+            "feature_compiled_in": {
+              "type": "boolean"
+            },
+            "quality_tier_published": {
+              "type": "boolean"
+            },
+            "semantic_only_search_available": {
               "type": "boolean"
             },
             "hint": {
@@ -24247,6 +24262,15 @@
             "progressive_ready": {
               "type": "boolean"
             },
+            "feature_compiled_in": {
+              "type": "boolean"
+            },
+            "quality_tier_published": {
+              "type": "boolean"
+            },
+            "semantic_only_search_available": {
+              "type": "boolean"
+            },
             "hint": {
               "type": [
                 "string",
@@ -26033,6 +26057,9 @@
         "healthy": {
           "type": "boolean"
         },
+        "health_level": {
+          "type": "string"
+        },
         "initialized": {
           "type": "boolean"
         },
@@ -26041,6 +26068,12 @@
             "string",
             "null"
           ]
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "data_dir": {
           "type": "string"
@@ -26114,6 +26147,21 @@
           "properties": {
             "active": {
               "type": "boolean"
+            },
+            "stalled": {
+              "type": "boolean"
+            },
+            "last_progress_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_progress_age_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "mode": {
               "type": [
@@ -26985,6 +27033,50 @@
             "controllers"
           ]
         },
+        "ingest_quarantine": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_window_seconds": {
+              "type": "integer"
+            },
+            "circuit_breaker_limit": {
+              "type": "integer"
+            },
+            "circuit_breaker_active": {
+              "type": "boolean"
+            },
+            "quarantine_files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "newest_last_attempt_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "recommended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
         "responsiveness": {
           "type": "object",
           "description": "Machine-responsiveness governor telemetry. Explains why the indexer is running at reduced fan-out and what pressure triggered any recent shrinkage.",
@@ -27119,6 +27211,9 @@
                 "rebuilding": {
                   "type": "boolean"
                 },
+                "stalled": {
+                  "type": "boolean"
+                },
                 "activity_at": {
                   "type": [
                     "string",
@@ -27133,6 +27228,9 @@
                 },
                 "empty_with_messages": {
                   "type": "boolean"
+                },
+                "quarantined_conversations": {
+                  "type": "integer"
                 },
                 "fingerprint": {
                   "type": "object",
@@ -27288,6 +27386,21 @@
                     "null"
                   ]
                 },
+                "stalled": {
+                  "type": "boolean"
+                },
+                "last_progress_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_progress_age_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "started_at": {
                   "type": [
                     "string",
@@ -27380,6 +27493,15 @@
                   "type": "boolean"
                 },
                 "progressive_ready": {
+                  "type": "boolean"
+                },
+                "feature_compiled_in": {
+                  "type": "boolean"
+                },
+                "quality_tier_published": {
+                  "type": "boolean"
+                },
+                "semantic_only_search_available": {
                   "type": "boolean"
                 },
                 "hint": {
@@ -27590,6 +27712,50 @@
                       ]
                     }
                   }
+                }
+              }
+            },
+            "ingest_quarantine": {
+              "type": "object",
+              "properties": {
+                "schema_version": {
+                  "type": "integer"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "quarantined_conversations": {
+                  "type": "integer"
+                },
+                "recent_quarantined_conversations": {
+                  "type": "integer"
+                },
+                "recent_window_seconds": {
+                  "type": "integer"
+                },
+                "circuit_breaker_limit": {
+                  "type": "integer"
+                },
+                "circuit_breaker_active": {
+                  "type": "boolean"
+                },
+                "quarantine_files": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "newest_last_attempt_at_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "recommended_action": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               }
             },
@@ -27893,6 +28059,12 @@
             "integer",
             "null"
           ]
+        },
+        "quarantined_conversations": {
+          "type": "integer"
+        },
+        "lexical_update_deferred": {
+          "type": "boolean"
         },
         "indexing_stats": {
           "type": "object",
@@ -29225,6 +29397,9 @@
                     "rebuilding": {
                       "type": "boolean"
                     },
+                    "stalled": {
+                      "type": "boolean"
+                    },
                     "activity_at": {
                       "type": [
                         "string",
@@ -29239,6 +29414,9 @@
                     },
                     "empty_with_messages": {
                       "type": "boolean"
+                    },
+                    "quarantined_conversations": {
+                      "type": "integer"
                     },
                     "fingerprint": {
                       "type": "object",
@@ -29394,6 +29572,21 @@
                         "null"
                       ]
                     },
+                    "stalled": {
+                      "type": "boolean"
+                    },
+                    "last_progress_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "last_progress_age_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
                     "started_at": {
                       "type": [
                         "string",
@@ -29486,6 +29679,15 @@
                       "type": "boolean"
                     },
                     "progressive_ready": {
+                      "type": "boolean"
+                    },
+                    "feature_compiled_in": {
+                      "type": "boolean"
+                    },
+                    "quality_tier_published": {
+                      "type": "boolean"
+                    },
+                    "semantic_only_search_available": {
                       "type": "boolean"
                     },
                     "hint": {
@@ -29696,6 +29898,50 @@
                           ]
                         }
                       }
+                    }
+                  }
+                },
+                "ingest_quarantine": {
+                  "type": "object",
+                  "properties": {
+                    "schema_version": {
+                      "type": "integer"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "quarantined_conversations": {
+                      "type": "integer"
+                    },
+                    "recent_quarantined_conversations": {
+                      "type": "integer"
+                    },
+                    "recent_window_seconds": {
+                      "type": "integer"
+                    },
+                    "circuit_breaker_limit": {
+                      "type": "integer"
+                    },
+                    "circuit_breaker_active": {
+                      "type": "boolean"
+                    },
+                    "quarantine_files": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "newest_last_attempt_at_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "recommended_action": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 },
@@ -29946,6 +30192,9 @@
         "healthy": {
           "type": "boolean"
         },
+        "health_level": {
+          "type": "string"
+        },
         "initialized": {
           "type": "boolean"
         },
@@ -29954,6 +30203,12 @@
             "string",
             "null"
           ]
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "data_dir": {
           "type": "string"
@@ -30052,6 +30307,9 @@
             "rebuilding": {
               "type": "boolean"
             },
+            "stalled": {
+              "type": "boolean"
+            },
             "activity_at": {
               "type": [
                 "string",
@@ -30066,6 +30324,9 @@
             },
             "empty_with_messages": {
               "type": "boolean"
+            },
+            "quarantined_conversations": {
+              "type": "integer"
             },
             "fingerprint": {
               "type": "object",
@@ -30224,6 +30485,21 @@
                 "null"
               ]
             },
+            "stalled": {
+              "type": "boolean"
+            },
+            "last_progress_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_progress_age_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "started_at": {
               "type": [
                 "string",
@@ -30266,6 +30542,21 @@
           "properties": {
             "active": {
               "type": "boolean"
+            },
+            "stalled": {
+              "type": "boolean"
+            },
+            "last_progress_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_progress_age_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "mode": {
               "type": [
@@ -30435,6 +30726,15 @@
               "type": "boolean"
             },
             "progressive_ready": {
+              "type": "boolean"
+            },
+            "feature_compiled_in": {
+              "type": "boolean"
+            },
+            "quality_tier_published": {
+              "type": "boolean"
+            },
+            "semantic_only_search_available": {
               "type": "boolean"
             },
             "hint": {
@@ -30645,6 +30945,50 @@
                   ]
                 }
               }
+            }
+          }
+        },
+        "ingest_quarantine": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_window_seconds": {
+              "type": "integer"
+            },
+            "circuit_breaker_limit": {
+              "type": "integer"
+            },
+            "circuit_breaker_active": {
+              "type": "boolean"
+            },
+            "quarantine_files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "newest_last_attempt_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "recommended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         },
@@ -31654,6 +31998,9 @@
         "healthy": {
           "type": "boolean"
         },
+        "health_level": {
+          "type": "string"
+        },
         "initialized": {
           "type": "boolean"
         },
@@ -31662,6 +32009,12 @@
             "string",
             "null"
           ]
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "data_dir": {
           "type": "string"
@@ -31760,6 +32113,9 @@
             "rebuilding": {
               "type": "boolean"
             },
+            "stalled": {
+              "type": "boolean"
+            },
             "activity_at": {
               "type": [
                 "string",
@@ -31774,6 +32130,9 @@
             },
             "empty_with_messages": {
               "type": "boolean"
+            },
+            "quarantined_conversations": {
+              "type": "integer"
             },
             "fingerprint": {
               "type": "object",
@@ -31932,6 +32291,21 @@
                 "null"
               ]
             },
+            "stalled": {
+              "type": "boolean"
+            },
+            "last_progress_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_progress_age_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "started_at": {
               "type": [
                 "string",
@@ -31974,6 +32348,21 @@
           "properties": {
             "active": {
               "type": "boolean"
+            },
+            "stalled": {
+              "type": "boolean"
+            },
+            "last_progress_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_progress_age_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "mode": {
               "type": [
@@ -32143,6 +32532,15 @@
               "type": "boolean"
             },
             "progressive_ready": {
+              "type": "boolean"
+            },
+            "feature_compiled_in": {
+              "type": "boolean"
+            },
+            "quality_tier_published": {
+              "type": "boolean"
+            },
+            "semantic_only_search_available": {
               "type": "boolean"
             },
             "hint": {
@@ -32353,6 +32751,50 @@
                   ]
                 }
               }
+            }
+          }
+        },
+        "ingest_quarantine": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_window_seconds": {
+              "type": "integer"
+            },
+            "circuit_breaker_limit": {
+              "type": "integer"
+            },
+            "circuit_breaker_active": {
+              "type": "boolean"
+            },
+            "quarantine_files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "newest_last_attempt_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "recommended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         },
@@ -33366,6 +33808,9 @@
                 "rebuilding": {
                   "type": "boolean"
                 },
+                "stalled": {
+                  "type": "boolean"
+                },
                 "activity_at": {
                   "type": [
                     "string",
@@ -33380,6 +33825,9 @@
                 },
                 "empty_with_messages": {
                   "type": "boolean"
+                },
+                "quarantined_conversations": {
+                  "type": "integer"
                 },
                 "fingerprint": {
                   "type": "object",
@@ -33535,6 +33983,21 @@
                     "null"
                   ]
                 },
+                "stalled": {
+                  "type": "boolean"
+                },
+                "last_progress_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_progress_age_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "started_at": {
                   "type": [
                     "string",
@@ -33577,6 +34040,21 @@
               "properties": {
                 "active": {
                   "type": "boolean"
+                },
+                "stalled": {
+                  "type": "boolean"
+                },
+                "last_progress_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_progress_age_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "mode": {
                   "type": [
@@ -33746,6 +34224,15 @@
                   "type": "boolean"
                 },
                 "progressive_ready": {
+                  "type": "boolean"
+                },
+                "feature_compiled_in": {
+                  "type": "boolean"
+                },
+                "quality_tier_published": {
+                  "type": "boolean"
+                },
+                "semantic_only_search_available": {
                   "type": "boolean"
                 },
                 "hint": {

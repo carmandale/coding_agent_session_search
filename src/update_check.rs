@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
@@ -88,7 +88,10 @@ impl UpdateState {
                 .with_context(|| format!("creating update state directory {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+        let temp_path = write_update_state_temp_file(&path, json.as_bytes())
+            .with_context(|| format!("writing temporary update state for {}", path.display()))?;
+        replace_update_state_file_from_temp(&temp_path, &path)
+            .with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
     }
 
@@ -101,9 +104,11 @@ impl UpdateState {
                 .with_context(|| format!("creating update state directory {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(self).context("serializing update state")?;
-        asupersync::fs::write(&path, json)
+        let temp_path = write_update_state_temp_file_async(&path, json.as_bytes())
             .await
-            .with_context(|| format!("writing {}", path.display()))?;
+            .with_context(|| format!("writing temporary update state for {}", path.display()))?;
+        replace_update_state_file_from_temp(&temp_path, &path)
+            .with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
     }
 
@@ -260,6 +265,9 @@ fn is_browser_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
+    if url_has_userinfo(&parsed) {
+        return false;
+    }
     matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
 }
 
@@ -267,7 +275,10 @@ fn is_trusted_release_notes_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
-    if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some("github.com")
+        || url_has_userinfo(&parsed)
+    {
         return false;
     }
 
@@ -290,6 +301,10 @@ fn is_trusted_release_notes_url(url: &str) -> bool {
     owner.eq_ignore_ascii_case(expected_owner)
         && repo.eq_ignore_ascii_case(expected_repo)
         && section == "releases"
+}
+
+fn url_has_userinfo(url: &url::Url) -> bool {
+    !url.username().is_empty() || url.password().is_some()
 }
 
 fn release_asset_url(version: &str, asset: &str) -> String {
@@ -524,6 +539,9 @@ fn is_allowed_update_api_url(url: &str) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
+    if url_has_userinfo(&parsed) {
+        return false;
+    }
 
     match parsed.scheme() {
         "https" => matches!(host, "api.github.com" | "github.com"),
@@ -542,6 +560,190 @@ fn legacy_state_path() -> PathBuf {
         || PathBuf::from("update_state.json"),
         |dirs| dirs.data_dir().join("update_state.json"),
     )
+}
+
+fn write_update_state_temp_file(path: &Path, contents: &[u8]) -> std::io::Result<PathBuf> {
+    for _ in 0..100 {
+        let temp_path = unique_update_state_temp_path(path);
+        match write_update_state_temp_file_at(&temp_path, contents) {
+            Ok(()) => return Ok(temp_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate unique update state temp path for {}",
+            path.display()
+        ),
+    ))
+}
+
+fn write_update_state_temp_file_at(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+async fn write_update_state_temp_file_async(
+    path: &Path,
+    contents: &[u8],
+) -> std::io::Result<PathBuf> {
+    for _ in 0..100 {
+        let temp_path = unique_update_state_temp_path(path);
+        match write_update_state_temp_file_at_async(&temp_path, contents).await {
+            Ok(()) => return Ok(temp_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate unique update state temp path for {}",
+            path.display()
+        ),
+    ))
+}
+
+async fn write_update_state_temp_file_at_async(
+    path: &Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    use asupersync::io::AsyncWriteExt;
+
+    let mut file = asupersync::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await?;
+    file.write_all(contents).await?;
+    file.sync_all().await
+}
+
+fn replace_update_state_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        match std::fs::rename(temp_path, final_path) {
+            Ok(()) => sync_parent_directory(final_path),
+            Err(first_err)
+                if update_state_path_entry_exists(final_path)?
+                    && matches!(
+                        first_err.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                let backup_path = unique_update_state_backup_path(final_path);
+                std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    std::io::Error::other(format!(
+                        "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
+                        backup_path.display(),
+                        final_path.display(),
+                        first_err,
+                        backup_err
+                    ))
+                })?;
+                match std::fs::rename(temp_path, final_path) {
+                    Ok(()) => sync_parent_directory(final_path),
+                    Err(second_err) => match std::fs::rename(&backup_path, final_path) {
+                        Ok(()) => {
+                            sync_parent_directory(final_path)?;
+                            Err(std::io::Error::other(format!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restored original file; temp file retained at {}",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err,
+                                temp_path.display()
+                            )))
+                        }
+                        Err(restore_err) => Err(std::io::Error::other(format!(
+                            "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}",
+                            final_path.display(),
+                            temp_path.display(),
+                            first_err,
+                            second_err,
+                            restore_err,
+                            temp_path.display()
+                        ))),
+                    },
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temp_path, final_path)?;
+        sync_parent_directory(final_path)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn update_state_path_entry_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => Ok(false),
+        Err(err) => Err(std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed inspecting update state replacement target {}: {err}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn unique_update_state_temp_path(path: &Path) -> PathBuf {
+    unique_update_state_sidecar_path(path, "tmp")
+}
+
+#[cfg(windows)]
+fn unique_update_state_backup_path(path: &Path) -> PathBuf {
+    unique_update_state_sidecar_path(path, "bak")
+}
+
+fn unique_update_state_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("update_state.json");
+
+    path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
 }
 
 /// Current unix timestamp
@@ -635,29 +837,28 @@ fn build_update_info(
 
 /// Fetch latest release using the native asupersync HTTP client.
 async fn fetch_latest_release() -> Result<GitHubRelease> {
-    if let Some(cx) = asupersync::Cx::current() {
-        return fetch_latest_release_with_cx(&cx).await;
-    }
+    if let Some(handle) = asupersync::runtime::Runtime::current_handle() {
+        let (tx, rx) = std::sync::mpsc::channel();
 
-    let handle = asupersync::runtime::Runtime::current_handle()
-        .context("update check requires an active asupersync runtime")?;
-    let (tx, rx) = std::sync::mpsc::channel();
+        handle
+            .try_spawn_with_cx(move |cx| async move {
+                let _ = tx.send(fetch_latest_release_with_cx(&cx).await);
+            })
+            .context("spawning update check task")?;
 
-    handle
-        .try_spawn_with_cx(move |cx| async move {
-            let _ = tx.send(fetch_latest_release_with_cx(&cx).await);
-        })
-        .context("spawning update check task")?;
-
-    loop {
-        match rx.try_recv() {
-            Ok(result) => return result,
-            Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
-            Err(TryRecvError::Disconnected) => {
-                anyhow::bail!("update check task exited before returning a result");
+        loop {
+            match rx.try_recv() {
+                Ok(result) => return result,
+                Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
+                Err(TryRecvError::Disconnected) => {
+                    anyhow::bail!("update check task exited before returning a result");
+                }
             }
         }
     }
+
+    let cx = asupersync::Cx::current().context("update check requires an active asupersync Cx")?;
+    fetch_latest_release_with_cx(&cx).await
 }
 
 async fn fetch_latest_release_with_cx(cx: &asupersync::Cx) -> Result<GitHubRelease> {
@@ -833,6 +1034,40 @@ mod tests {
         assert!(!is_browser_url("file:///etc/passwd"));
         assert!(!is_browser_url("javascript:alert(1)"));
         assert!(!is_browser_url("data:text/html,<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn test_url_validation_rejects_userinfo_credentials() -> Result<(), &'static str> {
+        for url in [
+            "https://user:pass@github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v1.2.3",
+            "http://user@localhost:8080/releases/v1.2.3",
+        ] {
+            if is_browser_url(url) {
+                return Err("browser URL validation accepted embedded credentials");
+            }
+        }
+
+        let state = UpdateState::default();
+        let release = GitHubRelease {
+            tag_name: "v9.9.9".to_string(),
+            html_url: format!("https://token@github.com/{GITHUB_REPO}/releases/tag/v9.9.9"),
+        };
+        if build_update_info("1.0.0", release, &state).is_some() {
+            return Err("release metadata accepted embedded credentials");
+        }
+
+        for url in [
+            "https://token@api.github.com/repos/foo/bar",
+            "https://token:secret@github.com/Dicklesworthstone/coding_agent_session_search/releases",
+            "http://user@localhost:8080/api",
+            "http://user:pass@[::1]:8080/api",
+        ] {
+            if is_allowed_update_api_url(url) {
+                return Err("update API override accepted embedded credentials");
+            }
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -1087,6 +1322,115 @@ mod tests {
         assert!(!loaded.is_skipped("0.1.50")); // Only latest skip is stored
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn update_state_replacement_path_entry_exists_detects_dangling_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::TempDir::new()?;
+        let state_file = temp_dir.path().join("update_state.json");
+        let missing_target = temp_dir.path().join("missing-update-state.json");
+        symlink(&missing_target, &state_file)?;
+
+        match std::fs::metadata(&state_file) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(anyhow::anyhow!("dangling update state symlink resolved")),
+            Err(err) => return Err(err.into()),
+        }
+        if !update_state_path_entry_exists(&state_file)? {
+            return Err(anyhow::anyhow!(
+                "update state replacement entry check missed dangling symlink {}",
+                state_file.display()
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn install_update_state_symlink(data_dir: &std::path::Path) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::symlink;
+
+        let outside_dir = tempfile::TempDir::new().unwrap();
+        let target_file = outside_dir.path().join("target-update-state.json");
+        std::fs::write(&target_file, "untouched").unwrap();
+        symlink(&target_file, data_dir.join("update_state.json")).unwrap();
+        (outside_dir, target_file)
+    }
+
+    #[cfg(unix)]
+    fn assert_update_state_symlink_was_replaced(
+        data_dir: &std::path::Path,
+        target_file: &std::path::Path,
+        expected_ts: i64,
+    ) {
+        let state_file = data_dir.join("update_state.json");
+        assert_eq!(
+            std::fs::read_to_string(target_file).unwrap(),
+            "untouched",
+            "update state persistence must not follow an existing symlink"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&state_file)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "state path should be replaced with a regular JSON file"
+        );
+
+        let loaded: UpdateState =
+            serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert_eq!(loaded.last_check_ts, expected_ts);
+        assert_eq!(loaded.skipped_version, Some("0.2.0".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_update_state_save_replaces_existing_symlink() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let (_outside_dir, target_file) = install_update_state_symlink(temp_dir.path());
+        unsafe {
+            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
+        }
+
+        let state = UpdateState {
+            last_check_ts: 42,
+            skipped_version: Some("0.2.0".to_string()),
+        };
+        state.save().unwrap();
+
+        unsafe {
+            std::env::remove_var("CASS_DATA_DIR");
+        }
+        assert_update_state_symlink_was_replaced(temp_dir.path(), &target_file, 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_update_state_save_async_replaces_existing_symlink() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let (_outside_dir, target_file) = install_update_state_symlink(temp_dir.path());
+        unsafe {
+            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
+        }
+
+        let state = UpdateState {
+            last_check_ts: 43,
+            skipped_version: Some("0.2.0".to_string()),
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(state.save_async()).unwrap();
+
+        unsafe {
+            std::env::remove_var("CASS_DATA_DIR");
+        }
+        assert_update_state_symlink_was_replaced(temp_dir.path(), &target_file, 43);
+    }
+
     #[test]
     #[serial]
     fn test_update_info_upgrade_workflow() {
@@ -1200,26 +1544,52 @@ mod tests {
         response_body: &str,
         status: u16,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
-        use std::io::{Read, Write};
+        use std::io::{ErrorKind, Read, Write};
         use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind to ephemeral port");
         let addr = listener.local_addr().expect("get local addr");
+        let _ = listener.set_nonblocking(true);
 
         let response = http_response(status, response_body);
+        let (ready_tx, ready_rx) = mpsc::channel();
 
         let handle = std::thread::spawn(move || {
-            // Accept one connection and respond
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let _ = stream.write_all(response.as_bytes());
+            let _ = ready_tx.send(());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(err)
+                        if err.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            };
+
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            let mut buf = [0u8; 4096];
+            match stream.read(&mut buf) {
+                Ok(_) => {}
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::UnexpectedEof
+                    ) => {}
+                Err(_) => return,
+            }
+
+            if stream.write_all(response.as_bytes()).is_ok() {
                 let _ = stream.flush();
+                std::thread::sleep(Duration::from_millis(25));
             }
         });
 
-        // Small delay to ensure server is ready
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(1));
 
         (addr, handle)
     }

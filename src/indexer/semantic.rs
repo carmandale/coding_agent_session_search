@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use frankensearch::index::{
@@ -19,6 +19,9 @@ use crate::indexer::memoization::{
     ContentAddressedMemoCache, MemoCacheAuditRecord, MemoContentHash, MemoKey, MemoLookup,
 };
 use crate::indexer::responsiveness;
+use crate::indexer::semantic_progress::{
+    SemanticProgressEvent, SemanticProgressFields, SemanticProgressSink,
+};
 use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
 use crate::model::types::{Conversation, Message};
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
@@ -44,8 +47,26 @@ use crate::storage::sqlite::FrankenStorage;
 /// memory reservation stays bounded for large corpora.
 const DEFAULT_SEMANTIC_BATCH_SIZE: usize = 128;
 const DEFAULT_SEMANTIC_PREP_MEMO_CAPACITY: usize = 4_096;
+const DEFAULT_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS: u64 = 30_000;
+const DEFAULT_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS: u64 = 300_000;
+const DEFAULT_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT: usize = 10_000;
+const DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT: u64 = 8 * 1024 * 1024;
 const SEMANTIC_PREP_MEMO_ALGORITHM: &str = "semantic_prepare_window";
 const SEMANTIC_PREP_MEMO_VERSION: &str = "canonicalize_for_embedding:v2:stable-content-hash";
+
+fn resolved_env_usize(key: &str, default: usize) -> usize {
+    dotenvy::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn resolved_env_u64(key: &str, default: u64) -> u64 {
+    dotenvy::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
 
 fn resolved_default_batch_size() -> usize {
     dotenvy::var("CASS_SEMANTIC_BATCH_SIZE")
@@ -61,6 +82,20 @@ fn resolved_semantic_prep_memo_capacity() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_SEMANTIC_PREP_MEMO_CAPACITY)
+}
+
+fn resolved_semantic_embed_batch_warn_after_ms() -> u64 {
+    resolved_env_u64(
+        "CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS",
+        DEFAULT_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS,
+    )
+}
+
+fn resolved_semantic_embed_batch_fail_after_ms() -> u64 {
+    resolved_env_u64(
+        "CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS",
+        DEFAULT_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS,
+    )
 }
 
 /// Opt in to the rayon-parallel canonicalize+hash prep step. **Default: OFF.**
@@ -82,6 +117,10 @@ fn parallel_prep_enabled() -> bool {
 }
 
 fn saturating_u64_from_usize(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn saturating_u64_from_millis(value: u128) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
@@ -543,39 +582,96 @@ struct CanonicalEmbeddingBatch {
     total_conversations: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticCheckpointCaps {
+    max_messages: usize,
+    max_bytes: u64,
+}
+
+impl SemanticCheckpointCaps {
+    fn unlimited() -> Self {
+        Self {
+            max_messages: 0,
+            max_bytes: 0,
+        }
+    }
+
+    fn from_env() -> Self {
+        Self {
+            max_messages: resolved_env_usize(
+                "CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT",
+                DEFAULT_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT,
+            ),
+            max_bytes: resolved_env_u64(
+                "CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT",
+                DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT,
+            ),
+        }
+    }
+
+    fn message_limited(self) -> bool {
+        self.max_messages > 0
+    }
+
+    fn byte_limited(self) -> bool {
+        self.max_bytes > 0
+    }
+}
+
 pub(crate) struct CanonicalIncrementalEmbeddingBatch {
     pub inputs: Vec<EmbeddingInput>,
     pub conversations_in_batch: u64,
     pub raw_max_message_id: Option<i64>,
 }
 
-fn matching_semantic_checkpoint_offset(
-    manifest: &SemanticManifest,
-    tier: TierKind,
-    embedder_id: &str,
-    db_fingerprint: &str,
-) -> i64 {
-    manifest
-        .checkpoint
-        .as_ref()
-        .filter(|checkpoint| {
-            checkpoint.tier == tier
-                && checkpoint.embedder_id == embedder_id
-                && checkpoint.is_valid(db_fingerprint)
-        })
-        .map_or(0, |checkpoint| checkpoint.last_offset)
-}
-
 fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
+    let hinted_fallback_sql = "SELECT c.id
+             FROM conversations c
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = c.id
+                 LIMIT 1
+             )";
+    let fallback_sql = "SELECT c.id
+             FROM conversations c
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM messages
+                 WHERE conversation_id = c.id
+                 LIMIT 1
+             )";
     let count: i64 = storage
         .raw()
         .query_row_map(
-            "SELECT COUNT(DISTINCT m.conversation_id)
-             FROM messages m
-             JOIN conversations c ON c.id = m.conversation_id",
+            "SELECT COUNT(*) FROM conversations WHERE message_count > 0",
             &[] as &[ParamValue],
             |row| row.get_typed(0),
         )
+        .or_else(|err| {
+            if !err.to_string().contains("no such column: message_count") {
+                return Err(err);
+            }
+            let conversation_ids: Vec<i64> = storage
+                .raw()
+                .query_map_collect(hinted_fallback_sql, &[] as &[ParamValue], |row| {
+                    row.get_typed(0)
+                })
+                .or_else(|err| {
+                    if err
+                        .to_string()
+                        .contains("no such index: sqlite_autoindex_messages_1")
+                    {
+                        return storage.raw().query_map_collect(
+                            fallback_sql,
+                            &[] as &[ParamValue],
+                            |row| row.get_typed(0),
+                        );
+                    }
+                    Err(err)
+                })?;
+            Ok(i64::try_from(conversation_ids.len()).unwrap_or(i64::MAX))
+        })
         .with_context(|| "counting canonical conversations with semantic messages")?;
     Ok(u64::try_from(count.max(0)).unwrap_or(u64::MAX))
 }
@@ -854,23 +950,88 @@ fn fetch_canonical_embedding_batch(
     after_conversation_id: i64,
     max_conversations: usize,
 ) -> Result<CanonicalEmbeddingBatch> {
+    fetch_canonical_embedding_batch_inner(storage, after_conversation_id, max_conversations, None)
+}
+
+/// Variant of [`fetch_canonical_embedding_batch`] that additionally
+/// filters out canonical messages with `message_id <= after_message_id`
+/// when set. This is how sub-fix 2 (`last_message_id` cursor) enforces
+/// the "resume MUST advance past `last_message_id`" rule on a partially
+/// embedded conversation.
+fn fetch_canonical_embedding_batch_inner(
+    storage: &FrankenStorage,
+    after_conversation_id: i64,
+    max_conversations: usize,
+    after_message_id: Option<i64>,
+) -> Result<CanonicalEmbeddingBatch> {
+    fetch_canonical_embedding_batch_inner_with_caps(
+        storage,
+        after_conversation_id,
+        max_conversations,
+        after_message_id,
+        SemanticCheckpointCaps::unlimited(),
+    )
+}
+
+fn fetch_canonical_embedding_batch_inner_with_caps(
+    storage: &FrankenStorage,
+    after_conversation_id: i64,
+    max_conversations: usize,
+    after_message_id: Option<i64>,
+    caps: SemanticCheckpointCaps,
+) -> Result<CanonicalEmbeddingBatch> {
     let total_conversations = total_semantic_conversations(storage)?;
     let max_conversations_i64 = i64::try_from(max_conversations.max(1)).unwrap_or(i64::MAX);
+    let mut params = vec![
+        ParamValue::from(after_conversation_id),
+        ParamValue::from(max_conversations_i64),
+    ];
+    let message_cursor_predicate = if let Some(after_message_id) = after_message_id {
+        params.push(ParamValue::from(after_message_id));
+        " AND id > ?3"
+    } else {
+        ""
+    };
+    let hinted_sql = format!(
+        "SELECT c.id
+         FROM conversations c
+         WHERE c.id > ?1
+           AND EXISTS (
+               SELECT 1
+               FROM messages INDEXED BY sqlite_autoindex_messages_1
+               WHERE conversation_id = c.id{message_cursor_predicate}
+               LIMIT 1
+           )
+         ORDER BY c.id ASC
+         LIMIT ?2"
+    );
+    let fallback_sql = format!(
+        "SELECT c.id
+         FROM conversations c
+         WHERE c.id > ?1
+           AND EXISTS (
+               SELECT 1
+               FROM messages
+               WHERE conversation_id = c.id{message_cursor_predicate}
+               LIMIT 1
+           )
+         ORDER BY c.id ASC
+         LIMIT ?2"
+    );
     let conversation_ids: Vec<i64> = storage
         .raw()
-        .query_map_collect(
-            "SELECT DISTINCT m.conversation_id
-             FROM messages m
-             JOIN conversations c ON c.id = m.conversation_id
-             WHERE m.conversation_id > ?1
-             ORDER BY m.conversation_id ASC
-             LIMIT ?2",
-            &[
-                ParamValue::from(after_conversation_id),
-                ParamValue::from(max_conversations_i64),
-            ],
-            |row| row.get_typed(0),
-        )
+        .query_map_collect(&hinted_sql, &params, |row| row.get_typed(0))
+        .or_else(|err| {
+            if err
+                .to_string()
+                .contains("no such index: sqlite_autoindex_messages_1")
+            {
+                return storage
+                    .raw()
+                    .query_map_collect(&fallback_sql, &params, |row| row.get_typed(0));
+            }
+            Err(err)
+        })
         .with_context(|| {
             format!("fetching semantic backfill conversation ids after {after_conversation_id}")
         })?;
@@ -888,34 +1049,93 @@ fn fetch_canonical_embedding_batch(
 
     let mut grouped_messages =
         storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
-    let mut inputs = Vec::new();
-    for conversation in &conversations {
-        let messages = grouped_messages
-            .remove(&conversation.conversation_id)
-            .unwrap_or_default();
-        let provenance = canonical_embedding_packet_provenance(conversation);
-        let canonical = canonical_embedding_conversation(conversation, &provenance, messages);
-        let packet = ConversationPacket::from_canonical_replay(&canonical, provenance);
-        inputs.extend(embedding_inputs_from_conversation_packet(
-            conversation,
-            &packet,
-        ));
-    }
+    let (conversations, capped_last_conversation_id) = select_checkpoint_capped_conversations(
+        conversations,
+        &mut grouped_messages,
+        after_message_id,
+        caps,
+    );
+    let (inputs, _) = packet_embedding_inputs_from_materialized_canonical_messages(
+        &conversations,
+        &mut grouped_messages,
+        |_| true,
+    );
 
-    let conversations_in_batch = u64::try_from(conversation_ids.len()).unwrap_or(u64::MAX);
+    let conversations_in_batch = u64::try_from(conversations.len()).unwrap_or(u64::MAX);
     tracing::debug!(
         conversations_in_batch,
         packet_driven = true,
         semantic_inputs = inputs.len(),
+        max_messages_per_checkpoint = caps.max_messages,
+        max_bytes_per_checkpoint = caps.max_bytes,
+        ?after_message_id,
         "built semantic backfill batch from ConversationPacket canonical replay"
     );
 
     Ok(CanonicalEmbeddingBatch {
         inputs,
         conversations_in_batch,
-        last_conversation_id: *conversation_ids.last().unwrap_or(&after_conversation_id),
+        last_conversation_id: capped_last_conversation_id.unwrap_or(after_conversation_id),
         total_conversations,
     })
+}
+
+fn select_checkpoint_capped_conversations(
+    conversations: Vec<CanonicalEmbeddingConversationRow>,
+    grouped_messages: &mut HashMap<i64, Vec<Message>>,
+    after_message_id: Option<i64>,
+    caps: SemanticCheckpointCaps,
+) -> (Vec<CanonicalEmbeddingConversationRow>, Option<i64>) {
+    let mut selected = Vec::new();
+    let mut selected_messages = 0usize;
+    let mut selected_bytes = 0u64;
+    let mut last_conversation_id = None;
+
+    for conversation in conversations {
+        let mut messages = grouped_messages
+            .remove(&conversation.conversation_id)
+            .unwrap_or_default();
+        if let Some(min_exclusive) = after_message_id {
+            messages.retain(|message| message.id.is_some_and(|id| id > min_exclusive));
+        }
+        if messages.is_empty() {
+            continue;
+        }
+
+        let message_count = messages.len();
+        let byte_count = messages
+            .iter()
+            .map(|message| saturating_u64_from_usize(message.content.len()))
+            .fold(0u64, u64::saturating_add);
+        let would_exceed_messages = caps.message_limited()
+            && !selected.is_empty()
+            && selected_messages.saturating_add(message_count) > caps.max_messages;
+        let would_exceed_bytes = caps.byte_limited()
+            && !selected.is_empty()
+            && selected_bytes.saturating_add(byte_count) > caps.max_bytes;
+        if would_exceed_messages || would_exceed_bytes {
+            tracing::debug!(
+                conversation_id = conversation.conversation_id,
+                selected_conversations = selected.len(),
+                selected_messages,
+                selected_bytes,
+                candidate_messages = message_count,
+                candidate_bytes = byte_count,
+                max_messages_per_checkpoint = caps.max_messages,
+                max_bytes_per_checkpoint = caps.max_bytes,
+                "semantic checkpoint cap stopped this batch before the next full conversation"
+            );
+            break;
+        }
+
+        selected_messages = selected_messages.saturating_add(message_count);
+        selected_bytes = selected_bytes.saturating_add(byte_count);
+        last_conversation_id = Some(conversation.conversation_id);
+        grouped_messages.insert(conversation.conversation_id, messages);
+        selected.push(conversation);
+    }
+
+    (selected, last_conversation_id)
 }
 
 pub(crate) fn packet_embedding_inputs_from_storage(
@@ -927,7 +1147,7 @@ pub(crate) fn packet_embedding_inputs_from_storage(
 fn packet_embedding_inputs_from_selected_canonical_messages<F>(
     storage: &FrankenStorage,
     conversation_ids: &[i64],
-    mut include_message: F,
+    include_message: F,
 ) -> Result<(Vec<EmbeddingInput>, Option<i64>)>
 where
     F: FnMut(&Message) -> bool,
@@ -939,10 +1159,27 @@ where
     let conversations = fetch_canonical_embedding_conversations(storage, conversation_ids)?;
     let mut grouped_messages =
         storage.fetch_messages_for_lexical_rebuild_batch(conversation_ids, None, None)?;
+    Ok(
+        packet_embedding_inputs_from_materialized_canonical_messages(
+            &conversations,
+            &mut grouped_messages,
+            include_message,
+        ),
+    )
+}
+
+fn packet_embedding_inputs_from_materialized_canonical_messages<F>(
+    conversations: &[CanonicalEmbeddingConversationRow],
+    grouped_messages: &mut HashMap<i64, Vec<Message>>,
+    mut include_message: F,
+) -> (Vec<EmbeddingInput>, Option<i64>)
+where
+    F: FnMut(&Message) -> bool,
+{
     let mut inputs = Vec::new();
     let mut raw_max_message_id: Option<i64> = None;
 
-    for conversation in &conversations {
+    for conversation in conversations {
         let mut messages = grouped_messages
             .remove(&conversation.conversation_id)
             .unwrap_or_default();
@@ -967,7 +1204,7 @@ where
         ));
     }
 
-    Ok((inputs, raw_max_message_id))
+    (inputs, raw_max_message_id)
 }
 
 pub(crate) fn packet_embedding_inputs_from_storage_since(
@@ -1269,6 +1506,18 @@ impl SemanticIndexer {
     }
 
     pub fn embed_messages(&self, messages: &[EmbeddingInput]) -> Result<Vec<EmbeddedMessage>> {
+        self.embed_messages_with_sink(messages, &SemanticProgressSink::disabled())
+    }
+
+    /// Variant of [`embed_messages`] that emits `embed_batch_*` events
+    /// into the given JSONL sink. The sink is silent unless
+    /// `CASS_SEMANTIC_PROGRESS_JSONL` is set, so this path is safe to
+    /// take in production.
+    pub fn embed_messages_with_sink(
+        &self,
+        messages: &[EmbeddingInput],
+        sink: &SemanticProgressSink,
+    ) -> Result<Vec<EmbeddedMessage>> {
         if messages.is_empty() {
             return Ok(Vec::new());
         }
@@ -1298,6 +1547,11 @@ impl SemanticIndexer {
         let prep_memo_capacity = resolved_semantic_prep_memo_capacity();
         let mut prep_memo =
             serial_prep.then(|| ContentAddressedMemoCache::with_capacity(prep_memo_capacity));
+        let mut batch_index: u64 = 0;
+        let mut rows_processed: u64 = 0;
+        let rows_total = u64::try_from(messages.len()).ok();
+        let warn_after_ms = resolved_semantic_embed_batch_warn_after_ms();
+        let fail_after_ms = resolved_semantic_embed_batch_fail_after_ms();
         for (window_index, window_slice) in messages.chunks(window).enumerate() {
             let prepared_window = match prep_memo.as_mut() {
                 Some(cache) => {
@@ -1321,7 +1575,64 @@ impl SemanticIndexer {
             }
 
             for batch in prepared_window.chunks(self.batch_size) {
+                let batch_rows = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+                // Sum the canonicalized byte count so an operator can
+                // distinguish a stalled inference from a stalled query —
+                // a tiny `bytes` value paired with a long batch wall-time
+                // points at the model; a huge `bytes` paired with a short
+                // wall-time points at the storage side.
+                let batch_bytes: u64 = batch
+                    .iter()
+                    .map(|p| saturating_u64_from_usize(p.canonical.len()))
+                    .sum();
+                if sink.is_active() {
+                    sink.emit(
+                        SemanticProgressEvent::EmbedBatchStart,
+                        SemanticProgressFields {
+                            batch_index: Some(batch_index),
+                            batch_rows: Some(batch_rows),
+                            rows_processed: Some(rows_processed),
+                            rows_total,
+                            bytes: Some(batch_bytes),
+                            ..Default::default()
+                        },
+                    );
+                }
+                let batch_started = Instant::now();
                 flush_prepared_batch(batch, &mut embeddings, &pb, self.embedder.as_ref())?;
+                let elapsed_ms = saturating_u64_from_millis(batch_started.elapsed().as_millis());
+                rows_processed = rows_processed.saturating_add(batch_rows);
+                if warn_after_ms > 0 && elapsed_ms > warn_after_ms {
+                    tracing::warn!(
+                        batch_index,
+                        elapsed_ms,
+                        warn_after_ms,
+                        batch_rows,
+                        batch_bytes,
+                        embedder = self.embedder_id(),
+                        "semantic embed batch exceeded watchdog warning threshold"
+                    );
+                }
+                if fail_after_ms > 0 && elapsed_ms > fail_after_ms {
+                    bail!(
+                        "semantic embed batch {batch_index} took {elapsed_ms}ms, exceeding \
+                         CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS={fail_after_ms}"
+                    );
+                }
+                if sink.is_active() {
+                    sink.emit(
+                        SemanticProgressEvent::EmbedBatchDone,
+                        SemanticProgressFields {
+                            batch_index: Some(batch_index),
+                            batch_rows: Some(batch_rows),
+                            rows_processed: Some(rows_processed),
+                            rows_total,
+                            bytes: Some(batch_bytes),
+                            ..Default::default()
+                        },
+                    );
+                }
+                batch_index = batch_index.saturating_add(1);
             }
         }
 
@@ -1665,6 +1976,30 @@ impl SemanticIndexer {
         manifest: &mut SemanticManifest,
         plan: SemanticBackfillBatchPlan,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        self.run_backfill_batch_with_sink(
+            messages,
+            data_dir,
+            manifest,
+            plan,
+            None,
+            &SemanticProgressSink::disabled(),
+        )
+    }
+
+    /// Variant of [`run_backfill_batch`] that emits semantic progress
+    /// events to the given JSONL sink and persists `last_message_id`
+    /// into the resumable checkpoint when supplied. The sink is silent
+    /// unless `CASS_SEMANTIC_PROGRESS_JSONL` is set, so this path is
+    /// safe to take in production.
+    pub fn run_backfill_batch_with_sink(
+        &self,
+        messages: &[EmbeddingInput],
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillBatchPlan,
+        last_message_id: Option<i64>,
+        sink: &SemanticProgressSink,
+    ) -> Result<SemanticBackfillBatchOutcome> {
         if plan.db_fingerprint.trim().is_empty() {
             bail!("semantic backfill requires a non-empty DB fingerprint");
         }
@@ -1697,13 +2032,33 @@ impl SemanticIndexer {
             .as_ref()
             .map_or(0, |checkpoint| checkpoint.docs_embedded);
 
-        let embeddings = self.embed_messages(messages)?;
+        let embeddings = self.embed_messages_with_sink(messages, sink)?;
         let embedded_docs = u64::try_from(embeddings.len()).unwrap_or(u64::MAX);
+        if sink.is_active() {
+            sink.emit(
+                SemanticProgressEvent::StagingWriteStart,
+                SemanticProgressFields {
+                    batch_rows: Some(embedded_docs),
+                    note: Some(staging_path.display().to_string()),
+                    ..Default::default()
+                },
+            );
+        }
         let mut staged_index = self.write_backfill_staging_index(
             embeddings,
             &staging_path,
             prior_checkpoint.is_some(),
         )?;
+        if sink.is_active() {
+            sink.emit(
+                SemanticProgressEvent::StagingWriteDone,
+                SemanticProgressFields {
+                    batch_rows: Some(embedded_docs),
+                    note: Some(staging_path.display().to_string()),
+                    ..Default::default()
+                },
+            );
+        }
         let conversations_processed = prior_conversations
             .saturating_add(plan.conversations_in_batch)
             .min(plan.total_conversations);
@@ -1719,6 +2074,19 @@ impl SemanticIndexer {
                 })?;
             }
             drop(staged_index);
+            if sink.is_active() {
+                sink.emit(
+                    SemanticProgressEvent::PublishStart,
+                    SemanticProgressFields {
+                        rows_processed: Some(conversations_processed),
+                        rows_total: Some(plan.total_conversations),
+                        last_conversation_id: Some(plan.last_offset),
+                        last_message_id,
+                        note: Some(final_path.display().to_string()),
+                        ..Default::default()
+                    },
+                );
+            }
             fs::rename(&staging_path, &final_path).with_context(|| {
                 format!(
                     "publishing staged semantic index {} to {}",
@@ -1757,12 +2125,43 @@ impl SemanticIndexer {
             });
             manifest.refresh_backlog(plan.total_conversations, &db_fingerprint);
             manifest.save(data_dir)?;
+            if sink.is_active() {
+                sink.emit(
+                    SemanticProgressEvent::PublishDone,
+                    SemanticProgressFields {
+                        rows_processed: Some(conversations_processed),
+                        rows_total: Some(plan.total_conversations),
+                        last_conversation_id: Some(plan.last_offset),
+                        last_message_id,
+                        note: Some(final_path.display().to_string()),
+                        ..Default::default()
+                    },
+                );
+            }
         } else {
             let docs_embedded_on_disk =
                 u64::try_from(staged_index.record_count()).unwrap_or(u64::MAX);
             let checkpoint_docs = prior_docs
                 .saturating_add(embedded_docs)
                 .max(docs_embedded_on_disk);
+            if sink.is_active() {
+                sink.emit(
+                    SemanticProgressEvent::CheckpointSaveStart,
+                    SemanticProgressFields {
+                        rows_processed: Some(conversations_processed),
+                        rows_total: Some(plan.total_conversations),
+                        last_conversation_id: Some(plan.last_offset),
+                        last_message_id,
+                        ..Default::default()
+                    },
+                );
+            }
+            // Preserve any existing `last_message_id` cursor when the
+            // caller did not supply a fresher one — see sub-fix 2 for
+            // why durable message-PK resume matters.
+            let prior_last_message_id = prior_checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.last_message_id);
             manifest.save_checkpoint(BuildCheckpoint {
                 tier: plan.tier,
                 embedder_id: self.embedder_id().to_string(),
@@ -1774,8 +2173,21 @@ impl SemanticIndexer {
                 schema_version: SEMANTIC_SCHEMA_VERSION,
                 chunking_version: CHUNKING_STRATEGY_VERSION,
                 saved_at_ms: now_ms(),
+                last_message_id: last_message_id.or(prior_last_message_id),
             });
             manifest.save(data_dir)?;
+            if sink.is_active() {
+                sink.emit(
+                    SemanticProgressEvent::CheckpointSaveDone,
+                    SemanticProgressFields {
+                        rows_processed: Some(conversations_processed),
+                        rows_total: Some(plan.total_conversations),
+                        last_conversation_id: Some(plan.last_offset),
+                        last_message_id: last_message_id.or(prior_last_message_id),
+                        ..Default::default()
+                    },
+                );
+            }
         }
 
         Ok(SemanticBackfillBatchOutcome {
@@ -1799,18 +2211,186 @@ impl SemanticIndexer {
         manifest: &mut SemanticManifest,
         plan: SemanticBackfillStoragePlan,
     ) -> Result<SemanticBackfillBatchOutcome> {
-        let after_conversation_id = matching_semantic_checkpoint_offset(
+        self.run_backfill_from_storage_with_sink(
+            storage,
+            data_dir,
             manifest,
-            plan.tier,
-            self.embedder_id(),
-            &plan.db_fingerprint,
-        );
-        let batch = fetch_canonical_embedding_batch(
+            plan,
+            &SemanticProgressSink::disabled(),
+        )
+    }
+
+    /// Variant of [`run_backfill_from_storage`] that emits semantic
+    /// progress events to a JSONL sink and persists `last_message_id`
+    /// in the resumable checkpoint. The sink is silent unless
+    /// `CASS_SEMANTIC_PROGRESS_JSONL` is set.
+    pub fn run_backfill_from_storage_with_sink(
+        &self,
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillStoragePlan,
+        sink: &SemanticProgressSink,
+    ) -> Result<SemanticBackfillBatchOutcome> {
+        self.run_backfill_from_storage_with_caps_and_sink(
+            storage,
+            data_dir,
+            manifest,
+            plan,
+            SemanticCheckpointCaps::unlimited(),
+            sink,
+        )
+    }
+
+    /// Variant of [`run_backfill_from_storage_with_sink`] for CLI backfill
+    /// runs. It applies operator checkpoint caps from
+    /// `CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT` and
+    /// `CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT` while keeping each selected
+    /// conversation whole, so message-cursor resume cannot strand the tail of
+    /// a partially selected conversation.
+    pub fn run_capped_backfill_from_storage_with_sink(
+        &self,
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillStoragePlan,
+        sink: &SemanticProgressSink,
+    ) -> Result<SemanticBackfillBatchOutcome> {
+        self.run_backfill_from_storage_with_caps_and_sink(
+            storage,
+            data_dir,
+            manifest,
+            plan,
+            SemanticCheckpointCaps::from_env(),
+            sink,
+        )
+    }
+
+    fn run_backfill_from_storage_with_caps_and_sink(
+        &self,
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillStoragePlan,
+        caps: SemanticCheckpointCaps,
+        sink: &SemanticProgressSink,
+    ) -> Result<SemanticBackfillBatchOutcome> {
+        let prior_checkpoint = manifest.checkpoint.as_ref().filter(|checkpoint| {
+            checkpoint.tier == plan.tier
+                && checkpoint.embedder_id == self.embedder_id()
+                && checkpoint.is_valid(&plan.db_fingerprint)
+        });
+        let after_conversation_id = prior_checkpoint.map_or(0, |checkpoint| checkpoint.last_offset);
+        let prior_last_message_id =
+            prior_checkpoint.and_then(|checkpoint| checkpoint.last_message_id);
+
+        if sink.is_active() {
+            sink.emit(
+                SemanticProgressEvent::SelectionStart,
+                SemanticProgressFields {
+                    last_conversation_id: Some(after_conversation_id),
+                    last_message_id: prior_last_message_id,
+                    rows_total: Some(saturating_u64_from_usize(plan.max_conversations)),
+                    note: Some(plan.tier.as_str().to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let batch = match fetch_canonical_embedding_batch_inner_with_caps(
             storage,
             after_conversation_id,
             plan.max_conversations,
-        )?;
-        self.run_backfill_batch(
+            prior_last_message_id,
+            caps,
+        ) {
+            Ok(batch) => batch,
+            Err(err) => {
+                if sink.is_active() {
+                    sink.emit(
+                        SemanticProgressEvent::Error,
+                        SemanticProgressFields {
+                            error: Some(format!("selection: {err}")),
+                            last_conversation_id: Some(after_conversation_id),
+                            last_message_id: prior_last_message_id,
+                            ..Default::default()
+                        },
+                    );
+                }
+                return Err(err);
+            }
+        };
+
+        if sink.is_active() {
+            sink.emit(
+                SemanticProgressEvent::SelectionDone,
+                SemanticProgressFields {
+                    last_conversation_id: Some(batch.last_conversation_id),
+                    last_message_id: prior_last_message_id,
+                    conversations_in_batch: Some(batch.conversations_in_batch),
+                    rows_total: Some(batch.total_conversations),
+                    ..Default::default()
+                },
+            );
+            // PacketReplay {start,progress,done} bracket the
+            // envelope/messages/packet build done by
+            // `fetch_canonical_embedding_batch`. We can't easily plumb
+            // a callback inside that helper without refactoring it, so
+            // the start/done bracket here straddles the work that
+            // already happened (replay always finishes before we see
+            // the result). A future refactor — flagged in the
+            // SQL-shape follow-up — can move the packet-replay work
+            // into a streaming iterator and emit `progress` ticks
+            // per conversation. For now, the bracket still gives
+            // operators a clear "we got past replay" signal.
+            sink.emit(
+                SemanticProgressEvent::PacketReplayStart,
+                SemanticProgressFields {
+                    conversations_in_batch: Some(batch.conversations_in_batch),
+                    ..Default::default()
+                },
+            );
+            sink.emit(
+                SemanticProgressEvent::PacketReplayProgress,
+                SemanticProgressFields {
+                    conversations_in_batch: Some(batch.conversations_in_batch),
+                    rows_processed: Some(saturating_u64_from_usize(batch.inputs.len())),
+                    bytes: Some(
+                        batch
+                            .inputs
+                            .iter()
+                            .map(|i| saturating_u64_from_usize(i.content.len()))
+                            .sum(),
+                    ),
+                    ..Default::default()
+                },
+            );
+            sink.emit(
+                SemanticProgressEvent::PacketReplayDone,
+                SemanticProgressFields {
+                    conversations_in_batch: Some(batch.conversations_in_batch),
+                    rows_processed: Some(saturating_u64_from_usize(batch.inputs.len())),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Compute the freshest `last_message_id` from the inputs we are
+        // about to embed. EmbeddingInput.message_id is u64 (canonical
+        // message PK); we coerce to i64 since the manifest stores i64.
+        let batch_last_message_id = batch
+            .inputs
+            .iter()
+            .map(|input| i64::try_from(input.message_id).unwrap_or(i64::MAX))
+            .max();
+        let next_last_message_id = match (prior_last_message_id, batch_last_message_id) {
+            (Some(prior), Some(batch_max)) => Some(prior.max(batch_max)),
+            (Some(prior), None) => Some(prior),
+            (None, Some(batch_max)) => Some(batch_max),
+            (None, None) => None,
+        };
+
+        let outcome = self.run_backfill_batch_with_sink(
             &batch.inputs,
             data_dir,
             manifest,
@@ -1822,7 +2402,41 @@ impl SemanticIndexer {
                 conversations_in_batch: batch.conversations_in_batch,
                 last_offset: batch.last_conversation_id,
             },
-        )
+            next_last_message_id,
+            sink,
+        );
+
+        match &outcome {
+            Ok(o) => {
+                if sink.is_active() {
+                    sink.emit(
+                        SemanticProgressEvent::Complete,
+                        SemanticProgressFields {
+                            rows_processed: Some(o.conversations_processed),
+                            rows_total: Some(o.total_conversations),
+                            last_conversation_id: Some(o.last_offset),
+                            last_message_id: next_last_message_id,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            Err(err) => {
+                if sink.is_active() {
+                    sink.emit(
+                        SemanticProgressEvent::Error,
+                        SemanticProgressFields {
+                            error: Some(err.to_string()),
+                            last_conversation_id: Some(batch.last_conversation_id),
+                            last_message_id: next_last_message_id,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        }
+
+        outcome
     }
 
     /// Build and save an HNSW index for approximate nearest neighbor search.
@@ -2868,6 +3482,123 @@ mod tests {
     }
 
     #[test]
+    fn canonical_embedding_batch_pushes_last_message_id_filter_into_selection() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("before-watermark", "old semantic message"),
+        )?;
+        let watermark: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("after-watermark", "new semantic message"),
+        )?;
+
+        let batch = fetch_canonical_embedding_batch_inner(&storage, 0, 8, Some(watermark))?;
+
+        assert_eq!(
+            batch.conversations_in_batch, 1,
+            "last_message_id must be pushed into candidate selection so old conversations are not counted in the batch"
+        );
+        assert_eq!(batch.total_conversations, 2);
+        assert_eq!(batch.inputs.len(), 1);
+        assert_eq!(batch.inputs[0].content, "new semantic message");
+        assert!(
+            i64::try_from(batch.inputs[0].message_id).unwrap_or(i64::MAX) > watermark,
+            "selected semantic input must be strictly newer than the checkpoint message id"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_caps_stop_at_whole_conversation_boundary() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        for external_id in ["cap-first", "cap-second", "cap-third"] {
+            storage.insert_conversation_tree(
+                agent_id,
+                None,
+                &test_conversation_with_messages(
+                    external_id,
+                    vec![
+                        Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_700_000_000_500),
+                            content: format!("{external_id} user semantic text"),
+                            extra_json: json!({}),
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 1,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: Some(1_700_000_000_600),
+                            content: format!("{external_id} assistant semantic text"),
+                            extra_json: json!({}),
+                            snippets: Vec::new(),
+                        },
+                    ],
+                ),
+            )?;
+        }
+
+        let first_conversation_id: i64 = storage.raw().query_row_map(
+            "SELECT MIN(id) FROM conversations",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        let batch = fetch_canonical_embedding_batch_inner_with_caps(
+            &storage,
+            0,
+            8,
+            None,
+            SemanticCheckpointCaps {
+                max_messages: 3,
+                max_bytes: 0,
+            },
+        )?;
+
+        assert_eq!(batch.conversations_in_batch, 1);
+        assert_eq!(batch.last_conversation_id, first_conversation_id);
+        assert_eq!(batch.inputs.len(), 2);
+        assert!(
+            batch
+                .inputs
+                .iter()
+                .all(|input| input.content.contains("cap-first"))
+        );
+        assert_eq!(batch.total_conversations, 3);
+        Ok(())
+    }
+
+    #[test]
     fn packet_embedding_inputs_from_storage_since_only_emits_new_canonical_messages() -> Result<()>
     {
         let temp = tempdir().unwrap();
@@ -3307,6 +4038,30 @@ mod tests {
         let _guard = EnvVarGuard::remove("CASS_SEMANTIC_BATCH_SIZE");
         let indexer = SemanticIndexer::new("hash", None).unwrap();
         assert_eq!(indexer.batch_size(), DEFAULT_SEMANTIC_BATCH_SIZE);
+    }
+
+    #[test]
+    fn semantic_watchdog_and_checkpoint_caps_have_derived_defaults() {
+        let _warn = EnvVarGuard::remove("CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS");
+        let _fail = EnvVarGuard::remove("CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS");
+        let _messages = EnvVarGuard::remove("CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT");
+        let _bytes = EnvVarGuard::remove("CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT");
+
+        assert_eq!(
+            resolved_semantic_embed_batch_warn_after_ms(),
+            DEFAULT_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS
+        );
+        assert_eq!(
+            resolved_semantic_embed_batch_fail_after_ms(),
+            DEFAULT_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS
+        );
+        assert_eq!(
+            SemanticCheckpointCaps::from_env(),
+            SemanticCheckpointCaps {
+                max_messages: DEFAULT_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT,
+                max_bytes: DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT,
+            }
+        );
     }
 
     #[test]

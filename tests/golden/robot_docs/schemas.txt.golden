@@ -341,10 +341,12 @@ schemas: (auto-generated from contract)
         - matches_current_db_fingerprint: ?
       - fresh: boolean
       - last_indexed_at: ?
+      - quarantined_conversations: integer
       - reason: ?
       - rebuilding: boolean
       - stale: boolean
       - stale_threshold_seconds: integer
+      - stalled: boolean
       - status: string
     - locks: array
     - needs_rebuild: boolean
@@ -609,6 +611,7 @@ schemas: (auto-generated from contract)
         - present: boolean
         - ready: boolean
         - size_bytes: ?
+      - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
       - hnsw_ready: boolean
@@ -625,6 +628,8 @@ schemas: (auto-generated from contract)
         - present: boolean
         - ready: boolean
         - size_bytes: ?
+      - quality_tier_published: boolean
+      - semantic_only_search_available: boolean
       - status: string
       - summary: string
       - vector_index_path: ?
@@ -2438,6 +2443,7 @@ schemas: (auto-generated from contract)
         - present: boolean
         - ready: boolean
         - size_bytes: ?
+      - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
       - hnsw_ready: boolean
@@ -2454,6 +2460,8 @@ schemas: (auto-generated from contract)
         - present: boolean
         - ready: boolean
         - size_bytes: ?
+      - quality_tier_published: boolean
+      - semantic_only_search_available: boolean
       - status: string
       - summary: string
       - vector_index_path: ?
@@ -2720,7 +2728,19 @@ schemas: (auto-generated from contract)
       - surface: string
     - errors: array
     - explanation: ?
+    - health_level: string
     - healthy: boolean
+    - ingest_quarantine: object
+      - circuit_breaker_active: boolean
+      - circuit_breaker_limit: integer
+      - newest_last_attempt_at_ms: ?
+      - quarantine_files: array
+      - quarantined_conversations: integer
+      - recent_quarantined_conversations: integer
+      - recent_window_seconds: integer
+      - recommended_action: ?
+      - schema_version: integer
+      - status: string
     - initialized: boolean
     - latency_ms: integer
     - parallel_wal_shadow: object
@@ -2756,6 +2776,8 @@ schemas: (auto-generated from contract)
       - indexed_docs: ?
       - inflight_message_bytes: ?
       - inflight_message_bytes_headroom: ?
+      - last_progress_age_ms: ?
+      - last_progress_at: ?
       - max_message_bytes_in_flight: ?
       - mode: ?
       - pending_batch_conversations: ?
@@ -2767,6 +2789,7 @@ schemas: (auto-generated from contract)
       - queue_headroom: ?
       - remaining_conversations: ?
       - runtime_available: boolean
+      - stalled: boolean
       - total_conversations: ?
       - updated_at: ?
     - recommended_action: ?
@@ -2831,10 +2854,23 @@ schemas: (auto-generated from contract)
         - fingerprint: object
         - fresh: boolean
         - last_indexed_at: ?
+        - quarantined_conversations: integer
         - reason: ?
         - rebuilding: boolean
         - stale: boolean
         - stale_threshold_seconds: integer
+        - stalled: boolean
+        - status: string
+      - ingest_quarantine: object
+        - circuit_breaker_active: boolean
+        - circuit_breaker_limit: integer
+        - newest_last_attempt_at_ms: ?
+        - quarantine_files: array
+        - quarantined_conversations: integer
+        - recent_quarantined_conversations: integer
+        - recent_window_seconds: integer
+        - recommended_action: ?
+        - schema_version: integer
         - status: string
       - pending: object
         - orphaned: boolean
@@ -2848,12 +2884,15 @@ schemas: (auto-generated from contract)
         - indexed_docs: ?
         - job_id: ?
         - job_kind: ?
+        - last_progress_age_ms: ?
+        - last_progress_at: ?
         - mode: ?
         - orphaned: boolean
         - phase: ?
         - pid: ?
         - pipeline: object
         - processed_conversations: ?
+        - stalled: boolean
         - started_at: ?
         - total_conversations: ?
         - updated_at: ?
@@ -2866,6 +2905,7 @@ schemas: (auto-generated from contract)
         - embedder_id: ?
         - fallback_mode: ?
         - fast_tier: object
+        - feature_compiled_in: boolean
         - hint: ?
         - hnsw_path: ?
         - hnsw_ready: boolean
@@ -2873,10 +2913,13 @@ schemas: (auto-generated from contract)
         - preferred_backend: string
         - progressive_ready: boolean
         - quality_tier: object
+        - quality_tier_published: boolean
+        - semantic_only_search_available: boolean
         - status: string
         - summary: string
         - vector_index_path: ?
     - status: string
+    - warnings: array
   index:
     - conversations: ?
     - data_dir: ?
@@ -2887,7 +2930,9 @@ schemas: (auto-generated from contract)
     - force_rebuild: ?
     - full: ?
     - indexing_stats: object
+    - lexical_update_deferred: boolean
     - messages: ?
+    - quarantined_conversations: integer
     - success: boolean
   introspect:
     - api_version: integer
@@ -3056,6 +3101,7 @@ schemas: (auto-generated from contract)
         - _meta: object
         - database: object
         - index: object
+        - ingest_quarantine: object
         - pending: object
         - policy_registry: object
         - rebuild: object
@@ -3200,6 +3246,7 @@ schemas: (auto-generated from contract)
       - status: string
       - surface: string
     - explanation: ?
+    - health_level: string
     - healthy: boolean
     - index: object
       - activity_at: ?
@@ -3220,10 +3267,23 @@ schemas: (auto-generated from contract)
         - matches_current_db_fingerprint: ?
       - fresh: boolean
       - last_indexed_at: ?
+      - quarantined_conversations: integer
       - reason: ?
       - rebuilding: boolean
       - stale: boolean
       - stale_threshold_seconds: integer
+      - stalled: boolean
+      - status: string
+    - ingest_quarantine: object
+      - circuit_breaker_active: boolean
+      - circuit_breaker_limit: integer
+      - newest_last_attempt_at_ms: ?
+      - quarantine_files: array
+      - quarantined_conversations: integer
+      - recent_quarantined_conversations: integer
+      - recent_window_seconds: integer
+      - recommended_action: ?
+      - schema_version: integer
       - status: string
     - initialized: boolean
     - pending: object
@@ -3239,12 +3299,15 @@ schemas: (auto-generated from contract)
       - indexed_docs: ?
       - job_id: ?
       - job_kind: ?
+      - last_progress_age_ms: ?
+      - last_progress_at: ?
       - mode: ?
       - orphaned: boolean
       - phase: ?
       - pid: ?
       - pipeline: object
       - processed_conversations: ?
+      - stalled: boolean
       - started_at: ?
       - total_conversations: ?
       - updated_at: ?
@@ -3256,6 +3319,8 @@ schemas: (auto-generated from contract)
       - indexed_docs: ?
       - inflight_message_bytes: ?
       - inflight_message_bytes_headroom: ?
+      - last_progress_age_ms: ?
+      - last_progress_at: ?
       - max_message_bytes_in_flight: ?
       - mode: ?
       - pending_batch_conversations: ?
@@ -3267,6 +3332,7 @@ schemas: (auto-generated from contract)
       - queue_headroom: ?
       - remaining_conversations: ?
       - runtime_available: boolean
+      - stalled: boolean
       - total_conversations: ?
       - updated_at: ?
     - recommended_action: ?
@@ -3324,6 +3390,7 @@ schemas: (auto-generated from contract)
         - present: boolean
         - ready: boolean
         - size_bytes: ?
+      - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
       - hnsw_ready: boolean
@@ -3340,6 +3407,8 @@ schemas: (auto-generated from contract)
         - present: boolean
         - ready: boolean
         - size_bytes: ?
+      - quality_tier_published: boolean
+      - semantic_only_search_available: boolean
       - status: string
       - summary: string
       - vector_index_path: ?
@@ -3379,6 +3448,7 @@ schemas: (auto-generated from contract)
         - sockets: integer
         - source: string
         - topology_class: string
+    - warnings: array
   stats:
     - by_agent: array
     - conversations: integer
@@ -3518,6 +3588,7 @@ schemas: (auto-generated from contract)
       - status: string
       - surface: string
     - explanation: ?
+    - health_level: string
     - healthy: boolean
     - index: object
       - activity_at: ?
@@ -3538,10 +3609,23 @@ schemas: (auto-generated from contract)
         - matches_current_db_fingerprint: ?
       - fresh: boolean
       - last_indexed_at: ?
+      - quarantined_conversations: integer
       - reason: ?
       - rebuilding: boolean
       - stale: boolean
       - stale_threshold_seconds: integer
+      - stalled: boolean
+      - status: string
+    - ingest_quarantine: object
+      - circuit_breaker_active: boolean
+      - circuit_breaker_limit: integer
+      - newest_last_attempt_at_ms: ?
+      - quarantine_files: array
+      - quarantined_conversations: integer
+      - recent_quarantined_conversations: integer
+      - recent_window_seconds: integer
+      - recommended_action: ?
+      - schema_version: integer
       - status: string
     - initialized: boolean
     - pending: object
@@ -3557,12 +3641,15 @@ schemas: (auto-generated from contract)
       - indexed_docs: ?
       - job_id: ?
       - job_kind: ?
+      - last_progress_age_ms: ?
+      - last_progress_at: ?
       - mode: ?
       - orphaned: boolean
       - phase: ?
       - pid: ?
       - pipeline: object
       - processed_conversations: ?
+      - stalled: boolean
       - started_at: ?
       - total_conversations: ?
       - updated_at: ?
@@ -3574,6 +3661,8 @@ schemas: (auto-generated from contract)
       - indexed_docs: ?
       - inflight_message_bytes: ?
       - inflight_message_bytes_headroom: ?
+      - last_progress_age_ms: ?
+      - last_progress_at: ?
       - max_message_bytes_in_flight: ?
       - mode: ?
       - pending_batch_conversations: ?
@@ -3585,6 +3674,7 @@ schemas: (auto-generated from contract)
       - queue_headroom: ?
       - remaining_conversations: ?
       - runtime_available: boolean
+      - stalled: boolean
       - total_conversations: ?
       - updated_at: ?
     - recommended_action: ?
@@ -3642,6 +3732,7 @@ schemas: (auto-generated from contract)
         - present: boolean
         - ready: boolean
         - size_bytes: ?
+      - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
       - hnsw_ready: boolean
@@ -3658,6 +3749,8 @@ schemas: (auto-generated from contract)
         - present: boolean
         - ready: boolean
         - size_bytes: ?
+      - quality_tier_published: boolean
+      - semantic_only_search_available: boolean
       - status: string
       - summary: string
       - vector_index_path: ?
@@ -3697,6 +3790,7 @@ schemas: (auto-generated from contract)
         - sockets: integer
         - source: string
         - topology_class: string
+    - warnings: array
   triage:
     - _meta: object
       - data_dir: string
@@ -3733,10 +3827,12 @@ schemas: (auto-generated from contract)
         - fingerprint: object
         - fresh: boolean
         - last_indexed_at: ?
+        - quarantined_conversations: integer
         - reason: ?
         - rebuilding: boolean
         - stale: boolean
         - stale_threshold_seconds: integer
+        - stalled: boolean
         - status: string
       - pending: object
         - orphaned: boolean
@@ -3747,12 +3843,15 @@ schemas: (auto-generated from contract)
         - indexed_docs: ?
         - job_id: ?
         - job_kind: ?
+        - last_progress_age_ms: ?
+        - last_progress_at: ?
         - mode: ?
         - orphaned: boolean
         - phase: ?
         - pid: ?
         - pipeline: object
         - processed_conversations: ?
+        - stalled: boolean
         - started_at: ?
         - total_conversations: ?
         - updated_at: ?
@@ -3764,6 +3863,8 @@ schemas: (auto-generated from contract)
         - indexed_docs: ?
         - inflight_message_bytes: ?
         - inflight_message_bytes_headroom: ?
+        - last_progress_age_ms: ?
+        - last_progress_at: ?
         - max_message_bytes_in_flight: ?
         - mode: ?
         - pending_batch_conversations: ?
@@ -3775,6 +3876,7 @@ schemas: (auto-generated from contract)
         - queue_headroom: ?
         - remaining_conversations: ?
         - runtime_available: boolean
+        - stalled: boolean
         - total_conversations: ?
         - updated_at: ?
       - semantic: object
@@ -3786,6 +3888,7 @@ schemas: (auto-generated from contract)
         - embedder_id: ?
         - fallback_mode: ?
         - fast_tier: object
+        - feature_compiled_in: boolean
         - hint: ?
         - hnsw_path: ?
         - hnsw_ready: boolean
@@ -3793,6 +3896,8 @@ schemas: (auto-generated from contract)
         - preferred_backend: string
         - progressive_ready: boolean
         - quality_tier: object
+        - quality_tier_published: boolean
+        - semantic_only_search_available: boolean
         - status: string
         - summary: string
         - vector_index_path: ?

@@ -11,11 +11,27 @@
 //! - ModernBERT-embed (bake-off candidate)
 //! - Snowflake Arctic Embed (bake-off candidate)
 //! - Nomic Embed Text (bake-off candidate)
+//!
+//! # `semantic` feature gate (cass#256)
+//!
+//! When the `semantic` Cargo feature is **disabled** (i.e. baseline build), the
+//! `fastembed` crate and the prebuilt Microsoft ONNX Runtime binary it pulls in
+//! are not linked. In that build the loader methods (`load_from_dir`,
+//! `load_with_config`, `load_by_name`) return a stable
+//! `EmbedderError::EmbedderUnavailable` describing the missing capability. The
+//! free static methods (`canonical_name`, `model_dir_for`, `embedder_id_static`,
+//! `default_model_dir`, `config_for`, `select_model_file`,
+//! `runtime_model_dir_for`, etc.) remain fully functional so the lexical-only
+//! search path continues to compile and run.
 
-use std::fs;
 use std::path::{Path, PathBuf};
+
+#[cfg(feature = "semantic")]
+use std::fs;
+#[cfg(feature = "semantic")]
 use std::sync::Mutex;
 
+#[cfg(feature = "semantic")]
 use fastembed::{
     InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
 };
@@ -23,13 +39,25 @@ use fastembed::{
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
 use frankensearch::{ModelCategory, ModelTier};
 
+/// Stand-in for `fastembed::Pooling` when the `semantic` feature is disabled.
+///
+/// Mirrors only the variants that cass references (`Mean` is the sole pooling
+/// strategy in [`OnnxEmbedderConfig::default`]). The variant carries no
+/// behaviour in baseline builds because all loader paths return
+/// `EmbedderUnavailable` before pooling would be consulted.
+#[cfg(not(feature = "semantic"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pooling {
+    Mean,
+}
+
 // MiniLM constants (baseline)
 const MINILM_MODEL_ID: &str = "all-minilm-l6-v2";
 const MINILM_DIR_NAME: &str = "all-MiniLM-L6-v2";
 const MINILM_EMBEDDER_ID: &str = "minilm-384";
 const MINILM_DIMENSION: usize = 384;
 
-// Standard ONNX file names — prefer onnx/ subdir (modern layout), fall back to flat (legacy).
+// Standard ONNX file names: prefer onnx/ subdir (modern layout), fall back to flat (legacy).
 pub const MODEL_ONNX_SUBDIR: &str = "onnx/model.onnx";
 pub const MODEL_ONNX_LEGACY: &str = "model.onnx";
 const TOKENIZER_JSON: &str = "tokenizer.json";
@@ -64,7 +92,12 @@ impl Default for OnnxEmbedderConfig {
 /// FastEmbed-backed semantic embedder.
 ///
 /// Supports multiple ONNX models with configurable dimensions and pooling.
+///
+/// In baseline builds (`#[cfg(not(feature = "semantic"))]`), the `model`
+/// field is omitted and any loader method returns
+/// `EmbedderError::EmbedderUnavailable`.
 pub struct FastEmbedder {
+    #[cfg(feature = "semantic")]
     model: Mutex<TextEmbedding>,
     id: String,
     model_id: String,
@@ -85,7 +118,7 @@ impl FastEmbedder {
     /// Required non-model files for any ONNX embedder.
     ///
     /// The ONNX model itself can live at `onnx/model.onnx` (modern) or
-    /// `model.onnx` (legacy) — use [`select_model_file`] to find it.
+    /// `model.onnx` (legacy); use [`select_model_file`] to find it.
     pub fn required_model_files() -> &'static [&'static str] {
         &[
             TOKENIZER_JSON,
@@ -118,7 +151,7 @@ impl FastEmbedder {
 
     /// Get model directory for a specific embedder name.
     pub fn model_dir_for(data_dir: &Path, embedder_name: &str) -> Option<PathBuf> {
-        let dir_name = match embedder_name {
+        let dir_name = match Self::canonical_name(embedder_name)? {
             "minilm" => MINILM_DIR_NAME,
             "snowflake-arctic-s" => "snowflake-arctic-embed-s",
             "nomic-embed" => "nomic-embed-text-v1.5",
@@ -127,9 +160,32 @@ impl FastEmbedder {
         Some(data_dir.join("models").join(dir_name))
     }
 
+    /// Resolve the runtime model directory for an embedder.
+    ///
+    /// `model_dir_for` is the cass-managed cache location. This variant honors
+    /// the explicit FRANKENSEARCH_MODEL_DIR override used by operators who
+    /// pre-stage a model bundle outside the cass data directory.
+    pub fn runtime_model_dir_for(data_dir: &Path, embedder_name: &str) -> Option<PathBuf> {
+        model_dir_override().or_else(|| Self::model_dir_for(data_dir, embedder_name))
+    }
+
+    pub fn canonical_name(embedder_name: &str) -> Option<&'static str> {
+        match embedder_name.trim().to_ascii_lowercase().as_str() {
+            "fastembed" | "minilm" | "all-minilm-l6-v2" | "minilm-384" => Some("minilm"),
+            "snowflake"
+            | "snowflake-arctic-s"
+            | "snowflake-arctic-embed-s"
+            | "snowflake-arctic-s-384" => Some("snowflake-arctic-s"),
+            "nomic" | "nomic-embed" | "nomic-embed-text-v1.5" | "nomic-embed-768" => {
+                Some("nomic-embed")
+            }
+            _ => None,
+        }
+    }
+
     /// Get config for a specific embedder by name.
     pub fn config_for(embedder_name: &str) -> Option<OnnxEmbedderConfig> {
-        match embedder_name {
+        match Self::canonical_name(embedder_name)? {
             "minilm" => Some(OnnxEmbedderConfig {
                 embedder_id: "minilm-384".to_string(),
                 model_id: "all-minilm-l6-v2".to_string(),
@@ -153,11 +209,25 @@ impl FastEmbedder {
     }
 
     /// Load the MiniLM model (convenience wrapper).
+    ///
+    /// Baseline builds (no `semantic` feature) return
+    /// `EmbedderError::EmbedderUnavailable` because the prebuilt ONNX Runtime
+    /// is not linked; see the crate-level note on cass#256.
+    #[cfg(feature = "semantic")]
     pub fn load_from_dir(model_dir: &Path) -> EmbedderResult<Self> {
         Self::load_with_config(model_dir, OnnxEmbedderConfig::default())
     }
 
+    #[cfg(not(feature = "semantic"))]
+    pub fn load_from_dir(_model_dir: &Path) -> EmbedderResult<Self> {
+        Err(Self::unavailable_error(
+            MINILM_EMBEDDER_ID,
+            "semantic search is not available in this build (cass was built without the `semantic` feature; rebuild with `--features semantic` or use the full release artifact)",
+        ))
+    }
+
     /// Load an ONNX embedder with custom configuration.
+    #[cfg(feature = "semantic")]
     pub fn load_with_config(model_dir: &Path, config: OnnxEmbedderConfig) -> EmbedderResult<Self> {
         if !model_dir.is_dir() {
             return Err(Self::unavailable_error(
@@ -246,15 +316,31 @@ impl FastEmbedder {
         })
     }
 
+    /// Baseline-build stub: see the crate-level note on cass#256.
+    #[cfg(not(feature = "semantic"))]
+    pub fn load_with_config(_model_dir: &Path, config: OnnxEmbedderConfig) -> EmbedderResult<Self> {
+        Err(Self::unavailable_error(
+            &config.embedder_id,
+            "semantic search is not available in this build (cass was built without the `semantic` feature; rebuild with `--features semantic` or use the full release artifact)",
+        ))
+    }
+
     /// Load an embedder by name from the data directory.
+    #[cfg(feature = "semantic")]
     pub fn load_by_name(data_dir: &Path, embedder_name: &str) -> EmbedderResult<Self> {
-        let model_dir = Self::model_dir_for(data_dir, embedder_name).ok_or_else(|| {
+        let canonical_name = Self::canonical_name(embedder_name).ok_or_else(|| {
             Self::unavailable_error(
                 embedder_name,
                 format!("unknown embedder: {}", embedder_name),
             )
         })?;
-        let config = Self::config_for(embedder_name).ok_or_else(|| {
+        let model_dir = Self::runtime_model_dir_for(data_dir, canonical_name).ok_or_else(|| {
+            Self::unavailable_error(
+                embedder_name,
+                format!("unknown embedder: {}", embedder_name),
+            )
+        })?;
+        let config = Self::config_for(canonical_name).ok_or_else(|| {
             Self::unavailable_error(
                 embedder_name,
                 format!("no config for embedder: {}", embedder_name),
@@ -263,11 +349,20 @@ impl FastEmbedder {
         Self::load_with_config(&model_dir, config)
     }
 
+    #[cfg(not(feature = "semantic"))]
+    pub fn load_by_name(_data_dir: &Path, embedder_name: &str) -> EmbedderResult<Self> {
+        Err(Self::unavailable_error(
+            embedder_name,
+            "semantic search is not available in this build (cass was built without the `semantic` feature; rebuild with `--features semantic` or use the full release artifact)",
+        ))
+    }
+
     /// Stable model identifier for compatibility checks.
     pub fn model_id(&self) -> &str {
         &self.model_id
     }
 
+    #[cfg(feature = "semantic")]
     fn read_required(path: PathBuf, label: &str, model_id: &str) -> EmbedderResult<Vec<u8>> {
         fs::read(&path).map_err(|e| {
             Self::unavailable_error(
@@ -284,6 +379,7 @@ impl FastEmbedder {
         }
     }
 
+    #[cfg(feature = "semantic")]
     fn normalize_in_place(embedding: &mut [f32]) {
         let norm_sq: f32 = embedding.iter().map(|x| x * x).sum();
         if norm_sq.is_finite() && norm_sq > f32::EPSILON {
@@ -292,12 +388,35 @@ impl FastEmbedder {
                 *v *= inv_norm;
             }
         } else {
-            // NaN/Inf contamination — zero out to prevent poisoning similarity search.
+            // NaN/Inf contamination: zero out to prevent poisoning similarity search.
             embedding.fill(0.0);
         }
     }
 }
 
+pub fn model_dir_override() -> Option<PathBuf> {
+    dotenvy::var("FRANKENSEARCH_MODEL_DIR")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| expand_model_dir_override(&raw))
+}
+
+fn expand_model_dir_override(raw: &str) -> PathBuf {
+    if raw == "~" {
+        return dotenvy::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(raw));
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return dotenvy::var("HOME")
+            .map(|home| PathBuf::from(home).join(rest))
+            .unwrap_or_else(|_| PathBuf::from(raw));
+    }
+    PathBuf::from(raw)
+}
+
+#[cfg(feature = "semantic")]
 impl Embedder for FastEmbedder {
     fn embed_sync(&self, text: &str) -> EmbedderResult<Vec<f32>> {
         if text.is_empty() {
@@ -428,9 +547,56 @@ impl Embedder for FastEmbedder {
     }
 }
 
+// Baseline-build `Embedder` impl. `FastEmbedder` cannot actually be
+// instantiated in this build (`load_*` all return `EmbedderUnavailable`),
+// so the `embed_sync` / `embed_batch_sync` arms are unreachable in practice.
+// We still provide the impl so existing `Arc<dyn Embedder>` plumbing
+// compiles without a `cfg`-shower in every call site.
+#[cfg(not(feature = "semantic"))]
+impl Embedder for FastEmbedder {
+    fn embed_sync(&self, _text: &str) -> EmbedderResult<Vec<f32>> {
+        Err(Self::unavailable_error(
+            &self.id,
+            "semantic search is not available in this build (cass was built without the `semantic` feature; rebuild with `--features semantic` or use the full release artifact)",
+        ))
+    }
+
+    fn embed_batch_sync(&self, _texts: &[&str]) -> EmbedderResult<Vec<Vec<f32>>> {
+        Err(Self::unavailable_error(
+            &self.id,
+            "semantic search is not available in this build (cass was built without the `semantic` feature; rebuild with `--features semantic` or use the full release artifact)",
+        ))
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model_id
+    }
+
+    fn is_semantic(&self) -> bool {
+        true
+    }
+
+    fn category(&self) -> ModelCategory {
+        ModelCategory::TransformerEmbedder
+    }
+
+    fn tier(&self) -> ModelTier {
+        ModelTier::Quality
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn fastembed_missing_files_returns_unavailable() {
@@ -501,5 +667,49 @@ mod tests {
         assert_eq!(nomic.dimension, 768);
 
         assert!(FastEmbedder::config_for("unknown").is_none());
+    }
+
+    #[test]
+    fn canonical_name_accepts_policy_and_index_aliases() {
+        assert_eq!(FastEmbedder::canonical_name("fastembed"), Some("minilm"));
+        assert_eq!(
+            FastEmbedder::canonical_name("snowflake-arctic-s-384"),
+            Some("snowflake-arctic-s")
+        );
+        assert_eq!(
+            FastEmbedder::canonical_name("nomic-embed-text-v1.5"),
+            Some("nomic-embed")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_model_dir_honors_frankensearch_override_and_expands_home() {
+        let old_override = dotenvy::var("FRANKENSEARCH_MODEL_DIR").ok();
+        let old_home = dotenvy::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", "/tmp/cass-home-for-model-test");
+            std::env::set_var("FRANKENSEARCH_MODEL_DIR", "~/models/snowflake");
+        }
+
+        let resolved = FastEmbedder::runtime_model_dir_for(Path::new("/tmp/cass"), "snowflake")
+            .expect("runtime model dir");
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/cass-home-for-model-test/models/snowflake")
+        );
+
+        unsafe {
+            if let Some(value) = old_override {
+                std::env::set_var("FRANKENSEARCH_MODEL_DIR", value);
+            } else {
+                std::env::remove_var("FRANKENSEARCH_MODEL_DIR");
+            }
+            if let Some(value) = old_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
     }
 }

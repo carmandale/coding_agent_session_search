@@ -97,10 +97,10 @@ cass sources agents include openclaw
 **Quarantine, GC, and the doctor/diag surface**
 - Corrupt or failed-validation assets are quarantined rather than auto-deleted. `cass diag --json --quarantine` enumerates every quarantined artifact (failed seed bundles, retained publish backups, quarantined lexical generations) with `size_bytes`, `age_seconds`, `safe_to_gc`, and a human-readable `gc_reason`. The `safe_to_gc` flag is **advisory** — it reflects retention policy + cleanup dry-run eligibility and is not wired to any automatic deletion path.
 - `cass doctor --json` surfaces the same quarantine summary plus `checks[]` status for every diagnostic the tool runs. Without `--fix`, doctor is read-only (`auto_fix_applied=false`, `auto_fix_actions=[]`, `issues_fixed=0`); with `--fix` it applies only the repairs whose dry-run plans are proven safe (currently: Track A analytics rebuild, Track B rollup rebuild via `rebuild_token_daily_stats` when the `token_usage` ledger is intact).
-- Lexical generation cleanup uses a dispositions + inspection-required-first policy. Operators running `cass doctor --fix` never have a generation reclaimed silently — every quarantine stays on disk until an explicit `cass models backfill` / `cass index --full --force-rebuild` replaces the source data.
+- Lexical generation cleanup uses a dispositions + inspection-required-first policy. Operators running `cass doctor --fix` never have a generation reclaimed silently — every quarantine stays on disk until an explicit derived-asset rebuild (`cass models backfill` or an index refresh recommended by `cass health --json`) supersedes it.
 
 **Schema stability guarantees**
-- The JSON contract surfaces (`triage`, `capabilities`, `health`, `status`, `diag`, `models status`, `models verify`, `models check-update`, `introspect`, `doctor`, `api-version`, `stats`, `sessions`, `search`, `pack`) are pinned by golden-file regression tests under `tests/golden/robot/`. A change to any field name, type, or nullability fails the golden test suite and requires a deliberate regeneration pass (`UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`).
+- The JSON contract surfaces (`triage`, `capabilities`, `health`, `status`, `diag`, `models status`, `models verify`, `models check-update`, `introspect`, `doctor`, `api-version`, `stats`, `sessions`, `search`, `pack`, `swarm status`, `swarm work-packet`, `swarm lint`) are pinned by golden-file regression tests under `tests/golden/robot/`. A change to any field name, type, or nullability fails the golden test suite and requires a deliberate regeneration pass (`UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`).
 - `cass introspect --json`'s `response_schemas` block enumerates every schema in a stable alphabetical order (`BTreeMap`-backed — see bead coding_agent_session_search-8sl73).
 - Error envelopes (`{error: {code, kind, message, hint, retryable}}`) have a fixed shape. `kind` values are kebab-case; branch on `err.kind`, not on the numeric code, for codes ≥ 10 (see the Error Handling section below).
 
@@ -880,6 +880,41 @@ or `no_evidence_found` are data, not prose; branch on the JSON fields before
 copying the pack into another tool. Stale selected evidence is structural:
 inspect `freshness.stale_evidence_count`.
 
+### Swarm Operations Workflow
+
+Use the swarm surfaces when multiple agents are sharing one repo and you need a
+single read-only view before claiming work:
+
+```bash
+# Current shared-work snapshot; does not claim, reopen, release, or run builds
+cass swarm status --json
+
+# Advisory packet for one bead; still create real reservations and Beads updates yourself
+cass swarm work-packet --json --bead coding_agent_session_search-example
+
+# Coordination hygiene check before closeout or takeover review
+cass swarm lint --json --bead coding_agent_session_search-example
+
+# Read-only sibling dependency drift sentinel
+cass swarm dependency-drift --json
+```
+
+`swarm status` composes Beads, Agent Mail metadata, git state, rch/build
+pressure, cass health/status, and proof references. Stale candidates are
+advisory only: coordinate through Beads and Agent Mail before reopening,
+force-releasing, or taking over work. Suggested commands are robot-safe
+templates, not automatic actions.
+
+`swarm dependency-drift` reads `Cargo.toml` and optional sibling checkouts to
+report manifest pins, local HEAD/dirty state, strict validation commands, and
+release-risk recommendations. It does not fetch remotes, edit manifests, run
+builds, update Beads, send Agent Mail, delete files, or mutate git state.
+
+When status points at prior evidence, use `cass pack "query" --robot` to create
+a bounded cited handoff for another agent. Packs complement the cockpit; they do
+not replace Beads for ownership, Agent Mail for coordination, or rch for proof
+commands.
+
 ### Token Budget Management
 
 LLMs have context limits. `cass` provides multiple levers to control output size:
@@ -936,7 +971,7 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 | 2 | Usage error | Fix syntax (hint provided) |
 | 3 | Index/DB missing | Run `cass index --full` (retryable: true) |
 | 4 | Network error | Check connectivity |
-| 5 | Data corruption | Run `cass index --full --force-rebuild` |
+| 5 | Data corruption | Run `cass doctor check --json`; repair or restore the canonical SQLite archive before indexing |
 | 6 | Incompatible version | Update cass |
 | 7 | Lock/busy | Retry later |
 | 8 | Partial result | Increase `--timeout` or reduce scope |
@@ -2235,7 +2270,7 @@ This ensures that version upgrades with schema changes can rebuild the lexical d
 | Schema version change | Hash mismatch in `schema_hash.json` | Full rebuild |
 | Missing `meta.json` | Tantivy can't open index | Rebuild and publish a fresh derivative |
 | Corrupted index files | `Index::open_in_dir()` fails | Rebuild and publish a fresh derivative |
-| Explicit request | `--force-rebuild` flag | Clean slate rebuild |
+| Explicit request | `--force-rebuild` flag | Rebuild derived search assets from the canonical SQLite archive |
 
 **SQLite as Ground Truth**:
 The SQLite database serves as the authoritative data store. Lexical rebuilds reconstruct the Tantivy index from SQLite:
@@ -2502,6 +2537,9 @@ cass status --json                    # Quick health snapshot
 cass health                           # Minimal pre-flight check (<50ms)
 cass capabilities --json              # First-stop agent self-description
 cass introspect --json                # Full API schema
+cass swarm status --json              # Read-only Beads/Agent Mail/git/rch swarm snapshot
+cass swarm work-packet --json         # Advisory claim packet; no mutations
+cass swarm lint --json                # Coordination and proof-gap lint
 cass context /path/to/session --json  # Find related sessions
 cass view /path/to/file -n 42 --json  # View source at line
 
@@ -2536,6 +2574,10 @@ cass completions bash > ~/.bash_completion.d/cass
 | `health` | Minimal health check (<50ms), exit 0=healthy, 1=unhealthy |
 | `capabilities` | First-stop agent self-description: workflow recipes, mistake recoveries, commands, global flags, exit codes, env vars, and limits |
 | `introspect` | Full API schema: commands, arguments, response shapes |
+| `swarm status --json` | Read-only shared-repo operations snapshot across Beads, Agent Mail metadata, git, build pressure, cass readiness, and proof refs |
+| `swarm work-packet --json` | Advisory one-agent packet with readiness, suggested reservations, verification commands, and closeout checklist; it does not claim or reserve |
+| `swarm lint --json` | Read-only coordination protocol lint for missing mail, stale reservations, status mismatches, and proof gaps |
+| `swarm dependency-drift --json` | Read-only sibling dependency sentinel for Cargo.toml pins, optional local checkout HEAD/dirty state, strict validation commands, and release-risk recommendations |
 | `sessions [--workspace DIR] [--current]` | Discover recent session files for follow-up actions |
 | `context <path>` | Find related sessions by workspace, day, or agent |
 | `view <path> -n N` | View source file at specific line (follow-up on search) |
@@ -2861,6 +2903,11 @@ Update check state is stored in the data directory:
 | `CASS_DEBUG_CACHE_METRICS` | unset | Enable cache hit/miss logging |
 | **Semantic Search** | | |
 | `CASS_SEMANTIC_EMBEDDER` | auto | Force embedder: `hash` or `minilm` |
+| `CASS_SEMANTIC_PROGRESS_JSONL` | unset | Absolute path to a JSONL file the semantic backfill appends one event per transition to (`selection_*`, `packet_replay_*`, `embed_batch_*`, `staging_write_*`, `checkpoint_save_*`, `publish_*`, `error`, `cancelled`, `complete`). Each line carries timestamp, phase + sub-phase, batch/row counters, byte counts, elapsed-since-start, and a cheap RSS estimate. Silent when unset. Best-effort writes — failures log at debug and never crash a backfill. See [cass#257](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/257). |
+| `CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS` | 30000 | Warn when one embedder batch takes more than 30s. Derived from cass#257 boxed quality-corpus telemetry: 60 MiniLM batches averaged ~5.95s, so the default is about 5x the observed healthy batch. Set `0` to disable warnings. |
+| `CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS` | 300000 | Abort a semantic backfill batch after a single embedder batch returns if it exceeded 5 minutes. Derived as a conservative ~50x multiple of the cass#257 healthy 128-doc MiniLM batch average. Set `0` to disable failure. |
+| `CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT` | 10000 | Soft cap for `cass models backfill`: checkpoint after a whole-conversation prefix near 10k selected messages. Derived from cass#257 high-volume proof (7,618 docs in ~6 minutes) plus the original 10k-message workaround. Set `0` for no message cap. |
+| `CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT` | 8388608 | Soft cap for `cass models backfill`: checkpoint after a whole-conversation prefix near 8 MiB selected content. Derived from cass#257 high-volume proof (4.3 MiB selected bytes) with about 2x headroom. Set `0` for no byte cap. |
 | **TUI** | | |
 | `TUI_HEADLESS` | unset | Disable interactive features |
 | `CASS_ALLOW_DUMB_TERM` | unset | Allow TUI startup even when `TERM=dumb` |
@@ -2880,23 +2927,24 @@ Update check state is stored in the data directory:
 
 ---
 
-## Sibling Dependency Contract
+## Dependency Source Contract
 
-`cass` pins git revisions in [`Cargo.toml`](Cargo.toml) for `asupersync`, `frankensqlite`/`fsqlite-types`, `franken-agent-detection`, `frankensearch`, `frankentui`, and `toon` (`tru`). The repo also commits local `[patch]` overrides for `frankensqlite`, `franken-agent-detection`, and `frankensearch`; the remaining sibling repos can be switched to `/data/projects/*` checkouts during local development.
+`cass` pins dependency identities in [`Cargo.toml`](Cargo.toml): registry versions for crates.io-only dependencies and git revisions for source dependencies. The repo keeps local `[patch]` overrides commented out by default; enable them only for local development and never commit an active sibling path override.
 
-| Dependency | Pinned revision |
+| Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `c8ce64fd` |
-| `franken-agent-detection` | `a0ce134b` |
-| `asupersync` | `0.3.1` |
-| `frankensearch` | `831b3b13` |
+| `frankensqlite` / `fsqlite-types` | `0.1.4` (crates.io; #93 + #94 fixes) |
+| `franken-agent-detection` | `b62d8597` |
+| `asupersync` | `0.3.2` |
+| `frankensearch` | `2cad158f` |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 
 **Build-time validation**
-- `build.rs` validates the active local overrides against the expected package name, package version, patch path, and Cargo feature/default-features contract.
-- If an active sibling checkout has drifted away from the pinned git revision or has a dirty worktree, the build emits a warning instead of silently trusting it.
+- `build.rs` validates the committed dependency source contract against the expected package name, package version, Cargo feature/default-features contract, and git source where applicable.
+- If an active git-pinned sibling checkout has drifted away from the pinned revision or has a dirty worktree, the build emits a warning instead of silently trusting it. Crates.io-only pins are validated by package version.
 - Enable strict enforcement with `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation` or `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. Strict mode upgrades drift warnings to hard errors and also validates the optional sibling repos before you switch them to local path overrides.
+- Use `cass swarm dependency-drift --json` for a fast read-only preflight. It reports each manifest pin, optional sibling checkout HEAD/dirty state, upstream status as `not_checked`, and the exact strict-validation commands to run; it never fetches remotes or mutates files.
 
 **Expected interface contract**
 - `frankensqlite` (`fsqlite`): `Connection`, `params!`, and `compat::{ConnectionExt, RowExt}` with `row.get_typed(...)`.

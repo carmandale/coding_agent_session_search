@@ -267,6 +267,14 @@ fn prepare_local_sync_container(sync_root: &Path, local_path: &Path) -> Result<(
     Ok(())
 }
 
+fn prepare_local_sync_root(local_store: &Path, mirror_dir: &Path) -> Result<(), String> {
+    reject_local_symlink_below_root(local_store, mirror_dir)?;
+    std::fs::create_dir_all(mirror_dir)
+        .map_err(|e| format!("Failed to create directory: {}", e))?;
+    reject_local_symlink_below_root(local_store, mirror_dir)?;
+    Ok(())
+}
+
 fn sftp_file_stat_is_symlink(stat: &FileStat) -> bool {
     stat.file_type().is_symlink()
 }
@@ -657,7 +665,8 @@ impl SyncEngine {
 
         // Create the mirror directory
         let mirror_dir = self.mirror_dir(&source.name);
-        std::fs::create_dir_all(&mirror_dir)?;
+        prepare_local_sync_root(&self.local_store, &mirror_dir)
+            .map_err(|e| SyncError::CreateDirFailed(std::io::Error::other(e)))?;
 
         // Pre-fetch remote home directory if any paths use tilde (avoids multiple SSH calls)
         let remote_home = if source.paths.iter().enumerate().any(|(index, path)| {
@@ -2423,9 +2432,7 @@ impl SyncStatus {
             std::fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(self)?;
-        let tmp_path = unique_atomic_temp_path(&path);
-        std::fs::write(&tmp_path, content)?;
-        sync_file_path(&tmp_path)?;
+        let tmp_path = write_sync_status_temp_file(&path, content.as_bytes())?;
         replace_file_from_temp(&tmp_path, &path)
     }
 
@@ -2607,6 +2614,37 @@ fn sync_result_auth_failure(result: &SyncResult) -> bool {
 
 fn unique_atomic_temp_path(path: &Path) -> PathBuf {
     unique_atomic_sidecar_path(path, "tmp", "sync_status.json")
+}
+
+fn write_sync_status_temp_file(
+    final_path: &Path,
+    content: &[u8],
+) -> Result<PathBuf, std::io::Error> {
+    for _ in 0..100 {
+        let tmp_path = unique_atomic_temp_path(final_path);
+        match write_sync_status_temp_file_at(&tmp_path, content) {
+            Ok(()) => return Ok(tmp_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate unique sync status temp path for {}",
+            final_path.display()
+        ),
+    ))
+}
+
+fn write_sync_status_temp_file_at(path: &Path, content: &[u8]) -> Result<(), std::io::Error> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(content)?;
+    file.sync_all()
 }
 
 fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std::io::Error> {
@@ -3106,6 +3144,33 @@ mod tests {
         assert!(err.contains("mirror-link"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_prepare_local_sync_root_rejects_symlinked_source_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let local_store = temp.path().join("data");
+        let remotes = local_store.join("remotes");
+        let outside = temp.path().join("outside");
+        let source_link = remotes.join("laptop");
+        let mirror_dir = source_link.join("mirror");
+
+        std::fs::create_dir_all(&remotes).expect("create remotes");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        symlink(&outside, &source_link).expect("symlink source parent");
+
+        let err = prepare_local_sync_root(&local_store, &mirror_dir)
+            .expect_err("symlinked source parent should be rejected before mkdir");
+
+        assert!(err.contains("Refusing to write"));
+        assert!(err.contains("laptop"));
+        assert!(
+            !outside.join("mirror").exists(),
+            "sync root preparation must not create directories through source parent symlinks"
+        );
+    }
+
     #[test]
     fn test_sftp_file_stat_is_symlink_detects_link_modes() {
         let symlink = FileStat {
@@ -3477,6 +3542,35 @@ Total transferred file size: 1,234 bytes
         assert_eq!(info.files_synced, 3);
         assert_eq!(info.bytes_transferred, 42);
         assert!(matches!(info.last_result, SyncResult::Success));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sync_status_temp_write_refuses_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let protected = temp.path().join("protected.json");
+        let temp_path = temp.path().join(".sync_status.json.tmp");
+
+        std::fs::write(&protected, b"protected").expect("write protected target");
+        symlink(&protected, &temp_path).expect("create temp symlink");
+
+        let err = write_sync_status_temp_file_at(&temp_path, br#"{"sources":{}}"#)
+            .expect_err("existing temp symlink must be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&protected).expect("read protected target"),
+            b"protected"
+        );
+        assert!(
+            std::fs::symlink_metadata(&temp_path)
+                .expect("temp path metadata")
+                .file_type()
+                .is_symlink(),
+            "failed temp write should leave the existing symlink untouched"
+        );
     }
 
     #[test]

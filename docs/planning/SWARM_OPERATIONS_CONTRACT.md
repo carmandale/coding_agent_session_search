@@ -15,10 +15,77 @@ The initial command name is:
 cass swarm status --json
 ```
 
+The first advisory planning command built on that status payload is:
+
+```bash
+cass swarm work-packet --json
+cass swarm work-packet --json --bead coding_agent_session_search-example
+```
+
 The command is advisory. It does not claim beads, release reservations, kill
 processes, run builds, repair indexes, mutate git state, or scrape raw private
 session content. It reports what it can prove, names the source of each section,
 and marks unavailable providers as partial data.
+
+## Operator Workflow
+
+Use the swarm surface as a cockpit, not as an ownership system. Beads remains
+the source of truth for issue status, Agent Mail remains the coordination
+channel, rch remains the required build/test execution path, and cass
+search/pack remains the evidence lookup and handoff path.
+
+1. Start with a read-only snapshot:
+
+   ```bash
+   cass swarm status --json
+   ```
+
+   Read `summary.recommended_action`, `providers[]`, `beads.ready[]`,
+   `reservations[]`, `build_pressure`, and `evidence.proof_gaps[]`. Partial
+   provider status is a warning to inspect, not permission to override another
+   agent.
+
+2. If a bead looks safe, ask for a scoped packet before editing:
+
+   ```bash
+   cass swarm work-packet --json --bead coding_agent_session_search-example
+   ```
+
+   The packet may suggest file reservations, Agent Mail copy, and rch proof
+   commands. It does not create those reservations, send the mail, update Beads,
+   or run the commands. Agents still use the real tools:
+   `br update ... --status in_progress --json`, Agent Mail reservations and
+   messages, and `rch exec -- env CARGO_TARGET_DIR=... cargo ...`.
+
+3. If `stale_candidate_count` is non-zero, treat it as a review queue:
+
+   ```bash
+   cass swarm status --json --stale-threshold-seconds 3600
+   br show coding_agent_session_search-example --json
+   ```
+
+   Stale detection is advisory only. Do not reopen, force-release, or take over
+   work until Beads, Agent Mail, reservations, dirty paths, and recent commits
+   all agree that the holder is inactive or explicit coordination has happened.
+
+4. If status points at prior proof or discussion, build a bounded cited handoff:
+
+   ```bash
+   cass pack "coding_agent_session_search-example closeout proof" --robot --max-tokens 8000
+   ```
+
+   Packs are token-budgeted evidence bundles. They are useful for handoff and
+   review, but they do not replace Beads close reasons, Agent Mail closeout, or
+   command transcripts.
+
+5. Before closeout or takeover review, lint coordination hygiene:
+
+   ```bash
+   cass swarm lint --json --bead coding_agent_session_search-example
+   ```
+
+   Findings are suggestions. The lint surface never acknowledges messages,
+   sends mail, edits files, releases reservations, updates beads, or runs git.
 
 ## Goals
 
@@ -80,6 +147,111 @@ JSON error envelope with `err.kind="swarm-unsupported-format"`.
 Provider fixtures must never contact live Agent Mail, run git commands against a
 remote, or inspect private session logs. They are for deterministic tests and
 golden generation.
+
+## Work Packet Surface
+
+`cass swarm work-packet --json` is a read-only projection over
+`cass swarm status --json`. It selects the first safe ready bead, or a requested
+`--bead <id>`, and returns a scoped advisory packet for one agent. It must not
+claim the bead, reserve files, send Agent Mail, or run verification commands.
+
+Top-level shape:
+
+```json
+{
+  "schema_version": "cass.swarm.work_packet.v1",
+  "status": "ok",
+  "_meta": {
+    "source_schema_version": "cass.swarm.status.v1"
+  },
+  "filter": {"bead_id": null},
+  "summary": {
+    "bead_id": "coding_agent_session_search-example",
+    "safe_to_start": true,
+    "readiness_state": "ready",
+    "recommended_action": "claim-ready-bead",
+    "requires_coordination": false,
+    "claim_blocker_count": 0,
+    "suggested_reservation_count": 2,
+    "proof_command_count": 3
+  },
+  "work_packet": {
+    "bead": {},
+    "readiness": {},
+    "suggested_reservations": [],
+    "coordination": {},
+    "verification": {},
+    "closeout": {},
+    "fallback_actions": []
+  },
+  "source_status": {},
+  "privacy": {}
+}
+```
+
+`readiness_state` is branchable: `ready`, `blocked`,
+`build-pressure-high`, `provider-partial`, `bead-not-found`, or
+`no-ready-work`. Only `ready` sets `summary.safe_to_start=true`. Suggested file
+reservations are heuristics derived from labels and existing status evidence;
+they are not leases. Operators and agents still create real reservations through
+Agent Mail. Verification commands must use the project rch command shapes, and
+high build pressure changes the recommendation to `wait-for-rch-capacity`
+without deleting the later proof plan.
+
+The work packet closeout section may include commands such as `br close ...`,
+but these remain suggestions. Agents still need an artifact-backed proof summary,
+an Agent Mail closeout, and the normal Beads state transition.
+
+## Coordination Lint Surface
+
+`cass swarm lint --json` is a read-only protocol checker over the same Beads,
+Agent Mail, git, reservation, and evidence snapshots used by status and
+work-packet. It detects hygiene problems before an agent starts or closes work:
+missing start mail, missing closeout mail, unacknowledged `ack_required`
+messages, stale or dead-agent reservations, bead status mismatches, missing
+close reasons, missing proof references, dirty peer files, unsafe takeover
+language, and unavailable Agent Mail.
+
+The lint command never acknowledges messages, sends mail, updates Beads,
+releases reservations, edits files, or runs git commands. Its `safe_next_action`
+fields are suggestions only.
+
+```json
+{
+  "schema_version": "cass.swarm.coordination_lint.v1",
+  "status": "ok",
+  "summary": {
+    "finding_count": 0,
+    "error_count": 0,
+    "warning_count": 0,
+    "info_count": 0,
+    "mutation_performed": false,
+    "recommended_action": "coordination-clean"
+  },
+  "findings": [],
+  "mutation_contract": {
+    "read_only": true,
+    "agent_mail_mutations": false,
+    "bead_mutations": false,
+    "reservation_mutations": false,
+    "git_mutations": false,
+    "safe_next_actions_are_suggestions": true
+  }
+}
+```
+
+Findings are deterministic and metadata-only:
+
+| Field | Type | Contract |
+|-------|------|----------|
+| `id` | string | Stable `code:subject_kind:subject_id` identifier. |
+| `severity` | enum | `error`, `warning`, or `info`. |
+| `code` | string | Branchable finding code such as `missing-closeout-mail`. |
+| `subject_kind` | string | `bead`, `message`, `reservation`, `provider`, or `git`. |
+| `subject_id` | string | Bead id, message id/thread id, reservation reason, or provider name. |
+| `evidence_refs` | array[string] | Provider paths used for the finding. |
+| `safe_next_action` | string | Suggested non-mutating or explicitly operator-chosen next step. |
+| `redacted_snippet` | string/null | Optional redacted subject/snippet only; full mail bodies stay omitted. |
 
 ## Exit Semantics
 

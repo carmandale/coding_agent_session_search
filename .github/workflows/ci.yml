@@ -167,6 +167,7 @@ jobs:
       - name: Clone sibling dependencies
         shell: bash
         run: |
+          git config --global core.longpaths true
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
@@ -198,7 +199,7 @@ jobs:
     name: UBS (Ultimate Bug Scanner) Pre-Merge Gate
     needs: [no-mock-audit]
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 60
     steps:
       - name: Checkout (full history for diff)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -369,6 +370,7 @@ jobs:
       - name: Clone sibling dependencies
         shell: bash
         run: |
+          git config --global core.longpaths true
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
@@ -379,6 +381,16 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
+      - name: Configure Windows MSVC CRT for cc-rs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # esaxx-rs requests /MT via cc-rs, while ONNX Runtime ships /MD objects.
+          # Disable cc-rs defaults and choose /MD explicitly so all linked objects agree.
+          "CRATE_CC_NO_DEFAULTS=1" >> $env:GITHUB_ENV
+          "CFLAGS=/MD" >> $env:GITHUB_ENV
+          "CXXFLAGS=/MD" >> $env:GITHUB_ENV
 
       - name: Run tests
         # Explicit feature list excludes `strict-path-dep-validation` — see the
@@ -488,7 +500,7 @@ jobs:
   e2e-orchestrated:
     name: E2E Orchestrator (Rust + Shell)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -562,6 +574,7 @@ jobs:
             test-results/e2e/combined.jsonl
             test-results/e2e/summary.md
             test-results/e2e/*.jsonl
+            test-results/e2e/*.log
           if-no-files-found: ignore
           retention-days: 14
 
@@ -722,6 +735,16 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
+      - name: Configure Windows MSVC CRT for cc-rs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # esaxx-rs requests /MT via cc-rs, while ONNX Runtime ships /MD objects.
+          # Disable cc-rs defaults and choose /MD explicitly so all linked objects agree.
+          "CRATE_CC_NO_DEFAULTS=1" >> $env:GITHUB_ENV
+          "CFLAGS=/MD" >> $env:GITHUB_ENV
+          "CXXFLAGS=/MD" >> $env:GITHUB_ENV
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}

@@ -1,11 +1,14 @@
 pub(crate) mod lexical_generation;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
+pub mod quarantine;
 pub mod redact_secrets;
 pub mod refresh_ledger;
 pub(crate) mod responsiveness;
 pub mod semantic;
+pub mod semantic_progress;
 
+use self::quarantine::{QuarantineKey, QuarantineState};
 use self::refresh_ledger::{
     EquivalenceArtifacts as RefreshEquivalenceArtifacts, PhaseRecord, RefreshLedger,
     RefreshLedgerEvidence, RefreshPhase,
@@ -23,13 +26,14 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
+use frankensearch::index::VectorIndex as FsVectorIndex;
 use frankensqlite::compat::{
     ConnectionExt, ParamValue, RowExt, Transaction as FrankenTransaction,
     TransactionExt as FrankenTransactionExt,
@@ -60,14 +64,17 @@ use crate::search::canonicalize::is_hard_message_noise;
 use crate::search::tantivy::{
     SearchableIndexSummary, TantivyIndex, index_dir, schema_hash_matches,
 };
-use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
+use crate::search::vector_index::{
+    ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, vector_index_path,
+};
 
 use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{
     DailyStatsRebuildResult, FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,
-    MigrationError, StatsAggregator, StatsDelta, seed_canonical_from_best_historical_bundle,
+    LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, StatsAggregator, StatsDelta,
+    seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
     EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage,
@@ -103,29 +110,92 @@ struct SourceFileId {
     ino: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveSessionSourceReason {
+    TestOverride,
+    WritableFileDescriptor,
+    AdvisoryLock,
+    RecentlyModified,
+}
+
 #[derive(Debug, Default)]
 struct ActiveSessionSourceFilter {
     writable_file_ids: HashSet<SourceFileId>,
+    recent_write_window: Option<Duration>,
 }
 
 impl ActiveSessionSourceFilter {
-    fn new() -> Self {
+    fn new(enable_recent_write_window: bool) -> Self {
         Self {
             writable_file_ids: collect_writable_open_session_file_ids(),
+            recent_write_window: active_session_recent_write_window(enable_recent_write_window),
         }
     }
 
-    fn is_active_writer_source(&self, path: &Path) -> bool {
+    #[cfg(test)]
+    fn with_recent_write_window_for_test(recent_write_window: Option<Duration>) -> Self {
+        Self {
+            writable_file_ids: HashSet::new(),
+            recent_write_window,
+        }
+    }
+
+    fn active_writer_reason(&self, path: &Path) -> Option<ActiveSessionSourceReason> {
         if !is_session_log_source_candidate(path) {
-            return false;
+            return None;
         }
         if test_active_session_source_path_matches(path) {
-            return true;
+            return Some(ActiveSessionSourceReason::TestOverride);
+        }
+        // Cheap mtime check first: a single `stat` is dramatically cheaper than
+        // walking `/proc/*/fd` (Linux) or shelling out to `lsof` (macOS), and it
+        // is the only signal that catches macOS Claude Code's buffered-append
+        // writers (which hold no writable fd advertised through lsof and do not
+        // take advisory locks). False positives just defer a just-finished file
+        // to the next watch cycle (acceptable). See #251 — the v0.5.1 data-loss
+        // regression — for the original root cause.
+        if self
+            .recent_write_window
+            .is_some_and(|window| source_file_recently_modified(path, window))
+        {
+            tracing::debug!(
+                source_path = %path.display(),
+                "active-source filter: mtime fallback fired"
+            );
+            return Some(ActiveSessionSourceReason::RecentlyModified);
         }
         if source_file_id(path).is_some_and(|file_id| self.writable_file_ids.contains(&file_id)) {
-            return true;
+            return Some(ActiveSessionSourceReason::WritableFileDescriptor);
         }
-        source_file_has_active_advisory_lock(path)
+        if source_file_has_active_advisory_lock(path) {
+            return Some(ActiveSessionSourceReason::AdvisoryLock);
+        }
+        None
+    }
+}
+
+fn active_session_recent_write_window(enable_recent_write_window: bool) -> Option<Duration> {
+    if !enable_recent_write_window {
+        return None;
+    }
+    let seconds = dotenvy::var("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(120)
+        .min(3_600);
+    (seconds > 0).then_some(Duration::from_secs(seconds))
+}
+
+fn source_file_recently_modified(path: &Path, window: Duration) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified_at) = metadata.modified() else {
+        return false;
+    };
+    match SystemTime::now().duration_since(modified_at) {
+        Ok(age) => age <= window,
+        Err(_) => true,
     }
 }
 
@@ -160,15 +230,16 @@ fn should_skip_active_session_source(
     if source_id != LOCAL_SOURCE_ID {
         return false;
     }
-    let active = active_source_filter.is_active_writer_source(source_path);
-    if active {
-        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
-        tracing::debug!(
-            source_path = %source_path.display(),
-            "skipping session source currently open for writing"
-        );
-    }
-    active
+    let Some(reason) = active_source_filter.active_writer_reason(source_path) else {
+        return false;
+    };
+    ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
+    tracing::info!(
+        source_path = %source_path.display(),
+        ?reason,
+        "skipping session source that appears to be actively written"
+    );
+    true
 }
 
 #[cfg(unix)]
@@ -701,6 +772,21 @@ pub struct LexicalRepairStats {
     pub observed_tantivy_docs: Option<usize>,
 }
 
+/// Structured proof for `cass index --semantic --watch-once <path>`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SemanticWatchOnceStats {
+    pub published: bool,
+    pub selected_docs: usize,
+    pub embedded_docs: usize,
+    pub tier: String,
+    pub vector_index_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_before_db_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_after_db_fingerprint: Option<String>,
+    pub reason: String,
+}
+
 /// Aggregate indexing statistics for JSON output (T7.4).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IndexingStats {
@@ -727,9 +813,9 @@ pub struct IndexingStats {
     /// Automatic lexical repair/catch-up performed before normal indexing work.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lexical_repair: Option<LexicalRepairStats>,
-    /// Conversations persisted while deferring inline lexical maintenance after an OOM.
-    #[serde(skip_serializing_if = "is_zero_usize")]
-    pub lexical_deferred_conversations: usize,
+    /// Targeted semantic watch-once publish proof.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_watch_once: Option<SemanticWatchOnceStats>,
     /// Conversations skipped by ingest quarantine during this run.
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub quarantined_conversations: usize,
@@ -852,6 +938,10 @@ pub struct IndexingProgress {
     pub rebuild_pipeline_producer_handoff_wait_ms: AtomicUsize,
     /// Sampled host 1-minute load average while the rebuild is active, in milli-loadavg units.
     pub rebuild_pipeline_host_loadavg_1m_milli: Mutex<Option<u32>>,
+    /// Sampled host MemAvailable while the rebuild is active.
+    pub rebuild_pipeline_host_available_memory_bytes: Mutex<Option<u64>>,
+    /// Sampled process resident set size while the rebuild is active.
+    pub rebuild_pipeline_process_rss_bytes: Mutex<Option<u64>>,
     /// Human-readable runtime controller mode for the active rebuild.
     pub rebuild_pipeline_controller_mode: Mutex<String>,
     /// Human-readable reason explaining the current controller mode.
@@ -878,6 +968,24 @@ pub struct IndexingProgress {
     pub rebuild_pipeline_staged_shard_build_pending_jobs: AtomicUsize,
     /// Human-readable reason explaining the current staged shard-build budget.
     pub rebuild_pipeline_staged_shard_build_controller_reason: Mutex<String>,
+    /// Host memory reserve below which new staged shard builds are throttled.
+    pub rebuild_pipeline_staged_shard_build_memory_reserve_bytes: AtomicUsize,
+    /// Host memory reserve below which new staged shard builds are paused.
+    pub rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes: AtomicUsize,
+    /// Completed staged shard-build jobs in the active rebuild.
+    pub rebuild_pipeline_staged_shard_build_completed_jobs: AtomicUsize,
+    /// Last completed staged shard index.
+    pub rebuild_pipeline_staged_shard_build_last_shard_index: Mutex<Option<usize>>,
+    /// Raw message bytes in the last completed staged shard.
+    pub rebuild_pipeline_staged_shard_build_last_message_bytes: AtomicUsize,
+    /// On-disk bytes in the last completed staged shard index.
+    pub rebuild_pipeline_staged_shard_build_last_index_size_bytes: AtomicU64,
+    /// Wall-clock milliseconds spent building the last staged shard.
+    pub rebuild_pipeline_staged_shard_build_last_duration_ms: AtomicU64,
+    /// Last observed index-size/raw-message-byte amplification in milli-units.
+    pub rebuild_pipeline_staged_shard_build_last_amplification_milli: Mutex<Option<u64>>,
+    /// Conservative observed amplification used by staged shard admission.
+    pub rebuild_pipeline_staged_shard_build_observed_amplification_milli: Mutex<Option<u64>>,
 }
 
 impl IndexingProgress {
@@ -950,6 +1058,16 @@ impl IndexingProgress {
             .lock()
             .ok()
             .and_then(|value| *value);
+        let rebuild_pipeline_host_available_memory_bytes = self
+            .rebuild_pipeline_host_available_memory_bytes
+            .lock()
+            .ok()
+            .and_then(|value| *value);
+        let rebuild_pipeline_process_rss_bytes = self
+            .rebuild_pipeline_process_rss_bytes
+            .lock()
+            .ok()
+            .and_then(|value| *value);
         let rebuild_pipeline_controller_mode = self
             .rebuild_pipeline_controller_mode
             .lock()
@@ -997,6 +1115,39 @@ impl IndexingProgress {
             .lock()
             .map(|value| value.clone())
             .unwrap_or_default();
+        let rebuild_pipeline_staged_shard_build_memory_reserve_bytes = self
+            .rebuild_pipeline_staged_shard_build_memory_reserve_bytes
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes = self
+            .rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_staged_shard_build_completed_jobs = self
+            .rebuild_pipeline_staged_shard_build_completed_jobs
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_staged_shard_build_last_shard_index = self
+            .rebuild_pipeline_staged_shard_build_last_shard_index
+            .lock()
+            .ok()
+            .and_then(|value| *value);
+        let rebuild_pipeline_staged_shard_build_last_message_bytes = self
+            .rebuild_pipeline_staged_shard_build_last_message_bytes
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_staged_shard_build_last_index_size_bytes = self
+            .rebuild_pipeline_staged_shard_build_last_index_size_bytes
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_staged_shard_build_last_duration_ms = self
+            .rebuild_pipeline_staged_shard_build_last_duration_ms
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_staged_shard_build_last_amplification_milli = self
+            .rebuild_pipeline_staged_shard_build_last_amplification_milli
+            .lock()
+            .ok()
+            .and_then(|value| *value);
+        let rebuild_pipeline_staged_shard_build_observed_amplification_milli = self
+            .rebuild_pipeline_staged_shard_build_observed_amplification_milli
+            .lock()
+            .ok()
+            .and_then(|value| *value);
         let (quarantined_conversations, lexical_update_deferred) = self
             .stats
             .lock()
@@ -1054,6 +1205,8 @@ impl IndexingProgress {
                 "host_loadavg_1m": rebuild_pipeline_host_loadavg_1m_milli.map(|value| {
                     f64::from(value) / 1000.0
                 }),
+                "host_available_memory_bytes": rebuild_pipeline_host_available_memory_bytes,
+                "process_rss_bytes": rebuild_pipeline_process_rss_bytes,
                 "controller_mode": non_empty_json_string(rebuild_pipeline_controller_mode),
                 "controller_reason": non_empty_json_string(rebuild_pipeline_controller_reason),
                 // The staged-merge / staged-shard-build controllers
@@ -1079,6 +1232,15 @@ impl IndexingProgress {
                 "staged_shard_build_active_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_active_jobs),
                 "staged_shard_build_pending_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_pending_jobs),
                 "staged_shard_build_controller_reason": active_rebuild_json_string(is_rebuilding, rebuild_pipeline_staged_shard_build_controller_reason),
+                "staged_shard_build_memory_reserve_bytes": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_memory_reserve_bytes),
+                "staged_shard_build_emergency_memory_reserve_bytes": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes),
+                "staged_shard_build_completed_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_completed_jobs),
+                "staged_shard_build_last_shard_index": active_rebuild_json_optional_usize(is_rebuilding, rebuild_pipeline_staged_shard_build_last_shard_index),
+                "staged_shard_build_last_message_bytes": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_last_message_bytes),
+                "staged_shard_build_last_index_size_bytes": staged_u64_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_last_index_size_bytes),
+                "staged_shard_build_last_duration_ms": staged_u64_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_last_duration_ms),
+                "staged_shard_build_last_amplification_milli": active_rebuild_json_optional_u64(is_rebuilding, rebuild_pipeline_staged_shard_build_last_amplification_milli),
+                "staged_shard_build_observed_amplification_milli": active_rebuild_json_optional_u64(is_rebuilding, rebuild_pipeline_staged_shard_build_observed_amplification_milli),
             },
         })
     }
@@ -1097,12 +1259,39 @@ fn staged_field_or_null(is_rebuilding: bool, value: usize) -> serde_json::Value 
     }
 }
 
+fn staged_u64_field_or_null(is_rebuilding: bool, value: u64) -> serde_json::Value {
+    if is_rebuilding {
+        serde_json::json!(value)
+    } else {
+        serde_json::Value::Null
+    }
+}
+
 fn non_empty_json_string(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
 fn active_rebuild_json_string(is_rebuilding: bool, value: String) -> Option<String> {
     (is_rebuilding && !value.is_empty()).then_some(value)
+}
+
+fn active_rebuild_json_optional_usize(
+    is_rebuilding: bool,
+    value: Option<usize>,
+) -> serde_json::Value {
+    if is_rebuilding {
+        serde_json::json!(value)
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+fn active_rebuild_json_optional_u64(is_rebuilding: bool, value: Option<u64>) -> serde_json::Value {
+    if is_rebuilding {
+        serde_json::json!(value)
+    } else {
+        serde_json::Value::Null
+    }
 }
 
 #[derive(Clone)]
@@ -1298,6 +1487,18 @@ fn record_lexical_population_strategy_if_unset(
     }
 }
 
+fn record_semantic_watch_once_stats(
+    progress: Option<&Arc<IndexingProgress>>,
+    stats: SemanticWatchOnceStats,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut indexing_stats) = progress.stats.lock() {
+        indexing_stats.semantic_watch_once = Some(stats);
+    }
+}
+
 fn record_incremental_canonical_lexical_repair(
     progress: Option<&Arc<IndexingProgress>>,
     plan: &IncrementalCanonicalLexicalRepairPlan,
@@ -1464,6 +1665,8 @@ fn capture_lexical_rebuild_pipeline_runtime(
         producer_handoff_wait_count: producer_snapshot.handoff_wait_count,
         producer_handoff_wait_ms: producer_snapshot.handoff_wait_ms,
         host_loadavg_1m_milli: lexical_rebuild_host_loadavg_1m_milli(),
+        host_available_memory_bytes: responsiveness::available_memory_bytes(),
+        process_rss_bytes: responsiveness::process_resident_memory_bytes(),
         controller_mode,
         controller_reason,
         staged_merge_workers_max: 0,
@@ -1477,6 +1680,15 @@ fn capture_lexical_rebuild_pipeline_runtime(
         staged_shard_build_active_jobs: 0,
         staged_shard_build_pending_jobs: 0,
         staged_shard_build_controller_reason: String::new(),
+        staged_shard_build_memory_reserve_bytes: 0,
+        staged_shard_build_emergency_memory_reserve_bytes: 0,
+        staged_shard_build_completed_jobs: 0,
+        staged_shard_build_last_shard_index: None,
+        staged_shard_build_last_message_bytes: 0,
+        staged_shard_build_last_index_size_bytes: 0,
+        staged_shard_build_last_duration_ms: 0,
+        staged_shard_build_last_amplification_milli: None,
+        staged_shard_build_observed_amplification_milli: None,
         updated_at_ms: FrankenStorage::now_millis(),
     }
 }
@@ -1542,6 +1754,14 @@ fn refresh_lexical_rebuild_pipeline_runtime(
     if let Ok(mut host_loadavg) = progress.rebuild_pipeline_host_loadavg_1m_milli.lock() {
         *host_loadavg = latest_runtime.host_loadavg_1m_milli;
     }
+    if let Ok(mut host_available_memory) =
+        progress.rebuild_pipeline_host_available_memory_bytes.lock()
+    {
+        *host_available_memory = latest_runtime.host_available_memory_bytes;
+    }
+    if let Ok(mut process_rss) = progress.rebuild_pipeline_process_rss_bytes.lock() {
+        *process_rss = latest_runtime.process_rss_bytes;
+    }
     if let Ok(mut controller_mode) = progress.rebuild_pipeline_controller_mode.lock() {
         *controller_mode = latest_runtime.controller_mode.clone();
     }
@@ -1601,6 +1821,60 @@ fn refresh_lexical_rebuild_pipeline_runtime(
         .lock()
     {
         *staged_shard_build_reason = latest_runtime.staged_shard_build_controller_reason.clone();
+    }
+    progress
+        .rebuild_pipeline_staged_shard_build_memory_reserve_bytes
+        .store(
+            latest_runtime.staged_shard_build_memory_reserve_bytes,
+            Ordering::Relaxed,
+        );
+    progress
+        .rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes
+        .store(
+            latest_runtime.staged_shard_build_emergency_memory_reserve_bytes,
+            Ordering::Relaxed,
+        );
+    progress
+        .rebuild_pipeline_staged_shard_build_completed_jobs
+        .store(
+            latest_runtime.staged_shard_build_completed_jobs,
+            Ordering::Relaxed,
+        );
+    if let Ok(mut last_shard_index) = progress
+        .rebuild_pipeline_staged_shard_build_last_shard_index
+        .lock()
+    {
+        *last_shard_index = latest_runtime.staged_shard_build_last_shard_index;
+    }
+    progress
+        .rebuild_pipeline_staged_shard_build_last_message_bytes
+        .store(
+            latest_runtime.staged_shard_build_last_message_bytes,
+            Ordering::Relaxed,
+        );
+    progress
+        .rebuild_pipeline_staged_shard_build_last_index_size_bytes
+        .store(
+            latest_runtime.staged_shard_build_last_index_size_bytes,
+            Ordering::Relaxed,
+        );
+    progress
+        .rebuild_pipeline_staged_shard_build_last_duration_ms
+        .store(
+            latest_runtime.staged_shard_build_last_duration_ms,
+            Ordering::Relaxed,
+        );
+    if let Ok(mut last_amplification) = progress
+        .rebuild_pipeline_staged_shard_build_last_amplification_milli
+        .lock()
+    {
+        *last_amplification = latest_runtime.staged_shard_build_last_amplification_milli;
+    }
+    if let Ok(mut observed_amplification) = progress
+        .rebuild_pipeline_staged_shard_build_observed_amplification_milli
+        .lock()
+    {
+        *observed_amplification = latest_runtime.staged_shard_build_observed_amplification_milli;
     }
 }
 
@@ -1830,6 +2104,95 @@ fn should_try_readonly_nonresumable_lexical_resume(opts: &IndexOptions) -> bool 
             .watch_once_paths
             .as_ref()
             .is_none_or(|paths| paths.is_empty())
+}
+
+fn should_try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> bool {
+    opts.force_rebuild
+        && !opts.full
+        && !opts.watch
+        && !opts.semantic
+        && !opts.build_hnsw
+        && opts
+            .watch_once_paths
+            .as_ref()
+            .is_none_or(|paths| paths.is_empty())
+        && opts.db_path.exists()
+}
+
+fn try_readonly_canonical_force_rebuild(
+    opts: &IndexOptions,
+    progress_bump: &Arc<AtomicI64>,
+) -> Result<bool> {
+    if !should_try_readonly_canonical_force_rebuild(opts) {
+        return Ok(false);
+    }
+
+    let storage = FrankenStorage::open_readonly(&opts.db_path).with_context(|| {
+        format!(
+            "opening canonical database read-only for force rebuild: {}",
+            opts.db_path.display()
+        )
+    })?;
+    let total_conversations = count_total_conversations_exact(&storage)?;
+    if total_conversations == 0 {
+        storage.close_without_checkpoint().with_context(|| {
+            format!(
+                "closing empty canonical database after read-only force rebuild preflight: {}",
+                opts.db_path.display()
+            )
+        })?;
+        return Ok(false);
+    }
+    let total_messages = count_total_messages_exact(&storage)?;
+    storage.close_without_checkpoint().with_context(|| {
+        format!(
+            "closing canonical database before read-only force rebuild: {}",
+            opts.db_path.display()
+        )
+    })?;
+
+    tracing::info!(
+        db_path = %opts.db_path.display(),
+        conversations = total_conversations,
+        messages = total_messages,
+        "running force rebuild from populated canonical database without writable storage preflight"
+    );
+    record_lexical_population_strategy(
+        opts.progress.as_ref(),
+        LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+        "force_rebuild_uses_readonly_authoritative_canonical_db_rebuild_only",
+    );
+    tracing::info!(
+        strategy = LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild.as_str(),
+        reason = "force_rebuild_uses_readonly_authoritative_canonical_db_rebuild_only",
+        "selected_lexical_population_strategy"
+    );
+
+    let rebuild_start = Instant::now();
+    let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
+        &opts.db_path,
+        &opts.data_dir,
+        total_conversations,
+        opts.progress.clone(),
+        Arc::clone(progress_bump),
+    )?;
+    if let Some(p) = &opts.progress
+        && let Ok(mut stats) = p.stats.lock()
+    {
+        stats.scan_ms = 0;
+        stats.index_ms = rebuild_start.elapsed().as_millis() as u64;
+        stats.total_conversations = total_conversations;
+        stats.total_messages = total_messages;
+        stats.total_counts_exact = true;
+    }
+    if let Some(observed_messages) = rebuild.observed_messages {
+        record_exact_total_counts_in_progress(
+            opts.progress.as_ref(),
+            total_conversations,
+            observed_messages,
+        );
+    }
+    Ok(true)
 }
 
 fn should_preserve_matching_completed_lexical_checkpoint_during_full_scan(
@@ -2180,6 +2543,30 @@ struct IndexRunLockGuard {
     _path: PathBuf,
     started_at_ms: i64,
     updated_at_ms: i64,
+    /// Forward-progress timestamp owned exclusively by the indexing
+    /// thread (cass#258). The background `IndexRunLockHeartbeat` thread
+    /// refreshes `updated_at_ms` to prove the process is alive, but it
+    /// MUST NOT touch `last_progress_at_ms` — only real mode/phase
+    /// transitions (i.e. `write_metadata` / `set_mode`) and explicit
+    /// per-batch atomic progress bumps advance it. Readers
+    /// (`asset_state::maintenance_stall_age_ms`) compare this to
+    /// wall-clock to flip `status: "stalled"` when the indexer wedges
+    /// while the heartbeat keeps refreshing.
+    last_progress_at_ms: i64,
+    /// F4 (cass tech debt): atomic mirror of `last_progress_at_ms` that
+    /// the indexer's per-batch / per-conversation / per-shard-flush hot
+    /// loops can update with a single `Relaxed` store — no I/O, no
+    /// POSIX-advisory-lock contention with the heartbeat thread. The
+    /// heartbeat thread (which is already paying the I/O cost every ~1 s
+    /// to refresh `updated_at_ms`) consults this atomic and folds the
+    /// most-recent bump into the same on-disk rewrite. This preserves
+    /// the cass#258 ownership invariant — the indexer thread is the
+    /// sole writer of forward progress — while making the indexer
+    /// itself trivially cheap to instrument. A `0` value means
+    /// "indexer has not yet posted a per-batch progress bump"; the
+    /// heartbeat falls back to leaving `last_progress_at_ms` unchanged
+    /// in that case.
+    last_progress_at_ms_atomic: Arc<AtomicI64>,
     db_path: PathBuf,
     job_id: String,
     job_kind: SearchMaintenanceJobKind,
@@ -2191,17 +2578,55 @@ impl Drop for IndexRunLockGuard {
         let _ = self.file.set_len(0);
         let _ = self.file.rewind();
         let _ = self.file.flush();
+        let _ = crate::search::asset_state::clear_index_run_lock_metadata_sidecar(&self._path);
         let _ = self.file.unlock();
     }
 }
 
 impl IndexRunLockGuard {
     fn write_metadata(&mut self, mode: SearchMaintenanceMode) -> Result<()> {
+        self.write_metadata_with_phase(mode, mode.as_lock_value())
+    }
+
+    /// Write the full lock metadata with a caller-supplied sub-phase
+    /// string. The on-disk `mode=` field tracks the user-facing
+    /// `SearchMaintenanceMode` (`watch_startup`, `watch`, `index`,
+    /// `watch_once`, …), while the `phase=` field carries a finer-
+    /// grained breadcrumb (e.g. `watch_startup:fingerprint`,
+    /// `watch_startup:fts_validate`) so cass#265 operators can see
+    /// which preflight step wedged on a multi-GB DB.
+    ///
+    /// Phase breadcrumbs MUST satisfy two invariants so the existing
+    /// `IndexStallWatchdog` keeps resetting its `last_progress_advance`
+    /// timer at each sub-phase transition:
+    ///   1. Each call produces a strictly different `phase=` string
+    ///      than the previous call (the watchdog gates on
+    ///      `phase_code != self.last_phase` to reset).
+    ///   2. The free function `bump_index_run_lock_progress_atomic`
+    ///      is also called at each transition so the heartbeat
+    ///      thread folds a fresh `last_progress_at_ms=` into the
+    ///      on-disk payload even if the watchdog tick is rare.
+    fn write_metadata_with_phase(
+        &mut self,
+        mode: SearchMaintenanceMode,
+        phase: &str,
+    ) -> Result<()> {
         let _write_guard = self
             .metadata_write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("index-run metadata write lock poisoned"))?;
-        self.updated_at_ms = FrankenStorage::now_millis();
+        let now_ms = FrankenStorage::now_millis();
+        self.updated_at_ms = now_ms;
+        // cass#258: every `write_metadata` / `set_mode` / `set_phase`
+        // call is, by definition, the indexing thread reporting a real
+        // mode/phase transition — i.e. forward progress. Bump
+        // `last_progress_at_ms` here, while the background heartbeat
+        // thread refreshes `updated_at_ms` independently but preserves
+        // this field verbatim so a wedged indexer flips
+        // `status: "stalled"` instead of silently staying "building".
+        self.last_progress_at_ms = now_ms;
+        self.last_progress_at_ms_atomic
+            .store(now_ms, Ordering::Relaxed);
         self.file.set_len(0).with_context(|| {
             format!(
                 "truncating index-run lock file before metadata update: {}",
@@ -2214,30 +2639,562 @@ impl IndexRunLockGuard {
                 self._path.display()
             )
         })?;
-        writeln!(
-            self.file,
-            "pid={}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path={}\nmode={}\njob_id={}\njob_kind={}\nphase={}",
+        let metadata = format!(
+            "pid={}\nstarted_at_ms={}\nupdated_at_ms={}\nlast_progress_at_ms={}\ndb_path={}\nmode={}\njob_id={}\njob_kind={}\nphase={}",
             std::process::id(),
             self.started_at_ms,
             self.updated_at_ms,
+            self.last_progress_at_ms,
             self.db_path.display(),
             mode.as_lock_value(),
             self.job_id,
             self.job_kind.as_lock_value(),
-            mode.as_lock_value()
-        )
-        .with_context(|| format!("writing index-run metadata to {}", self._path.display()))?;
+            phase
+        );
+        writeln!(self.file, "{metadata}")
+            .with_context(|| format!("writing index-run metadata to {}", self._path.display()))?;
         self.file
             .flush()
             .with_context(|| format!("flushing index-run lock file {}", self._path.display()))?;
         self.file
             .sync_all()
             .with_context(|| format!("syncing index-run lock file {}", self._path.display()))?;
+        crate::search::asset_state::write_index_run_lock_metadata_sidecar(
+            &self._path,
+            &format!("{metadata}\n"),
+        )?;
         Ok(())
     }
 
     fn set_mode(&mut self, mode: SearchMaintenanceMode) -> Result<()> {
         self.write_metadata(mode)
+    }
+
+    /// Update only the `phase=` sub-phase breadcrumb without changing
+    /// the `mode=`. Use this at the entry of each watch-startup preflight
+    /// step so cass#265 operators can pinpoint which step wedged — the
+    /// previous v0.6.5 lock-file payload only reported `phase=watch_startup`,
+    /// which hid the wedge inside a multi-second-to-multi-hour preflight
+    /// block.
+    fn set_phase(&mut self, mode: SearchMaintenanceMode, phase: &str) -> Result<()> {
+        self.write_metadata_with_phase(mode, phase)
+    }
+}
+
+/// cass#265: watch_startup preflight per-op skip + timeout configuration.
+///
+/// The v0.6.6 fix `fad3f03d` shipped sub-phase breadcrumbs so operators
+/// could pinpoint which preflight step wedged, but it did NOT add a
+/// failure mode: a wedged step still hangs forever. The reporter on
+/// cass#265 confirmed `phase=watch_startup:cleanup_orphan_fk_rows` on
+/// v0.6.6 against a 3.25 GB / 7,566-conversation / 417,234-message DB
+/// — i.e. the `ORDER BY conversation_id ASC LIMIT 1` query in
+/// `collect_orphan_message_ids` descends the `messages` B-tree without
+/// a usable index and wedges in fsqlite.
+///
+/// This module turns the diagnostic infrastructure into a *self-
+/// debugging surface*:
+/// 1. Per-op atomic watchdog: every `preflight_phase!(...)` enter
+///    records `step_started_at_ms`. A dedicated watchdog thread
+///    polls it every 5 s; if a step exceeds `CASS_PREFLIGHT_OP_TIMEOUT_SECS`
+///    (default 180 s), the watchdog rewrites the lock file's
+///    `phase=` to `<step>_TIMEOUT`, logs a structured diagnostic, and
+///    aborts the process with `EX_SOFTWARE (70)` so operators get an
+///    immediate, named failure instead of staring at a stalled health
+///    JSON for hours.
+/// 2. Per-op skip env vars: `CASS_SKIP_PREFLIGHT_<NAME>=1` lets an
+///    operator bypass a single wedged step (e.g.
+///    `CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1`) so they can
+///    actually use cass while the underlying fsqlite/cass bug is
+///    being root-caused.
+/// 3. Per-op completion bump: every bounded preflight step calls the
+///    completion macro after it returns, disarming the per-op watchdog
+///    and bumping the shared progress timestamp so the heartbeat can
+///    fold completion progress into the lock metadata.
+mod watch_startup_preflight {
+    use anyhow::Context;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    /// Default per-op timeout (seconds). Chosen so a single preflight
+    /// step has 60 s of headroom over the F4 `CASS_INDEX_STALL_DETECT_SECS`
+    /// default (120 s). Operators investigating a wedge see the F4
+    /// `stall_detected` event first (so logs still flag the wedge at
+    /// 120 s), and the harder per-op kill at 180 s prevents the
+    /// indefinite hang the reporter on cass#265 observed.
+    pub(super) const DEFAULT_TIMEOUT_SECS: u64 = 180;
+
+    /// Sentinel meaning "no preflight step is currently active".
+    /// Used so the watchdog can skip its check between steps (e.g.
+    /// while a `preflight_phase!` block is between active step
+    /// boundaries).
+    pub(super) const NO_STEP: u8 = u8::MAX;
+
+    /// Read the per-op timeout once. We resolve the env var lazily on
+    /// `WatchStartupPreflightWatchdog::start` so test harnesses that
+    /// mutate the env (`set_var`) see the latest value, while
+    /// production code pays one `dotenvy::var` lookup per `run_index`
+    /// invocation.
+    pub(super) fn op_timeout() -> Duration {
+        let secs = dotenvy::var("CASS_PREFLIGHT_OP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        // Hard floor at 1 s so test harnesses can deliberately trip
+        // the watchdog inside one second. Hard ceiling at 1 hour so
+        // a wedged production process can't outlive any reasonable
+        // operator-attention window.
+        Duration::from_secs(secs.clamp(1, 3600))
+    }
+
+    /// Convert a sub-phase string (e.g. `"watch_startup:cleanup_orphan_fk_rows"`)
+    /// to the env-var name fragment (`CLEANUP_ORPHAN_FK_ROWS`).
+    ///
+    /// The mapping is intentionally lossless: an operator who sees
+    /// `phase=watch_startup:foo_bar` in the lock file knows exactly
+    /// which env var to set (`CASS_SKIP_PREFLIGHT_FOO_BAR=1`).
+    pub(super) fn skip_env_name(sub_phase: &str) -> String {
+        let bare = sub_phase
+            .strip_prefix("watch_startup:")
+            .unwrap_or(sub_phase);
+        format!("CASS_SKIP_PREFLIGHT_{}", bare.to_uppercase())
+    }
+
+    /// Returns true if the operator has opted to skip this preflight
+    /// step. Logs at WARN so the bypass is auditable.
+    pub(super) fn should_skip(sub_phase: &str) -> bool {
+        let var = skip_env_name(sub_phase);
+        let raw = dotenvy::var(&var).ok();
+        let skip = raw
+            .as_deref()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        if skip {
+            tracing::warn!(
+                target: "cass::preflight_skip",
+                sub_phase,
+                env_var = %var,
+                "cass#265: operator-requested preflight skip — bypassing this watch_startup step"
+            );
+        }
+        skip
+    }
+
+    /// Shared state the watchdog thread reads on every tick. Held by
+    /// `Arc` so the macro can clone references into nested scopes
+    /// without threading the `&mut IndexRunLockGuard` through every
+    /// preflight call site.
+    pub(super) struct WatchStartupPreflightState {
+        /// Index into the documented sub-phase taxonomy, or `NO_STEP`
+        /// when no step is currently active. `AtomicU8` because the
+        /// taxonomy is < 256 entries.
+        pub(super) current_step_idx: AtomicU8,
+        /// `FrankenStorage::now_millis()` of the most recent
+        /// `preflight_phase!` enter for `current_step_idx`. The
+        /// watchdog computes `now - step_started_at_ms` and fires if
+        /// it exceeds `op_timeout`.
+        pub(super) step_started_at_ms: AtomicI64,
+        /// Set to true by the watchdog when it fires, so the main
+        /// thread (if it ever unwedges) can't race a successful
+        /// completion ahead of the abort, and so the regression test
+        /// can observe the trip without exiting the process.
+        pub(super) tripped: AtomicBool,
+    }
+
+    impl WatchStartupPreflightState {
+        pub(super) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                current_step_idx: AtomicU8::new(NO_STEP),
+                step_started_at_ms: AtomicI64::new(0),
+                tripped: AtomicBool::new(false),
+            })
+        }
+
+        /// Called by `preflight_phase!` at the START of each step.
+        /// Records the active step so the watchdog can compute
+        /// `now - step_started_at_ms`. Must NOT be called from within
+        /// the watchdog thread.
+        ///
+        /// Memory ordering: `step_started_at_ms` is written first with
+        /// `Relaxed`, then `current_step_idx` with `Release`. The
+        /// watchdog reads `current_step_idx` with `Acquire` and
+        /// `step_started_at_ms` with `Relaxed`. The Release–Acquire pair
+        /// guarantees that once the watchdog observes the new
+        /// `current_step_idx` it also observes the `step_started_at_ms`
+        /// written before it. Without this pairing, a weakly-ordered
+        /// CPU (AArch64) could let the watchdog see the new step index
+        /// but the old (or zero) timestamp, computing a falsely enormous
+        /// `elapsed_ms` and firing a spurious timeout.
+        pub(super) fn enter(&self, step_idx: u8, started_at_ms: i64) {
+            // Write timestamp BEFORE step index so the Release on
+            // `current_step_idx` acts as the synchronisation point.
+            self.step_started_at_ms
+                .store(started_at_ms, Ordering::Relaxed);
+            self.current_step_idx.store(step_idx, Ordering::Release);
+        }
+
+        /// Documented API for explicitly quiescing the watchdog after a
+        /// bounded preflight step completes and before long-running scan
+        /// or rebuild work begins.
+        pub(super) fn exit(&self) {
+            self.current_step_idx.store(NO_STEP, Ordering::Relaxed);
+        }
+    }
+
+    /// Policy for what the watchdog does on a timeout. Production
+    /// uses `Abort`; the regression test injects `RecordOnly` so it
+    /// can observe the trip without exiting the test process.
+    #[derive(Clone, Copy)]
+    pub(super) enum TimeoutPolicy {
+        /// Rewrite lock-file phase, emit structured event, then exit
+        /// the process with status 70.
+        Abort,
+        /// Rewrite lock-file phase, emit structured event, but
+        /// DON'T exit. The watchdog still stops itself after one
+        /// trip so the test doesn't loop. Used only by
+        /// `tests::watch_startup_preflight_watchdog_fires_on_wedged_step`.
+        #[cfg_attr(not(test), allow(dead_code))]
+        RecordOnly,
+    }
+
+    /// The watchdog thread itself. Polls `WatchStartupPreflightState`
+    /// every 5 s in production (50 ms in tests, gated by the
+    /// `poll_interval` parameter). On timeout: rewrites the lock-file
+    /// `phase=` to `<step>_TIMEOUT`, logs structured diagnostics, and
+    /// applies the configured `TimeoutPolicy`.
+    pub(super) struct WatchStartupPreflightWatchdog {
+        stop: Arc<AtomicBool>,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl WatchStartupPreflightWatchdog {
+        /// `metadata_write_lock` is the same `Arc<Mutex<()>>` that the
+        /// heartbeat thread and `IndexRunLockGuard::write_metadata` take
+        /// before every lock-file write. Passing it here ensures the
+        /// watchdog's `_TIMEOUT` rewrite cannot be overwritten by a
+        /// concurrent heartbeat tick: without this lock the heartbeat
+        /// could clobber the `_TIMEOUT` breadcrumb between the watchdog's
+        /// `set_len(0)` and `write_all` (or just after), leaving
+        /// operators with an unmodified `phase=` in the lock file even
+        /// though `process::exit(70)` was called.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn start(
+            state: Arc<WatchStartupPreflightState>,
+            taxonomy: &'static [&'static str],
+            lock_path: std::path::PathBuf,
+            data_dir: std::path::PathBuf,
+            timeout: Duration,
+            poll_interval: Duration,
+            policy: TimeoutPolicy,
+            metadata_write_lock: std::sync::Arc<std::sync::Mutex<()>>,
+        ) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_flag = Arc::clone(&stop);
+            let join = thread::spawn(move || {
+                while !stop_flag.load(Ordering::Relaxed) {
+                    thread::park_timeout(poll_interval);
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // Acquire pairs with the Release in `enter()` so
+                    // that once we see the new step index we are also
+                    // guaranteed to see the `step_started_at_ms` that
+                    // was stored (Relaxed) before the Release store.
+                    let step_idx = state.current_step_idx.load(Ordering::Acquire);
+                    if step_idx == NO_STEP {
+                        continue;
+                    }
+                    let started_at_ms = state.step_started_at_ms.load(Ordering::Relaxed);
+                    let now_ms = super::FrankenStorage::now_millis();
+                    let elapsed_ms = now_ms.saturating_sub(started_at_ms).max(0);
+                    if (elapsed_ms as u128) < timeout.as_millis() {
+                        continue;
+                    }
+                    // Race guard: if the main thread has already
+                    // advanced past this step (exit -> NO_STEP -> next
+                    // enter sets a different idx) then `step_idx` here
+                    // may be stale. Re-read with Acquire so we also
+                    // observe any `step_started_at_ms` update the main
+                    // thread wrote before advancing past this step.
+                    let current_again = state.current_step_idx.load(Ordering::Acquire);
+                    if current_again != step_idx {
+                        continue;
+                    }
+                    if state.tripped.load(Ordering::SeqCst) {
+                        // Another tick already tripped; nothing to do.
+                        break;
+                    }
+                    let sub_phase = taxonomy
+                        .get(step_idx as usize)
+                        .copied()
+                        .unwrap_or("watch_startup:unknown");
+                    let timeout_phase = format!("{sub_phase}_TIMEOUT");
+                    let timeout_secs = timeout.as_secs();
+                    tracing::error!(
+                        target: "cass::preflight_timeout",
+                        sub_phase,
+                        elapsed_ms,
+                        timeout_secs,
+                        skip_env = %skip_env_name(sub_phase),
+                        "cass#265: watch_startup preflight step exceeded timeout; \
+                         the indexing process is being aborted to surface the wedge. \
+                         Re-run with the documented skip env var set to bypass this step."
+                    );
+                    // Rewrite the lock file's `phase=` to the
+                    // `_TIMEOUT` variant so any concurrent reader
+                    // (cass health --json, the operator's terminal)
+                    // sees exactly which step hung. ORDER MATTERS:
+                    // the lock-file and sidecar rewrite happen before
+                    // `tripped=true` so the test and any same-process
+                    // observer can treat the flag as "timeout metadata
+                    // is already durable".
+                    //
+                    // We hold `metadata_write_lock` across the entire
+                    // rewrite. The heartbeat thread and
+                    // `IndexRunLockGuard::write_metadata` both take the
+                    // same lock before every lock-file write, so this
+                    // prevents a concurrent heartbeat tick from
+                    // clobbering the `_TIMEOUT` breadcrumb after we
+                    // truncate but before we finish writing.
+                    let _metadata_guard = metadata_write_lock.lock().ok();
+                    if let Err(err) =
+                        rewrite_lock_phase_for_timeout(&lock_path, &timeout_phase, now_ms)
+                    {
+                        tracing::error!(
+                            target: "cass::preflight_timeout",
+                            error = %err,
+                            "failed to rewrite lock-file phase to TIMEOUT variant; aborting anyway"
+                        );
+                    }
+                    state.tripped.store(true, Ordering::SeqCst);
+                    // Also emit a JSON line on stderr so structured-
+                    // log consumers get a self-contained event.
+                    let event = serde_json::json!({
+                        "event": "watch_startup_preflight_timeout",
+                        "sub_phase": sub_phase,
+                        "elapsed_ms": elapsed_ms,
+                        "timeout_secs": timeout_secs,
+                        "skip_env": skip_env_name(sub_phase),
+                        "data_dir": data_dir.display().to_string(),
+                        "lock_path": lock_path.display().to_string(),
+                        "hint": format!(
+                            "Set {} to bypass this preflight step. The wedge \
+                             needs a root-cause fix; the skip is a temporary \
+                             workaround. See cass#265 for the running investigation.",
+                            skip_env_name(sub_phase)
+                        ),
+                    });
+                    eprintln!("{event}");
+                    match policy {
+                        TimeoutPolicy::Abort => {
+                            // EX_SOFTWARE (70): internal software
+                            // error. `std::process::exit` skips stack
+                            // destructors, so the
+                            // `IndexRunLockGuard::Drop` impl doesn't
+                            // run — it would truncate the file and
+                            // erase the `_TIMEOUT` breadcrumb we
+                            // just wrote.
+                            std::process::exit(70);
+                        }
+                        TimeoutPolicy::RecordOnly => {
+                            // Test path: stop polling and let the
+                            // main thread observe `state.tripped`
+                            // and the rewritten lock file.
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                stop,
+                join: Some(join),
+            }
+        }
+
+        /// Stop the watchdog cleanly. Called by `Drop` on the watchdog
+        /// itself so a normal `run_index` exit doesn't leak the
+        /// watchdog thread.
+        pub(super) fn shutdown(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(join) = self.join.take() {
+                join.thread().unpark();
+                let _ = join.join();
+            }
+        }
+    }
+
+    impl Drop for WatchStartupPreflightWatchdog {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    /// Direct lock-file rewrite for the TIMEOUT path. We can't go
+    /// through `IndexRunLockGuard::set_phase` from the watchdog
+    /// thread because the guard isn't `Send`. Re-open, re-write,
+    /// fsync.
+    pub(super) fn rewrite_lock_phase_for_timeout(
+        lock_path: &std::path::Path,
+        timeout_phase: &str,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        match rewrite_lock_phase_file_for_timeout(lock_path, timeout_phase, now_ms) {
+            Ok(payload) => crate::search::asset_state::write_index_run_lock_metadata_sidecar(
+                lock_path, &payload,
+            ),
+            Err(err) if timeout_rewrite_hit_windows_lock_conflict(&err) => {
+                let sidecar_path =
+                    crate::search::asset_state::index_run_lock_metadata_sidecar_path(lock_path);
+                let raw = std::fs::read_to_string(&sidecar_path).with_context(|| {
+                    format!(
+                        "reading index-run lock metadata sidecar for timeout rewrite {}",
+                        sidecar_path.display()
+                    )
+                })?;
+                let payload = timeout_lock_metadata_payload(&raw, timeout_phase, now_ms);
+                crate::search::asset_state::write_index_run_lock_metadata_sidecar(
+                    lock_path, &payload,
+                )
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn rewrite_lock_phase_file_for_timeout(
+        lock_path: &std::path::Path,
+        timeout_phase: &str,
+        now_ms: i64,
+    ) -> anyhow::Result<String> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        let payload = timeout_lock_metadata_payload(&buf, timeout_phase, now_ms);
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(payload.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(payload)
+    }
+
+    fn timeout_lock_metadata_payload(existing: &str, timeout_phase: &str, now_ms: i64) -> String {
+        // Rewrite each line in place: `phase=...` -> `phase=<timeout_phase>`,
+        // `updated_at_ms=...` -> `updated_at_ms=<now_ms>`. Preserve
+        // every other line verbatim so the field order remains stable
+        // for parsers.
+        let mut new_lines = Vec::with_capacity(16);
+        let mut wrote_phase = false;
+        let mut wrote_updated_at = false;
+        for line in existing.lines() {
+            if line.strip_prefix("phase=").is_some() {
+                new_lines.push(format!("phase={timeout_phase}"));
+                wrote_phase = true;
+            } else if line.starts_with("updated_at_ms=") {
+                new_lines.push(format!("updated_at_ms={now_ms}"));
+                wrote_updated_at = true;
+            } else {
+                new_lines.push(line.to_string());
+            }
+        }
+        if !wrote_updated_at {
+            new_lines.push(format!("updated_at_ms={now_ms}"));
+        }
+        if !wrote_phase {
+            new_lines.push(format!("phase={timeout_phase}"));
+        }
+        let joined = new_lines.join("\n");
+        if joined.ends_with('\n') {
+            joined
+        } else {
+            format!("{joined}\n")
+        }
+    }
+
+    fn timeout_rewrite_hit_windows_lock_conflict(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(crate::search::asset_state::windows_lock_conflict)
+        })
+    }
+}
+
+use watch_startup_preflight::{
+    TimeoutPolicy as PreflightTimeoutPolicy, WatchStartupPreflightState,
+    WatchStartupPreflightWatchdog,
+};
+
+/// Canonical taxonomy of watch_startup preflight sub-phase breadcrumbs,
+/// in the order they execute inside `run_index`. The watchdog uses the
+/// array index as a `u8` step id; the `watch_startup_sub_phase_taxonomy_is_documented_and_stable`
+/// regression test pins this list against the call sites; and the
+/// public docs / release notes / cass#265 triage runbook reference
+/// these strings verbatim.
+///
+/// Two invariants every entry must satisfy:
+/// 1. Starts with `watch_startup:`.
+/// 2. No whitespace, no second colon — the lock file parser splits on
+///    `=` and the sub-phase becomes a single-token value.
+const WATCH_STARTUP_SUB_PHASE_TAXONOMY: &[&str] = &[
+    "watch_startup:ensure_index_dir",
+    "watch_startup:ensure_storage_headroom",
+    "watch_startup:open_storage",
+    "watch_startup:writable_preflight",
+    "watch_startup:validate_fts_messages",
+    "watch_startup:cleanup_orphan_fk_rows",
+    "watch_startup:count_total_conversations",
+    "watch_startup:probe_lexical_checkpoint",
+    "watch_startup:repair_daily_stats",
+    "watch_startup:tantivy_reader_preflight",
+    "watch_startup:historical_salvage",
+    "watch_startup:count_total_messages",
+    "watch_startup:published_index_validate",
+    "watch_startup:scan_entry",
+];
+
+/// Lookup the taxonomy step index for a sub-phase string. Returns
+/// `None` if the string isn't documented. Stable order — adding a new
+/// preflight must append to the array (not insert) so existing call
+/// sites keep the same id.
+fn watch_startup_step_idx(sub_phase: &str) -> Option<u8> {
+    WATCH_STARTUP_SUB_PHASE_TAXONOMY
+        .iter()
+        .position(|s| *s == sub_phase)
+        .and_then(|i| u8::try_from(i).ok())
+}
+
+/// True if the operator has set `CASS_SKIP_PREFLIGHT_<NAME>=1` for the
+/// given sub-phase. Logs at WARN when it returns true so the bypass
+/// is auditable in production. Thin wrapper over
+/// `watch_startup_preflight::should_skip` so call sites in `run_index`
+/// can read as `if preflight_skip("watch_startup:cleanup_orphan_fk_rows") { ... }`.
+fn preflight_skip(sub_phase: &str) -> bool {
+    watch_startup_preflight::should_skip(sub_phase)
+}
+
+/// Per-batch / per-conversation / per-shard-flush atomic bump that the
+/// indexer hot loops call. Single `Relaxed` store; the heartbeat folds
+/// the value into the on-disk payload on its next tick. Returns the
+/// timestamp that was stored (useful for tracing).
+///
+/// Threading the full `IndexRunLockGuard` reference down through every
+/// layer of the staged lexical rebuild pipeline is a layering
+/// nightmare; the only state the bump actually needs is the shared
+/// atomic, which is `Arc::clone`-able and trivially passable.
+fn bump_index_run_lock_progress_atomic(atomic: &Arc<AtomicI64>) -> i64 {
+    let now_ms = FrankenStorage::now_millis();
+    atomic.store(now_ms, Ordering::Relaxed);
+    now_ms
+}
+
+fn bump_index_run_lock_progress_if_present(progress_bump: Option<&Arc<AtomicI64>>) {
+    if let Some(atomic) = progress_bump {
+        bump_index_run_lock_progress_atomic(atomic);
     }
 }
 
@@ -2247,7 +3204,19 @@ struct IndexRunLockHeartbeat {
 }
 
 impl IndexRunLockHeartbeat {
-    fn start(data_dir: PathBuf, interval: Duration, metadata_write_lock: Arc<Mutex<()>>) -> Self {
+    fn start(
+        data_dir: PathBuf,
+        interval: Duration,
+        metadata_write_lock: Arc<Mutex<()>>,
+        // F4: indexer hot loops bump this atomic on each batch
+        // commit / shard flush / conversation completion. The heartbeat
+        // thread reads it on every tick and folds the latest value into
+        // the on-disk `last_progress_at_ms=` line in the same rewrite
+        // that already refreshes `updated_at_ms=`, so cass#258's
+        // stall detector flips correctly on a wedged indexer without
+        // making each batch pay the I/O cost.
+        last_progress_at_ms_atomic: Arc<AtomicI64>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
         // Use `park_timeout` instead of `thread::sleep` so `Drop` below can
@@ -2265,9 +3234,12 @@ impl IndexRunLockHeartbeat {
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Err(err) =
-                    heartbeat_index_run_lock_with_lock(&data_dir, Some(&metadata_write_lock))
-                {
+                let last_progress_at_ms = last_progress_at_ms_atomic.load(Ordering::Relaxed);
+                if let Err(err) = heartbeat_index_run_lock_with_lock_and_progress(
+                    &data_dir,
+                    Some(&metadata_write_lock),
+                    last_progress_at_ms,
+                ) {
                     tracing::debug!(
                         error = %err,
                         path = %data_dir.display(),
@@ -2301,17 +3273,53 @@ fn heartbeat_index_run_lock_with_lock(
     data_dir: &Path,
     metadata_write_lock: Option<&Arc<Mutex<()>>>,
 ) -> Result<()> {
+    // Legacy call site (test-only): when no fresh forward-progress
+    // value is supplied, do NOT touch the `last_progress_at_ms=` line.
+    // cass#258 invariant — heartbeat refreshing the progress field by
+    // itself would silently disable the stall detector.
+    heartbeat_index_run_lock_with_lock_and_progress(data_dir, metadata_write_lock, 0)
+}
+
+/// Production heartbeat that ALSO folds the indexer's most-recent
+/// `last_progress_at_ms` atomic bump into the on-disk rewrite. The
+/// indexer owns the value (it writes the atomic from its hot loops);
+/// the heartbeat thread is purely the I/O layer — it never invents
+/// progress on its own. Pass `0` (or any value ≤ the existing on-disk
+/// value) to leave the field untouched, preserving the legacy heartbeat
+/// behaviour for tests that exercise just the `updated_at_ms` path.
+fn heartbeat_index_run_lock_with_lock_and_progress(
+    data_dir: &Path,
+    metadata_write_lock: Option<&Arc<Mutex<()>>>,
+    last_progress_at_ms: i64,
+) -> Result<()> {
     let _write_guard = metadata_write_lock
         .map(|lock| {
             lock.lock()
                 .map_err(|_| anyhow::anyhow!("index-run metadata write lock poisoned"))
         })
         .transpose()?;
-    let lock_path = data_dir.join("index-run.lock");
+    let lock_path = crate::search::asset_state::index_run_lock_path(data_dir);
     let existing = match fs::read_to_string(&lock_path) {
         Ok(contents) if !contents.is_empty() => contents,
         Ok(_) => return Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if crate::search::asset_state::windows_lock_conflict(&err) => {
+            let sidecar_path =
+                crate::search::asset_state::index_run_lock_metadata_sidecar_path(&lock_path);
+            match fs::read_to_string(&sidecar_path) {
+                Ok(contents) if !contents.is_empty() => contents,
+                Ok(_) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "reading index-run lock heartbeat sidecar {}",
+                            sidecar_path.display()
+                        )
+                    });
+                }
+            }
+        }
         Err(err) => {
             return Err(err).with_context(|| {
                 format!("reading index-run lock heartbeat {}", lock_path.display())
@@ -2319,16 +3327,45 @@ fn heartbeat_index_run_lock_with_lock(
         }
     };
 
-    let mut wrote_updated_at = false;
     let now_ms = FrankenStorage::now_millis();
-    let mut itoa_buf = itoa::Buffer::new();
-    let now_ms_str = itoa_buf.format(now_ms);
-    let mut refreshed = String::with_capacity(existing.len() + 32);
+    let mut updated_at_buf = itoa::Buffer::new();
+    let now_ms_str = updated_at_buf.format(now_ms);
+
+    // Read the existing on-disk progress so we only rewrite the
+    // `last_progress_at_ms=` line if the indexer-owned atomic carries a
+    // strictly larger value. This preserves the cass#258 invariant
+    // (heartbeat never invents progress on its own) and avoids racing
+    // with a `write_metadata` call that just wrote a fresh phase
+    // transition.
+    let existing_progress = existing
+        .lines()
+        .find_map(|line| line.strip_prefix("last_progress_at_ms="))
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let should_advance_progress = last_progress_at_ms > existing_progress;
+    let mut progress_buf = itoa::Buffer::new();
+    let progress_str = if should_advance_progress {
+        progress_buf.format(last_progress_at_ms)
+    } else {
+        ""
+    };
+
+    let mut wrote_updated_at = false;
+    let mut wrote_progress = !should_advance_progress;
+    let mut refreshed = String::with_capacity(existing.len() + 64);
     for line in existing.lines() {
         if line.strip_prefix("updated_at_ms=").is_some() {
             refreshed.push_str("updated_at_ms=");
             refreshed.push_str(now_ms_str);
             wrote_updated_at = true;
+        } else if line.strip_prefix("last_progress_at_ms=").is_some() {
+            if should_advance_progress {
+                refreshed.push_str("last_progress_at_ms=");
+                refreshed.push_str(progress_str);
+            } else {
+                refreshed.push_str(line);
+            }
+            wrote_progress = true;
         } else {
             refreshed.push_str(line);
         }
@@ -2339,11 +3376,38 @@ fn heartbeat_index_run_lock_with_lock(
         refreshed.push_str(now_ms_str);
         refreshed.push('\n');
     }
+    if !wrote_progress {
+        refreshed.push_str("last_progress_at_ms=");
+        refreshed.push_str(progress_str);
+        refreshed.push('\n');
+    }
 
     write_index_run_lock_heartbeat_in_place(&lock_path, &refreshed)
 }
 
 fn write_index_run_lock_heartbeat_in_place(lock_path: &Path, refreshed: &str) -> Result<()> {
+    match write_index_run_lock_file_in_place(lock_path, refreshed) {
+        Ok(()) => {
+            crate::search::asset_state::write_index_run_lock_metadata_sidecar(lock_path, refreshed)
+        }
+        Err(err) => {
+            let lock_conflict = err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(crate::search::asset_state::windows_lock_conflict)
+            });
+            if lock_conflict {
+                crate::search::asset_state::write_index_run_lock_metadata_sidecar(
+                    lock_path, refreshed,
+                )
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn write_index_run_lock_file_in_place(lock_path: &Path, refreshed: &str) -> Result<()> {
     // Do not temp-file+rename `index-run.lock`: POSIX advisory locks attach
     // to the existing file inode/open handle, and replacing the path would
     // let another process lock a fresh inode while this process still holds
@@ -3084,7 +4148,9 @@ fn assign_lexical_rebuild_flow_reservation_bytes(
         .map(|packet| packet.message_bytes)
         .sum::<usize>();
     if total_message_bytes == 0 {
-        packets[0].flow_reservation_bytes = reserved_bytes;
+        if let Some(first_packet) = packets.first_mut() {
+            first_packet.flow_reservation_bytes = reserved_bytes;
+        }
         return;
     }
 
@@ -3102,6 +4168,36 @@ fn assign_lexical_rebuild_flow_reservation_bytes(
         packet.flow_reservation_bytes = share;
         remaining_reserved = remaining_reserved.saturating_sub(share);
         remaining_message_bytes = remaining_message_bytes.saturating_sub(packet.message_bytes);
+    }
+}
+
+struct StreamingBatchFlowReservation<'a> {
+    limiter: Option<&'a StreamingByteLimiter>,
+    reserved_bytes: usize,
+}
+
+impl<'a> StreamingBatchFlowReservation<'a> {
+    fn new(limiter: Option<&'a StreamingByteLimiter>, reserved_bytes: usize) -> Self {
+        Self {
+            limiter,
+            reserved_bytes,
+        }
+    }
+
+    fn release_now(&mut self) {
+        let reserved_bytes = std::mem::take(&mut self.reserved_bytes);
+        if reserved_bytes == 0 {
+            return;
+        }
+        if let Some(limiter) = self.limiter {
+            limiter.release(reserved_bytes);
+        }
+    }
+}
+
+impl Drop for StreamingBatchFlowReservation<'_> {
+    fn drop(&mut self) {
+        self.release_now();
     }
 }
 
@@ -3160,6 +4256,10 @@ fn flush_streamed_lexical_rebuild_batch(
         .iter()
         .map(|packet| packet.flow_reservation_bytes)
         .sum::<usize>();
+    let mut flow_reservation = StreamingBatchFlowReservation::new(
+        lexical_rebuild_flow_limiter,
+        chunk_flow_reservation_bytes,
+    );
     let chunk_limit = *current_batch_conversation_limit;
     let prepare_started = perf_profile.as_ref().map(|_| Instant::now());
     let prepared_docs =
@@ -3185,9 +4285,7 @@ fn flush_streamed_lexical_rebuild_batch(
     }
     *messages_since_commit = (*messages_since_commit).saturating_add(chunk_message_count);
     *message_bytes_since_commit = (*message_bytes_since_commit).saturating_add(chunk_message_bytes);
-    if let Some(flow_limiter) = lexical_rebuild_flow_limiter {
-        flow_limiter.release(chunk_flow_reservation_bytes);
-    }
+    flow_reservation.release_now();
     tracing::info!(
         page_size,
         packet_version = pending_batch
@@ -3293,6 +4391,7 @@ fn build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
 struct LexicalRebuildShardBuildWork {
     shard: LexicalShardPlanShard,
     packets: Vec<LexicalRebuildConversationPacket>,
+    message_bytes: usize,
     shard_index_path: PathBuf,
     writer_parallelism: usize,
 }
@@ -3303,6 +4402,76 @@ struct LexicalRebuildShardBuildResult {
     indexed_docs: usize,
     segments: usize,
     shard_index_path: PathBuf,
+    message_bytes: usize,
+    index_size_bytes: u64,
+    build_duration_ms: u64,
+    amplification_milli: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LexicalRebuildShardBuildTelemetrySnapshot {
+    completed_jobs: usize,
+    last_shard_index: Option<usize>,
+    last_message_bytes: usize,
+    last_index_size_bytes: u64,
+    last_duration_ms: u64,
+    last_amplification_milli: Option<u64>,
+    observed_amplification_milli: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct LexicalRebuildShardBuildTelemetry {
+    completed_jobs: AtomicUsize,
+    last_shard_index: AtomicUsize,
+    last_message_bytes: AtomicUsize,
+    last_index_size_bytes: AtomicU64,
+    last_duration_ms: AtomicU64,
+    last_amplification_milli: AtomicU64,
+    observed_amplification_milli: AtomicU64,
+}
+
+impl LexicalRebuildShardBuildTelemetry {
+    fn record(&self, result: &LexicalRebuildShardBuildResult) {
+        self.completed_jobs.fetch_add(1, Ordering::Relaxed);
+        self.last_shard_index
+            .store(result.shard.shard_index, Ordering::Relaxed);
+        self.last_message_bytes
+            .store(result.message_bytes, Ordering::Relaxed);
+        self.last_index_size_bytes
+            .store(result.index_size_bytes, Ordering::Relaxed);
+        self.last_duration_ms
+            .store(result.build_duration_ms, Ordering::Relaxed);
+        self.last_amplification_milli
+            .store(result.amplification_milli.unwrap_or(0), Ordering::Relaxed);
+        if let Some(amplification_milli) = result.amplification_milli {
+            let conservative_amplification = amplification_milli
+                .max(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI);
+            let _ = self.observed_amplification_milli.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.max(conservative_amplification)),
+            );
+        }
+    }
+
+    fn snapshot(&self) -> LexicalRebuildShardBuildTelemetrySnapshot {
+        let completed_jobs = self.completed_jobs.load(Ordering::Relaxed);
+        let last_shard_index = self.last_shard_index.load(Ordering::Relaxed);
+        let last_amplification_milli = self.last_amplification_milli.load(Ordering::Relaxed);
+        let observed_amplification_milli =
+            self.observed_amplification_milli.load(Ordering::Relaxed);
+        LexicalRebuildShardBuildTelemetrySnapshot {
+            completed_jobs,
+            last_shard_index: (completed_jobs > 0).then_some(last_shard_index),
+            last_message_bytes: self.last_message_bytes.load(Ordering::Relaxed),
+            last_index_size_bytes: self.last_index_size_bytes.load(Ordering::Relaxed),
+            last_duration_ms: self.last_duration_ms.load(Ordering::Relaxed),
+            last_amplification_milli: (last_amplification_milli > 0)
+                .then_some(last_amplification_milli),
+            observed_amplification_milli: (observed_amplification_milli > 0)
+                .then_some(observed_amplification_milli),
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3351,6 +4520,14 @@ enum LexicalRebuildShardBuildMessage {
     Error { shard_index: usize, error: String },
 }
 
+fn lexical_rebuild_amplification_milli(index_size_bytes: u64, message_bytes: usize) -> Option<u64> {
+    if message_bytes == 0 {
+        return None;
+    }
+    let scaled = u128::from(index_size_bytes).saturating_mul(1_000);
+    u64::try_from(scaled / (message_bytes as u128)).ok()
+}
+
 fn spawn_lexical_rebuild_shard_builder_workers(
     worker_count: usize,
     rx: Receiver<LexicalRebuildShardBuildWork>,
@@ -3374,6 +4551,8 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                             .iter()
                             .map(|packet| packet.flow_reservation_bytes)
                             .sum::<usize>();
+                        let shard_message_bytes = work.message_bytes;
+                        let build_started = Instant::now();
                         let result =
                             build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
                                 &work.shard_index_path,
@@ -3381,6 +4560,14 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                                 lexical_rebuild_worker_pool.as_deref(),
                                 Some(work.writer_parallelism),
                             );
+                        let build_duration_ms =
+                            u64::try_from(build_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let index_size_bytes =
+                            directory_size_bytes_best_effort(&work.shard_index_path);
+                        let amplification_milli = lexical_rebuild_amplification_milli(
+                            index_size_bytes,
+                            shard_message_bytes,
+                        );
                         flow_limiter.release(flow_reservation_bytes);
                         match result {
                             Ok(summary) => {
@@ -3390,6 +4577,10 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                                     writer_parallelism = work.writer_parallelism,
                                     indexed_docs = summary.docs,
                                     shard_conversations = work.shard.conversation_count,
+                                    shard_message_bytes,
+                                    index_size_bytes,
+                                    build_duration_ms,
+                                    amplification_milli,
                                     "built lexical rebuild shard index"
                                 );
                                 if tx
@@ -3399,6 +4590,10 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                                             indexed_docs: summary.docs,
                                             segments: summary.segments,
                                             shard_index_path: work.shard_index_path,
+                                            message_bytes: shard_message_bytes,
+                                            index_size_bytes,
+                                            build_duration_ms,
+                                            amplification_milli,
                                         },
                                     ))
                                     .is_err()
@@ -3937,13 +5132,34 @@ impl LexicalRebuildStagedMergeController {
 struct LexicalRebuildStagedShardBuildController {
     max_workers: usize,
     loadavg_high_watermark_1m_milli: Option<u32>,
+    memory_reserve_bytes: usize,
+    emergency_memory_reserve_bytes: usize,
 }
 
 impl LexicalRebuildStagedShardBuildController {
     fn new(max_workers: usize, loadavg_high_watermark_1m_milli: Option<u32>) -> Self {
+        Self::new_with_memory_reserves(
+            max_workers,
+            loadavg_high_watermark_1m_milli,
+            lexical_rebuild_staged_shard_build_memory_reserve_bytes(),
+            lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes(),
+        )
+    }
+
+    fn new_with_memory_reserves(
+        max_workers: usize,
+        loadavg_high_watermark_1m_milli: Option<u32>,
+        memory_reserve_bytes: usize,
+        emergency_memory_reserve_bytes: usize,
+    ) -> Self {
+        let memory_reserve_bytes = memory_reserve_bytes.max(1);
         Self {
             max_workers: max_workers.max(1),
             loadavg_high_watermark_1m_milli,
+            memory_reserve_bytes,
+            emergency_memory_reserve_bytes: emergency_memory_reserve_bytes
+                .max(1)
+                .min(memory_reserve_bytes),
         }
     }
 
@@ -3953,13 +5169,16 @@ impl LexicalRebuildStagedShardBuildController {
         staged_merge_runtime: &LexicalRebuildStagedMergeRuntimeSnapshot,
         active_jobs: usize,
         pending_jobs: usize,
+        next_pending_job_message_bytes: Option<usize>,
     ) -> LexicalRebuildStagedShardBuildRuntimeSnapshot {
         let backlog_jobs = active_jobs.saturating_add(pending_jobs);
         if backlog_jobs == 0 {
             return LexicalRebuildStagedShardBuildRuntimeSnapshot {
                 workers_max: self.max_workers,
+                allowed_jobs: 0,
+                active_jobs,
+                pending_jobs,
                 controller_reason: "no_staged_shard_build_backlog".to_string(),
-                ..LexicalRebuildStagedShardBuildRuntimeSnapshot::default()
             };
         }
 
@@ -3998,6 +5217,15 @@ impl LexicalRebuildStagedShardBuildController {
                 }
             };
 
+        let (allowed_jobs, controller_reason) = self.apply_memory_admission(
+            runtime,
+            active_jobs,
+            backlog_jobs,
+            next_pending_job_message_bytes,
+            allowed_jobs,
+            controller_reason,
+        );
+
         LexicalRebuildStagedShardBuildRuntimeSnapshot {
             workers_max: self.max_workers,
             allowed_jobs: allowed_jobs.min(backlog_jobs),
@@ -4005,6 +5233,112 @@ impl LexicalRebuildStagedShardBuildController {
             pending_jobs,
             controller_reason,
         }
+    }
+
+    fn apply_memory_admission(
+        &self,
+        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
+        active_jobs: usize,
+        backlog_jobs: usize,
+        next_pending_job_message_bytes: Option<usize>,
+        allowed_jobs: usize,
+        controller_reason: String,
+    ) -> (usize, String) {
+        let Some(available_memory_bytes) = runtime.host_available_memory_bytes else {
+            return (allowed_jobs, controller_reason);
+        };
+        let available_memory_bytes = usize_from_u64_saturating(available_memory_bytes);
+        let estimated_builder_bytes =
+            self.estimated_builder_memory_bytes(runtime, next_pending_job_message_bytes);
+        if available_memory_bytes <= self.emergency_memory_reserve_bytes {
+            if active_jobs == 0 && backlog_jobs > 0 {
+                let probe_ceiling =
+                    available_memory_bytes.saturating_sub(available_memory_bytes / 4);
+                if estimated_builder_bytes <= probe_ceiling {
+                    return (
+                        1.min(allowed_jobs).min(backlog_jobs),
+                        format!(
+                            "host_available_memory_bytes_{}_below_emergency_reserve_{}_admitting_single_small_staged_shard_build_estimated_builder_bytes_{}",
+                            available_memory_bytes,
+                            self.emergency_memory_reserve_bytes,
+                            estimated_builder_bytes
+                        ),
+                    );
+                }
+            }
+            return (
+                active_jobs.min(backlog_jobs),
+                format!(
+                    "host_available_memory_bytes_{}_below_emergency_reserve_{}_pausing_new_staged_shard_builds",
+                    available_memory_bytes, self.emergency_memory_reserve_bytes
+                ),
+            );
+        }
+        if available_memory_bytes <= self.memory_reserve_bytes {
+            let allowed_under_reserve = if active_jobs == 0 && backlog_jobs > 0 {
+                1
+            } else {
+                active_jobs
+            }
+            .min(allowed_jobs)
+            .min(backlog_jobs);
+            return (
+                allowed_under_reserve,
+                format!(
+                    "host_available_memory_bytes_{}_below_reserve_{}_limiting_staged_shard_builds_to_{}",
+                    available_memory_bytes, self.memory_reserve_bytes, allowed_under_reserve
+                ),
+            );
+        }
+
+        let memory_headroom = available_memory_bytes.saturating_sub(self.memory_reserve_bytes);
+        let active_estimated_bytes = estimated_builder_bytes.saturating_mul(active_jobs);
+        let additional_jobs =
+            memory_headroom.saturating_sub(active_estimated_bytes) / estimated_builder_bytes.max(1);
+        let memory_allowed_jobs = active_jobs
+            .saturating_add(additional_jobs)
+            .min(self.max_workers)
+            .min(backlog_jobs)
+            .max(active_jobs.min(backlog_jobs));
+        if memory_allowed_jobs < allowed_jobs {
+            (
+                memory_allowed_jobs,
+                format!(
+                    "host_available_memory_bytes_{}_reserve_{}_estimated_builder_bytes_{}_limiting_staged_shard_builds_to_{}",
+                    available_memory_bytes,
+                    self.memory_reserve_bytes,
+                    estimated_builder_bytes,
+                    memory_allowed_jobs
+                ),
+            )
+        } else {
+            (allowed_jobs, controller_reason)
+        }
+    }
+
+    fn estimated_builder_memory_bytes(
+        &self,
+        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
+        next_pending_job_message_bytes: Option<usize>,
+    ) -> usize {
+        let amplification_milli = runtime
+            .staged_shard_build_observed_amplification_milli
+            .unwrap_or(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI)
+            .max(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI)
+            .saturating_mul(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_HEADROOM_MILLI)
+            / 1_000;
+        let amplified_message_bytes = next_pending_job_message_bytes
+            .map(|message_bytes| {
+                let scaled =
+                    (message_bytes as u128).saturating_mul(u128::from(amplification_milli)) / 1_000;
+                usize::try_from(scaled).unwrap_or(usize::MAX)
+            })
+            .unwrap_or(0);
+        amplified_message_bytes
+            .max(usize_from_u64_saturating(
+                LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_ESTIMATED_BYTES,
+            ))
+            .max(1)
     }
 }
 
@@ -4076,6 +5410,66 @@ fn apply_staged_shard_build_runtime_snapshot(
         .lock()
     {
         *staged_shard_build_reason = staged_shard_build_runtime.controller_reason.clone();
+    }
+}
+
+fn apply_staged_shard_build_telemetry_snapshot(
+    latest_runtime: &mut LexicalRebuildPipelineRuntimeSnapshot,
+    progress: Option<&Arc<IndexingProgress>>,
+    memory_reserve_bytes: usize,
+    emergency_memory_reserve_bytes: usize,
+    telemetry: &LexicalRebuildShardBuildTelemetry,
+) {
+    let snapshot = telemetry.snapshot();
+    latest_runtime.staged_shard_build_memory_reserve_bytes = memory_reserve_bytes;
+    latest_runtime.staged_shard_build_emergency_memory_reserve_bytes =
+        emergency_memory_reserve_bytes;
+    latest_runtime.staged_shard_build_completed_jobs = snapshot.completed_jobs;
+    latest_runtime.staged_shard_build_last_shard_index = snapshot.last_shard_index;
+    latest_runtime.staged_shard_build_last_message_bytes = snapshot.last_message_bytes;
+    latest_runtime.staged_shard_build_last_index_size_bytes = snapshot.last_index_size_bytes;
+    latest_runtime.staged_shard_build_last_duration_ms = snapshot.last_duration_ms;
+    latest_runtime.staged_shard_build_last_amplification_milli = snapshot.last_amplification_milli;
+    latest_runtime.staged_shard_build_observed_amplification_milli =
+        snapshot.observed_amplification_milli;
+    let Some(progress) = progress else {
+        return;
+    };
+    progress
+        .rebuild_pipeline_staged_shard_build_memory_reserve_bytes
+        .store(memory_reserve_bytes, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes
+        .store(emergency_memory_reserve_bytes, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_staged_shard_build_completed_jobs
+        .store(snapshot.completed_jobs, Ordering::Relaxed);
+    if let Ok(mut last_shard_index) = progress
+        .rebuild_pipeline_staged_shard_build_last_shard_index
+        .lock()
+    {
+        *last_shard_index = snapshot.last_shard_index;
+    }
+    progress
+        .rebuild_pipeline_staged_shard_build_last_message_bytes
+        .store(snapshot.last_message_bytes, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_staged_shard_build_last_index_size_bytes
+        .store(snapshot.last_index_size_bytes, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_staged_shard_build_last_duration_ms
+        .store(snapshot.last_duration_ms, Ordering::Relaxed);
+    if let Ok(mut last_amplification) = progress
+        .rebuild_pipeline_staged_shard_build_last_amplification_milli
+        .lock()
+    {
+        *last_amplification = snapshot.last_amplification_milli;
+    }
+    if let Ok(mut observed_amplification) = progress
+        .rebuild_pipeline_staged_shard_build_observed_amplification_milli
+        .lock()
+    {
+        *observed_amplification = snapshot.observed_amplification_milli;
     }
 }
 
@@ -4323,6 +5717,8 @@ pub(crate) struct LexicalRebuildPipelineRuntimeSnapshot {
     pub producer_handoff_wait_count: usize,
     pub producer_handoff_wait_ms: usize,
     pub host_loadavg_1m_milli: Option<u32>,
+    pub host_available_memory_bytes: Option<u64>,
+    pub process_rss_bytes: Option<u64>,
     pub controller_mode: String,
     pub controller_reason: String,
     pub staged_merge_workers_max: usize,
@@ -4336,6 +5732,15 @@ pub(crate) struct LexicalRebuildPipelineRuntimeSnapshot {
     pub staged_shard_build_active_jobs: usize,
     pub staged_shard_build_pending_jobs: usize,
     pub staged_shard_build_controller_reason: String,
+    pub staged_shard_build_memory_reserve_bytes: usize,
+    pub staged_shard_build_emergency_memory_reserve_bytes: usize,
+    pub staged_shard_build_completed_jobs: usize,
+    pub staged_shard_build_last_shard_index: Option<usize>,
+    pub staged_shard_build_last_message_bytes: usize,
+    pub staged_shard_build_last_index_size_bytes: u64,
+    pub staged_shard_build_last_duration_ms: u64,
+    pub staged_shard_build_last_amplification_milli: Option<u64>,
+    pub staged_shard_build_observed_amplification_milli: Option<u64>,
     pub updated_at_ms: i64,
 }
 
@@ -4355,6 +5760,8 @@ impl LexicalRebuildPipelineRuntimeSnapshot {
             || self.producer_handoff_wait_count > 0
             || self.producer_handoff_wait_ms > 0
             || self.host_loadavg_1m_milli.is_some()
+            || self.host_available_memory_bytes.is_some()
+            || self.process_rss_bytes.is_some()
             || !self.controller_mode.is_empty()
             || !self.controller_reason.is_empty()
             || self.staged_merge_workers_max > 0
@@ -4368,6 +5775,17 @@ impl LexicalRebuildPipelineRuntimeSnapshot {
             || self.staged_shard_build_active_jobs > 0
             || self.staged_shard_build_pending_jobs > 0
             || !self.staged_shard_build_controller_reason.is_empty()
+            || self.staged_shard_build_memory_reserve_bytes > 0
+            || self.staged_shard_build_emergency_memory_reserve_bytes > 0
+            || self.staged_shard_build_completed_jobs > 0
+            || self.staged_shard_build_last_shard_index.is_some()
+            || self.staged_shard_build_last_message_bytes > 0
+            || self.staged_shard_build_last_index_size_bytes > 0
+            || self.staged_shard_build_last_duration_ms > 0
+            || self.staged_shard_build_last_amplification_milli.is_some()
+            || self
+                .staged_shard_build_observed_amplification_milli
+                .is_some()
     }
 }
 
@@ -4566,11 +5984,21 @@ fn acquire_index_run_lock(
             .with_context(|| format!("acquiring index-run lock {}", lock_path.display()));
     }
 
+    let now_ms = FrankenStorage::now_millis();
     let mut guard = IndexRunLockGuard {
         file,
         _path: lock_path,
-        started_at_ms: FrankenStorage::now_millis(),
-        updated_at_ms: FrankenStorage::now_millis(),
+        started_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        // cass#258: seed with `now` so the very first `read_search_maintenance_snapshot`
+        // call after `acquire_index_run_lock` sees a populated cursor.
+        // Forward progress will refresh this on every `write_metadata`
+        // / `set_mode` call and every per-batch atomic progress bump (F4).
+        last_progress_at_ms: now_ms,
+        // F4: indexer-thread mailbox the heartbeat folds into the on-disk
+        // payload. Seed with `now_ms` so a stall-detector that fires
+        // before the first bump cannot false-positive on `0`.
+        last_progress_at_ms_atomic: Arc::new(AtomicI64::new(now_ms)),
         db_path: crate::normalize_path_identity(db_path),
         job_id: String::new(),
         job_kind: maintenance_job_kind_for_mode(mode),
@@ -5343,6 +6771,17 @@ fn lexical_rebuild_controller_loadavg_low_watermark_1m_milli_from_high(
 
 pub(crate) fn lexical_rebuild_pipeline_settings_snapshot() -> LexicalRebuildPipelineSettingsSnapshot
 {
+    lexical_rebuild_pipeline_settings_snapshot_inner(true)
+}
+
+pub(crate) fn lexical_rebuild_pipeline_settings_snapshot_passive()
+-> LexicalRebuildPipelineSettingsSnapshot {
+    lexical_rebuild_pipeline_settings_snapshot_inner(false)
+}
+
+fn lexical_rebuild_pipeline_settings_snapshot_inner(
+    apply_responsiveness_governor: bool,
+) -> LexicalRebuildPipelineSettingsSnapshot {
     let steady_batch_fetch_conversations =
         lexical_rebuild_batch_fetch_conversation_limit(LEXICAL_REBUILD_PAGE_SIZE);
     let startup_batch_fetch_conversations =
@@ -5365,10 +6804,15 @@ pub(crate) fn lexical_rebuild_pipeline_settings_snapshot() -> LexicalRebuildPipe
     );
     let available_parallelism = lexical_rebuild_available_parallelism();
     let reserved_cores = lexical_rebuild_reserved_cores_for_available(available_parallelism);
-    let tantivy_writer_threads =
-        crate::search::tantivy::tantivy_writer_parallelism_hint_for_available_governed(
+    let tantivy_writer_threads_raw =
+        crate::search::tantivy::tantivy_writer_parallelism_hint_for_available(
             available_parallelism,
         );
+    let tantivy_writer_threads = if apply_responsiveness_governor {
+        responsiveness::effective_worker_count(tantivy_writer_threads_raw).max(1)
+    } else {
+        tantivy_writer_threads_raw
+    };
     let controller_restore_hold = lexical_rebuild_controller_restore_hold();
     let controller_loadavg_high_watermark_1m_milli =
         lexical_rebuild_controller_loadavg_high_watermark_1m_milli_for_available_and_reserved(
@@ -5385,8 +6829,16 @@ pub(crate) fn lexical_rebuild_pipeline_settings_snapshot() -> LexicalRebuildPipe
         available_parallelism,
         reserved_cores,
         tantivy_writer_threads,
-        staged_shard_builders: lexical_rebuild_staged_shard_builder_parallelism(),
-        staged_merge_workers: lexical_rebuild_staged_merge_worker_parallelism(),
+        staged_shard_builders: if apply_responsiveness_governor {
+            lexical_rebuild_staged_shard_builder_parallelism()
+        } else {
+            lexical_rebuild_staged_shard_builder_parallelism_configured()
+        },
+        staged_merge_workers: if apply_responsiveness_governor {
+            lexical_rebuild_staged_merge_worker_parallelism()
+        } else {
+            lexical_rebuild_staged_merge_worker_parallelism_configured()
+        },
         controller_mode: lexical_rebuild_responsiveness_policy().as_str().to_string(),
         controller_restore_clear_samples: lexical_rebuild_controller_restore_clear_samples(),
         controller_restore_hold_ms: controller_restore_hold.as_millis() as u64,
@@ -5402,7 +6854,11 @@ pub(crate) fn lexical_rebuild_pipeline_settings_snapshot() -> LexicalRebuildPipe
         steady_commit_every_message_bytes,
         startup_commit_every_message_bytes,
         pipeline_channel_size,
-        page_prep_workers: lexical_rebuild_page_prep_worker_parallelism(),
+        page_prep_workers: if apply_responsiveness_governor {
+            lexical_rebuild_page_prep_worker_parallelism()
+        } else {
+            lexical_rebuild_page_prep_worker_parallelism_configured()
+        },
         pipeline_max_message_bytes_in_flight,
     }
 }
@@ -5446,6 +6902,8 @@ struct LexicalRebuildResponsivenessController {
     loadavg_low_watermark_1m_milli: Option<u32>,
     restore_clear_samples: usize,
     restore_hold: Duration,
+    memory_reserve_bytes: usize,
+    emergency_memory_reserve_bytes: usize,
     state: LexicalRebuildResponsivenessState,
     reason: String,
     clear_samples: usize,
@@ -5494,6 +6952,9 @@ impl LexicalRebuildResponsivenessController {
             loadavg_low_watermark_1m_milli,
             restore_clear_samples: lexical_rebuild_controller_restore_clear_samples(),
             restore_hold: lexical_rebuild_controller_restore_hold(),
+            memory_reserve_bytes: lexical_rebuild_staged_shard_build_memory_reserve_bytes(),
+            emergency_memory_reserve_bytes:
+                lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes(),
             state,
             reason,
             clear_samples: 0,
@@ -5652,6 +7113,21 @@ impl LexicalRebuildResponsivenessController {
                 format_lexical_rebuild_loadavg_1m_milli(high_watermark_1m_milli)
             ));
         }
+        if let Some(available_memory_bytes) = runtime.host_available_memory_bytes {
+            let available_memory_bytes = usize_from_u64_saturating(available_memory_bytes);
+            if available_memory_bytes <= self.emergency_memory_reserve_bytes {
+                return Some(format!(
+                    "host_available_memory_bytes_{}_below_emergency_reserve_{}",
+                    available_memory_bytes, self.emergency_memory_reserve_bytes
+                ));
+            }
+            if available_memory_bytes <= self.memory_reserve_bytes {
+                return Some(format!(
+                    "host_available_memory_bytes_{}_below_reserve_{}",
+                    available_memory_bytes, self.memory_reserve_bytes
+                ));
+            }
+        }
         if new_producer_handoff_wait {
             return Some(format!(
                 "producer_handoff_wait_count_{}_observed_consumer_backpressure",
@@ -5708,6 +7184,12 @@ impl LexicalRebuildResponsivenessController {
             }
             (None, Some(_)) => true,
         };
+        let memory_is_clear = runtime
+            .host_available_memory_bytes
+            .map(|available_memory_bytes| {
+                usize_from_u64_saturating(available_memory_bytes) > self.memory_reserve_bytes
+            })
+            .unwrap_or(true);
         runtime.queue_depth == 0
             && runtime.ordered_buffered_pages == 0
             && runtime.pending_batch_conversations == 0
@@ -5718,6 +7200,7 @@ impl LexicalRebuildResponsivenessController {
                     .max_message_bytes_in_flight
                     .saturating_mul(Self::INFLIGHT_LOW_WATERMARK_PERCENT)
             && loadavg_is_clear
+            && memory_is_clear
     }
 }
 
@@ -5993,7 +7476,16 @@ fn lexical_rebuild_default_page_prep_worker_parallelism_for_workers(
 }
 
 fn lexical_rebuild_page_prep_worker_parallelism() -> usize {
-    let desired = dotenvy::var("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS")
+    let desired = lexical_rebuild_page_prep_worker_parallelism_configured();
+    // Let the machine-responsiveness governor scale this down when the host
+    // is under pressure. `effective_worker_count` returns the caller-requested
+    // value when the governor is idle or disabled, so behaviour on an idle
+    // box is unchanged.
+    responsiveness::effective_worker_count(desired).max(1)
+}
+
+fn lexical_rebuild_page_prep_worker_parallelism_configured() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -6007,12 +7499,7 @@ fn lexical_rebuild_page_prep_worker_parallelism() -> usize {
                 lexical_rebuild_worker_parallelism(),
             )
         })
-        .max(1);
-    // Let the machine-responsiveness governor scale this down when the host
-    // is under pressure. `effective_worker_count` returns the caller-requested
-    // value when the governor is idle or disabled, so behaviour on an idle
-    // box is unchanged.
-    responsiveness::effective_worker_count(desired).max(1)
+        .max(1)
 }
 
 fn lexical_rebuild_first_budget_promotion_wait() -> Duration {
@@ -6222,6 +7709,14 @@ fn live_tantivy_doc_count(index_path: &Path) -> Result<Option<usize>> {
 fn validate_lexical_rebuild_shard_build_result(
     result: &LexicalRebuildShardBuildResult,
 ) -> Result<LexicalRebuildShardMergeArtifact> {
+    crate::search::tantivy::validate_searchable_index_contract(&result.shard_index_path)
+        .with_context(|| {
+            format!(
+                "validating built lexical rebuild shard {} at {}",
+                result.shard.shard_index,
+                result.shard_index_path.display()
+            )
+        })?;
     let observed_docs = live_tantivy_doc_count(&result.shard_index_path)?.ok_or_else(|| {
         anyhow::anyhow!(
             "built lexical rebuild shard {} at {} is not searchable",
@@ -6618,6 +8113,7 @@ fn maybe_persist_staged_lexical_rebuild_progress(
     progress_heartbeat_interval_conversations: usize,
     last_progress_persist: &mut Instant,
     progress_heartbeat_interval: Duration,
+    progress_bump: Option<&Arc<AtomicI64>>,
     mut perf_profile: Option<&mut LexicalRebuildPerfProfile>,
 ) -> Result<bool> {
     // Staged shard-build resume safety is restart-from-zero, so these persists
@@ -6644,6 +8140,7 @@ fn maybe_persist_staged_lexical_rebuild_progress(
         runtime,
         base_meta_fingerprint_override,
     )?;
+    bump_index_run_lock_progress_if_present(progress_bump);
     if let (Some(profile), Some(started)) = (perf_profile.as_mut(), heartbeat_progress_started) {
         profile.heartbeat_persist_count = profile.heartbeat_persist_count.saturating_add(1);
         profile.heartbeat_progress_duration += started.elapsed();
@@ -6888,6 +8385,11 @@ struct IncrementalCanonicalLexicalRepairContext {
     completed_checkpoint_indexed_docs: Option<usize>,
     tantivy_requires_rebuild: bool,
     observed_tantivy_docs: Option<usize>,
+    /// True when a completed lexical-rebuild checkpoint records this exact
+    /// canonical data (matching storage fingerprint). This is diagnostic
+    /// context only: SQLite remains authoritative, and a fresh sparse live-doc
+    /// observation must still repair the derived lexical index.
+    published_index_validated_for_current_data: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6949,6 +8451,13 @@ fn choose_incremental_canonical_lexical_repair_plan(
 
     let observed_tantivy_docs = context.observed_tantivy_docs?;
     if observed_tantivy_docs < context.canonical_messages {
+        if context.published_index_validated_for_current_data {
+            tracing::warn!(
+                canonical_messages = context.canonical_messages,
+                observed_tantivy_docs,
+                "completed lexical checkpoint matches the canonical DB, but the live lexical index is sparse; repairing derived search assets from SQLite"
+            );
+        }
         return Some(IncrementalCanonicalLexicalRepairPlan {
             canonical_messages: context.canonical_messages,
             observed_tantivy_docs: Some(observed_tantivy_docs),
@@ -7625,6 +9134,69 @@ fn lexical_rebuild_default_shard_budget(
         .clamp(min_budget, max_budget)
 }
 
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_FLOOR: usize = 16 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING: usize = 128 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_MEMORY_FRACTION: u64 = 2_048;
+
+fn lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(
+    available_memory_bytes: Option<u64>,
+) -> usize {
+    let Some(available_memory_bytes) = available_memory_bytes else {
+        return LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_DEFAULT;
+    };
+    let scaled =
+        available_memory_bytes / LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_MEMORY_FRACTION;
+    let scaled =
+        usize::try_from(scaled).unwrap_or(LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING);
+    scaled.clamp(
+        LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_FLOOR,
+        LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING,
+    )
+}
+
+fn lexical_rebuild_staged_shard_max_message_bytes(
+    settings: &LexicalRebuildPipelineSettingsSnapshot,
+) -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(
+                responsiveness::available_memory_bytes(),
+            )
+        })
+        .min(settings.steady_commit_every_message_bytes.max(1))
+        .max(1)
+}
+
+fn lexical_rebuild_pending_shard_build_max_message_bytes(
+    settings: &LexicalRebuildPipelineSettingsSnapshot,
+) -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_PENDING_SHARD_BUILD_MAX_MESSAGE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            settings
+                .pipeline_max_message_bytes_in_flight
+                .max(lexical_rebuild_staged_shard_max_message_bytes(settings))
+        })
+        .max(1)
+}
+
+fn lexical_rebuild_pending_shard_build_max_jobs(
+    settings: &LexicalRebuildPipelineSettingsSnapshot,
+) -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_PENDING_SHARD_BUILD_MAX_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| settings.staged_shard_builders.max(1).saturating_mul(32))
+        .clamp(1, 256)
+}
+
 fn lexical_rebuild_default_shard_planner_budgets_for_totals(
     settings: &LexicalRebuildPipelineSettingsSnapshot,
     total_conversations: usize,
@@ -7633,6 +9205,11 @@ fn lexical_rebuild_default_shard_planner_budgets_for_totals(
 ) -> LexicalShardPlannerBudgets {
     let target_shards =
         lexical_rebuild_target_shard_count(settings.workers, settings.tantivy_writer_threads);
+    let max_message_bytes_per_shard = lexical_rebuild_staged_shard_max_message_bytes(settings);
+    let min_message_bytes_per_shard = settings
+        .startup_commit_every_message_bytes
+        .min(max_message_bytes_per_shard)
+        .max(1);
     LexicalShardPlannerBudgets {
         max_conversations_per_shard: lexical_rebuild_default_shard_budget(
             total_conversations,
@@ -7649,8 +9226,8 @@ fn lexical_rebuild_default_shard_planner_budgets_for_totals(
         max_message_bytes_per_shard: lexical_rebuild_default_shard_budget(
             total_message_bytes,
             target_shards,
-            settings.startup_commit_every_message_bytes,
-            settings.steady_commit_every_message_bytes,
+            min_message_bytes_per_shard,
+            max_message_bytes_per_shard,
         ),
     }
 }
@@ -7670,10 +9247,105 @@ fn lexical_rebuild_shard_planner_conversations_from_storage(
         .collect())
 }
 
+const LEXICAL_REBUILD_ID_ONLY_MAX_CONVERSATIONS_PER_SHARD: usize = 64;
+
+fn plan_lexical_rebuild_shards_from_conversation_ids_with_settings(
+    storage: &FrankenStorage,
+    settings: &LexicalRebuildPipelineSettingsSnapshot,
+    total_conversations: usize,
+    total_messages: usize,
+) -> Result<LexicalShardPlan> {
+    let conversation_ids = storage
+        .list_conversation_ids_for_lexical_rebuild()
+        .with_context(|| "listing canonical conversation ids for id-only lexical shard planning")?;
+    let exact_total_conversations = conversation_ids.len();
+    let average_messages_per_conversation = if exact_total_conversations == 0 {
+        0
+    } else {
+        total_messages.div_ceil(exact_total_conversations).max(1)
+    };
+    let estimated_message_bytes_per_conversation = average_messages_per_conversation
+        .saturating_mul(LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE);
+    let max_message_bytes_per_shard = lexical_rebuild_staged_shard_max_message_bytes(settings);
+    let max_conversations_by_average_bytes = if estimated_message_bytes_per_conversation == 0 {
+        LEXICAL_REBUILD_ID_ONLY_MAX_CONVERSATIONS_PER_SHARD
+    } else {
+        max_message_bytes_per_shard
+            .saturating_div(estimated_message_bytes_per_conversation)
+            .max(1)
+    };
+    let max_conversations_per_shard = settings
+        .steady_commit_every_conversations
+        .clamp(1, LEXICAL_REBUILD_ID_ONLY_MAX_CONVERSATIONS_PER_SHARD)
+        .min(max_conversations_by_average_bytes.max(1))
+        .max(1);
+    let max_messages_per_shard = average_messages_per_conversation
+        .saturating_mul(max_conversations_per_shard)
+        .max(1);
+    let estimated_message_bytes_per_shard = estimated_message_bytes_per_conversation
+        .saturating_mul(max_conversations_per_shard)
+        .max(1)
+        .min(max_message_bytes_per_shard.max(1));
+
+    tracing::info!(
+        total_conversations,
+        exact_total_conversations,
+        total_messages,
+        average_messages_per_conversation,
+        estimated_message_bytes_per_conversation,
+        max_conversations_per_shard,
+        max_messages_per_shard,
+        max_message_bytes_per_shard = estimated_message_bytes_per_shard,
+        "using conservative conversation-id-only lexical shard plan because canonical DB has no tail footprint metadata"
+    );
+
+    let conversations = conversation_ids
+        .into_iter()
+        .map(|conversation_id| LexicalShardPlannerConversation {
+            conversation_id,
+            message_count: average_messages_per_conversation,
+            message_bytes: estimated_message_bytes_per_conversation,
+        })
+        .collect::<Vec<_>>();
+    let budgets = LexicalShardPlannerBudgets {
+        max_conversations_per_shard,
+        max_messages_per_shard,
+        max_message_bytes_per_shard: estimated_message_bytes_per_shard,
+    };
+    let mut plan = plan_lexical_rebuild_shards(&conversations, budgets);
+    for shard in &mut plan.shards {
+        shard.message_count = LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT;
+    }
+    plan.total_conversations = exact_total_conversations;
+    plan.total_messages = total_messages;
+    plan.total_message_bytes =
+        total_messages.saturating_mul(LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE);
+    plan.plan_id = lexical_shard_plan_id(
+        plan.budgets,
+        &plan.shards,
+        plan.total_conversations,
+        plan.total_messages,
+        plan.total_message_bytes,
+        &plan.oversized_conversation_ids,
+    );
+    Ok(plan)
+}
+
 fn plan_lexical_rebuild_shards_from_storage_with_settings(
     storage: &FrankenStorage,
     settings: &LexicalRebuildPipelineSettingsSnapshot,
+    total_conversations: usize,
 ) -> Result<LexicalShardPlan> {
+    if !storage.lexical_rebuild_has_tail_footprint_metadata()? {
+        let total_messages = count_total_messages_exact(storage)?;
+        return plan_lexical_rebuild_shards_from_conversation_ids_with_settings(
+            storage,
+            settings,
+            total_conversations,
+            total_messages,
+        );
+    }
+
     let conversations = lexical_rebuild_shard_planner_conversations_from_storage(storage)?;
     let total_conversations = conversations.len();
     let total_messages = conversations
@@ -7765,12 +9437,111 @@ struct LexicalRebuildShardBuilderSettings {
     writer_parallelism_budget: usize,
 }
 
+const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_NUMERATOR: u64 = 2;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_DENOMINATOR: u64 = 3;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FRACTION: u64 = 8;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FALLBACK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FLOOR_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_CEILING_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_RESERVE_FRACTION: u64 = 32;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FALLBACK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI: u64 = 8_000;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_HEADROOM_MILLI: u64 = 1_500;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_ESTIMATED_BYTES: u64 = 512 * 1024 * 1024;
+
+fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
+    workers: usize,
+    available_memory_bytes: Option<u64>,
+) -> usize {
+    let cpu_ceiling = workers.clamp(1, 8);
+    let Some(available_memory_bytes) = available_memory_bytes else {
+        return cpu_ceiling;
+    };
+    let memory_budget = available_memory_bytes
+        .saturating_mul(LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_NUMERATOR)
+        / LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_DENOMINATOR.max(1);
+    let memory_ceiling = usize::try_from(
+        memory_budget / LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES.max(1),
+    )
+    .unwrap_or(usize::MAX)
+    .clamp(1, 8);
+    cpu_ceiling.min(memory_ceiling).max(1)
+}
+
 fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(workers: usize) -> usize {
-    workers.clamp(1, 8)
+    lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
+        workers,
+        responsiveness::available_memory_bytes(),
+    )
+}
+
+fn usize_from_u64_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn lexical_rebuild_default_staged_shard_build_memory_reserve_bytes_for_total_memory(
+    total_memory_bytes: Option<u64>,
+) -> usize {
+    let reserve = total_memory_bytes
+        .map(|total| total / LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FRACTION.max(1))
+        .unwrap_or(LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FALLBACK_BYTES)
+        .clamp(
+            LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FLOOR_BYTES,
+            LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_CEILING_BYTES,
+        );
+    usize_from_u64_saturating(reserve)
+}
+
+fn lexical_rebuild_staged_shard_build_memory_reserve_bytes() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILD_MEMORY_RESERVE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            lexical_rebuild_default_staged_shard_build_memory_reserve_bytes_for_total_memory(
+                responsiveness::total_memory_bytes(),
+            )
+        })
+}
+
+fn lexical_rebuild_default_staged_shard_build_emergency_memory_reserve_bytes_for_total_memory(
+    total_memory_bytes: Option<u64>,
+) -> usize {
+    let reserve = total_memory_bytes
+        .map(|total| total / LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_RESERVE_FRACTION.max(1))
+        .unwrap_or(LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FALLBACK_BYTES)
+        .clamp(
+            LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FLOOR_BYTES,
+            LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_CEILING_BYTES,
+        );
+    usize_from_u64_saturating(reserve)
+}
+
+fn lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_MEMORY_RESERVE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            lexical_rebuild_default_staged_shard_build_emergency_memory_reserve_bytes_for_total_memory(
+                responsiveness::total_memory_bytes(),
+            )
+        })
 }
 
 fn lexical_rebuild_staged_shard_builder_parallelism() -> usize {
-    let raw = dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS")
+    let raw = lexical_rebuild_staged_shard_builder_parallelism_configured();
+    // Apply the responsiveness governor so shard-builder fanout shrinks
+    // together with page-prep when the host is under pressure. On an idle
+    // box this is a no-op; under pressure it preserves interactive headroom.
+    responsiveness::effective_worker_count(raw).max(1)
+}
+
+fn lexical_rebuild_staged_shard_builder_parallelism_configured() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -7778,11 +9549,7 @@ fn lexical_rebuild_staged_shard_builder_parallelism() -> usize {
             lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(
                 lexical_rebuild_worker_parallelism(),
             )
-        });
-    // Apply the responsiveness governor so shard-builder fanout shrinks
-    // together with page-prep when the host is under pressure. On an idle
-    // box this is a no-op; under pressure it preserves interactive headroom.
-    responsiveness::effective_worker_count(raw).max(1)
+        })
 }
 
 fn lexical_rebuild_default_staged_merge_worker_parallelism_for_workers(workers: usize) -> usize {
@@ -7792,7 +9559,14 @@ fn lexical_rebuild_default_staged_merge_worker_parallelism_for_workers(workers: 
 }
 
 fn lexical_rebuild_staged_merge_worker_parallelism() -> usize {
-    let raw = dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS")
+    let raw = lexical_rebuild_staged_merge_worker_parallelism_configured();
+    // Same governor wire-up as shard builders above: keep at most 1 merger on
+    // tiny hosts, scale with measured machine responsiveness.
+    responsiveness::effective_worker_count(raw).max(1)
+}
+
+fn lexical_rebuild_staged_merge_worker_parallelism_configured() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -7800,10 +9574,7 @@ fn lexical_rebuild_staged_merge_worker_parallelism() -> usize {
             lexical_rebuild_default_staged_merge_worker_parallelism_for_workers(
                 lexical_rebuild_worker_parallelism(),
             )
-        });
-    // Same governor wire-up as shard builders above: keep at most 1 merger on
-    // tiny hosts, scale with measured machine responsiveness.
-    responsiveness::effective_worker_count(raw).max(1)
+        })
 }
 
 fn lexical_rebuild_staged_shard_builder_settings(
@@ -7907,6 +9678,42 @@ pub(crate) fn load_active_lexical_rebuild_pipeline_runtime(
 
 pub(crate) fn lexical_storage_fingerprint_for_db(db_path: &Path) -> Result<String> {
     lexical_rebuild_storage_fingerprint(db_path)
+}
+
+/// True iff a *completed* lexical-rebuild checkpoint exists for `db_path` whose
+/// recorded storage fingerprint matches the current canonical DB. Used to
+/// recognize an already-published, still-valid lexical generation and skip a
+/// redundant from-scratch rebuild that would otherwise loop on every restart
+/// after an OOM-killed shard merge (issue #248,
+/// coding_agent_session_search-raoug). Conservative by construction: any missing
+/// checkpoint, incomplete rebuild, path-identity mismatch, changed data
+/// (different fingerprint), or read error returns `false`, preserving the
+/// existing rebuild behavior.
+fn published_lexical_index_validated_for_current_data(index_path: &Path, db_path: &Path) -> bool {
+    let checkpoint = match load_lexical_rebuild_checkpoint(index_path) {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => return false,
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "could not load lexical rebuild checkpoint while validating published index"
+            );
+            return false;
+        }
+    };
+    if !checkpoint.completed || !crate::stored_path_identity_matches(&checkpoint.db_path, db_path) {
+        return false;
+    }
+    match lexical_storage_fingerprint_for_db(db_path) {
+        Ok(current_fingerprint) => current_fingerprint == checkpoint.storage_fingerprint,
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "could not compute current storage fingerprint while validating published index"
+            );
+            false
+        }
+    }
 }
 
 fn persist_completed_lexical_rebuild_checkpoint_from_observations(
@@ -9788,7 +11595,9 @@ fn run_streaming_index_with_connector_factories(
         additional_scan_roots: additional_scan_roots.clone(),
         since_ts,
         progress: opts.progress.clone(),
-        active_source_filter: Arc::new(ActiveSessionSourceFilter::new()),
+        active_source_filter: Arc::new(ActiveSessionSourceFilter::new(
+            opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
+        )),
     };
 
     // Spawn producer threads for each connector
@@ -9927,7 +11736,9 @@ fn run_batch_index_with_connector_factories(
 
     let progress_ref = opts.progress.as_ref();
     let data_dir = opts.data_dir.clone();
-    let active_source_filter = Arc::new(ActiveSessionSourceFilter::new());
+    let active_source_filter = Arc::new(ActiveSessionSourceFilter::new(
+        opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
+    ));
 
     // Return type includes whether agent was discovered (for post-parallel name collection)
     let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>, bool)> =
@@ -10164,6 +11975,19 @@ fn run_batch_index_with_connector_factories(
     Ok(ingest_outcome)
 }
 
+fn non_watch_scan_since_ts(
+    full: bool,
+    needs_rebuild: bool,
+    retry_stale_index_ingest_quarantine: bool,
+    last_scan_ts: Option<i64>,
+) -> Option<i64> {
+    if full || needs_rebuild || retry_stale_index_ingest_quarantine {
+        None
+    } else {
+        last_scan_ts.map(|ts| ts.saturating_sub(1))
+    }
+}
+
 pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
@@ -10188,7 +12012,15 @@ pub fn run_index(
         opts.data_dir.clone(),
         index_run_lock_heartbeat_interval(),
         Arc::clone(&index_run_lock.metadata_write_lock),
+        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
     );
+    // F4: clone the atomic so deeply nested batch loops can bump progress
+    // without holding a `&mut IndexRunLockGuard`. The clone is cheap
+    // (single Arc bump) and lives only inside this function.
+    let progress_bump = Arc::clone(&index_run_lock.last_progress_at_ms_atomic);
+    // The atomic-store bump runs once per "interesting" batch boundary
+    // — currently used at the per-conversation completion ingest loop
+    // and the lexical commit boundary; see `bump_index_run_lock_progress_atomic`.
 
     if can_skip_absent_explicit_watch_once_index_run(&opts) {
         let path_count = opts
@@ -10205,7 +12037,86 @@ pub fn run_index(
         return Ok(());
     }
 
+    // cass#265: each preflight step gets its own sub-phase breadcrumb so
+    // operators investigating a watch_startup wedge can see WHICH step
+    // stalled instead of an opaque `phase=watch_startup` for the entire
+    // pre-pipeline block. Each `set_phase` call also bumps
+    // `last_progress_at_ms` (in both the atomic and the on-disk field)
+    // and emits a new `phase=` string that `IndexStallWatchdog` treats
+    // as a phase transition (resets its `last_progress_advance` timer).
+    // The macro keeps the call sites compact: noop on non-watch_startup
+    // modes so plain `cass index` runs don't pay the I/O cost on the
+    // initial-state non-watch path.
+    //
+    // v0.6.7 extension: the macro also notifies the
+    // `WatchStartupPreflightState` so the watchdog thread can detect
+    // a wedge that exceeds `CASS_PREFLIGHT_OP_TIMEOUT_SECS` (default
+    // 180 s) and abort the process with a `<step>_TIMEOUT` breadcrumb
+    // instead of hanging forever.
+    let preflight_state = WatchStartupPreflightState::new();
+    let _preflight_watchdog = if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
+        Some(WatchStartupPreflightWatchdog::start(
+            Arc::clone(&preflight_state),
+            WATCH_STARTUP_SUB_PHASE_TAXONOMY,
+            index_run_lock._path.clone(),
+            opts.data_dir.clone(),
+            watch_startup_preflight::op_timeout(),
+            std::time::Duration::from_secs(5),
+            PreflightTimeoutPolicy::Abort,
+            // INV3: pass the shared write lock so the watchdog's
+            // `_TIMEOUT` rewrite is serialised with the heartbeat.
+            Arc::clone(&index_run_lock.metadata_write_lock),
+        ))
+    } else {
+        None
+    };
+    macro_rules! preflight_phase {
+        ($phase:expr) => {{
+            if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
+                // Notify the watchdog of the new active step BEFORE
+                // writing the lock-file breadcrumb. If the lock-file
+                // write itself wedges (it shouldn't, but
+                // belt-and-suspenders), the watchdog can still kill
+                // the process with the right `<step>_TIMEOUT` phase.
+                if let Some(step_idx) = watch_startup_step_idx($phase) {
+                    preflight_state
+                        .enter(step_idx, FrankenStorage::now_millis());
+                } else {
+                    // Coding error: an undocumented sub-phase reached
+                    // the macro. Fail loud in debug builds; in release
+                    // we still write the breadcrumb so the operator
+                    // gets *some* signal, just no watchdog coverage.
+                    debug_assert!(
+                        false,
+                        "undocumented watch_startup sub-phase `{}`; add it to WATCH_STARTUP_SUB_PHASE_TAXONOMY",
+                        $phase
+                    );
+                }
+                if let Err(err) = index_run_lock.set_phase(initial_lock_mode, $phase) {
+                    tracing::debug!(
+                        sub_phase = $phase,
+                        error = %err,
+                        "watch_startup preflight phase breadcrumb write failed (continuing)"
+                    );
+                }
+            }
+        }};
+    }
+    macro_rules! complete_preflight_phase {
+        () => {{
+            if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
+                preflight_state.exit();
+                bump_index_run_lock_progress_atomic(&progress_bump);
+            }
+        }};
+    }
+
+    preflight_phase!("watch_startup:ensure_index_dir");
     let index_path = index_dir(&opts.data_dir)?;
+    complete_preflight_phase!();
+    preflight_phase!("watch_startup:ensure_storage_headroom");
+    ensure_index_storage_headroom(&opts.data_dir, &opts.db_path)?;
+    complete_preflight_phase!();
     if should_try_readonly_nonresumable_lexical_resume(&opts) {
         match nonresumable_pending_lexical_rebuild_status_from_readonly_db(
             &index_path,
@@ -10227,11 +12138,12 @@ pub fn run_index(
                     reason = "readonly_fast_resume_incomplete_nonresumable_lexical_rebuild",
                     "selected_lexical_population_strategy"
                 );
-                let rebuild = rebuild_tantivy_from_db_deferred_startup(
+                let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                     &opts.db_path,
                     &opts.data_dir,
                     total_conversations,
                     opts.progress.clone(),
+                    Arc::clone(&progress_bump),
                 )?;
                 if let Some(p) = &opts.progress
                     && let Ok(mut stats) = p.stats.lock()
@@ -10258,15 +12170,18 @@ pub fn run_index(
             }
         }
     }
+    if try_readonly_canonical_force_rebuild(&opts, &progress_bump)? {
+        return Ok(());
+    }
 
-    let (storage, canonical_storage_rebuilt, opened_fresh_for_full) =
+    preflight_phase!("watch_startup:open_storage");
+    let (mut storage, canonical_storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
+    complete_preflight_phase!();
     let defer_checkpoints = !opts.watch;
-    let mut storage = storage;
-    let mut canonical_storage_rebuilt = canonical_storage_rebuilt;
-    let mut opened_fresh_for_full = opened_fresh_for_full;
     let mut reopened_after_writable_preflight = false;
 
+    preflight_phase!("watch_startup:writable_preflight");
     // CASS #162 item 2: Verify the connection is writable early, before the
     // code reaches deep batch-insert paths where a readonly failure is hard
     // to diagnose.  A benign no-op UPDATE catches "attempt to write a readonly
@@ -10301,21 +12216,74 @@ pub fn run_index(
 
     persist::apply_index_writer_busy_timeout(&storage);
     persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
+    complete_preflight_phase!();
+
+    preflight_phase!("watch_startup:validate_fts_messages");
+    // cass#265: `CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES=1` short-
+    // circuits the FTS5 full-table integrity scan, which is one of
+    // the three most likely wedge candidates on multi-GB DBs. When
+    // skipped, any genuine FTS corruption surfaces later on the next
+    // real write.
+    let _validate_fts_skipped = preflight_skip("watch_startup:validate_fts_messages");
+    if !_validate_fts_skipped && let Err(err) = storage.validate_fts_messages_integrity() {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            error = %err,
+            "derived fallback FTS metadata is inconsistent; repairing before index pipeline"
+        );
+        storage.close_best_effort_in_place();
+        let mut repair_storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+            &opts.db_path,
+            Duration::from_secs(10),
+        )
+        .with_context(|| {
+            format!(
+                "opening fresh storage for fallback FTS repair before indexing {}",
+                opts.db_path.display()
+            )
+        })?;
+        let repair = repair_storage.ensure_search_fallback_fts_consistency();
+        repair_storage.close_best_effort_in_place();
+        let repair = repair.with_context(|| {
+            format!(
+                "repairing derived fallback FTS before indexing {}",
+                opts.db_path.display()
+            )
+        })?;
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            ?repair,
+            "derived fallback FTS repair completed before index pipeline"
+        );
+        storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+            &opts.db_path,
+            Duration::from_secs(10),
+        )
+        .with_context(|| {
+            format!(
+                "reopening storage after fallback FTS repair before indexing {}",
+                opts.db_path.display()
+            )
+        })?;
+        persist::apply_index_writer_busy_timeout(&storage);
+        persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
+    }
+    complete_preflight_phase!();
 
     if opts.full
         && !opened_fresh_for_full
         && let Some(reason) = full_rebuild_existing_storage_integrity_problem(&storage)?
     {
-        tracing::warn!(
+        tracing::error!(
             db_path = %opts.db_path.display(),
             reason = %reason,
-            "full rebuild detected an unhealthy current-schema canonical db; backing it up and starting from a fresh archive"
+            "full rebuild detected an unhealthy current-schema canonical db; refusing to replace the canonical archive"
         );
-        storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
-        canonical_storage_rebuilt = true;
-        opened_fresh_for_full = true;
-        persist::apply_index_writer_busy_timeout(&storage);
-        persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
+        storage.close_best_effort_in_place();
+        return Err(canonical_archive_unhealthy_for_index_error(
+            &opts.db_path,
+            &reason,
+        ));
     }
 
     if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage, &index_path)? {
@@ -10340,38 +12308,46 @@ pub fn run_index(
         return close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run");
     }
 
-    if finalize_deferred_lexical_refresh_before_maintenance_if_ready(&opts, &storage, &index_path)?
-    {
-        return close_storage_after_index(
-            storage,
-            &opts.db_path,
-            "deferred lexical refresh pre-maintenance no-op finalization",
-        );
-    }
-
+    preflight_phase!("watch_startup:cleanup_orphan_fk_rows");
     // cass#202 self-heal: a Connection dropped mid-transaction (the
     // `drop_close` warning) can leave child rows persisted without a matching
-    // parent — specifically `messages` referencing a `conversation_id` that
-    // does not exist, and the `message_metrics`/`token_usage` cascades that
-    // follow. With FK enforcement on, every subsequent indexer pass would then
-    // trip `FOREIGN KEY constraint failed` on the next write and the pending
-    // backlog grows without bound. Sweep before the indexer touches the DB so
-    // one bad commit cannot poison every future run. Skipped on full rebuilds
-    // because the canonical DB will be replaced anyway. The function logs its
-    // own WARN on a successful cleanup; the caller only needs to surface the
-    // failure mode so the index run continues rather than aborting.
-    if !opts.full
-        && let Err(err) = storage.cleanup_orphan_fk_rows()
-    {
+    // parent. Sweep before the indexer touches the DB so one bad commit cannot
+    // poison every future run. A failed sweep is now fatal for this run:
+    // continuing after OOM/corruption can reuse a poisoned connection and make
+    // the canonical archive worse.
+    //
+    // cass#265: the cass#265 reporter confirmed this is the wedging
+    // step on a 3.25 GB / 7,566-conversation / 417,234-message DB
+    // (v0.6.6 lock file `phase=watch_startup:cleanup_orphan_fk_rows`).
+    // `CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1` lets the operator
+    // bypass the sweep so cass can actually run while the underlying
+    // fsqlite B-tree descent bug is being root-caused. The skip is
+    // intentionally per-step so it doesn't disable the rest of the
+    // preflight (cass#202 OOM detection still fires for other paths).
+    if preflight_skip("watch_startup:cleanup_orphan_fk_rows") {
+        tracing::warn!(
+            target: "cass::fk_repair",
+            db_path = %opts.db_path.display(),
+            "cass#265: skipping cleanup_orphan_fk_rows preflight by operator request \
+             (CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1). cass#202 orphan FK \
+             self-heal is bypassed for this run only; a future run without the \
+             env var will re-attempt the sweep."
+        );
+    } else if let Err(err) = storage.cleanup_orphan_fk_rows() {
         tracing::warn!(
             target: "cass::fk_repair",
             db_path = %opts.db_path.display(),
             error = %err,
-            "cass#202: orphan FK self-heal failed; continuing index run (cleanup will retry next pass)"
+            "cass#202: orphan FK self-heal failed; aborting index run before further writes"
         );
+        storage.close_best_effort_in_place();
+        return Err(orphan_fk_cleanup_failed_index_error(&opts.db_path, &err));
     }
+    complete_preflight_phase!();
 
-    let mut initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+    preflight_phase!("watch_startup:count_total_conversations");
+    let initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+    complete_preflight_phase!();
     if opts.full
         && !opened_fresh_for_full
         && full_rebuild_requires_historical_restart(
@@ -10380,17 +12356,16 @@ pub fn run_index(
             initial_canonical_sessions_before_salvage,
         )?
     {
-        tracing::info!(
+        tracing::error!(
             db_path = %opts.db_path.display(),
             conversations = initial_canonical_sessions_before_salvage,
-            "full rebuild detected incomplete historical salvage state; restarting from a fresh canonical database"
+            "full rebuild detected incomplete historical salvage state; refusing to replace the canonical archive"
         );
-        storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
-        canonical_storage_rebuilt = true;
-        opened_fresh_for_full = true;
-        persist::apply_index_writer_busy_timeout(&storage);
-        persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
-        initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+        storage.close_best_effort_in_place();
+        return Err(canonical_archive_unhealthy_for_index_error(
+            &opts.db_path,
+            "historical salvage restart would require replacing canonical SQLite",
+        ));
     }
     // canonical_only_full_rebuild: when --force-rebuild is set and we already
     // have canonical sessions in the DB, skip the expensive filesystem rescan
@@ -10402,6 +12377,7 @@ pub fn run_index(
         .watch_once_paths
         .as_ref()
         .is_some_and(|paths| !paths.is_empty());
+    let targeted_semantic_watch_once = should_run_targeted_semantic_watch_once(&opts);
     let populated_explicit_watch_once_only = has_explicit_watch_once_paths
         && !opts.watch
         && !opts.full
@@ -10409,6 +12385,7 @@ pub fn run_index(
         && !opts.semantic
         && !opts.build_hnsw
         && initial_canonical_sessions_before_salvage > 0;
+    preflight_phase!("watch_startup:probe_lexical_checkpoint");
     let mut initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus::default();
     let mut restart_pending_lexical_rebuild_from_zero = false;
     let resume_lexical_rebuild = if opts.force_rebuild {
@@ -10474,6 +12451,7 @@ pub fn run_index(
             "preserving matching completed lexical checkpoint during full scan until canonical mutations require a rebuild"
         );
     }
+    complete_preflight_phase!();
     let pre_scan_daily_stats_archive_fingerprint =
         preserve_matching_completed_checkpoint_during_full_scan
             .then_some(
@@ -10484,6 +12462,7 @@ pub fn run_index(
             .flatten();
     let mut checked_daily_stats_pre_scan = false;
     if opts.full && !canonical_only_full_rebuild {
+        preflight_phase!("watch_startup:repair_daily_stats");
         if let DailyStatsRepairOutcome::SkippedKnownHealthyForFingerprint {
             archive_fingerprint,
         } = repair_daily_stats_if_drifted(
@@ -10497,6 +12476,7 @@ pub fn run_index(
                 "skipping pre-scan daily_stats health probe because this full run preserved an archive fingerprint already known to be healthy"
             );
         }
+        complete_preflight_phase!();
         checked_daily_stats_pre_scan = true;
     } else if canonical_only_full_rebuild {
         tracing::info!(
@@ -10508,13 +12488,63 @@ pub fn run_index(
     let mut performed_scan = false;
     let mut scan_canonical_mutations = CanonicalMutationCounts::default();
     let mut scan_lexical_update_deferred = false;
+    let mut stale_index_ingest_quarantine_retry_attempted = false;
 
     let mut tantivy_requires_rebuild = false;
     let mut observed_tantivy_docs = None;
+    preflight_phase!("watch_startup:tantivy_reader_preflight");
     if should_preflight_existing_tantivy_reader(resume_lexical_rebuild, opts.full) {
-        let preflight = preflight_existing_tantivy_state(&index_path)?;
-        tantivy_requires_rebuild = opts.force_rebuild || preflight.0;
-        observed_tantivy_docs = preflight.1;
+        // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
+        // IMPORTANT: This must stay aligned with TantivyIndex::open_or_create() rebuild triggers.
+        let schema_hash_path = index_path.join("schema_hash.json");
+        let schema_matches = schema_hash_path.exists()
+            && std::fs::read_to_string(&schema_hash_path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+                .and_then(|json| {
+                    json.get("schema_hash")
+                        .and_then(|v| v.as_str())
+                        .map(schema_hash_matches)
+                })
+                .unwrap_or(false);
+
+        // Treat missing schema hash as rebuild (open_or_create will wipe/recreate).
+        tantivy_requires_rebuild = opts.force_rebuild
+            || !crate::search::tantivy::searchable_index_exists(&index_path)
+            || !schema_matches;
+
+        // Preflight open: if the cass-compatible Tantivy reader can't open, force a
+        // rebuild so we do a full scan and reindex messages into the new index
+        // (SQLite is incremental-only by default).
+        if !tantivy_requires_rebuild {
+            match crate::search::tantivy::searchable_index_summary(&index_path) {
+                Ok(Some(summary)) => {
+                    if let Err(e) =
+                        crate::search::tantivy::validate_searchable_index_contract(&index_path)
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            path = %index_path.display(),
+                            "tantivy contract preflight failed; forcing rebuild"
+                        );
+                        tantivy_requires_rebuild = true;
+                    } else {
+                        observed_tantivy_docs = Some(summary.docs);
+                    }
+                }
+                Ok(None) => {
+                    tantivy_requires_rebuild = true;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %index_path.display(),
+                        "tantivy open preflight failed; forcing rebuild"
+                    );
+                    tantivy_requires_rebuild = true;
+                }
+            }
+        }
     } else if resume_lexical_rebuild {
         tracing::info!(
             db_path = %opts.db_path.display(),
@@ -10528,6 +12558,7 @@ pub fn run_index(
     } else {
         tracing::info!(db_path = %opts.db_path.display(), "skipping live Tantivy reader preflight");
     }
+    complete_preflight_phase!();
     let mut needs_rebuild =
         should_force_authoritative_rebuild(canonical_storage_rebuilt, tantivy_requires_rebuild);
     let initial_needs_rebuild = needs_rebuild;
@@ -10602,18 +12633,20 @@ pub fn run_index(
             "selected_lexical_population_strategy"
         );
         let rebuild = if restart_pending_lexical_rebuild_from_zero {
-            rebuild_tantivy_from_db_deferred_startup(
+            rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                 &opts.db_path,
                 &opts.data_dir,
                 initial_canonical_sessions_before_salvage,
                 opts.progress.clone(),
+                Arc::clone(&progress_bump),
             )?
         } else {
-            rebuild_tantivy_from_db(
+            rebuild_tantivy_from_db_with_progress_bump(
                 &opts.db_path,
                 &opts.data_dir,
                 initial_canonical_sessions_before_salvage,
                 opts.progress.clone(),
+                Arc::clone(&progress_bump),
             )?
         };
         exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
@@ -10643,16 +12676,12 @@ pub fn run_index(
         let mut t_index: Option<TantivyIndex> = None;
 
         if opts.full && !opened_fresh_for_full && initial_canonical_sessions_before_salvage == 0 {
-            storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
-            persist::apply_index_writer_busy_timeout(&storage);
-            persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
-            // NOTE: We deliberately do NOT call delete_all() here. The Tantivy
-            // index will be atomically replaced by rebuild_tantivy_from_db() at
-            // the end of a successful --full rebuild.  Eagerly deleting is both
-            // redundant (rebuild_tantivy_from_db removes + recreates the dir)
-            // and dangerous: if the scan or rebuild OOMs / hits a constraint
-            // error, the user is left with a 0-segment empty index and no
-            // automatic recovery path.  (CASS #164)
+            // NOTE: We deliberately do NOT reset either SQLite or Tantivy here.
+            // An empty canonical archive can be populated in place, and the
+            // Tantivy index will be atomically replaced by rebuild_tantivy_from_db()
+            // at the end of a successful --full rebuild. Eagerly deleting or
+            // replacing anything is both redundant and dangerous if the scan or
+            // rebuild OOMs / hits a constraint error. (CASS #164)
         } else if opts.full {
             // Same rationale — skip eager delete_all(); rebuild_tantivy_from_db()
             // handles starting fresh after the scan succeeds.  (CASS #164)
@@ -10693,6 +12722,7 @@ pub fn run_index(
             should_salvage_historical,
             "historical salvage decision"
         );
+        preflight_phase!("watch_startup:historical_salvage");
         let historical_salvage: HistoricalSalvageOutcome = if targeted_watch_once_only {
             tracing::info!(
                 db_path = %opts.db_path.display(),
@@ -10731,6 +12761,7 @@ pub fn run_index(
             );
             HistoricalSalvageOutcome::default()
         };
+        complete_preflight_phase!();
         if historical_salvage.messages_imported > 0 {
             tracing::info!(
                 bundles_imported = historical_salvage.bundles_imported,
@@ -10752,14 +12783,52 @@ pub fn run_index(
                 .completed_indexed_docs,
             tantivy_requires_rebuild,
             observed_tantivy_docs,
+            // Placeholder: validating the published index opens the DB read-only
+            // and runs COUNT scans, so it is computed lazily below — only when the
+            // live index actually looks sparse — to keep normal index/watch runs
+            // cheap (#248, coding_agent_session_search-raoug).
+            published_index_validated_for_current_data: false,
         };
         let incremental_canonical_lexical_repair = if canonical_sessions_before_salvage > 0
             && should_evaluate_incremental_canonical_lexical_repair(&repair_context)
+            // cass#265: `CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES=1`
+            // short-circuits the entire incremental-canonical-lexical-
+            // repair branch — `count_total_messages_exact` issues a
+            // `SELECT COUNT(*) FROM messages` which, on the cass#265
+            // reporter's 417k-row DB, can route through the same
+            // fsqlite full-table-scan path that wedges
+            // `cleanup_orphan_fk_rows`. Skipping leaves the planner
+            // in the "no repair plan" branch, which falls through to
+            // the normal scan loop instead of the lexical-repair
+            // shortcut.
+            && !preflight_skip("watch_startup:count_total_messages")
         {
+            preflight_phase!("watch_startup:count_total_messages");
             let canonical_messages = count_total_messages_exact(&storage)?;
+            complete_preflight_phase!();
+            // #248 (coding_agent_session_search-raoug): only pay for the
+            // published-index validation (a read-only DB open + fingerprint COUNT
+            // scans) when the live index actually looks sparse — i.e. when it would
+            // otherwise trigger a from-scratch rebuild. A genuinely missing/invalid
+            // index rebuilds regardless (handled in
+            // choose_incremental_canonical_lexical_repair_plan via
+            // tantivy_requires_rebuild), so skip the check then.
+            let published_index_validated_for_current_data = !tantivy_requires_rebuild
+                && observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages)
+                && !preflight_skip("watch_startup:published_index_validate")
+                && {
+                    preflight_phase!("watch_startup:published_index_validate");
+                    let validated = published_lexical_index_validated_for_current_data(
+                        &index_path,
+                        &opts.db_path,
+                    );
+                    complete_preflight_phase!();
+                    validated
+                };
             choose_incremental_canonical_lexical_repair_plan(
                 IncrementalCanonicalLexicalRepairContext {
                     canonical_messages,
+                    published_index_validated_for_current_data,
                     ..repair_context
                 },
             )
@@ -10843,11 +12912,12 @@ pub fn run_index(
             drop(t_index.take());
             let rebuild_start = std::time::Instant::now();
             let rebuild_convs = canonical_sessions_before_salvage;
-            let rebuild = rebuild_tantivy_from_db_deferred_startup(
+            let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                 &opts.db_path,
                 &opts.data_dir,
                 rebuild_convs,
                 opts.progress.clone(),
+                Arc::clone(&progress_bump),
             )?;
             exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
             let rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
@@ -10906,11 +12976,12 @@ pub fn run_index(
 
                 drop(t_index.take());
                 let rebuild_convs = count_total_conversations_exact(&storage)?;
-                let rebuild = rebuild_tantivy_from_db_deferred_startup(
+                let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                     &opts.db_path,
                     &opts.data_dir,
                     rebuild_convs,
                     opts.progress.clone(),
+                    Arc::clone(&progress_bump),
                 )?;
                 exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
                 if let Some(observed_messages) = rebuild.observed_messages {
@@ -10955,6 +13026,21 @@ pub fn run_index(
                     lexical_strategy,
                     lexical_strategy_reason,
                 );
+                let stale_index_ingest_quarantine_retry =
+                    if targeted_watch_once_only || canonical_only_full_rebuild {
+                        None
+                    } else {
+                        stale_index_ingest_quarantine_version_retry(&opts.data_dir)?
+                    };
+                if let Some(retry) = &stale_index_ingest_quarantine_retry {
+                    tracing::warn!(
+                        stale_records = retry.stale_records,
+                        legacy_records = retry.legacy_records,
+                        previous_versions = ?retry.previous_versions,
+                        current_version = current_cass_version(),
+                        "retrying stale index-ingest quarantine records after cass version change"
+                    );
+                }
                 if followup_scan_after_authoritative_repair {
                     tracing::info!(
                         strategy = lexical_strategy.as_str(),
@@ -10978,14 +13064,12 @@ pub fn run_index(
                 // Get last scan timestamp for incremental indexing.
                 // If full rebuild or force_rebuild, scan everything (since_ts = None).
                 // Otherwise, only scan files modified since last successful scan.
-                let since_ts = if opts.full || needs_rebuild {
-                    None
-                } else {
-                    storage
-                        .get_last_scan_ts()
-                        .unwrap_or(None)
-                        .map(|ts| ts.saturating_sub(1))
-                };
+                let since_ts = non_watch_scan_since_ts(
+                    opts.full,
+                    needs_rebuild,
+                    stale_index_ingest_quarantine_retry.is_some(),
+                    storage.get_last_scan_ts().unwrap_or(None),
+                );
 
                 if since_ts.is_some() {
                     tracing::info!(since_ts = ?since_ts, "incremental_scan: using last_scan_ts");
@@ -11007,6 +13091,8 @@ pub fn run_index(
                         "scan phase is deferring Tantivy writer open/commit until the authoritative rebuild"
                     );
                 }
+                preflight_phase!("watch_startup:scan_entry");
+                complete_preflight_phase!();
                 if streaming_index_enabled() {
                     tracing::info!("using streaming indexing (Opt 8.2)");
                     let scan_outcome = run_streaming_index(
@@ -11018,6 +13104,13 @@ pub fn run_index(
                         additional_scan_roots.clone(),
                         scan_start_ts,
                     )?;
+                    // F4 (cass tech debt): a completed scan is a real
+                    // forward-progress boundary; bump the atomic so the
+                    // heartbeat folds the timestamp into the lock file
+                    // on its next tick and a long single-mode scan does
+                    // not false-positive as `status: "stalled"`
+                    // (cass#258 follow-up).
+                    bump_index_run_lock_progress_atomic(&progress_bump);
                     scan_canonical_mutations =
                         scan_canonical_mutations.accumulate(scan_outcome.canonical_mutations);
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
@@ -11034,11 +13127,14 @@ pub fn run_index(
                         additional_scan_roots.clone(),
                         scan_start_ts,
                     )?;
+                    bump_index_run_lock_progress_atomic(&progress_bump);
                     scan_canonical_mutations =
                         scan_canonical_mutations.accumulate(scan_outcome.canonical_mutations);
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                 }
                 performed_scan = true;
+                stale_index_ingest_quarantine_retry_attempted =
+                    stale_index_ingest_quarantine_retry.is_some();
 
                 if scan_lexical_update_deferred {
                     tracing::warn!(
@@ -11049,11 +13145,12 @@ pub fn run_index(
                     );
                     drop(t_index.take());
                     let rebuild_convs = count_total_conversations_exact(&storage)?;
-                    let rebuild = rebuild_tantivy_from_db_deferred_startup(
+                    let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                         &opts.db_path,
                         &opts.data_dir,
                         rebuild_convs,
                         opts.progress.clone(),
+                        Arc::clone(&progress_bump),
                     )?;
                     exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
                     if let Some(observed_messages) = rebuild.observed_messages {
@@ -11128,11 +13225,12 @@ pub fn run_index(
                         }
                         drop(t_index.take());
                         let rebuild_convs = count_total_conversations_exact(&storage)?;
-                        let rebuild = rebuild_tantivy_from_db_deferred_startup(
+                        let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                             &opts.db_path,
                             &opts.data_dir,
                             rebuild_convs,
                             opts.progress.clone(),
+                            Arc::clone(&progress_bump),
                         )?;
                         exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
                         // Update stats to reflect the authoritative rebuild
@@ -11161,8 +13259,35 @@ pub fn run_index(
         t_index
     };
 
+    if stale_index_ingest_quarantine_retry_attempted && scan_watermark_preservation_active() {
+        tracing::info!(
+            data_dir = %opts.data_dir.display(),
+            "leaving stale index-ingest quarantine retry records unchanged because this scan preserved the source watermark"
+        );
+    } else if stale_index_ingest_quarantine_retry_attempted {
+        match mark_stale_index_ingest_quarantine_retry_attempted(&opts.data_dir) {
+            Ok(marked) if marked > 0 => tracing::info!(
+                data_dir = %opts.data_dir.display(),
+                marked,
+                current_version = current_cass_version(),
+                "marked stale index-ingest quarantine records as retried for current cass version"
+            ),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                data_dir = %opts.data_dir.display(),
+                error = %err,
+                "failed to mark stale index-ingest quarantine records as retried"
+            ),
+        }
+    }
+
     // Semantic indexing (if enabled)
-    if opts.semantic {
+    if opts.semantic && targeted_semantic_watch_once {
+        tracing::info!(
+            embedder = %opts.embedder,
+            "deferring broad semantic indexing until targeted watch-once ingest completes"
+        );
+    } else if opts.semantic {
         // In watch mode, skip the expensive bulk re-embed if a vector index and
         // watermark already exist. The incremental path in the watch callback
         // will pick up any new messages via WAL append.
@@ -11520,8 +13645,17 @@ pub fn run_index(
         // The initial pass already embedded everything, so we start the clock
         // from now — the cooldown must elapse before the first incremental pass.
         let semantic_enabled = opts.semantic;
+        let targeted_semantic_watch_once = targeted_semantic_watch_once && watch_once_mode;
         let embedder_id = opts.embedder.clone();
         let data_dir_for_semantic = opts.data_dir.clone();
+        let pre_watch_semantic_conversations = if targeted_semantic_watch_once {
+            let storage = storage.lock().map_err(|err| {
+                anyhow::anyhow!("storage lock poisoned before semantic watch-once: {err}")
+            })?;
+            count_total_conversations_exact(&storage)?
+        } else {
+            0
+        };
         let semantic_cooldown = Duration::from_secs(
             dotenvy::var("CASS_WATCH_SEMANTIC_COOLDOWN_SECS")
                 .ok()
@@ -11609,6 +13743,16 @@ pub fn run_index(
                     {
                         tracing::warn!(error = %e, "segment merge failed during watch");
                     }
+                    if targeted_semantic_watch_once {
+                        let stats = run_targeted_semantic_watch_once_publish(
+                            &embedder_id,
+                            &data_dir_for_semantic,
+                            &storage_for_watch,
+                            indexed,
+                            pre_watch_semantic_conversations,
+                        )?;
+                        record_semantic_watch_once_stats(opts_clone.progress.as_ref(), stats);
+                    }
                     indexed
                 } else {
                     let indexed = finalize_watch_reindex_result(
@@ -11647,7 +13791,7 @@ pub fn run_index(
                 };
 
                 // Incremental semantic embedding with cooldown
-                if semantic_enabled && indexed > 0 {
+                if semantic_enabled && indexed > 0 && !targeted_semantic_watch_once {
                     let should_embed = last_semantic_embed
                         .lock()
                         .map(|t| t.elapsed() >= semantic_cooldown)
@@ -11908,6 +14052,440 @@ impl WatchSemanticDelta {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticContentFingerprint {
+    total_conversations: usize,
+    max_conversation_id: i64,
+    max_message_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetedSemanticWatchOnceMode {
+    RebuildAll,
+    AppendToExisting,
+    AlreadyCovered,
+}
+
+#[derive(Debug)]
+struct TargetedSemanticWatchOnceSelection {
+    mode: TargetedSemanticWatchOnceMode,
+    inputs: Vec<EmbeddingInput>,
+    raw_max_message_id: Option<i64>,
+    tier: SemanticTierKind,
+    index_path: PathBuf,
+    total_conversations: u64,
+    current_db_fingerprint: String,
+    manifest_before_db_fingerprint: Option<String>,
+    reason: &'static str,
+}
+
+fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
+    opts.semantic
+        && !opts.watch
+        && !opts.full
+        && !opts.force_rebuild
+        && !opts.build_hnsw
+        && opts
+            .watch_once_paths
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty())
+}
+
+fn parse_semantic_content_fingerprint(raw: &str) -> Option<SemanticContentFingerprint> {
+    let mut parts = raw.strip_prefix("content-v1:")?.split(':');
+    let total_conversations = parts.next()?.parse::<usize>().ok()?;
+    let max_conversation_id = parts.next()?.parse::<i64>().ok()?;
+    let max_message_id = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(SemanticContentFingerprint {
+        total_conversations,
+        max_conversation_id,
+        max_message_id,
+    })
+}
+
+fn semantic_artifact_for_tier(
+    manifest: &SemanticManifest,
+    tier: SemanticTierKind,
+) -> Option<&ArtifactRecord> {
+    match tier {
+        SemanticTierKind::Fast => manifest.fast_tier.as_ref(),
+        SemanticTierKind::Quality => manifest.quality_tier.as_ref(),
+    }
+}
+
+fn semantic_artifact_index_path(data_dir: &Path, artifact: &ArtifactRecord) -> Result<PathBuf> {
+    let path = PathBuf::from(&artifact.index_path);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+
+    let mut resolved = data_dir.to_path_buf();
+    for component in path.components() {
+        let std::path::Component::Normal(part) = component else {
+            anyhow::bail!(
+                "semantic watch-once cannot use unsafe relative vector artifact path {}",
+                artifact.index_path
+            );
+        };
+        resolved.push(part);
+    }
+    Ok(resolved)
+}
+
+fn validate_semantic_watch_once_artifact(
+    data_dir: &Path,
+    artifact: &ArtifactRecord,
+    indexer: &SemanticIndexer,
+    tier: SemanticTierKind,
+) -> Result<PathBuf> {
+    if !artifact.ready {
+        anyhow::bail!("semantic watch-once cannot reuse artifact that is not ready");
+    }
+    let artifact_matches_indexer = artifact.tier.eq(&tier)
+        && artifact.embedder_id.as_str().eq(indexer.embedder_id())
+        && artifact.dimension.eq(&indexer.embedder_dimension())
+        && artifact.schema_version.eq(&SEMANTIC_SCHEMA_VERSION)
+        && artifact.chunking_version.eq(&CHUNKING_STRATEGY_VERSION);
+    if !artifact_matches_indexer {
+        anyhow::bail!(
+            "semantic watch-once cannot prove coverage from incompatible semantic artifact"
+        );
+    }
+
+    let index_path = semantic_artifact_index_path(data_dir, artifact)?;
+    let canonical_index_path = vector_index_path(data_dir, indexer.embedder_id());
+    if !index_path.eq(&canonical_index_path) {
+        anyhow::bail!(
+            "semantic watch-once cannot append to non-canonical vector path {}; expected {}",
+            index_path.display(),
+            canonical_index_path.display()
+        );
+    }
+    let index = FsVectorIndex::open(&index_path).map_err(|err| {
+        anyhow::anyhow!(
+            "semantic watch-once cannot open existing vector artifact {}: {err}",
+            index_path.display()
+        )
+    })?;
+    let observed_docs = u64::try_from(index.record_count()).unwrap_or(u64::MAX);
+    if !observed_docs.eq(&artifact.doc_count) {
+        anyhow::bail!(
+            "semantic watch-once cannot prove existing vector prefix: manifest doc_count={} but index has {} records",
+            artifact.doc_count,
+            observed_docs
+        );
+    }
+    Ok(index_path)
+}
+
+fn semantic_artifact_is_append_only_prefix(
+    storage: &FrankenStorage,
+    artifact_fingerprint: SemanticContentFingerprint,
+    current_fingerprint: SemanticContentFingerprint,
+) -> Result<bool> {
+    if artifact_fingerprint.total_conversations > current_fingerprint.total_conversations
+        || artifact_fingerprint.max_conversation_id > current_fingerprint.max_conversation_id
+        || artifact_fingerprint.max_message_id > current_fingerprint.max_message_id
+    {
+        return Ok(false);
+    }
+
+    let prefix_conversations: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*)
+             FROM conversations
+             WHERE id <= ?1",
+            &[ParamValue::from(artifact_fingerprint.max_conversation_id)],
+            |row| row.get_typed(0),
+        )
+        .context("checking semantic watch-once prefix conversation count")?;
+    let observed_prefix_conversations =
+        usize::try_from(prefix_conversations.max(0)).unwrap_or(usize::MAX);
+    Ok(observed_prefix_conversations.eq(&artifact_fingerprint.total_conversations))
+}
+
+fn filter_semantic_watch_once_inputs(inputs: &mut Vec<EmbeddingInput>) {
+    inputs.retain(|message| {
+        !is_hard_message_noise(semantic_role_name(message.role), &message.content)
+    });
+}
+
+fn select_targeted_semantic_watch_once_inputs(
+    storage: &FrankenStorage,
+    data_dir: &Path,
+    indexer: &SemanticIndexer,
+    pre_watch_conversations: usize,
+) -> Result<TargetedSemanticWatchOnceSelection> {
+    let total_conversations = count_total_conversations_exact(storage)?;
+    if total_conversations == 0 {
+        anyhow::bail!(
+            "semantic watch-once indexed zero conversations; refusing to publish semantic success"
+        );
+    }
+    let current_db_fingerprint = lexical_rebuild_content_fingerprint(storage, total_conversations)?;
+    let current_fingerprint = parse_semantic_content_fingerprint(&current_db_fingerprint)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "semantic watch-once could not parse current DB fingerprint {current_db_fingerprint}"
+            )
+        })?;
+    let tier = semantic_tier_for_embedder_id(indexer.embedder_id()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "semantic watch-once cannot publish unknown embedder tier for {}",
+            indexer.embedder_id()
+        )
+    })?;
+    let manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
+        anyhow::anyhow!("loading semantic manifest for semantic watch-once: {err}")
+    })?;
+    let artifact = semantic_artifact_for_tier(&manifest, tier)
+        .filter(|artifact| artifact.embedder_id.as_str().eq(indexer.embedder_id()))
+        .cloned();
+    let manifest_before_db_fingerprint = artifact
+        .as_ref()
+        .map(|artifact| artifact.db_fingerprint.clone());
+
+    if let Some(artifact) = artifact.as_ref()
+        && artifact.db_fingerprint.eq(&current_db_fingerprint)
+    {
+        let index_path = validate_semantic_watch_once_artifact(data_dir, artifact, indexer, tier)?;
+        return Ok(TargetedSemanticWatchOnceSelection {
+            mode: TargetedSemanticWatchOnceMode::AlreadyCovered,
+            inputs: Vec::new(),
+            raw_max_message_id: (current_fingerprint.max_message_id > 0)
+                .then_some(current_fingerprint.max_message_id),
+            tier,
+            index_path,
+            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
+            current_db_fingerprint,
+            manifest_before_db_fingerprint,
+            reason: "semantic_artifact_already_covers_db",
+        });
+    }
+
+    if pre_watch_conversations == 0 {
+        let mut inputs = packet_embedding_inputs_from_storage(storage)?;
+        let raw_max_message_id = inputs
+            .iter()
+            .filter_map(|input| i64::try_from(input.message_id).ok())
+            .max()
+            .or_else(|| {
+                (current_fingerprint.max_message_id > 0)
+                    .then_some(current_fingerprint.max_message_id)
+            });
+        filter_semantic_watch_once_inputs(&mut inputs);
+        return Ok(TargetedSemanticWatchOnceSelection {
+            mode: TargetedSemanticWatchOnceMode::RebuildAll,
+            inputs,
+            raw_max_message_id,
+            tier,
+            index_path: vector_index_path(data_dir, indexer.embedder_id()),
+            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
+            current_db_fingerprint,
+            manifest_before_db_fingerprint,
+            reason: "fresh_watch_once_db",
+        });
+    }
+
+    let artifact = artifact.ok_or_else(|| {
+        anyhow::anyhow!(
+            "semantic watch-once cannot prove bounded coverage: no existing {} artifact for populated DB",
+            tier.as_str()
+        )
+    })?;
+    let artifact_fingerprint = parse_semantic_content_fingerprint(&artifact.db_fingerprint)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "semantic watch-once cannot parse existing artifact fingerprint {}",
+                artifact.db_fingerprint
+            )
+        })?;
+    let artifact_fingerprint_conversations =
+        u64::try_from(artifact_fingerprint.total_conversations).unwrap_or(u64::MAX);
+    if !artifact
+        .conversation_count
+        .eq(&artifact_fingerprint_conversations)
+    {
+        anyhow::bail!(
+            "semantic watch-once cannot prove existing vector prefix: manifest conversation_count={} but fingerprint has {} conversations",
+            artifact.conversation_count,
+            artifact_fingerprint.total_conversations
+        );
+    }
+    let index_path = validate_semantic_watch_once_artifact(data_dir, &artifact, indexer, tier)?;
+    if !semantic_artifact_is_append_only_prefix(storage, artifact_fingerprint, current_fingerprint)?
+    {
+        anyhow::bail!(
+            "semantic watch-once cannot prove bounded coverage: existing semantic artifact is not an append-only prefix of the current DB"
+        );
+    }
+
+    let mut batch =
+        packet_embedding_inputs_from_storage_since(storage, artifact_fingerprint.max_message_id)?;
+    let raw_max_message_id = batch.raw_max_message_id.or_else(|| {
+        (current_fingerprint.max_message_id > 0).then_some(current_fingerprint.max_message_id)
+    });
+    filter_semantic_watch_once_inputs(&mut batch.inputs);
+    Ok(TargetedSemanticWatchOnceSelection {
+        mode: TargetedSemanticWatchOnceMode::AppendToExisting,
+        inputs: batch.inputs,
+        raw_max_message_id,
+        tier,
+        index_path,
+        total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
+        current_db_fingerprint,
+        manifest_before_db_fingerprint,
+        reason: "semantic_artifact_is_append_only_prefix",
+    })
+}
+
+fn publish_semantic_watch_once_artifact(
+    data_dir: &Path,
+    indexer: &SemanticIndexer,
+    selection: &TargetedSemanticWatchOnceSelection,
+    doc_count: u64,
+    build_started_at_ms: i64,
+) -> Result<()> {
+    let size_bytes = fs::metadata(&selection.index_path)
+        .with_context(|| {
+            format!(
+                "stat semantic watch-once index {}",
+                selection.index_path.display()
+            )
+        })?
+        .len();
+    let relative_index_path = selection
+        .index_path
+        .strip_prefix(data_dir)
+        .unwrap_or(selection.index_path.as_path())
+        .to_string_lossy()
+        .to_string();
+    let mut manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
+        anyhow::anyhow!("loading semantic manifest for semantic watch-once publish: {err}")
+    })?;
+    manifest.publish_artifact(ArtifactRecord {
+        tier: selection.tier,
+        embedder_id: indexer.embedder_id().to_string(),
+        model_revision: semantic_model_revision_for_embedder_id(indexer.embedder_id()),
+        schema_version: SEMANTIC_SCHEMA_VERSION,
+        chunking_version: CHUNKING_STRATEGY_VERSION,
+        dimension: indexer.embedder_dimension(),
+        doc_count,
+        conversation_count: selection.total_conversations,
+        db_fingerprint: selection.current_db_fingerprint.clone(),
+        index_path: relative_index_path,
+        size_bytes,
+        started_at_ms: build_started_at_ms,
+        completed_at_ms: semantic_indexing_now_ms(),
+        ready: true,
+    });
+    manifest.refresh_backlog(
+        selection.total_conversations,
+        &selection.current_db_fingerprint,
+    );
+    manifest
+        .save(data_dir)
+        .map_err(|err| anyhow::anyhow!("saving semantic watch-once manifest: {err}"))
+}
+
+fn run_targeted_semantic_watch_once_publish(
+    embedder: &str,
+    data_dir: &Path,
+    storage: &Mutex<FrankenStorage>,
+    indexed_conversations: usize,
+    pre_watch_conversations: usize,
+) -> Result<SemanticWatchOnceStats> {
+    if indexed_conversations == 0 {
+        anyhow::bail!(
+            "semantic watch-once indexed zero conversations; refusing to publish semantic success"
+        );
+    }
+
+    let indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
+    let selection = {
+        let storage = storage.lock().map_err(|err| {
+            anyhow::anyhow!("lock storage for semantic watch-once selection: {err}")
+        })?;
+        select_targeted_semantic_watch_once_inputs(
+            &storage,
+            data_dir,
+            &indexer,
+            pre_watch_conversations,
+        )?
+    };
+    let selected_docs = selection.inputs.len();
+    let build_started_at_ms = semantic_indexing_now_ms();
+    let embedded = if selection.inputs.is_empty() {
+        Vec::new()
+    } else {
+        indexer.embed_messages(&selection.inputs)?
+    };
+    let embedded_docs = embedded.len();
+
+    let doc_count = match selection.mode {
+        TargetedSemanticWatchOnceMode::AlreadyCovered => {
+            let index = FsVectorIndex::open(&selection.index_path).map_err(|err| {
+                anyhow::anyhow!(
+                    "open already-covered semantic watch-once index {}: {err}",
+                    selection.index_path.display()
+                )
+            })?;
+            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+        }
+        TargetedSemanticWatchOnceMode::RebuildAll => {
+            let index = indexer.build_and_save_index(embedded, data_dir)?;
+            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+        }
+        TargetedSemanticWatchOnceMode::AppendToExisting => {
+            if embedded_docs > 0 {
+                let appended = indexer.append_to_index(embedded, data_dir)?;
+                if !appended.eq(&embedded_docs) {
+                    anyhow::bail!(
+                        "semantic watch-once append count mismatch: appended {appended}, embedded {embedded_docs}"
+                    );
+                }
+            }
+            let index = FsVectorIndex::open(&selection.index_path).map_err(|err| {
+                anyhow::anyhow!(
+                    "open appended semantic watch-once index {}: {err}",
+                    selection.index_path.display()
+                )
+            })?;
+            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+        }
+    };
+
+    publish_semantic_watch_once_artifact(
+        data_dir,
+        &indexer,
+        &selection,
+        doc_count,
+        build_started_at_ms,
+    )?;
+    if let Some(raw_max_message_id) = selection.raw_max_message_id {
+        update_incremental_semantic_watermark(
+            storage,
+            raw_max_message_id,
+            "updating semantic watch-once watermark",
+        )?;
+    }
+
+    Ok(SemanticWatchOnceStats {
+        published: true,
+        selected_docs,
+        embedded_docs,
+        tier: selection.tier.as_str().to_string(),
+        vector_index_path: selection.index_path.display().to_string(),
+        manifest_before_db_fingerprint: selection.manifest_before_db_fingerprint,
+        manifest_after_db_fingerprint: Some(selection.current_db_fingerprint),
+        reason: selection.reason.to_string(),
+    })
+}
+
 fn update_incremental_semantic_watermark(
     storage: &Mutex<FrankenStorage>,
     raw_max_id: i64,
@@ -12023,14 +14601,42 @@ fn incremental_semantic_embed(
     )
 }
 
-/// Open frankensqlite storage for indexing with forward-compatibility recovery.
+/// Open frankensqlite storage for indexing without replacing canonical data.
 ///
-/// Returns `(storage, rebuilt)` where `rebuilt=true` means we detected an
-/// incompatible/future schema, backed up + recreated the DB, and reopened it.
+/// Returns `(storage, rebuilt, opened_fresh_for_full)`. `rebuilt` and
+/// `opened_fresh_for_full` are retained for progress metadata compatibility;
+/// this path now fails closed on existing unreadable/incompatible archives
+/// instead of backing them up and creating an empty replacement.
 fn open_storage_for_index(
     db_path: &Path,
-    allow_full_recovery: bool,
+    full_index: bool,
 ) -> Result<(FrankenStorage, bool, bool)> {
+    if db_path.exists() {
+        match non_destructive_meta_schema_version(db_path) {
+            Ok(Some(version)) if version > crate::storage::sqlite::CURRENT_SCHEMA_VERSION => {
+                return Err(canonical_archive_unhealthy_for_index_error(
+                    db_path,
+                    &format!(
+                        "schema_version {version} is newer than supported version {}",
+                        crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
+                return Err(anyhow::anyhow!(
+                    "canonical db is busy/locked during index open; refusing to replace it: {err:#}"
+                ));
+            }
+            Err(err) => {
+                return Err(canonical_archive_unhealthy_for_index_error(
+                    db_path,
+                    &index_storage_open_error_reason(&err),
+                ));
+            }
+        }
+    }
+
     if db_path.exists() {
         match crate::storage::sqlite::open_current_schema_storage_with_timeout(
             db_path,
@@ -12041,92 +14647,81 @@ fn open_storage_for_index(
             Err(err) => tracing::warn!(
                 db_path = %db_path.display(),
                 error = ?err,
-                "single-open current-schema storage path failed; falling back to compatibility recovery"
+                "single-open current-schema storage path failed; attempting non-destructive compatibility open"
             ),
         }
     }
 
-    match FrankenStorage::open_or_rebuild(db_path) {
-        Ok(storage) => Ok((storage, false, false)),
-        Err(MigrationError::RebuildRequired {
-            reason,
-            backup_path,
-        }) => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                reason = %reason,
-                backup_path = ?backup_path.as_ref().map(|p| p.display().to_string()),
-                "storage schema incompatible; rebuilt database before indexing"
-            );
-            // `open_or_rebuild` has already backed up and `remove_database_files`'d
-            // the incompatible DB before returning `RebuildRequired`, so the path
-            // no longer exists. Use `FrankenStorage::open` (which creates +
-            // migrates a fresh DB) rather than `open_franken_storage_with_timeout`
-            // (which bails on missing-file).
-            let storage = FrankenStorage::open(db_path).with_context(|| {
-                format!(
-                    "opening fresh frankensqlite db after schema rebuild at {}",
-                    db_path.display()
-                )
-            })?;
-            Ok((storage, true, true))
-        }
-        Err(err) if allow_full_recovery && migration_error_is_retryable_open_contention(&err) => {
-            Err(anyhow::anyhow!(
-                "canonical db is busy/locked during full rebuild open; refusing to replace it: {err}"
-            ))
-        }
-        Err(err) if allow_full_recovery => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "full rebuild storage open failed; backing up and reopening with a fresh canonical db"
-            );
-            let backup_path =
-                crate::storage::sqlite::create_backup(db_path).map_err(|backup_err| {
-                    anyhow::anyhow!(
-                        "backing up busy/corrupt canonical db before full rebuild: {backup_err}"
-                    )
-                })?;
-            if db_path.exists() {
-                crate::storage::sqlite::remove_database_files(db_path).with_context(|| {
-                    format!(
-                        "removing busy/corrupt canonical db bundle before full rebuild: {}",
-                        db_path.display()
-                    )
-                })?;
+    if db_path.exists() {
+        match FrankenStorage::open(db_path) {
+            Ok(storage) => Ok((storage, false, false)),
+            Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
+                Err(anyhow::anyhow!(
+                    "canonical db is busy/locked during index open; refusing to replace it: {err}"
+                ))
             }
-            if let Some(path) = backup_path {
-                tracing::info!(
-                    db_path = %db_path.display(),
-                    backup_path = %path.display(),
-                    "backed up canonical db after full-rebuild open failure"
-                );
-            }
-            // Same rationale as the `RebuildRequired` branch: we just removed
-            // the DB, so we need `FrankenStorage::open` to create+migrate it.
-            let storage = FrankenStorage::open(db_path).with_context(|| {
-                format!(
-                    "opening fresh frankensqlite db after full-rebuild recovery at {}",
-                    db_path.display()
-                )
-            })?;
-            Ok((storage, true, true))
+            Err(err) => Err(canonical_archive_unhealthy_for_index_error(
+                db_path,
+                &index_storage_open_error_reason(&err),
+            )),
         }
-        Err(err) => Err(anyhow::anyhow!(
-            "failed to open frankensqlite storage: {err:#}"
-        )),
+    } else {
+        FrankenStorage::open(db_path)
+            .map(|storage| (storage, false, full_index))
+            .with_context(|| format!("creating frankensqlite storage at {}", db_path.display()))
     }
 }
 
-fn migration_error_is_retryable_open_contention(err: &MigrationError) -> bool {
-    match err {
-        MigrationError::Database(err) => crate::storage::sqlite::retryable_franken_error(err),
-        MigrationError::Other(message) => {
-            crate::storage::sqlite::retryable_storage_error_message(message)
-        }
-        MigrationError::RebuildRequired { .. } | MigrationError::Io(_) => false,
+fn index_storage_open_error_reason(err: &anyhow::Error) -> String {
+    let message = format!("{err:#}");
+    crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
+        .map(|fts_err| fts_err.to_string())
+        .unwrap_or(message)
+}
+
+fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
+    let mut conn = crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
+        db_path,
+        Duration::from_secs(10),
+    )
+    .with_context(|| {
+        format!(
+            "opening canonical archive read-only before index: {}",
+            db_path.display()
+        )
+    })?;
+
+    let result = match conn.query("SELECT value FROM meta WHERE key = 'schema_version';") {
+        Ok(rows) => Ok(rows
+            .first()
+            .and_then(|row| row.get_typed::<String>(0).ok())
+            .and_then(|raw| raw.parse::<i64>().ok())),
+        Err(err) if storage_error_mentions_missing_table_or_column(&err) => Ok(None),
+        Err(err) => Err(anyhow::anyhow!(
+            "reading canonical archive schema_version before index: {err}"
+        )),
+    };
+
+    if let Err(close_err) = conn.close_without_checkpoint_in_place() {
+        tracing::debug!(
+            error = %close_err,
+            db_path = %db_path.display(),
+            "non_destructive_meta_schema_version: close_without_checkpoint_in_place failed"
+        );
+        conn.close_best_effort_in_place();
     }
+
+    result
+}
+
+fn storage_error_mentions_missing_table_or_column(err: &impl std::fmt::Display) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("no such table") || message.contains("no such column")
+}
+
+fn anyhow_chain_indicates_retryable_storage_contention(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| crate::storage::sqlite::retryable_storage_error_message(&cause.to_string()))
 }
 
 fn full_rebuild_existing_storage_integrity_problem(
@@ -12176,6 +14771,152 @@ fn full_rebuild_existing_storage_integrity_problem(
     Ok(None)
 }
 
+fn canonical_archive_unhealthy_for_index_error(db_path: &Path, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "canonical cass archive at {} is not safe for indexing: {reason}. \
+         cass index will not replace or truncate the SQLite source of truth. \
+         Run 'cass doctor check --json' to inspect the archive, then use the \
+         doctor repair plan or recover from an explicit backup before indexing again.",
+        db_path.display()
+    )
+}
+
+fn orphan_fk_cleanup_failed_index_error(db_path: &Path, err: &anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "orphan FK self-heal failed for canonical cass archive at {}: {err:#}. \
+         cass stopped before counting or writing because the archive connection may be OOM-poisoned or corrupt. \
+         Run 'cass doctor check --json' and free disk/memory pressure before retrying.",
+        db_path.display()
+    )
+}
+
+const INDEX_MIN_FREE_SPACE_BYTES: u64 = 512 * 1024 * 1024;
+
+fn ensure_index_storage_headroom(data_dir: &Path, db_path: &Path) -> Result<()> {
+    if index_disk_headroom_check_disabled() {
+        return Ok(());
+    }
+
+    let required = required_index_headroom_bytes(db_path);
+    for probe_path in existing_headroom_probe_paths(data_dir, db_path) {
+        let available = fs2::available_space(&probe_path).with_context(|| {
+            format!(
+                "checking free disk space for cass index at {}",
+                probe_path.display()
+            )
+        })?;
+        if available >= required {
+            continue;
+        }
+
+        return Err(anyhow::anyhow!(
+            "canonical archive disk headroom check failed for {}: available={} bytes, required={} bytes. \
+             Free space before running cass index so SQLite, WAL, and lexical scratch writes cannot fail mid-commit. \
+             Run 'cass doctor check --json' for a read-only health report.",
+            probe_path.display(),
+            available,
+            required
+        ));
+    }
+
+    Ok(())
+}
+
+fn index_disk_headroom_check_disabled() -> bool {
+    dotenvy::var("CASS_INDEX_SKIP_DISK_HEADROOM_CHECK")
+        .map(|value| env_value_truthy(&value))
+        .unwrap_or(false)
+}
+
+fn env_value_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn existing_headroom_probe_paths(data_dir: &Path, db_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(2);
+    for candidate in [data_dir, db_path.parent().unwrap_or(db_path)] {
+        if let Some(existing) = nearest_existing_path(candidate) {
+            push_unique_headroom_probe_path(&mut paths, existing);
+        }
+    }
+    if paths.is_empty() {
+        paths.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+    }
+    paths
+}
+
+fn push_unique_headroom_probe_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if paths
+        .iter()
+        .any(|existing| same_headroom_probe_path(existing, &candidate))
+    {
+        return;
+    }
+    paths.push(candidate);
+}
+
+fn same_headroom_probe_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            let current = Path::new(".");
+            if current.exists() {
+                return Some(current.to_path_buf());
+            }
+            continue;
+        }
+        if ancestor.exists() {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+fn required_index_headroom_bytes(db_path: &Path) -> u64 {
+    let db_bundle_bytes = database_bundle_size_bytes(db_path);
+    INDEX_MIN_FREE_SPACE_BYTES.max(db_bundle_bytes.saturating_mul(2))
+}
+
+fn database_bundle_size_bytes(db_path: &Path) -> u64 {
+    let mut total = file_size_bytes(db_path);
+    for sidecar in database_sidecar_paths(db_path) {
+        total = total.saturating_add(file_size_bytes(&sidecar));
+    }
+    total
+}
+
+fn database_sidecar_paths(db_path: &Path) -> [PathBuf; 2] {
+    [
+        database_path_with_suffix(db_path, "-wal"),
+        database_path_with_suffix(db_path, "-shm"),
+    ]
+}
+
+fn database_path_with_suffix(db_path: &Path, suffix: &str) -> PathBuf {
+    let Some(file_name) = db_path.file_name() else {
+        return PathBuf::from(format!("{}{}", db_path.display(), suffix));
+    };
+    let mut sidecar_name = file_name.to_os_string();
+    sidecar_name.push(suffix);
+    db_path.with_file_name(sidecar_name)
+}
+
+fn file_size_bytes(path: &Path) -> u64 {
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
 #[cfg(test)]
 fn current_schema_fast_probe(db_path: &Path) -> Result<bool> {
     let mut storage = FrankenStorage::open_readonly(db_path)
@@ -12199,44 +14940,6 @@ fn current_schema_fast_probe(db_path: &Path) -> Result<bool> {
     }
 
     Ok(version == Some(crate::storage::sqlite::CURRENT_SCHEMA_VERSION))
-}
-
-fn reopen_fresh_storage_for_full_rebuild(
-    storage: FrankenStorage,
-    db_path: &Path,
-) -> Result<FrankenStorage> {
-    storage.close().with_context(|| {
-        format!(
-            "closing canonical db before replacing it for full rebuild: {}",
-            db_path.display()
-        )
-    })?;
-
-    let backup_path = crate::storage::sqlite::create_backup(db_path)
-        .map_err(|err| anyhow::anyhow!("backing up canonical db before full rebuild: {err}"))?;
-    if db_path.exists() {
-        crate::storage::sqlite::remove_database_files(db_path).with_context(|| {
-            format!(
-                "removing existing canonical db bundle before full rebuild: {}",
-                db_path.display()
-            )
-        })?;
-    }
-
-    if let Some(path) = backup_path {
-        tracing::info!(
-            db_path = %db_path.display(),
-            backup_path = %path.display(),
-            "replaced canonical db with a fresh empty database for full rebuild"
-        );
-    }
-
-    FrankenStorage::open(db_path).with_context(|| {
-        format!(
-            "opening fresh canonical db for full rebuild: {}",
-            db_path.display()
-        )
-    })
 }
 
 fn quarantine_failed_seed_bundle(db_path: &Path) -> Result<Option<PathBuf>> {
@@ -12383,6 +15086,24 @@ pub(crate) fn rebuild_tantivy_from_db(
         total_conversations,
         progress,
         LexicalRebuildStartupOptions::default(),
+        None,
+    )
+}
+
+fn rebuild_tantivy_from_db_with_progress_bump(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<Arc<IndexingProgress>>,
+    progress_bump: Arc<AtomicI64>,
+) -> Result<LexicalRebuildOutcome> {
+    rebuild_tantivy_from_db_with_options(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress,
+        LexicalRebuildStartupOptions::default(),
+        Some(progress_bump),
     )
 }
 
@@ -12420,6 +15141,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         data_dir.to_path_buf(),
         index_run_lock_heartbeat_interval(),
         Arc::clone(&index_run_lock.metadata_write_lock),
+        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
     );
 
     let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
@@ -12472,18 +15194,56 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         )
     })?;
 
-    let rebuild =
-        rebuild_tantivy_from_db_deferred_startup(db_path, data_dir, total_conversations, progress)?;
+    let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress,
+        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
+    )?;
     Ok(SearchLexicalRepairOutcome {
         indexed_docs: rebuild.indexed_docs,
     })
 }
 
+#[cfg(test)]
 fn rebuild_tantivy_from_db_deferred_startup(
     db_path: &Path,
     data_dir: &Path,
     total_conversations: usize,
     progress: Option<Arc<IndexingProgress>>,
+) -> Result<LexicalRebuildOutcome> {
+    rebuild_tantivy_from_db_deferred_startup_with_options(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress,
+        None,
+    )
+}
+
+fn rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<Arc<IndexingProgress>>,
+    progress_bump: Arc<AtomicI64>,
+) -> Result<LexicalRebuildOutcome> {
+    rebuild_tantivy_from_db_deferred_startup_with_options(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress,
+        Some(progress_bump),
+    )
+}
+
+fn rebuild_tantivy_from_db_deferred_startup_with_options(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<Arc<IndexingProgress>>,
+    progress_bump: Option<Arc<AtomicI64>>,
 ) -> Result<LexicalRebuildOutcome> {
     rebuild_tantivy_from_db_with_options(
         db_path,
@@ -12493,6 +15253,7 @@ fn rebuild_tantivy_from_db_deferred_startup(
         LexicalRebuildStartupOptions {
             defer_initial_content_fingerprint: true,
         },
+        progress_bump,
     )
 }
 
@@ -12562,6 +15323,37 @@ fn release_completed_lexical_rebuild_pages(
     }
 }
 
+struct StreamingByteReservation<'a> {
+    flow_limiter: &'a StreamingByteLimiter,
+    reserved_bytes: usize,
+}
+
+impl<'a> StreamingByteReservation<'a> {
+    fn new(flow_limiter: &'a StreamingByteLimiter, reserved_bytes: usize) -> Self {
+        Self {
+            flow_limiter,
+            reserved_bytes,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.reserved_bytes = 0;
+    }
+
+    fn release_now(&mut self) {
+        if self.reserved_bytes > 0 {
+            self.flow_limiter.release(self.reserved_bytes);
+            self.disarm();
+        }
+    }
+}
+
+impl Drop for StreamingByteReservation<'_> {
+    fn drop(&mut self) {
+        self.release_now();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_lexical_rebuild_page_work(
     storage: &mut FrankenStorage,
@@ -12578,6 +15370,24 @@ fn prepare_lexical_rebuild_page_work(
         .iter()
         .filter_map(|conv| conv.id)
         .collect::<Vec<_>>();
+
+    let (reserved_bytes, budget_wait_duration, waited_for_budget) =
+        acquire_ordered_lexical_rebuild_page_budget(
+            reservation_order,
+            flow_limiter,
+            sequence,
+            work.pipeline_budget.batch_fetch_message_bytes_limit,
+        )
+        .with_context(|| {
+            format!(
+                "acquiring lexical rebuild pipeline byte budget for ordered page sequence {}",
+                sequence
+            )
+        })?;
+    if waited_for_budget {
+        producer_telemetry.record_budget_wait(budget_wait_duration);
+    }
+    let mut reservation = StreamingByteReservation::new(flow_limiter, reserved_bytes);
 
     let message_fetch_started = Instant::now();
     let grouped_messages = match storage.fetch_messages_for_lexical_rebuild_batch(
@@ -12641,23 +15451,12 @@ fn prepare_lexical_rebuild_page_work(
         .iter()
         .map(|packet| packet.message_count)
         .sum::<usize>();
-    let (reserved_bytes, budget_wait_duration, waited_for_budget) =
-        acquire_ordered_lexical_rebuild_page_budget(
-            reservation_order,
-            flow_limiter,
-            sequence,
-            page_message_bytes,
-        )
-        .with_context(|| {
-            format!(
-                "acquiring lexical rebuild pipeline byte budget for ordered page sequence {}",
-                sequence
-            )
-        })?;
-    if waited_for_budget {
-        producer_telemetry.record_budget_wait(budget_wait_duration);
+    if prepared_packets.is_empty() {
+        reservation.release_now();
+    } else {
+        assign_lexical_rebuild_flow_reservation_bytes(&mut prepared_packets, reserved_bytes);
+        reservation.disarm();
     }
-    assign_lexical_rebuild_flow_reservation_bytes(&mut prepared_packets, reserved_bytes);
     let configured_page_size = usize::try_from(work.configured_page_size.max(1))
         .unwrap_or(usize::MAX)
         .max(1);
@@ -14095,12 +16894,14 @@ fn finalize_staged_lexical_rebuild_publish_artifact_from_artifacts(
             publish_path = %publish_path.display(),
             "reusing already-final staged lexical rebuild artifact without redundant final merge"
         );
-        if !crate::search::tantivy::searchable_index_exists(&publish_path) {
-            return Err(anyhow::anyhow!(
-                "single-input staged lexical rebuild artifact is not searchable: {}",
-                publish_path.display()
-            ));
-        }
+        crate::search::tantivy::validate_searchable_index_contract(&publish_path).with_context(
+            || {
+                format!(
+                    "single-input staged lexical rebuild artifact is not searchable: {}",
+                    publish_path.display()
+                )
+            },
+        )?;
         return Ok(LexicalRebuildFinalMergeArtifact {
             publish_path,
             docs: artifact.docs,
@@ -14268,9 +17069,11 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     producer_handle: JoinHandle<()>,
     mut perf_profile: Option<LexicalRebuildPerfProfile>,
     rebuild_profile_started: Option<Instant>,
+    progress_bump: Option<Arc<AtomicI64>>,
 ) -> Result<LexicalRebuildOutcome> {
     let persist_initial_checkpoint_started = Instant::now();
     persist_lexical_rebuild_state_for_active_run_start(index_path, &rebuild_state)?;
+    bump_index_run_lock_progress_if_present(progress_bump.as_ref());
     log_lexical_rebuild_prep_profile_step(
         prep_profile_started,
         persist_initial_checkpoint_started,
@@ -14368,7 +17171,12 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     let mut pending_completed_shards = BTreeMap::new();
     let mut completed_shard_artifacts = Vec::with_capacity(shard_plan.shards.len());
     let mut scheduled_completed_shard_artifacts = 0usize;
-    let mut pending_shard_build_jobs = VecDeque::new();
+    let mut pending_shard_build_jobs: VecDeque<LexicalRebuildShardBuildWork> = VecDeque::new();
+    let mut pending_shard_build_message_bytes = 0usize;
+    let pending_shard_build_max_message_bytes =
+        lexical_rebuild_pending_shard_build_max_message_bytes(&pipeline_settings);
+    let pending_shard_build_max_jobs =
+        lexical_rebuild_pending_shard_build_max_jobs(&pipeline_settings);
     let mut merge_coordinator = LexicalRebuildShardMergeCoordinator::new(eager_merge_stage_root);
     let staged_merge_controller = LexicalRebuildStagedMergeController::new(
         shard_merge_settings.workers,
@@ -14378,6 +17186,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         shard_builder_settings.max_builders,
         pipeline_settings.controller_loadavg_high_watermark_1m_milli,
     );
+    let shard_build_telemetry = LexicalRebuildShardBuildTelemetry::default();
     let mut max_conversation_id = 0i64;
     let mut max_message_id = 0i64;
     let mut final_merge_input_artifacts: Option<Vec<LexicalRebuildShardMergeArtifact>> = None;
@@ -14410,6 +17219,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         |latest_pipeline_runtime: &mut LexicalRebuildPipelineRuntimeSnapshot,
          merge_coordinator: &mut LexicalRebuildShardMergeCoordinator,
          pending_shard_build_jobs: &mut VecDeque<LexicalRebuildShardBuildWork>,
+         pending_shard_build_message_bytes: &mut usize,
          active_shard_build_jobs: &mut usize,
          enqueued_shards: &mut usize,
          producer_finished: bool|
@@ -14433,16 +17243,28 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 progress.as_ref(),
                 &applied_runtime,
             );
+            apply_staged_shard_build_telemetry_snapshot(
+                latest_pipeline_runtime,
+                progress.as_ref(),
+                staged_shard_build_controller.memory_reserve_bytes,
+                staged_shard_build_controller.emergency_memory_reserve_bytes,
+                &shard_build_telemetry,
+            );
             let staged_shard_build_runtime = staged_shard_build_controller.decide(
                 latest_pipeline_runtime,
                 &applied_runtime,
                 *active_shard_build_jobs,
                 pending_shard_build_jobs.len(),
+                pending_shard_build_jobs
+                    .front()
+                    .map(|work| work.shard.message_bytes),
             );
             while *active_shard_build_jobs < staged_shard_build_runtime.allowed_jobs {
                 let Some(mut work) = pending_shard_build_jobs.pop_front() else {
                     break;
                 };
+                *pending_shard_build_message_bytes =
+                    pending_shard_build_message_bytes.saturating_sub(work.message_bytes);
                 let dispatch_slot_index = *active_shard_build_jobs;
                 work.writer_parallelism =
                     lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(
@@ -14463,11 +17285,21 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 &applied_runtime,
                 *active_shard_build_jobs,
                 pending_shard_build_jobs.len(),
+                pending_shard_build_jobs
+                    .front()
+                    .map(|work| work.shard.message_bytes),
             );
             apply_staged_shard_build_runtime_snapshot(
                 latest_pipeline_runtime,
                 progress.as_ref(),
                 &applied_shard_build_runtime,
+            );
+            apply_staged_shard_build_telemetry_snapshot(
+                latest_pipeline_runtime,
+                progress.as_ref(),
+                staged_shard_build_controller.memory_reserve_bytes,
+                staged_shard_build_controller.emergency_memory_reserve_bytes,
+                &shard_build_telemetry,
             );
             Ok(())
         };
@@ -14484,11 +17316,21 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         &initial_staged_merge_runtime,
         active_shard_build_jobs,
         pending_shard_build_jobs.len(),
+        pending_shard_build_jobs
+            .front()
+            .map(|work| work.shard.message_bytes),
     );
     apply_staged_shard_build_runtime_snapshot(
         &mut latest_pipeline_runtime,
         progress.as_ref(),
         &initial_staged_shard_build_runtime,
+    );
+    apply_staged_shard_build_telemetry_snapshot(
+        &mut latest_pipeline_runtime,
+        progress.as_ref(),
+        staged_shard_build_controller.memory_reserve_bytes,
+        staged_shard_build_controller.emergency_memory_reserve_bytes,
+        &shard_build_telemetry,
     );
 
     let advance_completed_shards =
@@ -14523,6 +17365,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 if let Some(p) = &progress {
                     p.current.store(*processed_conversations, Ordering::Relaxed);
                 }
+                bump_index_run_lock_progress_if_present(progress_bump.as_ref());
                 if let Some(transition) = responsiveness_controller.record_first_durable_commit() {
                     apply_lexical_rebuild_budget_transition(
                         transition,
@@ -14557,9 +17400,11 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     let main_result: Result<()> = (|| {
         let never_shard_result_rx = never::<LexicalRebuildShardBuildMessage>();
         let never_merge_result_rx = never::<LexicalRebuildShardMergeMessage>();
+        let never_pipeline_rx = never::<LexicalRebuildPipelineMessage>();
         let mut shard_result_channel_open = true;
         let mut merge_result_channel_open = true;
         let mut producer_finished = false;
+        let mut pipeline_backlog_pause_logged = false;
         while !producer_finished {
             let active_shard_result_rx = if shard_result_channel_open {
                 &shard_result_rx
@@ -14571,12 +17416,42 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             } else {
                 &never_merge_result_rx
             };
+            let pipeline_backlog_paused = pending_shard_build_message_bytes
+                >= pending_shard_build_max_message_bytes
+                || pending_shard_build_jobs.len() >= pending_shard_build_max_jobs;
+            if pipeline_backlog_paused && !pipeline_backlog_pause_logged {
+                tracing::info!(
+                    pending_shard_build_jobs = pending_shard_build_jobs.len(),
+                    pending_shard_build_max_jobs,
+                    pending_shard_build_message_bytes,
+                    pending_shard_build_max_message_bytes,
+                    active_shard_build_jobs,
+                    "pausing lexical rebuild producer handoff while staged shard-build backlog drains"
+                );
+                pipeline_backlog_pause_logged = true;
+            } else if !pipeline_backlog_paused && pipeline_backlog_pause_logged {
+                tracing::info!(
+                    pending_shard_build_jobs = pending_shard_build_jobs.len(),
+                    pending_shard_build_max_jobs,
+                    pending_shard_build_message_bytes,
+                    pending_shard_build_max_message_bytes,
+                    active_shard_build_jobs,
+                    "resuming lexical rebuild producer handoff after staged shard-build backlog drained"
+                );
+                pipeline_backlog_pause_logged = false;
+            }
+            let active_pipeline_rx = if pipeline_backlog_paused {
+                &never_pipeline_rx
+            } else {
+                &pipeline_rx
+            };
             select! {
                 recv(active_shard_result_rx) -> message => {
                     match message {
                         Ok(LexicalRebuildShardBuildMessage::Built(result)) => {
                             active_shard_build_jobs = active_shard_build_jobs.saturating_sub(1);
                             received_shard_results = received_shard_results.saturating_add(1);
+                            shard_build_telemetry.record(&result);
                             pending_completed_shards.insert(result.shard.shard_index, result);
                         }
                         Ok(LexicalRebuildShardBuildMessage::Error { shard_index, error }) => {
@@ -14625,6 +17500,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         &mut latest_pipeline_runtime,
                         &mut merge_coordinator,
                         &mut pending_shard_build_jobs,
+                        &mut pending_shard_build_message_bytes,
                         &mut active_shard_build_jobs,
                         &mut enqueued_shards,
                         producer_finished,
@@ -14642,6 +17518,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         progress_heartbeat_interval_conversations,
                         &mut last_progress_persist,
                         progress_heartbeat_interval,
+                        progress_bump.as_ref(),
                         perf_profile.as_mut(),
                     )?;
                 }
@@ -14649,6 +17526,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                     match message {
                         Ok(LexicalRebuildShardMergeMessage::Built(result)) => {
                             merge_coordinator.complete_merge(result, &merge_work_tx)?;
+                            bump_index_run_lock_progress_if_present(progress_bump.as_ref());
                         }
                         Ok(LexicalRebuildShardMergeMessage::Error {
                             output_level,
@@ -14681,6 +17559,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         &mut latest_pipeline_runtime,
                         &mut merge_coordinator,
                         &mut pending_shard_build_jobs,
+                        &mut pending_shard_build_message_bytes,
                         &mut active_shard_build_jobs,
                         &mut enqueued_shards,
                         producer_finished,
@@ -14698,12 +17577,17 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         progress_heartbeat_interval_conversations,
                         &mut last_progress_persist,
                         progress_heartbeat_interval,
+                        progress_bump.as_ref(),
                         perf_profile.as_mut(),
                     )?;
                 }
-                recv(pipeline_rx) -> message => {
+                recv(active_pipeline_rx) -> message => {
                     match message {
                         Ok(LexicalRebuildPipelineMessage::Batch(prepared_page)) => {
+                            let mut page_reservation = StreamingByteReservation::new(
+                                lexical_rebuild_flow_limiter.as_ref(),
+                                lexical_rebuild_prepared_page_reserved_bytes(&prepared_page),
+                            );
                             if let Some(profile) = perf_profile.as_mut() {
                                 profile.conversation_list_duration +=
                                     prepared_page.conversation_list_duration;
@@ -14743,7 +17627,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 ));
                             }
 
-                            for packet in packets {
+                            for mut packet in packets {
                                 if options.defer_initial_content_fingerprint
                                     && let Some(last_message_id) = packet.last_message_id
                                 {
@@ -14752,8 +17636,15 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 equivalence_accumulator.absorb_packet(&packet);
                                 current_shard_message_bytes =
                                     current_shard_message_bytes.saturating_add(packet.message_bytes);
+                                packet.flow_reservation_bytes = 0;
                                 current_shard_packets.push(packet);
                             }
+                            bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+                            // The byte limiter covers producer-prepared pages
+                            // waiting for this consumer. After packets enter
+                            // the staged shard buffers, the pending-shard
+                            // backlog cap accounts for their heap footprint.
+                            page_reservation.release_now();
 
                             refresh_runtime(
                                 &mut latest_pipeline_runtime,
@@ -14766,6 +17657,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 &mut latest_pipeline_runtime,
                                 &mut merge_coordinator,
                                 &mut pending_shard_build_jobs,
+                                &mut pending_shard_build_message_bytes,
                                 &mut active_shard_build_jobs,
                                 &mut enqueued_shards,
                                 producer_finished,
@@ -14782,12 +17674,17 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                             planned_shard_index
                                         )
                                     })?;
+                                let shard_message_bytes = current_shard_message_bytes;
                                 let shard_packets = std::mem::take(&mut current_shard_packets);
                                 current_shard_message_bytes = 0;
                                 current_shard_index = None;
+                                pending_shard_build_message_bytes =
+                                    pending_shard_build_message_bytes
+                                        .saturating_add(shard_message_bytes);
                                 pending_shard_build_jobs.push_back(LexicalRebuildShardBuildWork {
                                     shard,
                                     packets: shard_packets,
+                                    message_bytes: shard_message_bytes,
                                     shard_index_path: shard_stage_root
                                         .path()
                                         .join(format!("shard-{planned_shard_index:05}")),
@@ -14797,6 +17694,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                     &mut latest_pipeline_runtime,
                                     &mut merge_coordinator,
                                     &mut pending_shard_build_jobs,
+                                    &mut pending_shard_build_message_bytes,
                                     &mut active_shard_build_jobs,
                                     &mut enqueued_shards,
                                     producer_finished,
@@ -14816,6 +17714,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 progress_heartbeat_interval_conversations,
                                 &mut last_progress_persist,
                                 progress_heartbeat_interval,
+                                progress_bump.as_ref(),
                                 perf_profile.as_mut(),
                             )?;
                         }
@@ -14835,6 +17734,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 &mut latest_pipeline_runtime,
                                 &mut merge_coordinator,
                                 &mut pending_shard_build_jobs,
+                                &mut pending_shard_build_message_bytes,
                                 &mut active_shard_build_jobs,
                                 &mut enqueued_shards,
                                 producer_finished,
@@ -14852,6 +17752,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 progress_heartbeat_interval_conversations,
                                 &mut last_progress_persist,
                                 progress_heartbeat_interval,
+                                progress_bump.as_ref(),
                                 perf_profile.as_mut(),
                             )?;
                         }
@@ -14861,6 +17762,24 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                             ));
                         }
                     }
+                }
+                default(Duration::from_millis(250)) => {
+                    refresh_runtime(
+                        &mut latest_pipeline_runtime,
+                        &mut responsiveness_controller,
+                        &mut current_batch_conversation_limit,
+                        current_shard_packets.len(),
+                        current_shard_message_bytes,
+                    );
+                    refresh_staged_parallelism_and_dispatch(
+                        &mut latest_pipeline_runtime,
+                        &mut merge_coordinator,
+                        &mut pending_shard_build_jobs,
+                        &mut pending_shard_build_message_bytes,
+                        &mut active_shard_build_jobs,
+                        &mut enqueued_shards,
+                        producer_finished,
+                    )?;
                 }
             }
         }
@@ -14872,7 +17791,9 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         }
 
         drop(shard_work_tx);
-        while received_shard_results < enqueued_shards || merge_coordinator.pending_merge_jobs() > 0
+        while !pending_shard_build_jobs.is_empty()
+            || received_shard_results < enqueued_shards
+            || merge_coordinator.pending_merge_jobs() > 0
         {
             let active_shard_result_rx = if shard_result_channel_open {
                 &shard_result_rx
@@ -14890,6 +17811,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         Ok(LexicalRebuildShardBuildMessage::Built(result)) => {
                             active_shard_build_jobs = active_shard_build_jobs.saturating_sub(1);
                             received_shard_results = received_shard_results.saturating_add(1);
+                            shard_build_telemetry.record(&result);
                             pending_completed_shards.insert(result.shard.shard_index, result);
                         }
                         Ok(LexicalRebuildShardBuildMessage::Error { shard_index, error }) => {
@@ -14936,6 +17858,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         &mut latest_pipeline_runtime,
                         &mut merge_coordinator,
                         &mut pending_shard_build_jobs,
+                        &mut pending_shard_build_message_bytes,
                         &mut active_shard_build_jobs,
                         &mut enqueued_shards,
                         true,
@@ -14953,6 +17876,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         progress_heartbeat_interval_conversations,
                         &mut last_progress_persist,
                         progress_heartbeat_interval,
+                        progress_bump.as_ref(),
                         perf_profile.as_mut(),
                     )?;
                 }
@@ -14960,6 +17884,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                     match message {
                         Ok(LexicalRebuildShardMergeMessage::Built(result)) => {
                             merge_coordinator.complete_merge(result, &merge_work_tx)?;
+                            bump_index_run_lock_progress_if_present(progress_bump.as_ref());
                         }
                         Ok(LexicalRebuildShardMergeMessage::Error {
                             output_level,
@@ -14992,6 +17917,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         &mut latest_pipeline_runtime,
                         &mut merge_coordinator,
                         &mut pending_shard_build_jobs,
+                        &mut pending_shard_build_message_bytes,
                         &mut active_shard_build_jobs,
                         &mut enqueued_shards,
                         true,
@@ -15009,7 +17935,26 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         progress_heartbeat_interval_conversations,
                         &mut last_progress_persist,
                         progress_heartbeat_interval,
+                        progress_bump.as_ref(),
                         perf_profile.as_mut(),
+                    )?;
+                }
+                default(Duration::from_millis(250)) => {
+                    refresh_runtime(
+                        &mut latest_pipeline_runtime,
+                        &mut responsiveness_controller,
+                        &mut current_batch_conversation_limit,
+                        current_shard_packets.len(),
+                        current_shard_message_bytes,
+                    );
+                    refresh_staged_parallelism_and_dispatch(
+                        &mut latest_pipeline_runtime,
+                        &mut merge_coordinator,
+                        &mut pending_shard_build_jobs,
+                        &mut pending_shard_build_message_bytes,
+                        &mut active_shard_build_jobs,
+                        &mut enqueued_shards,
+                        true,
                     )?;
                 }
             }
@@ -15115,6 +18060,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         progress_heartbeat_interval_conversations,
         &mut last_progress_persist,
         progress_heartbeat_interval,
+        progress_bump.as_ref(),
         perf_profile.as_mut(),
     )?;
 
@@ -15161,6 +18107,12 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     publish_staged_lexical_index(&final_merge_artifact.publish_path, index_path)?;
     log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
 
+    crate::search::tantivy::validate_searchable_index_contract(index_path).with_context(|| {
+        format!(
+            "validating staged lexical rebuild after publish: {}",
+            index_path.display()
+        )
+    })?;
     if let Some(observed_tantivy_docs) = live_tantivy_doc_count(index_path)?
         && observed_tantivy_docs != indexed_docs
     {
@@ -15225,6 +18177,7 @@ fn rebuild_tantivy_from_db_with_options(
     total_conversations: usize,
     progress: Option<Arc<IndexingProgress>>,
     options: LexicalRebuildStartupOptions,
+    progress_bump: Option<Arc<AtomicI64>>,
 ) -> Result<LexicalRebuildOutcome> {
     let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
     let prep_started = Instant::now();
@@ -15358,6 +18311,7 @@ fn rebuild_tantivy_from_db_with_options(
         Some(plan_lexical_rebuild_shards_from_storage_with_settings(
             &storage,
             &pipeline_settings,
+            total_conversations,
         )?)
     } else {
         None
@@ -15578,6 +18532,7 @@ fn rebuild_tantivy_from_db_with_options(
             producer_handle,
             perf_profile,
             rebuild_profile_started,
+            progress_bump,
         );
     }
 
@@ -15728,6 +18683,7 @@ fn rebuild_tantivy_from_db_with_options(
                 if let Some(p) = &progress {
                     p.current.fetch_add(1, Ordering::Relaxed);
                 }
+                bump_index_run_lock_progress_if_present(progress_bump.as_ref());
                 refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
                     &mut latest_pipeline_runtime,
                     progress.as_ref(),
@@ -16130,6 +19086,12 @@ fn rebuild_tantivy_from_db_with_options(
     }
 
     drop(t_index);
+    crate::search::tantivy::validate_searchable_index_contract(&index_path).with_context(|| {
+        format!(
+            "validating lexical rebuild after commit: {}",
+            index_path.display()
+        )
+    })?;
     if let Some(observed_tantivy_docs) = live_tantivy_doc_count(&index_path)?
         && observed_tantivy_docs != indexed_docs
     {
@@ -16347,10 +19309,13 @@ fn ingest_non_watch_batch_once(
     defer_checkpoints: bool,
 ) -> Result<NonWatchIngestOutcome> {
     if should_inject_non_watch_ingest_test_oom(convs) {
-        anyhow::bail!("out of memory");
+        // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
+        // exercises the downcast path that real frankensqlite OOMs hit, instead
+        // of relying on the plain-string fallback.
+        return Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory));
     }
 
-    ingest_batch_detailed(
+    let outcome = ingest_batch_detailed(
         storage,
         t_index,
         data_dir,
@@ -16358,7 +19323,14 @@ fn ingest_non_watch_batch_once(
         progress,
         lexical_strategy,
         defer_checkpoints,
-    )
+    )?;
+    clear_poison_conversations_after_successful_ingest(
+        data_dir,
+        INDEX_INGEST_POISON_FILE,
+        "index-ingest-out-of-memory",
+        convs,
+    );
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16551,6 +19523,13 @@ fn ingest_batch_with_semantic_delta_inner(
         }
     };
 
+    clear_poison_conversations_after_successful_ingest(
+        data_dir,
+        WATCH_INGEST_POISON_FILE,
+        "watch-ingest-out-of-memory",
+        convs,
+    );
+
     if let Some(p) = progress {
         p.current.fetch_add(convs.len(), Ordering::Relaxed);
     }
@@ -16688,7 +19667,10 @@ fn ingest_watch_batch_with_oom_split(
     }
 
     let batch_result = if should_inject_watch_ingest_test_oom(convs) {
-        Err(anyhow::anyhow!("out of memory"))
+        // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
+        // exercises the downcast path that real frankensqlite OOMs hit, instead
+        // of relying on the plain-string fallback.
+        Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
     } else {
         let mut semantic_delta = WatchSemanticDelta::default();
         ingest_batch_with_semantic_delta(
@@ -16802,8 +19784,7 @@ fn ingest_watch_batch_with_oom_split(
                 batch_outcome: persist::PersistBatchOutcome::default(),
                 processed_conversations: 1,
                 quarantined_conversations: 1,
-                lexical_deferred_conversations: 0,
-                max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
+                max_payload_watermark_ms: None,
             })
         }
         Err(error) => Err(error),
@@ -16855,9 +19836,59 @@ fn save_watch_state_watermark(
 
 fn error_is_out_of_memory(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        let message = cause.to_string().to_ascii_lowercase();
-        message.contains("out of memory") || message.contains("not enough memory")
+        if cause
+            .downcast_ref::<frankensqlite::FrankenError>()
+            .is_some_and(|err| matches!(err, frankensqlite::FrankenError::OutOfMemory))
+        {
+            return true;
+        }
+        error_message_is_exact_out_of_memory(&cause.to_string())
     })
+}
+
+fn error_message_is_exact_out_of_memory(message: &str) -> bool {
+    matches!(
+        message.trim().to_ascii_lowercase().as_str(),
+        "out of memory" | "not enough memory"
+    )
+}
+
+/// Render the full `anyhow::Error` chain as ` | `-joined causes so quarantine
+/// records preserve which subsystem produced the error. The top-level
+/// `error.to_string()` only shows the outermost cause, which for typed
+/// `FrankenError::OutOfMemory` is the bare literal "out of memory" — useless
+/// for triage.
+fn format_error_chain(error: &anyhow::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for cause in error.chain() {
+        let rendered = cause.to_string();
+        let trimmed = rendered.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if parts.last().is_some_and(|prev| prev == trimmed) {
+            continue;
+        }
+        parts.push(trimmed.to_string());
+    }
+    if parts.is_empty() {
+        return error.to_string();
+    }
+    parts.join(" | ")
+}
+
+fn record_watch_poison_conversation(
+    data_dir: &Path,
+    conv: &NormalizedConversation,
+    error: &anyhow::Error,
+) -> Result<()> {
+    record_poison_conversation(
+        data_dir,
+        WATCH_INGEST_POISON_FILE,
+        "watch-ingest-out-of-memory",
+        conv,
+        error,
+    )
 }
 
 fn record_index_poison_conversation(
@@ -16877,6 +19908,8 @@ fn record_index_poison_conversation(
 const WATCH_INGEST_POISON_FILE: &str = "watch_ingest_poison.jsonl";
 const INDEX_INGEST_POISON_FILE: &str = "index_ingest_poison.jsonl";
 const POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION: i64 = 1;
+const INGEST_QUARANTINE_CIRCUIT_DEFAULT_WINDOW_SECONDS: i64 = 3_600;
+const INGEST_QUARANTINE_CIRCUIT_DEFAULT_LIMIT: usize = 25;
 
 fn record_poison_conversation(
     data_dir: &Path,
@@ -16934,6 +19967,12 @@ fn record_poison_conversation(
         .unwrap_or(0)
         .saturating_add(1);
 
+    // Capture the FULL error chain in `last_error` so post-mortem triage can
+    // see why the OOM bubbled up (which crate, which operation). Without this
+    // we only saw the top-level `anyhow::Error::Display` rendering, which for
+    // `FrankenError::OutOfMemory` is just the bare string "out of memory" and
+    // tells us nothing about which subsystem failed.
+    let full_error_chain = format_error_chain(error);
     let record = serde_json::json!({
         "schema_version": POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION,
         "conversation_id": conversation_id,
@@ -16941,9 +19980,10 @@ fn record_poison_conversation(
         "first_quarantined_at_ms": first_quarantined_at_ms,
         "last_attempt_at_ms": now_ms,
         "attempt_count": attempt_count,
+        "cass_version_at_quarantine": current_cass_version(),
         "reason": reason,
         "error_kind": "out-of-memory",
-        "last_error": error.to_string(),
+        "last_error": full_error_chain,
         "error": error.to_string(),
         "agent_slug": conv.agent_slug,
         "external_id": conv.external_id.as_deref(),
@@ -16971,21 +20011,388 @@ fn record_poison_conversation(
     }
     file.sync_all()
         .with_context(|| format!("syncing ingest quarantine record {}", path.display()))?;
+    record_structured_poison_quarantine_state(
+        data_dir,
+        &conversation_id,
+        schema_version_at_quarantine,
+        reason,
+        error,
+        now_ms,
+    );
     Ok(())
 }
 
-fn record_watch_poison_conversation(
+fn current_cass_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleIndexIngestQuarantineRetry {
+    stale_records: usize,
+    legacy_records: usize,
+    previous_versions: Vec<String>,
+}
+
+#[derive(Default)]
+struct StalePoisonVersionAccumulator {
+    stale_keys: BTreeSet<(String, i64)>,
+    legacy_keys: BTreeSet<(String, i64)>,
+    previous_versions: BTreeSet<String>,
+    /// Keys that have been observed with `cass_version == current_version` in
+    /// at least one storage surface (JSONL or structured).  A key here must
+    /// not be promoted to `stale_keys` even if a *second* observation from a
+    /// different surface reports it as `None` (legacy) or an older version.
+    ///
+    /// Without this, the cross-surface race where
+    /// `mark_stale_index_ingest_jsonl_retry_attempted` succeeds but
+    /// `mark_stale_index_ingest_structured_retry_attempted`'s `state.save()`
+    /// fails would leave the structured record at `None`, causing
+    /// `stale_index_ingest_quarantine_version_retry` to signal a retry every
+    /// subsequent run even though the JSONL surface already records the retry
+    /// as complete for the current version — an unbounded retry storm
+    /// (cass#261).
+    already_current_keys: BTreeSet<(String, i64)>,
+}
+
+impl StalePoisonVersionAccumulator {
+    fn observe(&mut self, key: (String, i64), cass_version: Option<&str>, current_version: &str) {
+        match cass_version {
+            Some(version) if version == current_version => {
+                // This key is already marked as retried under the current
+                // binary.  Record it so that a stale observation from another
+                // storage surface cannot re-promote it to stale_keys.
+                self.stale_keys.remove(&key);
+                self.legacy_keys.remove(&key);
+                self.already_current_keys.insert(key);
+            }
+            Some(version) => {
+                if !self.already_current_keys.contains(&key) {
+                    self.stale_keys.insert(key);
+                    self.previous_versions.insert(version.to_string());
+                }
+            }
+            None => {
+                if !self.already_current_keys.contains(&key) {
+                    self.legacy_keys.insert(key.clone());
+                    self.stale_keys.insert(key);
+                    self.previous_versions.insert("unknown".to_string());
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> Option<StaleIndexIngestQuarantineRetry> {
+        (!self.stale_keys.is_empty()).then(|| StaleIndexIngestQuarantineRetry {
+            stale_records: self.stale_keys.len(),
+            legacy_records: self.legacy_keys.len(),
+            previous_versions: self.previous_versions.into_iter().collect(),
+        })
+    }
+}
+
+fn stale_index_ingest_quarantine_version_retry(
     data_dir: &Path,
-    conv: &NormalizedConversation,
+) -> Result<Option<StaleIndexIngestQuarantineRetry>> {
+    let current_version = current_cass_version();
+    let mut accumulator = StalePoisonVersionAccumulator::default();
+    let path = data_dir.join("quarantine").join(INDEX_INGEST_POISON_FILE);
+    if path.exists() {
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("reading index ingest quarantine file {}", path.display()))?;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                continue;
+            };
+            if let Some(key) = poison_record_key_from_value(&value) {
+                accumulator.observe(key, poison_record_cass_version(&value), current_version);
+            }
+        }
+    }
+
+    let state = QuarantineState::load(data_dir);
+    for (key, record) in state.iter() {
+        if record.last_reason.starts_with("index-ingest-out-of-memory") {
+            accumulator.observe(
+                (key.conversation_id, i64::from(key.schema_version)),
+                record.cass_version_at_quarantine.as_deref(),
+                current_version,
+            );
+        }
+    }
+
+    Ok(accumulator.finish())
+}
+
+fn mark_stale_index_ingest_quarantine_retry_attempted(data_dir: &Path) -> Result<usize> {
+    let jsonl_marked = mark_stale_index_ingest_jsonl_retry_attempted(data_dir)?;
+    let structured_marked = mark_stale_index_ingest_structured_retry_attempted(data_dir);
+    Ok(jsonl_marked.saturating_add(structured_marked))
+}
+
+fn mark_stale_index_ingest_jsonl_retry_attempted(data_dir: &Path) -> Result<usize> {
+    let path = data_dir.join("quarantine").join(INDEX_INGEST_POISON_FILE);
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("reading index ingest quarantine file {}", path.display()))?;
+    let current_version = current_cass_version();
+    let mut retained_lines = Vec::new();
+    let mut marked = 0usize;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            retained_lines.push(trimmed.to_string());
+            continue;
+        };
+        let should_mark = poison_record_key_from_value(&value).is_some()
+            && poison_record_version_needs_retry(
+                poison_record_cass_version(&value),
+                current_version,
+            );
+        if should_mark && let Some(object) = value.as_object_mut() {
+            object.insert(
+                "cass_version_at_quarantine".to_string(),
+                serde_json::json!(current_version),
+            );
+            marked = marked.saturating_add(1);
+            retained_lines.push(value.to_string());
+        } else {
+            retained_lines.push(trimmed.to_string());
+        }
+    }
+
+    if marked == 0 {
+        return Ok(0);
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("opening ingest quarantine file {}", path.display()))?;
+    for line in retained_lines {
+        writeln!(file, "{line}")
+            .with_context(|| format!("rewriting ingest quarantine file {}", path.display()))?;
+    }
+    file.sync_all()
+        .with_context(|| format!("syncing ingest quarantine file {}", path.display()))?;
+    Ok(marked)
+}
+
+fn mark_stale_index_ingest_structured_retry_attempted(data_dir: &Path) -> usize {
+    let mut state = QuarantineState::load(data_dir);
+    if state.is_empty() {
+        return 0;
+    }
+
+    let current_version = current_cass_version();
+    let mut marked = 0usize;
+    for record in state.entries.values_mut() {
+        if record.last_reason.starts_with("index-ingest-out-of-memory")
+            && record.is_version_stale_for_retry(current_version)
+        {
+            record.cass_version_at_quarantine = Some(current_version.to_string());
+            marked = marked.saturating_add(1);
+        }
+    }
+    if marked == 0 {
+        return 0;
+    }
+    if let Err(err) = state.save(data_dir) {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            error = %err,
+            "failed to persist structured ingest quarantine retry marker"
+        );
+        return 0;
+    }
+    marked
+}
+
+fn clear_poison_conversations_after_successful_ingest(
+    data_dir: &Path,
+    file_name: &str,
+    reason: &str,
+    convs: &[NormalizedConversation],
+) {
+    if convs.is_empty() {
+        return;
+    }
+    let conversation_ids = convs
+        .iter()
+        .map(poison_conversation_id)
+        .collect::<BTreeSet<_>>();
+
+    let jsonl_cleared =
+        match clear_poison_jsonl_records(data_dir, file_name, reason, &conversation_ids) {
+            Ok(cleared) => cleared,
+            Err(err) => {
+                tracing::warn!(
+                    data_dir = %data_dir.display(),
+                    file_name,
+                    error = %err,
+                    "failed to clear successful ingest records from poison quarantine JSONL"
+                );
+                0
+            }
+        };
+    let structured_cleared =
+        clear_structured_poison_quarantine_records(data_dir, reason, &conversation_ids);
+
+    let cleared = jsonl_cleared.saturating_add(structured_cleared);
+    if cleared > 0 {
+        tracing::info!(
+            data_dir = %data_dir.display(),
+            file_name,
+            reason,
+            cleared,
+            "cleared poison quarantine records after successful ingest retry"
+        );
+    }
+}
+
+fn clear_poison_jsonl_records(
+    data_dir: &Path,
+    file_name: &str,
+    reason: &str,
+    conversation_ids: &BTreeSet<String>,
+) -> Result<usize> {
+    let path = data_dir.join("quarantine").join(file_name);
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("reading ingest quarantine file {}", path.display()))?;
+    let mut retained_lines = Vec::new();
+    let mut cleared = 0usize;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let should_clear = serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .and_then(|value| {
+                let record_reason_matches = value
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|record_reason| record_reason == reason);
+                record_reason_matches
+                    .then(|| poison_record_key_from_value(&value))
+                    .flatten()
+            })
+            .is_some_and(|(conversation_id, _)| conversation_ids.contains(&conversation_id));
+        if should_clear {
+            cleared = cleared.saturating_add(1);
+        } else {
+            retained_lines.push(trimmed.to_string());
+        }
+    }
+
+    if cleared == 0 {
+        return Ok(0);
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("opening ingest quarantine file {}", path.display()))?;
+    for line in retained_lines {
+        writeln!(file, "{line}")
+            .with_context(|| format!("rewriting ingest quarantine file {}", path.display()))?;
+    }
+    file.sync_all()
+        .with_context(|| format!("syncing ingest quarantine file {}", path.display()))?;
+    Ok(cleared)
+}
+
+fn clear_structured_poison_quarantine_records(
+    data_dir: &Path,
+    reason: &str,
+    conversation_ids: &BTreeSet<String>,
+) -> usize {
+    let mut state = QuarantineState::load(data_dir);
+    if state.is_empty() {
+        return 0;
+    }
+
+    let keys = state
+        .iter()
+        .filter(|(key, record)| {
+            conversation_ids.contains(&key.conversation_id)
+                && record.last_reason.starts_with(reason)
+        })
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return 0;
+    }
+
+    let mut cleared = 0usize;
+    for key in keys {
+        if state.clear(&key) {
+            cleared = cleared.saturating_add(1);
+        }
+    }
+    if let Err(err) = state.save(data_dir) {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            error = %err,
+            "failed to persist structured ingest quarantine cleanup"
+        );
+        return 0;
+    }
+    cleared
+}
+
+fn record_structured_poison_quarantine_state(
+    data_dir: &Path,
+    conversation_id: &str,
+    schema_version_at_quarantine: i64,
+    reason: &str,
     error: &anyhow::Error,
-) -> Result<()> {
-    record_poison_conversation(
-        data_dir,
-        WATCH_INGEST_POISON_FILE,
-        "watch-ingest-out-of-memory",
-        conv,
-        error,
-    )
+    now_ms: i64,
+) {
+    let Ok(schema_version) = u32::try_from(schema_version_at_quarantine) else {
+        tracing::warn!(
+            schema_version_at_quarantine,
+            "skipping structured ingest quarantine state update because schema version is out of range"
+        );
+        return;
+    };
+    let Some(now) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms) else {
+        tracing::warn!(
+            now_ms,
+            "skipping structured ingest quarantine state update because timestamp is invalid"
+        );
+        return;
+    };
+
+    let mut state = QuarantineState::load(data_dir);
+    let key = QuarantineKey::new(conversation_id, schema_version);
+    state.record_attempt(&key, format!("{reason}: {error}"), now);
+    if let Err(err) = state.save(data_dir) {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            error = %err,
+            "failed to persist structured ingest quarantine state"
+        );
+    }
 }
 
 fn poison_conversation_id(conv: &NormalizedConversation) -> String {
@@ -17055,6 +20462,18 @@ fn poison_record_key_from_value(value: &serde_json::Value) -> Option<(String, i6
     ))
 }
 
+fn poison_record_cass_version(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("cass_version_at_quarantine")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+}
+
+fn poison_record_version_needs_retry(cass_version: Option<&str>, current_version: &str) -> bool {
+    !matches!(cass_version, Some(version) if version == current_version)
+}
+
 fn poison_record_first_quarantined_at_ms(value: &serde_json::Value) -> Option<i64> {
     value
         .get("first_quarantined_at_ms")
@@ -17071,6 +20490,10 @@ pub struct ConversationIngestQuarantineSummary {
     pub schema_version: i64,
     pub status: String,
     pub quarantined_conversations: usize,
+    pub recent_quarantined_conversations: usize,
+    pub recent_window_seconds: i64,
+    pub circuit_breaker_limit: usize,
+    pub circuit_breaker_active: bool,
     pub quarantine_files: Vec<String>,
     pub newest_last_attempt_at_ms: Option<i64>,
     pub recommended_action: Option<String>,
@@ -17081,8 +20504,32 @@ pub fn conversation_ingest_quarantine_summary(
 ) -> ConversationIngestQuarantineSummary {
     let quarantine_dir = data_dir.join("quarantine");
     let mut keys = BTreeSet::<(String, i64)>::new();
+    let mut recent_keys = BTreeSet::<(String, i64)>::new();
     let mut quarantine_files = Vec::new();
     let mut newest_last_attempt_at_ms: Option<i64> = None;
+    let recent_window_seconds = ingest_quarantine_circuit_window_seconds();
+    let recent_cutoff_ms =
+        FrankenStorage::now_millis().saturating_sub(recent_window_seconds.saturating_mul(1_000));
+    let circuit_breaker_limit = ingest_quarantine_circuit_limit();
+
+    let state_path = QuarantineState::path(data_dir);
+    if state_path.exists() {
+        quarantine_files.push(state_path.display().to_string());
+        let state = QuarantineState::load(data_dir);
+        for (key, record) in state.iter() {
+            let last_attempt_at_ms = record.last_attempt_at.timestamp_millis();
+            let summary_key = (key.conversation_id, i64::from(key.schema_version));
+            keys.insert(summary_key.clone());
+            if last_attempt_at_ms >= recent_cutoff_ms {
+                recent_keys.insert(summary_key);
+            }
+            newest_last_attempt_at_ms = Some(
+                newest_last_attempt_at_ms.map_or(last_attempt_at_ms, |current| {
+                    current.max(last_attempt_at_ms)
+                }),
+            );
+        }
+    }
 
     for file_name in [WATCH_INGEST_POISON_FILE, INDEX_INGEST_POISON_FILE] {
         let path = quarantine_dir.join(file_name);
@@ -17101,9 +20548,7 @@ pub fn conversation_ingest_quarantine_summary(
             let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
                 continue;
             };
-            if let Some(key) = poison_record_key_from_value(&value) {
-                keys.insert(key);
-            }
+            let key = poison_record_key_from_value(&value);
             if let Some(last_attempt_at_ms) = value
                 .get("last_attempt_at_ms")
                 .and_then(serde_json::Value::as_i64)
@@ -17113,31 +20558,70 @@ pub fn conversation_ingest_quarantine_summary(
                         .and_then(serde_json::Value::as_i64)
                 })
             {
+                if let Some(key) = key.as_ref()
+                    && last_attempt_at_ms >= recent_cutoff_ms
+                {
+                    recent_keys.insert(key.clone());
+                }
                 newest_last_attempt_at_ms = Some(
                     newest_last_attempt_at_ms.map_or(last_attempt_at_ms, |current| {
                         current.max(last_attempt_at_ms)
                     }),
                 );
             }
+            if let Some(key) = key {
+                keys.insert(key);
+            }
         }
     }
 
     let quarantined_conversations = keys.len();
+    let recent_quarantined_conversations = recent_keys.len();
+    let circuit_breaker_active =
+        circuit_breaker_limit > 0 && recent_quarantined_conversations >= circuit_breaker_limit;
     ConversationIngestQuarantineSummary {
         schema_version: POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION,
-        status: if quarantined_conversations > 0 {
+        status: if circuit_breaker_active {
+            "critical".to_string()
+        } else if quarantined_conversations > 0 {
             "degraded".to_string()
         } else {
             "ok".to_string()
         },
         quarantined_conversations,
+        recent_quarantined_conversations,
+        recent_window_seconds,
+        circuit_breaker_limit,
+        circuit_breaker_active,
         quarantine_files,
         newest_last_attempt_at_ms,
-        recommended_action: (quarantined_conversations > 0).then(|| {
-            "Inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` or run a bounded full refresh."
-                .to_string()
-        }),
+        recommended_action: if circuit_breaker_active {
+            Some(
+                "Quarantine volume exceeded the recent circuit-breaker threshold; pause the watcher, inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` before resuming watch."
+                    .to_string(),
+            )
+        } else {
+            (quarantined_conversations > 0).then(|| {
+                "Inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` or run a bounded full refresh."
+                    .to_string()
+            })
+        },
     }
+}
+
+fn ingest_quarantine_circuit_window_seconds() -> i64 {
+    dotenvy::var("CASS_INGEST_QUARANTINE_CIRCUIT_WINDOW_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(INGEST_QUARANTINE_CIRCUIT_DEFAULT_WINDOW_SECONDS)
+}
+
+fn ingest_quarantine_circuit_limit() -> usize {
+    dotenvy::var("CASS_INGEST_QUARANTINE_CIRCUIT_LIMIT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(INGEST_QUARANTINE_CIRCUIT_DEFAULT_LIMIT)
 }
 
 #[cfg(test)]
@@ -17673,7 +21157,9 @@ fn reindex_paths_with_semantic_delta(
 
     let mut semantic_delta = semantic_delta;
     let preserve_watch_watermark = scan_path_exclusions_active();
-    let active_source_filter = ActiveSessionSourceFilter::new();
+    let active_source_filter = ActiveSessionSourceFilter::new(
+        opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
+    );
 
     for (kind, root, min_ts, max_ts) in triggers {
         let conn = kind.create_connector();
@@ -17956,9 +21442,16 @@ fn reindex_paths_with_semantic_delta(
 
                 if !explicit_watch_once
                     && !preserve_this_watch_watermark
+                    && chunk_outcome.quarantined_conversations == 0
                     && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
                 {
                     save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
+                } else if chunk_outcome.quarantined_conversations > 0 {
+                    tracing::info!(
+                        ?kind,
+                        quarantined_conversations = chunk_outcome.quarantined_conversations,
+                        "preserving partial watch watermark so quarantined source can be retried"
+                    );
                 } else if preserve_this_watch_watermark {
                     tracing::debug!(
                         ?kind,
@@ -18033,14 +21526,21 @@ fn reindex_paths_with_semantic_delta(
         if !explicit_watch_once
             && conv_count > 0
             && !preserve_this_watch_watermark
+            && quarantined_conversations == 0
             && let Some(ts_val) = max_ts
         {
-            // Once every chunk for this trigger has either persisted or been
-            // explicitly quarantined, advance to the filesystem event
-            // high-water mark. Partial per-chunk updates above deliberately
-            // use payload timestamps so an unexpected later failure cannot
-            // hide unprocessed conversations that share the same source file.
+            // Once every chunk for this trigger has persisted without poison
+            // quarantine, advance to the filesystem event high-water mark.
+            // Partial per-chunk updates above deliberately use payload
+            // timestamps so an unexpected later failure cannot hide
+            // unprocessed conversations that share the same source file.
             save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
+        } else if !explicit_watch_once && quarantined_conversations > 0 {
+            tracing::info!(
+                ?kind,
+                quarantined_conversations,
+                "preserving final watch watermark so quarantined source can be retried"
+            );
         } else if !explicit_watch_once && conv_count > 0 && preserve_this_watch_watermark {
             tracing::info!(
                 ?kind,
@@ -18341,7 +21841,15 @@ fn finalize_watch_reindex_result(
             indexed
         }
         Err(error) => {
-            tracing::warn!(error = %error, context, "watch reindex failed");
+            // ERROR (not WARN) with the full chain so watch-cycle failures are
+            // visible: a failed cycle leaves the per-connector since_ts watermark
+            // un-advanced, so the next cycle re-scans the same backlog and fails
+            // again — the crash-loop symptom in issue #250
+            // (coding_agent_session_search-u7r1z).
+            tracing::error!(
+                context,
+                "watch reindex failed; since_ts not advanced this cycle: {error:#}"
+            );
             reset_progress_to_idle(progress);
             set_progress_last_error(progress, Some(format!("{context}: {error}")));
             detector.record_scan(0);
@@ -18363,7 +21871,15 @@ fn finalize_watch_once_reindex_result(
             Ok(indexed)
         }
         Err(error) => {
-            tracing::warn!(error = %error, context, "watch reindex failed");
+            // ERROR (not WARN) with the full chain so watch-cycle failures are
+            // visible: a failed cycle leaves the per-connector since_ts watermark
+            // un-advanced, so the next cycle re-scans the same backlog and fails
+            // again — the crash-loop symptom in issue #250
+            // (coding_agent_session_search-u7r1z).
+            tracing::error!(
+                context,
+                "watch reindex failed; since_ts not advanced this cycle: {error:#}"
+            );
             reset_progress_to_idle(progress);
             set_progress_last_error(progress, Some(format!("{context}: {error}")));
             detector.record_scan(0);
@@ -21884,6 +25400,7 @@ pub mod persist {
                 completed_checkpoint_indexed_docs: None,
                 tantivy_requires_rebuild: true,
                 observed_tantivy_docs: None,
+                published_index_validated_for_current_data: false,
             };
 
             assert!(crate::indexer::should_evaluate_incremental_canonical_lexical_repair(&base));
@@ -21944,6 +25461,7 @@ pub mod persist {
                         completed_checkpoint_indexed_docs: None,
                         tantivy_requires_rebuild: true,
                         observed_tantivy_docs: None,
+                        published_index_validated_for_current_data: false,
                     },
                 ),
                 Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
@@ -21968,6 +25486,7 @@ pub mod persist {
                         completed_checkpoint_indexed_docs: None,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(3),
+                        published_index_validated_for_current_data: false,
                     },
                 ),
                 Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
@@ -22055,6 +25574,7 @@ pub mod persist {
                         completed_checkpoint_indexed_docs: Some(4),
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(42),
+                        published_index_validated_for_current_data: false,
                     },
                 ),
                 None
@@ -22147,6 +25667,52 @@ pub mod persist {
                         ..base
                     }
                 )
+            );
+        }
+
+        #[test]
+        fn incremental_canonical_lexical_repair_plan_repairs_sparse_live_index_despite_checkpoint()
+        {
+            assert_eq!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        full_refresh: false,
+                        force_rebuild: false,
+                        resume_lexical_rebuild: false,
+                        targeted_watch_once_only: false,
+                        salvage_messages_imported: 0,
+                        canonical_messages: 42,
+                        tantivy_requires_rebuild: false,
+                        observed_tantivy_docs: Some(3),
+                        published_index_validated_for_current_data: true,
+                    },
+                ),
+                Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
+                    canonical_messages: 42,
+                    observed_tantivy_docs: Some(3),
+                    reason: "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan",
+                }),
+                "a matching checkpoint is not proof that the current live derived index covers SQLite"
+            );
+
+            // The validation flag must NOT mask a genuinely missing/unopenable
+            // index: `tantivy_requires_rebuild` still forces a rebuild plan.
+            assert!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        full_refresh: false,
+                        force_rebuild: false,
+                        resume_lexical_rebuild: false,
+                        targeted_watch_once_only: false,
+                        salvage_messages_imported: 0,
+                        canonical_messages: 42,
+                        tantivy_requires_rebuild: true,
+                        observed_tantivy_docs: None,
+                        published_index_validated_for_current_data: true,
+                    },
+                )
+                .is_some(),
+                "a missing/invalid tantivy index must still rebuild even when the validation flag is set"
             );
         }
 
@@ -23436,6 +27002,38 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    fn read_index_run_lock_metadata_for_test(lock_path: &Path) -> Result<String> {
+        #[cfg(windows)]
+        {
+            let sidecar_path =
+                crate::search::asset_state::index_run_lock_metadata_sidecar_path(lock_path);
+            if let Ok(raw) = std::fs::read_to_string(&sidecar_path)
+                && !raw.trim().is_empty()
+            {
+                return Ok(raw);
+            }
+        }
+        match std::fs::read_to_string(lock_path) {
+            Ok(raw) => Ok(raw),
+            Err(err) if crate::search::asset_state::windows_lock_conflict(&err) => {
+                let sidecar_path =
+                    crate::search::asset_state::index_run_lock_metadata_sidecar_path(lock_path);
+                std::fs::read_to_string(&sidecar_path).with_context(|| {
+                    format!(
+                        "reading index-run lock metadata sidecar {}",
+                        sidecar_path.display()
+                    )
+                })
+            }
+            Err(err) => Err(err).with_context(|| {
+                format!(
+                    "reading index-run lock metadata for test {}",
+                    lock_path.display()
+                )
+            }),
+        }
+    }
+
     #[test]
     fn scan_path_exclusions_value_active_handles_commas_and_newlines() {
         assert!(!scan_path_exclusions_value_active(None));
@@ -24510,6 +28108,112 @@ mod tests {
     }
 
     #[test]
+    fn active_session_recent_write_detection_is_watch_opt_in() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source_path = tmp.path().join("active-session.jsonl");
+        std::fs::write(&source_path, b"{\"type\":\"session\"}\n").expect("write source");
+
+        let inactive_filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+        assert_eq!(inactive_filter.active_writer_reason(&source_path), None);
+
+        let active_filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(Some(
+            Duration::from_secs(3_600),
+        ));
+        assert_eq!(
+            active_filter.active_writer_reason(&source_path),
+            Some(ActiveSessionSourceReason::RecentlyModified)
+        );
+    }
+
+    #[test]
+    fn out_of_memory_classifier_rejects_contextual_substrings() {
+        let typed: anyhow::Error = frankensqlite::FrankenError::OutOfMemory.into();
+        assert!(error_is_out_of_memory(&typed));
+
+        let exact = anyhow::anyhow!("out of memory");
+        assert!(error_is_out_of_memory(&exact));
+
+        let contextual = anyhow::anyhow!("connector parse failed: not enough memory in record");
+        assert!(
+            !error_is_out_of_memory(&contextual),
+            "contextual text must not be promoted into permanent OOM quarantine"
+        );
+    }
+
+    #[test]
+    fn poison_quarantine_record_preserves_full_error_chain() {
+        use crate::connectors::{NormalizedConversation, NormalizedMessage};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let data_dir = tmp.path().join("poison-chain");
+
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: Some("chain-capture-conv".into()),
+            title: Some("chain capture".into()),
+            workspace: Some(std::path::PathBuf::from("/ws/chain")),
+            source_path: std::path::PathBuf::from("/log/chain.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_010),
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1_700_000_000_005),
+                content: "trigger".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+
+        // Build a realistic wrapped chain: low-level FrankenError::OutOfMemory
+        // bubbling up through two layers of context (mirrors how it actually
+        // arrives at the quarantine path inside the watch ingest flow).
+        let typed: anyhow::Error = frankensqlite::FrankenError::OutOfMemory.into();
+        let with_inner_ctx = typed.context("vdbe register allocation");
+        let error: anyhow::Error = with_inner_ctx.context("ingest_batch_with_semantic_delta");
+
+        super::record_poison_conversation(
+            &data_dir,
+            WATCH_INGEST_POISON_FILE,
+            "watch-ingest-out-of-memory",
+            &conv,
+            &error,
+        )
+        .expect("record poison");
+
+        let path = data_dir.join("quarantine").join(WATCH_INGEST_POISON_FILE);
+        let contents = std::fs::read_to_string(&path).expect("read quarantine file");
+        let line = contents
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .expect("at least one record");
+        let value: serde_json::Value = serde_json::from_str(line).expect("parse record");
+        let last_error = value
+            .get("last_error")
+            .and_then(serde_json::Value::as_str)
+            .expect("last_error string");
+        assert!(
+            last_error.contains("ingest_batch_with_semantic_delta"),
+            "last_error must include outer context: {last_error}"
+        );
+        assert!(
+            last_error.contains("vdbe register allocation"),
+            "last_error must include intermediate context: {last_error}"
+        );
+        assert!(
+            last_error.contains("out of memory"),
+            "last_error must include innermost cause: {last_error}"
+        );
+        assert!(
+            last_error.contains(" | "),
+            "last_error must be ` | `-joined chain: {last_error}"
+        );
+    }
+
+    #[test]
     fn heartbeat_index_run_lock_refreshes_updated_at_without_touching_identity_fields() {
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("index-run.lock");
@@ -24522,22 +28226,27 @@ mod tests {
         heartbeat_index_run_lock(tmp.path()).unwrap();
         heartbeat_index_run_lock(tmp.path()).unwrap();
 
-        let refreshed = std::fs::read_to_string(&lock_path).unwrap();
+        let refreshed = read_index_run_lock_metadata_for_test(&lock_path).unwrap();
         assert!(refreshed.contains("pid=123"));
         assert!(refreshed.contains("started_at_ms=111"));
         assert!(refreshed.contains("db_path=/tmp/db.sqlite"));
         assert!(refreshed.contains("job_id=lexical_refresh-123"));
-        let updated_at_values: Vec<i64> = refreshed
+        let updated_at_raw_values: Vec<&str> = refreshed
             .lines()
             .filter_map(|line| line.strip_prefix("updated_at_ms="))
-            .map(|value| value.parse::<i64>().unwrap())
             .collect();
         assert_eq!(
-            updated_at_values.len(),
+            updated_at_raw_values.len(),
             1,
             "heartbeat refresh should replace the existing updated_at_ms line"
         );
-        assert!(updated_at_values[0] >= 222);
+        let updated_at_value = updated_at_raw_values
+            .first()
+            .and_then(|value| value.parse::<i64>().ok());
+        assert!(
+            updated_at_value.is_some_and(|value| value >= 222),
+            "updated_at_ms should be parseable and should not move backwards: {updated_at_raw_values:?}"
+        );
 
         let temp_artifacts: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
@@ -24549,6 +28258,665 @@ mod tests {
             temp_artifacts.is_empty(),
             "successful heartbeat refresh should not leave temp files: {temp_artifacts:?}"
         );
+    }
+
+    /// Regression for #258 (review follow-up — fix-and-test-the-writer-side).
+    ///
+    /// The original #258 fix landed the READER side
+    /// (`asset_state::maintenance_stall_age_ms` consumes
+    /// `last_progress_at_ms`) and the HEARTBEAT-PRESERVATION test below,
+    /// but the WRITER side — `IndexRunLockGuard::write_metadata`
+    /// actually emitting a `last_progress_at_ms=...` line into the
+    /// lock file — was missing in the initial commit. Without this
+    /// test, every lock file in production had
+    /// `last_progress_at_ms=None`, so the stall detector never fired
+    /// and the wedged-indexer fix was inert.
+    ///
+    /// This test exercises the REAL writer path (no string fixture):
+    /// it calls `acquire_index_run_lock` which calls `write_metadata`
+    /// on construction, then re-reads the lock file off disk and
+    /// asserts the field is populated. The same test passes through
+    /// `read_search_maintenance_snapshot` to verify the value flows
+    /// end-to-end into the same data the status JSON consumes.
+    #[test]
+    fn acquire_index_run_lock_writes_last_progress_at_ms_field() -> Result<()> {
+        use crate::search::asset_state::read_search_maintenance_snapshot;
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let before_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
+        let after_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+
+        // The on-disk lock file must include the `last_progress_at_ms`
+        // key with a fresh timestamp. Parsing it lets a future change
+        // to the field's value type surface as a precise test failure.
+        let lock_path = tmp.path().join("index-run.lock");
+        let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
+        let last_progress_lines: Vec<&str> = raw
+            .lines()
+            .filter_map(|line| line.strip_prefix("last_progress_at_ms="))
+            .collect();
+        assert_eq!(
+            last_progress_lines.len(),
+            1,
+            "lock file must contain exactly one last_progress_at_ms line; got {raw:?}",
+        );
+        let value: i64 = last_progress_lines
+            .first()
+            .context("last_progress_at_ms line missing")?
+            .parse()
+            .context("last_progress_at_ms must parse as i64")?;
+        assert!(
+            (before_ms..=after_ms).contains(&value),
+            "last_progress_at_ms ({value}) must be within [before_ms={before_ms}, after_ms={after_ms}] of the acquire_index_run_lock call",
+        );
+
+        // Cross-check via the same snapshot reader the status JSON uses:
+        // `last_progress_at_ms` must surface as Some(..) (NOT None,
+        // which is what production lock files had until this fix).
+        let snapshot = read_search_maintenance_snapshot(tmp.path());
+        assert_eq!(
+            snapshot.last_progress_at_ms,
+            Some(value),
+            "snapshot reader must surface last_progress_at_ms; #258 stall detector is inert otherwise",
+        );
+
+        drop(guard);
+        Ok(())
+    }
+
+    /// Regression for cass#265.
+    ///
+    /// Before this fix, every preflight step inside `run_index`'s
+    /// `phase=watch_startup` block ran with no progress bump and no
+    /// sub-phase breadcrumb. If any one of them wedged (e.g. a multi-
+    /// second-to-multi-hour COUNT scan against `messages` triggering a
+    /// fsqlite B-tree descent bug), operators saw only the opaque
+    /// `phase=watch_startup` for hours, with no way to tell whether
+    /// the wedge was in `cleanup_orphan_fk_rows`, the lexical-
+    /// checkpoint probe, the tantivy reader preflight, or somewhere
+    /// else. The reporter on cass#265 specifically asked: "Get a
+    /// thread-by-thread backtrace … I can produce one if the
+    /// maintainer can share … a guidance recipe for `lldb` to attach
+    /// to PID and dump symbolicated `bt all`." This sub-phase
+    /// breadcrumb is the same information, surfaced without requiring
+    /// the operator to attach `lldb` to a frozen process.
+    ///
+    /// The fix routes each preflight step through
+    /// `IndexRunLockGuard::set_phase`, which:
+    /// 1. Writes a fine-grained sub-phase string to the lock file's
+    ///    `phase=` line (e.g. `watch_startup:count_total_conversations`).
+    /// 2. Bumps `last_progress_at_ms` (both the on-disk field and the
+    ///    atomic the heartbeat folds in) so a real wedge inside ONE
+    ///    preflight surfaces at +120 s with the sub-phase pinpointed.
+    /// 3. Forces `IndexStallWatchdog` to reset its
+    ///    `last_progress_advance` timer at each sub-phase boundary so
+    ///    the watchdog scopes its stall window to a single preflight
+    ///    rather than the whole watch_startup block.
+    ///
+    /// This test exercises `set_phase` directly (without spinning up
+    /// the full indexer): acquire the lock as `WatchStartup`, call
+    /// `set_phase` with several sub-phases, and assert each call
+    /// updates the on-disk `phase=` line while leaving `mode=` at
+    /// `watch_startup` and advancing `last_progress_at_ms` strictly
+    /// monotonically.
+    #[test]
+    fn set_phase_writes_sub_phase_breadcrumb_and_bumps_progress() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let mut guard =
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::WatchStartup)?;
+        let lock_path = tmp.path().join("index-run.lock");
+
+        let initial = read_index_run_lock_metadata_for_test(&lock_path)?;
+        let initial_phase = initial
+            .lines()
+            .find_map(|line| line.strip_prefix("phase="))
+            .map(str::to_string);
+        assert_eq!(
+            initial_phase.as_deref(),
+            Some("watch_startup"),
+            "initial phase must equal the mode for the WatchStartup acquire"
+        );
+        let initial_progress: i64 = initial
+            .lines()
+            .find_map(|line| line.strip_prefix("last_progress_at_ms="))
+            .context("initial lock file must have last_progress_at_ms")?
+            .parse()?;
+
+        // Each preflight step writes a strictly different sub-phase
+        // and a strictly larger last_progress_at_ms. The sleep is
+        // tiny because `FrankenStorage::now_millis()` ticks every
+        // millisecond — production preflight steps take seconds, so
+        // monotonic strictness is the easy case.
+        let sub_phases = [
+            "watch_startup:ensure_index_dir",
+            "watch_startup:open_storage",
+            "watch_startup:validate_fts_messages",
+            "watch_startup:cleanup_orphan_fk_rows",
+            "watch_startup:count_total_conversations",
+            "watch_startup:probe_lexical_checkpoint",
+            "watch_startup:tantivy_reader_preflight",
+            "watch_startup:scan_entry",
+        ];
+        let mut prev_progress = initial_progress;
+        for sub_phase in sub_phases {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            guard.set_phase(SearchMaintenanceMode::WatchStartup, sub_phase)?;
+            let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
+            let phase_line = raw
+                .lines()
+                .find_map(|line| line.strip_prefix("phase="))
+                .map(str::to_string);
+            assert_eq!(
+                phase_line.as_deref(),
+                Some(sub_phase),
+                "set_phase must write the sub-phase string to the on-disk phase= field; got {raw:?}"
+            );
+            let mode_line = raw
+                .lines()
+                .find_map(|line| line.strip_prefix("mode="))
+                .map(str::to_string);
+            assert_eq!(
+                mode_line.as_deref(),
+                Some("watch_startup"),
+                "set_phase must leave mode= unchanged so SearchMaintenanceSnapshot.mode keeps reflecting WatchStartup; got {raw:?}"
+            );
+            let progress: i64 = raw
+                .lines()
+                .find_map(|line| line.strip_prefix("last_progress_at_ms="))
+                .context("last_progress_at_ms after set_phase")?
+                .parse()?;
+            assert!(
+                progress > prev_progress,
+                "set_phase must bump last_progress_at_ms (prev={prev_progress}, now={progress}); without this the stall detector cannot scope its window to a single sub-phase"
+            );
+            // The atomic mirror must also move; this is what the
+            // heartbeat thread reads.
+            let atomic_progress = guard.last_progress_at_ms_atomic.load(Ordering::Relaxed);
+            assert_eq!(
+                atomic_progress, progress,
+                "the atomic mirror used by the heartbeat thread must match the on-disk last_progress_at_ms after set_phase"
+            );
+            prev_progress = progress;
+        }
+
+        drop(guard);
+        Ok(())
+    }
+
+    /// Regression for cass#265.
+    ///
+    /// The `IndexStallWatchdog` resets its `last_progress_advance`
+    /// timer whenever `phase_code` changes. The new sub-phase
+    /// breadcrumbs live in the LOCK FILE's `phase=` field (a string),
+    /// not in `IndexingProgress::phase` (an atomic enum). So a
+    /// wedged preflight is detected by `last_progress_at_ms` (which
+    /// `set_phase` bumps) and surfaced to operators via the lock-file
+    /// `phase=` string. This test verifies the lock-file `phase=`
+    /// values are exactly the strings the README/issue triage docs
+    /// reference, so a future refactor that renames them will be
+    /// flagged here before it ships and silently breaks operator
+    /// runbooks.
+    ///
+    /// The taxonomy of sub-phases under `watch_startup:` is the
+    /// public contract — cass#265 hinge.
+    #[test]
+    fn watch_startup_sub_phase_taxonomy_is_documented_and_stable() -> Result<()> {
+        // This list MUST match the `preflight_phase!(...)` call sites
+        // in `run_index`. When you add or remove a preflight step,
+        // update this list AND the cass#265 release-note section so
+        // operators have a complete map of what `phase=` strings can
+        // surface in `cass health --robot`.
+        let documented_sub_phases = [
+            "watch_startup:ensure_index_dir",
+            "watch_startup:ensure_storage_headroom",
+            "watch_startup:open_storage",
+            "watch_startup:writable_preflight",
+            "watch_startup:validate_fts_messages",
+            "watch_startup:cleanup_orphan_fk_rows",
+            "watch_startup:count_total_conversations",
+            "watch_startup:probe_lexical_checkpoint",
+            "watch_startup:repair_daily_stats",
+            "watch_startup:tantivy_reader_preflight",
+            "watch_startup:historical_salvage",
+            "watch_startup:count_total_messages",
+            "watch_startup:published_index_validate",
+            "watch_startup:scan_entry",
+        ];
+        for sub_phase in documented_sub_phases {
+            assert!(
+                sub_phase.starts_with("watch_startup:"),
+                "sub-phase {sub_phase} must live under the watch_startup: namespace so health-check JSON consumers can route on prefix"
+            );
+            assert!(
+                !sub_phase.contains(char::is_whitespace),
+                "sub-phase {sub_phase} must not contain whitespace; the lock file parser splits on `=` and expects a single line value"
+            );
+            // No colons after the namespace separator: keep sub-phases
+            // simple identifiers so future structured-log consumers
+            // (e.g. Datadog facets) can treat them as enum values.
+            let after_namespace = sub_phase
+                .strip_prefix("watch_startup:")
+                .expect("namespace check above");
+            assert!(
+                !after_namespace.contains(':'),
+                "sub-phase {sub_phase} must not contain a second colon; keep the breadcrumb taxonomy flat"
+            );
+        }
+
+        // Cross-check against the source: every documented sub-phase
+        // must appear in src/indexer/mod.rs (this file). This makes
+        // a refactor that drops a preflight call fail this test
+        // before the next release ships.
+        let src = std::fs::read_to_string(file!()).context("read indexer source")?;
+        for sub_phase in documented_sub_phases {
+            assert!(
+                src.contains(sub_phase),
+                "documented sub-phase {sub_phase} is missing from src/indexer/mod.rs; if the preflight step was renamed, update the test AND the release-note operator runbook"
+            );
+        }
+
+        // v0.6.7: the taxonomy must also be consumable as a runtime
+        // const so the watchdog can map a `step_idx` -> sub_phase
+        // string without re-parsing source. Cross-check the test
+        // list against the const so a refactor that updates one but
+        // not the other fails here.
+        assert_eq!(
+            documented_sub_phases.as_slice(),
+            super::WATCH_STARTUP_SUB_PHASE_TAXONOMY,
+            "documented taxonomy and the WATCH_STARTUP_SUB_PHASE_TAXONOMY const must match \
+             — the watchdog uses the const as authority; if they diverge, the lock-file \
+             `<step>_TIMEOUT` breadcrumb will name the wrong step on a wedge"
+        );
+        Ok(())
+    }
+
+    /// Regression for cass#265 v0.6.7 hardening.
+    ///
+    /// The v0.6.6 fix shipped sub-phase breadcrumbs but didn't fail
+    /// the run on a wedge — operators still had to attach lldb or
+    /// kill the process manually after watching the lock file for
+    /// hours. The reporter on cass#265 confirmed the wedge persists
+    /// at `cleanup_orphan_fk_rows` on v0.6.6, so v0.6.7 ships a
+    /// proactive watchdog that aborts the process when any preflight
+    /// step exceeds `CASS_PREFLIGHT_OP_TIMEOUT_SECS` (default 180 s).
+    ///
+    /// This test simulates a wedged preflight by:
+    /// 1. Starting the watchdog with a 100 ms timeout and a
+    ///    `RecordOnly` policy (so the test process survives).
+    /// 2. Calling `state.enter(step_idx_for_cleanup_orphan_fk_rows, now_ms)`.
+    /// 3. Polling for the trip with a 750 ms deadline.
+    /// 4. Asserting:
+    ///    - `state.tripped` is true (watchdog fired).
+    ///    - The operator-visible metadata `phase=` line was rewritten to
+    ///      `watch_startup:cleanup_orphan_fk_rows_TIMEOUT`.
+    ///    - The lock-file `updated_at_ms=` advanced.
+    ///    - The other fields (pid, started_at_ms, db_path, mode,
+    ///      job_id, job_kind) are preserved verbatim — the watchdog
+    ///      must only touch `phase=` and `updated_at_ms=`, not the
+    ///      operator-visible job identity.
+    #[test]
+    fn watch_startup_preflight_watchdog_fires_on_wedged_step() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let guard =
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::WatchStartup)?;
+        let lock_path = tmp.path().join("index-run.lock");
+
+        // Snapshot the pre-trip lock-file fields so we can prove
+        // the watchdog preserved everything except `phase=` and
+        // `updated_at_ms=`.
+        let pre = read_index_run_lock_metadata_for_test(&lock_path)?;
+        let extract = |key: &str, raw: &str| -> Option<String> {
+            raw.lines()
+                .find_map(|line| line.strip_prefix(key))
+                .map(str::to_string)
+        };
+        let pre_pid = extract("pid=", &pre).context("pre pid=")?;
+        let pre_started = extract("started_at_ms=", &pre).context("pre started_at_ms=")?;
+        let pre_db = extract("db_path=", &pre).context("pre db_path=")?;
+        let pre_mode = extract("mode=", &pre).context("pre mode=")?;
+        let pre_job_id = extract("job_id=", &pre).context("pre job_id=")?;
+        let pre_job_kind = extract("job_kind=", &pre).context("pre job_kind=")?;
+        let pre_updated: i64 = extract("updated_at_ms=", &pre)
+            .context("pre updated_at_ms=")?
+            .parse()?;
+
+        // Locate the wedge-candidate step (the one cass#265 confirmed
+        // wedges on v0.6.6). Hard-coding the string keeps the
+        // taxonomy test as the single source of truth.
+        let wedged = "watch_startup:cleanup_orphan_fk_rows";
+        let step_idx = super::watch_startup_step_idx(wedged)
+            .context("cleanup_orphan_fk_rows must be in the taxonomy")?;
+
+        let state = super::WatchStartupPreflightState::new();
+        // Pass a dedicated write lock (matches the production call
+        // site) so the INV3 fix compiles and is exercised here.
+        let test_write_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let _watchdog = super::WatchStartupPreflightWatchdog::start(
+            Arc::clone(&state),
+            super::WATCH_STARTUP_SUB_PHASE_TAXONOMY,
+            lock_path.clone(),
+            tmp.path().to_path_buf(),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(25),
+            super::PreflightTimeoutPolicy::RecordOnly,
+            test_write_lock,
+        );
+
+        // Simulate the wedge: claim we entered the step `now` and
+        // never exit. The watchdog will trip after ~125 ms (timeout
+        // 100 ms, poll 25 ms).
+        let started_at_ms = FrankenStorage::now_millis();
+        state.enter(step_idx, started_at_ms);
+
+        // Give the watchdog enough wall-clock to poll, decide, and
+        // rewrite the lock file. 750 ms = many poll ticks at 25 ms
+        // — even a heavily loaded CI runner finishes that.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(750);
+        while std::time::Instant::now() < deadline {
+            if state.tripped.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            state.tripped.load(Ordering::Relaxed),
+            "watchdog must trip when a preflight step exceeds its timeout; otherwise the cass#265 wedge persists silently"
+        );
+
+        // Verify the operator-visible metadata now carries the
+        // TIMEOUT breadcrumb. This is the surface the operator's
+        // `cass health --json` reads: the lock file on POSIX, and the
+        // sidecar on Windows when the held lock prevents same-process
+        // lock-file rewrites. The watchdog sets `state.tripped` only
+        // after this metadata path is durable, but the bounded poll
+        // keeps the test robust to reader/writer scheduling jitter on
+        // heavily loaded CI runners.
+        let read_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let post = loop {
+            let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
+            if raw.contains("_TIMEOUT") || std::time::Instant::now() > read_deadline {
+                break raw;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let post_phase = extract("phase=", &post).context("post phase=")?;
+        assert_eq!(
+            post_phase,
+            format!("{wedged}_TIMEOUT"),
+            "watchdog must rewrite phase= to `<step>_TIMEOUT`; got {post:?}"
+        );
+        let sidecar_path =
+            crate::search::asset_state::index_run_lock_metadata_sidecar_path(&lock_path);
+        let sidecar = std::fs::read_to_string(&sidecar_path).with_context(|| {
+            format!(
+                "reading watchdog-rewritten metadata sidecar {}",
+                sidecar_path.display()
+            )
+        })?;
+        let sidecar_phase = extract("phase=", &sidecar).context("sidecar phase=")?;
+        assert_eq!(
+            sidecar_phase,
+            format!("{wedged}_TIMEOUT"),
+            "watchdog must also rewrite the sidecar phase= for lock-blocked readers; got {sidecar:?}"
+        );
+        // Everything else preserved.
+        assert_eq!(
+            extract("pid=", &post).as_deref(),
+            Some(pre_pid.as_str()),
+            "watchdog must NOT change pid="
+        );
+        assert_eq!(
+            extract("started_at_ms=", &post).as_deref(),
+            Some(pre_started.as_str()),
+            "watchdog must NOT change started_at_ms="
+        );
+        assert_eq!(
+            extract("db_path=", &post).as_deref(),
+            Some(pre_db.as_str()),
+            "watchdog must NOT change db_path="
+        );
+        assert_eq!(
+            extract("mode=", &post).as_deref(),
+            Some(pre_mode.as_str()),
+            "watchdog must NOT change mode= — that field reflects user-facing SearchMaintenanceMode and must stay `watch_startup`"
+        );
+        assert_eq!(
+            extract("job_id=", &post).as_deref(),
+            Some(pre_job_id.as_str()),
+            "watchdog must NOT change job_id="
+        );
+        assert_eq!(
+            extract("job_kind=", &post).as_deref(),
+            Some(pre_job_kind.as_str()),
+            "watchdog must NOT change job_kind="
+        );
+        let post_updated: i64 = extract("updated_at_ms=", &post)
+            .context("post updated_at_ms=")?
+            .parse()?;
+        assert!(
+            post_updated >= pre_updated,
+            "watchdog must bump updated_at_ms= (pre={pre_updated}, post={post_updated}); without this operators can't distinguish a fresh TIMEOUT from a stale lock"
+        );
+
+        drop(guard);
+        Ok(())
+    }
+
+    /// Regression for INV3 (v0.6.9 hardening).
+    ///
+    /// When the watchdog fires it holds `metadata_write_lock` across
+    /// the full `rewrite_lock_phase_for_timeout` call. This serialises
+    /// the watchdog's `_TIMEOUT` rewrite against the heartbeat thread,
+    /// which also takes the same lock before every write. Without this
+    /// serialisation the heartbeat can read, then overwrite, the lock
+    /// file between the watchdog's `set_len(0)` and `write_all`, leaving
+    /// the lock file without the `_TIMEOUT` breadcrumb even though
+    /// `process::exit(70)` was called.
+    ///
+    /// The test simulates the race by:
+    /// 1. Pre-holding `metadata_write_lock` from the test thread.
+    /// 2. Starting the watchdog (RecordOnly) with the same lock.
+    /// 3. Entering a step and verifying the watchdog trips but cannot
+    ///    write the lock file while the lock is held.
+    /// 4. Releasing the lock and confirming the rewrite then lands.
+    #[test]
+    fn watchdog_timeout_rewrite_serialised_by_metadata_write_lock() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let guard =
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::WatchStartup)?;
+        let lock_path = tmp.path().join("index-run.lock");
+
+        let metadata_write_lock = std::sync::Arc::clone(&guard.metadata_write_lock);
+
+        // Pre-hold the lock so the watchdog's rewrite is blocked.
+        let held = metadata_write_lock
+            .lock()
+            .expect("metadata_write_lock poisoned");
+
+        let wedged = "watch_startup:cleanup_orphan_fk_rows";
+        let step_idx = super::watch_startup_step_idx(wedged)
+            .context("cleanup_orphan_fk_rows must be in taxonomy")?;
+
+        let state = super::WatchStartupPreflightState::new();
+        let _watchdog = super::WatchStartupPreflightWatchdog::start(
+            Arc::clone(&state),
+            super::WATCH_STARTUP_SUB_PHASE_TAXONOMY,
+            lock_path.clone(),
+            tmp.path().to_path_buf(),
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10),
+            super::PreflightTimeoutPolicy::RecordOnly,
+            std::sync::Arc::clone(&metadata_write_lock),
+        );
+
+        let started_at_ms = FrankenStorage::now_millis();
+        state.enter(step_idx, started_at_ms);
+
+        // Wait long enough for the watchdog to have tripped internally
+        // (it sets `tripped` after acquiring the lock, so it must wait).
+        // 400 ms >> 50 ms timeout + 10 ms poll + acquisition delay.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        // Lock file must NOT yet have _TIMEOUT because the watchdog is
+        // blocked waiting for `metadata_write_lock`.
+        let before_release = std::fs::read_to_string(&lock_path).unwrap_or_default();
+        assert!(
+            !before_release.contains("_TIMEOUT"),
+            "watchdog must not rewrite the lock file while metadata_write_lock is held; \
+             got: {before_release:?}"
+        );
+
+        // Release the lock. Now the watchdog can complete its write.
+        drop(held);
+
+        let read_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let after_release = loop {
+            let raw = std::fs::read_to_string(&lock_path).unwrap_or_default();
+            if raw.contains("_TIMEOUT") || std::time::Instant::now() > read_deadline {
+                break raw;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(
+            after_release.contains("_TIMEOUT"),
+            "watchdog must rewrite lock file to _TIMEOUT after metadata_write_lock is released; \
+             got: {after_release:?}"
+        );
+
+        drop(guard);
+        Ok(())
+    }
+
+    /// Regression for cass#265 v0.6.7 hardening.
+    ///
+    /// The skip env var lets operators bypass a single wedged
+    /// preflight step without disabling the rest of the preflight.
+    /// This test pins the env-var naming convention (lossless from
+    /// sub-phase string) and the parsing rules.
+    #[test]
+    fn preflight_skip_env_var_naming_is_lossless() {
+        // Mapping is lossless: sub-phase -> CASS_SKIP_PREFLIGHT_<UPPER>.
+        assert_eq!(
+            super::watch_startup_preflight::skip_env_name("watch_startup:cleanup_orphan_fk_rows"),
+            "CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS"
+        );
+        assert_eq!(
+            super::watch_startup_preflight::skip_env_name("watch_startup:count_total_messages"),
+            "CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES"
+        );
+        assert_eq!(
+            super::watch_startup_preflight::skip_env_name("watch_startup:validate_fts_messages"),
+            "CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES"
+        );
+
+        // Round-trip every documented sub-phase so a future renamed
+        // entry surfaces here.
+        for sub_phase in super::WATCH_STARTUP_SUB_PHASE_TAXONOMY {
+            let env_name = super::watch_startup_preflight::skip_env_name(sub_phase);
+            assert!(
+                env_name.starts_with("CASS_SKIP_PREFLIGHT_"),
+                "skip env var for {sub_phase} must follow the documented prefix; got {env_name}"
+            );
+            assert!(
+                !env_name.contains(':'),
+                "skip env var for {sub_phase} must strip the watch_startup: namespace; got {env_name}"
+            );
+        }
+    }
+
+    /// Regression for #258. The heartbeat thread must refresh
+    /// `updated_at_ms` (its job: prove the process is alive) but MUST
+    /// NOT touch `last_progress_at_ms` (which the indexing thread alone
+    /// updates on real forward progress). If the heartbeat were to
+    /// refresh both, the stall detector in
+    /// `crate::search::asset_state::maintenance_stall_age_ms` would
+    /// silently never fire, recreating the bug.
+    #[test]
+    fn heartbeat_preserves_last_progress_at_ms_field_for_stall_detection() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("index-run.lock");
+        // Note: last_progress_at_ms is set to a deliberately small
+        // value (333) representing "indexing thread last reported
+        // forward progress at t=333ms".
+        std::fs::write(
+            &lock_path,
+            "pid=123\nstarted_at_ms=111\nupdated_at_ms=222\nlast_progress_at_ms=333\ndb_path=/tmp/db.sqlite\nmode=watch_startup\njob_id=lexical_refresh-123\njob_kind=lexical_refresh\nphase=watch_startup\n",
+        )
+        .unwrap();
+
+        // Heartbeat twice — simulate ~5 s of clock advance with no
+        // indexing-thread activity.
+        heartbeat_index_run_lock(tmp.path()).unwrap();
+        heartbeat_index_run_lock(tmp.path()).unwrap();
+
+        let refreshed = read_index_run_lock_metadata_for_test(&lock_path).unwrap();
+        let last_progress_lines: Vec<&str> = refreshed
+            .lines()
+            .filter_map(|line| line.strip_prefix("last_progress_at_ms="))
+            .collect();
+        assert_eq!(
+            last_progress_lines.len(),
+            1,
+            "heartbeat must keep exactly one last_progress_at_ms line, got {refreshed:?}",
+        );
+        assert_eq!(
+            last_progress_lines.first().copied(),
+            Some("333"),
+            "heartbeat must preserve last_progress_at_ms verbatim — refreshing it would silently disable the #258 stall detector",
+        );
+        // updated_at_ms must have moved.
+        let updated_at_value: Option<i64> = refreshed
+            .lines()
+            .filter_map(|line| line.strip_prefix("updated_at_ms="))
+            .next()
+            .and_then(|raw| raw.parse().ok());
+        assert!(
+            updated_at_value.is_some_and(|value| value > 222),
+            "updated_at_ms must advance past initial 222, got {refreshed:?}",
+        );
+    }
+
+    #[test]
+    fn heartbeat_folds_indexer_progress_atomic_into_last_progress_at_ms() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder").unwrap();
+        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)
+            .expect("acquire index run lock");
+        let lock_path = tmp.path().join("index-run.lock");
+        let before = read_index_run_lock_metadata_for_test(&lock_path).unwrap();
+        let old_progress = before
+            .lines()
+            .find_map(|line| line.strip_prefix("last_progress_at_ms="))
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .expect("initial progress line");
+        let bumped_progress = old_progress.saturating_add(1_000);
+        guard
+            .last_progress_at_ms_atomic
+            .store(bumped_progress, Ordering::Relaxed);
+
+        heartbeat_index_run_lock_with_lock_and_progress(
+            tmp.path(),
+            Some(&guard.metadata_write_lock),
+            guard.last_progress_at_ms_atomic.load(Ordering::Relaxed),
+        )
+        .expect("heartbeat should persist indexer-owned progress");
+
+        let refreshed = read_index_run_lock_metadata_for_test(&lock_path).unwrap();
+        let expected_line = format!("last_progress_at_ms={bumped_progress}");
+        assert!(
+            refreshed.lines().any(|line| line == expected_line),
+            "heartbeat must persist the indexer-owned progress bump, got {refreshed:?}"
+        );
+        drop(guard);
     }
 
     #[test]
@@ -25486,6 +29854,25 @@ mod tests {
     }
 
     #[test]
+    fn streaming_batch_flow_reservation_releases_on_drop_and_is_idempotent() {
+        let limiter = StreamingByteLimiter::new(16);
+        let reserved = limiter.acquire(7).unwrap();
+        {
+            let _guard = StreamingBatchFlowReservation::new(Some(&limiter), reserved);
+            assert_eq!(limiter.bytes_in_flight(), reserved);
+        }
+        assert_eq!(limiter.bytes_in_flight(), 0);
+
+        let reserved = limiter.acquire(5).unwrap();
+        {
+            let mut guard = StreamingBatchFlowReservation::new(Some(&limiter), reserved);
+            guard.release_now();
+            guard.release_now();
+        }
+        assert_eq!(limiter.bytes_in_flight(), 0);
+    }
+
+    #[test]
     fn flush_streamed_lexical_rebuild_batch_releases_flow_reservation_bytes() {
         let tmp = TempDir::new().unwrap();
         let index_path = tmp.path().join("tantivy");
@@ -25821,6 +30208,10 @@ mod tests {
             indexed_docs,
             segments: 1,
             shard_index_path: shard_path.clone(),
+            message_bytes: shard.message_bytes,
+            index_size_bytes: 0,
+            build_duration_ms: 0,
+            amplification_milli: None,
         };
 
         let artifact = validate_lexical_rebuild_shard_build_result(&result).unwrap();
@@ -25902,6 +30293,10 @@ mod tests {
             indexed_docs: 1,
             segments: 1,
             shard_index_path: shard_path,
+            message_bytes: "mismatch alpha".len() + "mismatch beta".len(),
+            index_size_bytes: 0,
+            build_duration_ms: 0,
+            amplification_milli: None,
         };
 
         let err = validate_lexical_rebuild_shard_build_result(&result)
@@ -25989,6 +30384,10 @@ mod tests {
             indexed_docs,
             segments: 1,
             shard_index_path: shard_path.clone(),
+            message_bytes: shard.message_bytes,
+            index_size_bytes: 0,
+            build_duration_ms: 0,
+            amplification_milli: None,
         };
 
         // Pre-fix this would have errored with "indexed 2 docs but
@@ -26084,6 +30483,10 @@ mod tests {
             indexed_docs,
             segments: 1,
             shard_index_path: shard_path.clone(),
+            message_bytes: shard.message_bytes,
+            index_size_bytes: 0,
+            build_duration_ms: 0,
+            amplification_milli: None,
         };
 
         let err = validate_lexical_rebuild_shard_build_result(&result)
@@ -26874,7 +31277,7 @@ mod tests {
             controller_reason: "no_staged_merge_backlog".to_string(),
         };
 
-        let decision = controller.decide(&runtime, &staged_merge_runtime, 2, 3);
+        let decision = controller.decide(&runtime, &staged_merge_runtime, 2, 3, None);
 
         assert_eq!(decision.workers_max, 6);
         assert_eq!(decision.allowed_jobs, 5);
@@ -26899,7 +31302,7 @@ mod tests {
             controller_reason: "pipeline_active".to_string(),
         };
 
-        let decision = controller.decide(&runtime, &staged_merge_runtime, 3, 3);
+        let decision = controller.decide(&runtime, &staged_merge_runtime, 3, 3, None);
 
         assert_eq!(decision.workers_max, 6);
         assert_eq!(decision.allowed_jobs, 4);
@@ -26908,6 +31311,163 @@ mod tests {
         assert_eq!(
             decision.controller_reason,
             "reserving_2_slots_for_staged_merge_active_jobs_1_ready_groups_1"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_staged_shard_build_controller_pauses_new_jobs_at_emergency_memory_reserve() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
+            6,
+            None,
+            16 * GIB,
+            4 * GIB,
+        );
+        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            host_available_memory_bytes: Some(2 * GIB as u64),
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
+
+        let decision = controller.decide(&runtime, &staged_merge_runtime, 2, 4, Some(64 << 20));
+
+        assert_eq!(decision.allowed_jobs, 2);
+        assert_eq!(decision.active_jobs, 2);
+        assert_eq!(decision.pending_jobs, 4);
+        assert_eq!(
+            decision.controller_reason,
+            format!(
+                "host_available_memory_bytes_{}_below_emergency_reserve_{}_pausing_new_staged_shard_builds",
+                2 * GIB,
+                4 * GIB
+            )
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_staged_shard_build_controller_allows_one_idle_job_below_memory_reserve() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
+            6,
+            None,
+            16 * GIB,
+            4 * GIB,
+        );
+        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            host_available_memory_bytes: Some(8 * GIB as u64),
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
+
+        let decision = controller.decide(&runtime, &staged_merge_runtime, 0, 4, Some(64 << 20));
+
+        assert_eq!(decision.allowed_jobs, 1);
+        assert_eq!(
+            decision.controller_reason,
+            format!(
+                "host_available_memory_bytes_{}_below_reserve_{}_limiting_staged_shard_builds_to_1",
+                8 * GIB,
+                16 * GIB
+            )
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_staged_shard_build_controller_allows_small_idle_probe_below_emergency() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        const MIB: usize = 1024 * 1024;
+        let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
+            6,
+            None,
+            4 * GIB,
+            GIB,
+        );
+        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            host_available_memory_bytes: Some(768 * MIB as u64),
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
+
+        let decision = controller.decide(&runtime, &staged_merge_runtime, 0, 4, Some(MIB));
+
+        assert_eq!(decision.allowed_jobs, 1);
+        assert_eq!(
+            decision.controller_reason,
+            format!(
+                "host_available_memory_bytes_{}_below_emergency_reserve_{}_admitting_single_small_staged_shard_build_estimated_builder_bytes_{}",
+                768 * MIB,
+                GIB,
+                512 * MIB
+            )
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_staged_shard_build_controller_caps_override_fanout_by_memory_headroom() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
+            8,
+            None,
+            4 * GIB,
+            GIB,
+        );
+        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            host_available_memory_bytes: Some(8 * GIB as u64),
+            staged_shard_build_observed_amplification_milli: Some(24_000),
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
+
+        let decision = controller.decide(&runtime, &staged_merge_runtime, 0, 8, Some(64 << 20));
+
+        assert_eq!(decision.allowed_jobs, 1);
+        assert_eq!(
+            decision.controller_reason,
+            format!(
+                "host_available_memory_bytes_{}_reserve_{}_estimated_builder_bytes_{}_limiting_staged_shard_builds_to_1",
+                8 * GIB,
+                4 * GIB,
+                36usize * (64usize << 20)
+            )
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_shard_build_telemetry_records_conservative_amplification() {
+        let telemetry = LexicalRebuildShardBuildTelemetry::default();
+        let result = LexicalRebuildShardBuildResult {
+            shard: LexicalShardPlanShard {
+                shard_index: 7,
+                first_conversation_id: 10,
+                last_conversation_id: 11,
+                conversation_count: 2,
+                message_count: 4,
+                message_bytes: 1_000,
+                conversation_id_fingerprint: "fingerprint".to_string(),
+                oversized_single_conversation: false,
+            },
+            indexed_docs: 4,
+            segments: 1,
+            shard_index_path: PathBuf::from("/tmp/shard-7"),
+            message_bytes: 1_000,
+            index_size_bytes: 2_500,
+            build_duration_ms: 123,
+            amplification_milli: lexical_rebuild_amplification_milli(2_500, 1_000),
+        };
+
+        telemetry.record(&result);
+        let snapshot = telemetry.snapshot();
+
+        assert_eq!(snapshot.completed_jobs, 1);
+        assert_eq!(snapshot.last_shard_index, Some(7));
+        assert_eq!(snapshot.last_message_bytes, 1_000);
+        assert_eq!(snapshot.last_index_size_bytes, 2_500);
+        assert_eq!(snapshot.last_duration_ms, 123);
+        assert_eq!(snapshot.last_amplification_milli, Some(2_500));
+        assert_eq!(
+            snapshot.observed_amplification_milli,
+            Some(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI),
+            "admission should use a conservative floor until observed amplification exceeds it"
         );
     }
 
@@ -27164,21 +31724,214 @@ mod tests {
 
     #[test]
     fn lexical_rebuild_default_staged_shard_builder_parallelism_uses_bounded_builder_farm() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
         assert_eq!(
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(1),
+            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
+                1, None,
+            ),
             1
         );
         assert_eq!(
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(4),
+            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
+                4, None,
+            ),
             4
         );
         assert_eq!(
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(8),
-            8
+            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
+                8,
+                Some(128 * GIB),
+            ),
+            2,
+            "128 GiB hosts should not default to an 8-shard Tantivy build storm"
         );
         assert_eq!(
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(32),
+            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
+                32,
+                Some(512 * GIB),
+            ),
             8
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_default_staged_shard_max_message_bytes_scales_with_available_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        assert_eq!(
+            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(None),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
+                32 * GIB
+            )),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
+                128 * GIB
+            )),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
+                512 * GIB
+            )),
+            128 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lexical_rebuild_shard_planner_respects_staged_shard_byte_cap() {
+        let _cap = set_env(
+            "CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES",
+            "65536",
+        );
+        let settings = LexicalRebuildPipelineSettingsSnapshot {
+            workers: 12,
+            available_parallelism: 12,
+            reserved_cores: 2,
+            tantivy_writer_threads: 8,
+            staged_shard_builders: 8,
+            staged_merge_workers: 3,
+            controller_mode: "steady".into(),
+            controller_restore_clear_samples: 3,
+            controller_restore_hold_ms: 0,
+            controller_loadavg_high_watermark_1m_milli: None,
+            controller_loadavg_low_watermark_1m_milli: None,
+            page_size: LEXICAL_REBUILD_PAGE_SIZE,
+            steady_batch_fetch_conversations: 1024,
+            startup_batch_fetch_conversations: 256,
+            steady_commit_every_conversations: 1024,
+            startup_commit_every_conversations: 256,
+            steady_commit_every_messages: 2048,
+            startup_commit_every_messages: 512,
+            steady_commit_every_message_bytes: 512 * 1024 * 1024,
+            startup_commit_every_message_bytes: 128 * 1024 * 1024,
+            pipeline_channel_size: 2,
+            page_prep_workers: 6,
+            pipeline_max_message_bytes_in_flight: 4 * 1024 * 1024,
+        };
+
+        let budgets = lexical_rebuild_default_shard_planner_budgets_for_totals(
+            &settings,
+            10_000,
+            1_000_000,
+            4usize * 1024 * 1024 * 1024,
+        );
+
+        assert_eq!(budgets.max_message_bytes_per_shard, 65_536);
+    }
+
+    #[test]
+    #[serial]
+    fn lexical_rebuild_pending_shard_build_job_cap_scales_with_builders_and_env() {
+        let _invalid_override = set_env("CASS_TANTIVY_REBUILD_PENDING_SHARD_BUILD_MAX_JOBS", "0");
+        let mut settings = LexicalRebuildPipelineSettingsSnapshot {
+            workers: 8,
+            available_parallelism: 8,
+            reserved_cores: 2,
+            tantivy_writer_threads: 8,
+            staged_shard_builders: 2,
+            staged_merge_workers: 1,
+            controller_mode: "steady".into(),
+            controller_restore_clear_samples: 3,
+            controller_restore_hold_ms: 0,
+            controller_loadavg_high_watermark_1m_milli: None,
+            controller_loadavg_low_watermark_1m_milli: None,
+            page_size: LEXICAL_REBUILD_PAGE_SIZE,
+            steady_batch_fetch_conversations: 1024,
+            startup_batch_fetch_conversations: 256,
+            steady_commit_every_conversations: 1024,
+            startup_commit_every_conversations: 256,
+            steady_commit_every_messages: 2048,
+            startup_commit_every_messages: 512,
+            steady_commit_every_message_bytes: 512 * 1024 * 1024,
+            startup_commit_every_message_bytes: 128 * 1024 * 1024,
+            pipeline_channel_size: 2,
+            page_prep_workers: 6,
+            pipeline_max_message_bytes_in_flight: 4 * 1024 * 1024,
+        };
+
+        assert_eq!(lexical_rebuild_pending_shard_build_max_jobs(&settings), 64);
+        settings.staged_shard_builders = 16;
+        assert_eq!(lexical_rebuild_pending_shard_build_max_jobs(&settings), 256);
+        drop(_invalid_override);
+
+        let _explicit_override = set_env("CASS_TANTIVY_REBUILD_PENDING_SHARD_BUILD_MAX_JOBS", "17");
+        assert_eq!(lexical_rebuild_pending_shard_build_max_jobs(&settings), 17);
+    }
+
+    #[test]
+    #[serial]
+    fn lexical_rebuild_large_corpus_planner_keeps_5m_message_shards_byte_bounded() {
+        const CONVERSATIONS: usize = 56_512;
+        const MESSAGES: usize = 5_347_311;
+        const MESSAGE_BYTES: usize = 8 * 1024 * 1024 * 1024;
+        const SHARD_CAP: usize = 64 * 1024 * 1024;
+        let _cap = set_env(
+            "CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES",
+            &SHARD_CAP.to_string(),
+        );
+        let settings = LexicalRebuildPipelineSettingsSnapshot {
+            workers: 16,
+            available_parallelism: 16,
+            reserved_cores: 2,
+            tantivy_writer_threads: 8,
+            staged_shard_builders: 2,
+            staged_merge_workers: 2,
+            controller_mode: "steady".into(),
+            controller_restore_clear_samples: 3,
+            controller_restore_hold_ms: 0,
+            controller_loadavg_high_watermark_1m_milli: None,
+            controller_loadavg_low_watermark_1m_milli: None,
+            page_size: LEXICAL_REBUILD_PAGE_SIZE,
+            steady_batch_fetch_conversations: 1024,
+            startup_batch_fetch_conversations: 256,
+            steady_commit_every_conversations: 10_000,
+            startup_commit_every_conversations: 2_048,
+            steady_commit_every_messages: 800_000,
+            startup_commit_every_messages: 800_000,
+            steady_commit_every_message_bytes: 512 * 1024 * 1024,
+            startup_commit_every_message_bytes: 128 * 1024 * 1024,
+            pipeline_channel_size: 4,
+            page_prep_workers: 8,
+            pipeline_max_message_bytes_in_flight: 512 * 1024 * 1024,
+        };
+        let budgets = lexical_rebuild_default_shard_planner_budgets_for_totals(
+            &settings,
+            CONVERSATIONS,
+            MESSAGES,
+            MESSAGE_BYTES,
+        );
+        let mut conversations = Vec::with_capacity(CONVERSATIONS);
+        for idx in 0..CONVERSATIONS {
+            let message_count =
+                MESSAGES / CONVERSATIONS + usize::from(idx < MESSAGES % CONVERSATIONS);
+            let message_bytes =
+                MESSAGE_BYTES / CONVERSATIONS + usize::from(idx < MESSAGE_BYTES % CONVERSATIONS);
+            conversations.push(LexicalShardPlannerConversation {
+                conversation_id: i64::try_from(idx + 1).unwrap(),
+                message_count,
+                message_bytes,
+            });
+        }
+
+        let plan = plan_lexical_rebuild_shards(&conversations, budgets);
+
+        assert_eq!(budgets.max_message_bytes_per_shard, SHARD_CAP);
+        assert!(
+            plan.shards.len() >= MESSAGE_BYTES.div_ceil(SHARD_CAP),
+            "large corpus should be split into enough shards to keep Tantivy builder heaps bounded"
+        );
+        assert!(
+            plan.shards
+                .iter()
+                .all(|shard| shard.message_bytes <= SHARD_CAP),
+            "no synthetic 5M-message shard should exceed the staged shard byte cap"
         );
     }
 
@@ -27611,7 +32364,7 @@ mod tests {
         };
 
         let plan =
-            plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &settings).unwrap();
+            plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &settings, 3).unwrap();
 
         assert_eq!(plan.total_conversations, 3);
         assert_eq!(plan.total_messages, 12);
@@ -27633,6 +32386,245 @@ mod tests {
                 .map(|shard| shard.conversation_count)
                 .collect::<Vec<_>>(),
             vec![1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_shard_plan_without_tail_metadata_uses_conservative_id_only_plan() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("legacy-canonical.db");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = frankensqlite::Connection::open(db_path_str).unwrap();
+        conn.execute_compat(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, source_path TEXT NOT NULL)",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                author TEXT,
+                created_at INTEGER,
+                content TEXT NOT NULL,
+                UNIQUE(conversation_id, idx)
+            )",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx)",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        for conversation_id in 1..=130 {
+            conn.execute_compat(
+                "INSERT INTO conversations(id, source_path) VALUES (?1, ?2)",
+                &[
+                    ParamValue::from(i64::from(conversation_id)),
+                    ParamValue::from(format!("/tmp/legacy-{conversation_id}.jsonl")),
+                ],
+            )
+            .unwrap();
+            conn.execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, content)
+                 VALUES (?1, 0, 'user', ?2)",
+                &[
+                    ParamValue::from(i64::from(conversation_id)),
+                    ParamValue::from(format!("message {conversation_id}")),
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+        assert!(
+            !storage
+                .lexical_rebuild_has_tail_footprint_metadata()
+                .unwrap(),
+            "legacy canonical DB fixture intentionally has no tail metadata"
+        );
+        let settings = LexicalRebuildPipelineSettingsSnapshot {
+            workers: 8,
+            available_parallelism: 8,
+            reserved_cores: 0,
+            tantivy_writer_threads: 8,
+            staged_shard_builders: 2,
+            staged_merge_workers: 1,
+            controller_mode: "steady".into(),
+            controller_restore_clear_samples: 1,
+            controller_restore_hold_ms: 0,
+            controller_loadavg_high_watermark_1m_milli: None,
+            controller_loadavg_low_watermark_1m_milli: None,
+            page_size: LEXICAL_REBUILD_PAGE_SIZE,
+            steady_batch_fetch_conversations: 512,
+            startup_batch_fetch_conversations: 512,
+            steady_commit_every_conversations: 512,
+            startup_commit_every_conversations: 512,
+            steady_commit_every_messages: 10_000,
+            startup_commit_every_messages: 10_000,
+            steady_commit_every_message_bytes: 64 * 1024 * 1024,
+            startup_commit_every_message_bytes: 64 * 1024 * 1024,
+            pipeline_channel_size: 2,
+            page_prep_workers: 1,
+            pipeline_max_message_bytes_in_flight: 256 * 1024,
+        };
+
+        let plan = plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &settings, 130)
+            .unwrap();
+
+        assert_eq!(plan.total_conversations, 130);
+        assert_eq!(plan.total_messages, 130);
+        assert_eq!(
+            plan.shards
+                .iter()
+                .map(|shard| shard.conversation_count)
+                .collect::<Vec<_>>(),
+            vec![64, 64, 2]
+        );
+        assert!(
+            plan.shards
+                .iter()
+                .all(|shard| shard.message_count == LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT),
+            "id-only plans must leave doc-count validation to observed rebuild accounting"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_shard_plan_with_sparse_tail_metadata_uses_conservative_id_only_plan() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("sparse-tail-canonical.db");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = frankensqlite::Connection::open(db_path_str).unwrap();
+        conn.execute_compat(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                source_path TEXT NOT NULL,
+                last_message_idx INTEGER
+            )",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                author TEXT,
+                created_at INTEGER,
+                content TEXT NOT NULL,
+                UNIQUE(conversation_id, idx)
+            )",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx)",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "CREATE TABLE conversation_tail_state (
+                conversation_id INTEGER PRIMARY KEY,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
+            )",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        for conversation_id in 1..=130 {
+            if conversation_id == 1 {
+                conn.execute_compat(
+                    "INSERT INTO conversations(id, source_path, last_message_idx)
+                     VALUES (?1, ?2, 0)",
+                    &[
+                        ParamValue::from(i64::from(conversation_id)),
+                        ParamValue::from(format!("/tmp/sparse-tail-{conversation_id}.jsonl")),
+                    ],
+                )
+                .unwrap();
+            } else {
+                conn.execute_compat(
+                    "INSERT INTO conversations(id, source_path, last_message_idx)
+                     VALUES (?1, ?2, NULL)",
+                    &[
+                        ParamValue::from(i64::from(conversation_id)),
+                        ParamValue::from(format!("/tmp/sparse-tail-{conversation_id}.jsonl")),
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, content)
+                 VALUES (?1, 0, 'user', ?2)",
+                &[
+                    ParamValue::from(i64::from(conversation_id)),
+                    ParamValue::from(format!("message {conversation_id}")),
+                ],
+            )
+            .unwrap();
+            conn.execute_compat(
+                "INSERT INTO conversation_tail_state(conversation_id, last_message_idx)
+                 VALUES (?1, 0)",
+                &[ParamValue::from(i64::from(conversation_id + 1_000))],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+        assert!(
+            !storage
+                .lexical_rebuild_has_tail_footprint_metadata()
+                .unwrap(),
+            "one populated conversation tail plus stale tail-state rows must not send a large legacy DB through full footprint aggregation"
+        );
+        let settings = LexicalRebuildPipelineSettingsSnapshot {
+            workers: 8,
+            available_parallelism: 8,
+            reserved_cores: 0,
+            tantivy_writer_threads: 8,
+            staged_shard_builders: 2,
+            staged_merge_workers: 1,
+            controller_mode: "steady".into(),
+            controller_restore_clear_samples: 1,
+            controller_restore_hold_ms: 0,
+            controller_loadavg_high_watermark_1m_milli: None,
+            controller_loadavg_low_watermark_1m_milli: None,
+            page_size: LEXICAL_REBUILD_PAGE_SIZE,
+            steady_batch_fetch_conversations: 512,
+            startup_batch_fetch_conversations: 512,
+            steady_commit_every_conversations: 512,
+            startup_commit_every_conversations: 512,
+            steady_commit_every_messages: 10_000,
+            startup_commit_every_messages: 10_000,
+            steady_commit_every_message_bytes: 64 * 1024 * 1024,
+            startup_commit_every_message_bytes: 64 * 1024 * 1024,
+            pipeline_channel_size: 2,
+            page_prep_workers: 1,
+            pipeline_max_message_bytes_in_flight: 256 * 1024,
+        };
+
+        let plan = plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &settings, 130)
+            .unwrap();
+
+        assert_eq!(
+            plan.shards
+                .iter()
+                .map(|shard| shard.conversation_count)
+                .collect::<Vec<_>>(),
+            vec![64, 64, 2]
+        );
+        assert!(
+            plan.shards
+                .iter()
+                .all(|shard| shard.message_count == LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT),
+            "sparse tail metadata should use the same validation-safe id-only plan as absent metadata"
         );
     }
 
@@ -28247,9 +33239,10 @@ mod tests {
             match msg {
                 LexicalRebuildPipelineMessage::Done => break,
                 LexicalRebuildPipelineMessage::Batch(batch) => {
-                    for packet in &batch.packets {
-                        flow_limiter.release(packet.message_bytes);
-                    }
+                    release_lexical_rebuild_prepared_page_reservation(
+                        &batch,
+                        flow_limiter.as_ref(),
+                    );
                 }
                 LexicalRebuildPipelineMessage::Error(err) => panic!("producer error: {err}"),
             }
@@ -28296,7 +33289,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn lexical_rebuild_packet_producer_records_handoff_wait_under_sustained_burst() {
+    fn lexical_rebuild_packet_producer_preserves_flow_budget_under_sustained_burst() {
         let _page_prep_workers = set_env("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS", "2");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("producer-handoff-backpressure.db");
@@ -28386,6 +33379,25 @@ mod tests {
             producer_telemetry.clone(),
         );
 
+        let saturation_deadline = Instant::now() + Duration::from_secs(5);
+        while rx.is_empty() && Instant::now() < saturation_deadline {
+            assert!(
+                !handle.is_finished(),
+                "producer finished before bounded handoff queue filled"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            rx.len(),
+            1,
+            "slow consumer should leave the bounded handoff queue saturated"
+        );
+        assert!(
+            !handle.is_finished(),
+            "producer should still be running while the handoff queue is saturated"
+        );
+
+        thread::sleep(Duration::from_millis(50));
         let first_batch = match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
             LexicalRebuildPipelineMessage::Batch(batch) => batch,
             other => panic!("expected first burst batch, got {other:?}"),
@@ -28393,24 +33405,19 @@ mod tests {
         assert_eq!(first_batch.packets.len(), 1);
 
         let mut held_batches = vec![first_batch];
-        for observed_pause_round in 0..3 {
-            thread::sleep(Duration::from_millis(50));
-            assert_eq!(
-                rx.len(),
-                1,
-                "slow-consumer round {observed_pause_round} should leave the bounded handoff queue saturated"
-            );
+        assert!(
+            flow_limiter.bytes_in_flight() > 0,
+            "holding a prepared page should keep its byte reservation visible until the consumer releases it"
+        );
+
+        while let Ok(LexicalRebuildPipelineMessage::Batch(batch)) =
+            rx.recv_timeout(Duration::from_millis(10))
+        {
+            held_batches.push(batch);
             assert!(
-                !handle.is_finished(),
-                "producer should still be blocked on bounded handoff in round {observed_pause_round}"
+                flow_limiter.bytes_in_flight() <= flow_limiter.max_bytes_in_flight(),
+                "producer must keep prepared-page reservations inside the configured byte budget"
             );
-            let queued_batch = match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                LexicalRebuildPipelineMessage::Batch(batch) => batch,
-                other => panic!(
-                    "expected queued burst batch in round {observed_pause_round}, got {other:?}"
-                ),
-            };
-            held_batches.push(queued_batch);
         }
 
         for batch in &held_batches {
@@ -28433,15 +33440,6 @@ mod tests {
         }
         handle.join().unwrap();
 
-        let telemetry = producer_telemetry.snapshot();
-        assert!(
-            telemetry.handoff_wait_count > 0,
-            "producer should record bounded handoff pressure under a sustained slow-consumer burst"
-        );
-        assert!(
-            telemetry.handoff_wait_ms > 0,
-            "bounded handoff stalls should accrue measurable wait time"
-        );
         assert_eq!(
             flow_limiter.bytes_in_flight(),
             0,
@@ -28539,7 +33537,7 @@ mod tests {
         };
         let storage = FrankenStorage::open_readonly(&db_path).unwrap();
         let planned_shard_plan =
-            plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &planned_settings)
+            plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &planned_settings, 6)
                 .unwrap();
         storage.close_without_checkpoint().unwrap();
 
@@ -29621,6 +34619,14 @@ mod tests {
             .lock()
             .expect("lock host loadavg") = Some(7_250);
         *progress
+            .rebuild_pipeline_host_available_memory_bytes
+            .lock()
+            .expect("lock host available memory") = Some(123_456_789);
+        *progress
+            .rebuild_pipeline_process_rss_bytes
+            .lock()
+            .expect("lock process rss") = Some(98_765_432);
+        *progress
             .rebuild_pipeline_controller_mode
             .lock()
             .expect("lock controller mode") = "pressure_limited".to_string();
@@ -29665,6 +34671,36 @@ mod tests {
             .lock()
             .expect("lock staged shard-build reason") =
             "reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1".to_string();
+        progress
+            .rebuild_pipeline_staged_shard_build_memory_reserve_bytes
+            .store(16_000, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes
+            .store(4_000, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_staged_shard_build_completed_jobs
+            .store(7, Ordering::Relaxed);
+        *progress
+            .rebuild_pipeline_staged_shard_build_last_shard_index
+            .lock()
+            .expect("lock last shard index") = Some(6);
+        progress
+            .rebuild_pipeline_staged_shard_build_last_message_bytes
+            .store(65_000_000, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_staged_shard_build_last_index_size_bytes
+            .store(130_000_000, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_staged_shard_build_last_duration_ms
+            .store(2_500, Ordering::Relaxed);
+        *progress
+            .rebuild_pipeline_staged_shard_build_last_amplification_milli
+            .lock()
+            .expect("lock last amplification") = Some(2_000);
+        *progress
+            .rebuild_pipeline_staged_shard_build_observed_amplification_milli
+            .lock()
+            .expect("lock observed amplification") = Some(8_000);
 
         let snapshot = progress.snapshot_json(2500);
 
@@ -29721,6 +34757,14 @@ mod tests {
             serde_json::json!(7.25)
         );
         assert_eq!(
+            snapshot["rebuild_pipeline"]["host_available_memory_bytes"],
+            serde_json::json!(123_456_789)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["process_rss_bytes"],
+            serde_json::json!(98_765_432)
+        );
+        assert_eq!(
             snapshot["rebuild_pipeline"]["controller_mode"],
             serde_json::json!("pressure_limited")
         );
@@ -29771,6 +34815,42 @@ mod tests {
         assert_eq!(
             snapshot["rebuild_pipeline"]["staged_shard_build_controller_reason"],
             serde_json::json!("reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1")
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_memory_reserve_bytes"],
+            serde_json::json!(16_000)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_emergency_memory_reserve_bytes"],
+            serde_json::json!(4_000)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_completed_jobs"],
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_last_shard_index"],
+            serde_json::json!(6)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_last_message_bytes"],
+            serde_json::json!(65_000_000)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_last_index_size_bytes"],
+            serde_json::json!(130_000_000u64)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_last_duration_ms"],
+            serde_json::json!(2_500u64)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_last_amplification_milli"],
+            serde_json::json!(2_000u64)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_observed_amplification_milli"],
+            serde_json::json!(8_000u64)
         );
     }
 
@@ -30004,10 +35084,345 @@ mod tests {
             );
             assert_eq!(record["external_id"], serde_json::json!("poison-single"));
 
+            let structured_state = QuarantineState::load(&data_dir);
+            assert_eq!(structured_state.len(), 1);
+            let structured_attempt_count = structured_state
+                .iter()
+                .next()
+                .map(|(_, record)| record.attempt_count);
+            assert_eq!(structured_attempt_count, Some(expected_attempts));
+
             let summary = conversation_ingest_quarantine_summary(&data_dir);
             assert_eq!(summary.quarantined_conversations, 1);
             assert_eq!(summary.status, "degraded");
         }
+    }
+
+    #[test]
+    fn stale_index_ingest_quarantine_version_retry_detects_legacy_records() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        let legacy = norm_conv(
+            Some("legacy-index-poison"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        let current = norm_conv(
+            Some("current-index-poison"),
+            vec![norm_msg(0, 1_700_000_000_001)],
+        );
+        let legacy_id = poison_conversation_id(&legacy);
+        let current_id = poison_conversation_id(&current);
+        std::fs::write(
+            quarantine_dir.join(INDEX_INGEST_POISON_FILE),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "conversation_id": legacy_id,
+                    "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                    "reason": "index-ingest-out-of-memory"
+                }),
+                serde_json::json!({
+                    "conversation_id": current_id,
+                    "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                    "cass_version_at_quarantine": current_cass_version(),
+                    "reason": "index-ingest-out-of-memory"
+                })
+            ),
+        )
+        .context("write index-ingest poison fixture")?;
+
+        let retry = stale_index_ingest_quarantine_version_retry(&data_dir)
+            .context("load index-ingest poison retry state")?
+            .context("legacy missing-version record should request one retry")?;
+        assert_eq!(retry.stale_records, 1);
+        assert_eq!(retry.legacy_records, 1);
+        assert_eq!(retry.previous_versions, vec!["unknown".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_index_ingest_quarantine_version_retry_detects_structured_legacy_records() -> Result<()>
+    {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        let schema_version = u32::try_from(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)
+            .context("current schema version fits in quarantine key")?;
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new("structured-legacy-index-poison", schema_version),
+            "index-ingest-out-of-memory: out of memory",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .context("valid quarantine timestamp")?,
+        );
+        state
+            .entries
+            .values_mut()
+            .next()
+            .context("structured quarantine record exists")?
+            .cass_version_at_quarantine = None;
+        state.save(&data_dir)?;
+
+        let retry = stale_index_ingest_quarantine_version_retry(&data_dir)
+            .context("load structured index-ingest poison retry state")?
+            .context("structured legacy record should request one retry")?;
+        assert_eq!(retry.stale_records, 1);
+        assert_eq!(retry.legacy_records, 1);
+        assert_eq!(retry.previous_versions, vec!["unknown".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn marking_stale_index_ingest_quarantine_retry_attempted_prevents_repeat() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        let conv = norm_conv(
+            Some("stale-index-poison-missing-source"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        let conversation_id = poison_conversation_id(&conv);
+        let jsonl_path = quarantine_dir.join(INDEX_INGEST_POISON_FILE);
+        std::fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                    "reason": "index-ingest-out-of-memory",
+                    "cass_version_at_quarantine": "0.0.0"
+                })
+            ),
+        )
+        .context("write stale index-ingest poison fixture")?;
+
+        let schema_version = u32::try_from(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)
+            .context("current schema version fits in quarantine key")?;
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new(conversation_id, schema_version),
+            "index-ingest-out-of-memory: out of memory",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .context("valid quarantine timestamp")?,
+        );
+        state
+            .entries
+            .values_mut()
+            .next()
+            .context("structured quarantine record exists")?
+            .cass_version_at_quarantine = None;
+        state.save(&data_dir)?;
+
+        let retry = stale_index_ingest_quarantine_version_retry(&data_dir)
+            .context("load index-ingest poison retry state")?
+            .context("stale records should request a retry before marking")?;
+        assert_eq!(retry.stale_records, 1);
+        assert_eq!(retry.legacy_records, 1);
+
+        assert_eq!(
+            mark_stale_index_ingest_quarantine_retry_attempted(&data_dir)
+                .context("mark stale retry attempted")?,
+            2,
+            "both JSONL and structured quarantine surfaces should be marked"
+        );
+        assert!(
+            stale_index_ingest_quarantine_version_retry(&data_dir)?.is_none(),
+            "marking an attempted retry must prevent repeat full scans"
+        );
+        assert!(
+            jsonl_path.exists(),
+            "marking retry attempted must rewrite the quarantine file in place, not delete it"
+        );
+        let jsonl = std::fs::read_to_string(&jsonl_path)?;
+        let record: serde_json::Value = serde_json::from_str(
+            jsonl
+                .lines()
+                .next()
+                .context("rewritten JSONL record remains")?,
+        )?;
+        assert_eq!(
+            poison_record_cass_version(&record),
+            Some(current_cass_version())
+        );
+
+        let structured_state = QuarantineState::load(&data_dir);
+        assert_eq!(structured_state.len(), 1);
+        let structured_record = structured_state
+            .entries
+            .values()
+            .next()
+            .context("structured quarantine record remains")?;
+        assert_eq!(
+            structured_record.cass_version_at_quarantine.as_deref(),
+            Some(current_cass_version())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn successful_ingest_clears_matching_index_poison_records_without_deleting_file() -> Result<()>
+    {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        let conv = norm_conv(
+            Some("stale-index-poison-cleared"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        let conversation_id = poison_conversation_id(&conv);
+        let jsonl_path = quarantine_dir.join(INDEX_INGEST_POISON_FILE);
+        std::fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                    "reason": "index-ingest-out-of-memory",
+                    "cass_version_at_quarantine": "0.0.0"
+                })
+            ),
+        )
+        .context("write index-ingest poison fixture")?;
+
+        let schema_version = u32::try_from(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)
+            .context("current schema version fits in quarantine key")?;
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new(conversation_id.clone(), schema_version),
+            "index-ingest-out-of-memory: out of memory",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .context("valid quarantine timestamp")?,
+        );
+        state.save(&data_dir)?;
+
+        clear_poison_conversations_after_successful_ingest(
+            &data_dir,
+            INDEX_INGEST_POISON_FILE,
+            "index-ingest-out-of-memory",
+            &[conv],
+        );
+
+        assert!(
+            jsonl_path.exists(),
+            "cleanup must truncate the quarantine file in place, not delete it"
+        );
+        assert!(
+            std::fs::read_to_string(&jsonl_path)?.trim().is_empty(),
+            "successful retry should remove the matching JSONL poison record"
+        );
+        assert!(
+            QuarantineState::load(&data_dir).is_empty(),
+            "successful retry should clear the matching structured quarantine record"
+        );
+        Ok(())
+    }
+
+    /// Regression for cass#261: cross-surface storm guard.
+    ///
+    /// If `mark_stale_index_ingest_jsonl_retry_attempted` succeeds for a
+    /// conversation (JSONL stamped with current_version) but
+    /// `mark_stale_index_ingest_structured_retry_attempted`'s `state.save()`
+    /// fails (leaving the structured record at `cass_version_at_quarantine =
+    /// None`), the next call to `stale_index_ingest_quarantine_version_retry`
+    /// must NOT signal a retry for that conversation even though the structured
+    /// record still looks legacy.  Without the `already_current_keys` guard
+    /// added to `StalePoisonVersionAccumulator`, the structured `None`
+    /// observation would win and trigger a full scan on every subsequent run —
+    /// an unbounded storm.
+    #[test]
+    fn cross_surface_current_version_suppresses_legacy_structured_entry() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        let conv = norm_conv(
+            Some("cross-surface-storm-guard"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        let conversation_id = poison_conversation_id(&conv);
+        let current = current_cass_version();
+        let schema_version = crate::storage::sqlite::CURRENT_SCHEMA_VERSION;
+
+        // JSONL: already stamped with current_version (mark succeeded here)
+        let jsonl_path = quarantine_dir.join(INDEX_INGEST_POISON_FILE);
+        std::fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "conversation_id": &conversation_id,
+                    "schema_version_at_quarantine": schema_version,
+                    "reason": "index-ingest-out-of-memory",
+                    "cass_version_at_quarantine": current  // already marked
+                })
+            ),
+        )
+        .context("write JSONL fixture with current version")?;
+
+        // Structured: still None (save failed during mark — the bug scenario)
+        let schema_version_u32 =
+            u32::try_from(schema_version).context("schema_version fits in u32")?;
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new(&conversation_id, schema_version_u32),
+            "index-ingest-out-of-memory: out of memory",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .context("valid quarantine timestamp")?,
+        );
+        state
+            .entries
+            .values_mut()
+            .next()
+            .context("structured record exists")?
+            .cass_version_at_quarantine = None; // simulate save failure leaving None
+        state
+            .save(&data_dir)
+            .context("persist structured fixture")?;
+
+        // Before the fix: this would return Some(retry) because the structured
+        // None observation wins over the JSONL current-version observation.
+        // After the fix: the JSONL current-version observation sets
+        // already_current_keys, suppressing the structured None observation.
+        let retry = stale_index_ingest_quarantine_version_retry(&data_dir)
+            .context("version retry check")?;
+        assert!(
+            retry.is_none(),
+            "a conversation already marked current in JSONL must not trigger a retry \
+             even if its structured record still has cass_version_at_quarantine=None \
+             (cass#261 cross-surface storm guard)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_index_ingest_quarantine_retry_forces_scan_from_start() {
+        assert_eq!(
+            non_watch_scan_since_ts(false, false, false, Some(1234)),
+            Some(1233)
+        );
+        assert_eq!(
+            non_watch_scan_since_ts(false, false, true, Some(1234)),
+            None
+        );
+        assert_eq!(
+            non_watch_scan_since_ts(true, false, false, Some(1234)),
+            None
+        );
+        assert_eq!(
+            non_watch_scan_since_ts(false, true, false, Some(1234)),
+            None
+        );
     }
 
     #[test]
@@ -30873,7 +36288,7 @@ mod tests {
     }
 
     #[test]
-    fn open_storage_for_index_recovers_from_newer_schema() {
+    fn open_storage_for_index_refuses_newer_schema_without_replacing_db() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("future-schema.db");
 
@@ -30891,16 +36306,18 @@ mod tests {
                 .unwrap();
         }
 
-        let (storage, rebuilt, opened_fresh_for_full) =
-            open_storage_for_index(&db_path, false).unwrap();
-        assert!(rebuilt, "newer schema should trigger rebuild recovery");
-        assert!(opened_fresh_for_full);
-        assert_eq!(
-            storage.schema_version().unwrap(),
-            crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+        let err = match open_storage_for_index(&db_path, false) {
+            Ok(_) => panic!("newer schema must fail closed before indexing"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("newer than supported"),
+            "diagnostic should name the schema mismatch: {err}"
         );
+        assert!(db_path.exists(), "canonical DB must remain in place");
 
-        // Rebuild path should preserve an on-disk backup.
+        // The index open path must not create backup-and-replace artifacts; a
+        // real repair plan belongs to doctor or an explicit operator restore.
         let backup_count = std::fs::read_dir(tmp.path())
             .unwrap()
             .flatten()
@@ -30913,56 +36330,79 @@ mod tests {
             })
             .count();
         assert!(
-            backup_count >= 1,
-            "expected backup artifact for rebuilt schema"
+            backup_count == 0,
+            "index open must not backup-and-replace a future-schema archive"
         );
     }
 
     #[test]
-    fn full_rebuild_open_failure_gate_refuses_retryable_contention() {
-        let retryable_errors = [
-            MigrationError::Database(frankensqlite::FrankenError::Busy),
-            MigrationError::Database(frankensqlite::FrankenError::BusyRecovery),
-            MigrationError::Database(frankensqlite::FrankenError::BusySnapshot {
-                conflicting_pages: "1,2".to_string(),
-            }),
-            MigrationError::Database(frankensqlite::FrankenError::DatabaseLocked {
-                path: PathBuf::from("/tmp/cass-busy.db"),
-            }),
-            MigrationError::Database(frankensqlite::FrankenError::WriteConflict {
-                page: 4,
-                holder: 7,
-            }),
-            MigrationError::Other("database is locked by another indexer".to_string()),
-            MigrationError::Other("temporarily unavailable while writer holds lock".to_string()),
-        ];
-
-        for err in retryable_errors {
-            assert!(
-                migration_error_is_retryable_open_contention(&err),
-                "retryable open failure must not allow canonical DB replacement: {err}"
-            );
-        }
+    fn open_storage_retryable_classifier_reads_anyhow_error_chain() {
+        let err = anyhow::anyhow!("database is locked by another indexer")
+            .context("opening canonical archive read-only before index");
+        assert!(
+            anyhow_chain_indicates_retryable_storage_contention(&err),
+            "retryable storage contention can be hidden below contextual anyhow wrappers: {err:#}"
+        );
     }
 
     #[test]
-    fn full_rebuild_open_failure_gate_allows_non_retryable_recovery_errors() {
-        let non_retryable_errors = [
-            MigrationError::Database(frankensqlite::FrankenError::DatabaseCorrupt {
-                detail: "bad page checksum".to_string(),
-            }),
-            MigrationError::Other("schema migration failed permanently".to_string()),
-            MigrationError::RebuildRequired {
-                reason: "future schema".to_string(),
-                backup_path: None,
-            },
-            MigrationError::Io(std::io::Error::other("permission denied")),
-        ];
+    fn open_storage_retryable_classifier_rejects_corruption() {
+        let err = anyhow::anyhow!("database disk image is malformed")
+            .context("opening canonical archive read-only before index");
+        assert!(
+            !anyhow_chain_indicates_retryable_storage_contention(&err),
+            "corruption must stay on the fail-closed archive-health path: {err:#}"
+        );
+    }
 
-        for err in non_retryable_errors {
+    #[test]
+    fn headroom_probe_uses_existing_ancestor_for_missing_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let missing_data_dir = tmp.path().join("missing").join("cass-data");
+        let missing_db_path = missing_data_dir.join("agent_search.db");
+
+        assert_eq!(
+            existing_headroom_probe_paths(&missing_data_dir, &missing_db_path),
+            vec![tmp.path().to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn headroom_probe_checks_data_dir_and_custom_db_parent_when_distinct() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let db_parent = tmp.path().join("custom-db");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&db_parent).unwrap();
+
+        assert_eq!(
+            existing_headroom_probe_paths(&data_dir, &db_parent.join("agent_search.db")),
+            vec![data_dir, db_parent]
+        );
+    }
+
+    #[test]
+    fn database_sidecar_paths_preserve_filename_bytes_without_display_roundtrip() {
+        let db_path = PathBuf::from("/tmp/cass.db");
+        let [wal, shm] = database_sidecar_paths(&db_path);
+
+        assert_eq!(wal, PathBuf::from("/tmp/cass.db-wal"));
+        assert_eq!(shm, PathBuf::from("/tmp/cass.db-shm"));
+    }
+
+    #[test]
+    fn disk_headroom_skip_env_value_parser_is_truthy_not_presence_based() {
+        for truthy in ["1", "true", "YES", "on"] {
             assert!(
-                !migration_error_is_retryable_open_contention(&err),
-                "non-retryable recovery failure should keep existing recovery semantics: {err}"
+                env_value_truthy(truthy),
+                "expected {truthy:?} to disable the headroom check"
+            );
+        }
+
+        for falsy in ["0", "false", "No", "off", "", "maybe"] {
+            assert!(
+                !env_value_truthy(falsy),
+                "expected {falsy:?} to keep the headroom check enabled"
             );
         }
     }
@@ -31651,6 +37091,43 @@ mod tests {
     }
 
     #[test]
+    fn readonly_canonical_force_rebuild_fast_path_is_narrow() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut opts = watch_once_skip_test_options(data_dir.clone(), None);
+        opts.force_rebuild = true;
+
+        assert!(
+            !should_try_readonly_canonical_force_rebuild(&opts),
+            "missing databases should continue through normal index creation"
+        );
+        std::fs::write(&opts.db_path, b"placeholder").unwrap();
+        assert!(
+            should_try_readonly_canonical_force_rebuild(&opts),
+            "plain force rebuild against an existing DB can use the read-only canonical path"
+        );
+
+        opts.full = true;
+        assert!(
+            !should_try_readonly_canonical_force_rebuild(&opts),
+            "--full still owns source rescan and historical salvage behavior"
+        );
+        opts.full = false;
+        opts.semantic = true;
+        assert!(
+            !should_try_readonly_canonical_force_rebuild(&opts),
+            "semantic indexing still requires the normal post-lexical command flow"
+        );
+        opts.semantic = false;
+        opts.watch_once_paths = Some(vec![tmp.path().join("session.jsonl")]);
+        assert!(
+            !should_try_readonly_canonical_force_rebuild(&opts),
+            "targeted watch-once force rebuild should not ignore explicit paths"
+        );
+    }
+
+    #[test]
     fn absent_explicit_watch_once_paths_skip_heavy_index_setup() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -32007,64 +37484,25 @@ mod tests {
     }
 
     #[test]
-    fn reopen_fresh_storage_for_full_rebuild_preserves_backup_and_starts_empty() {
+    fn open_storage_for_index_refuses_corrupt_archive_without_replacing_db() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
+        let original = b"not a sqlite database";
+        std::fs::write(&db_path, original).unwrap();
 
-        let agent = crate::model::types::Agent {
-            id: None,
-            slug: "tester".into(),
-            name: "Tester".into(),
-            version: None,
-            kind: crate::model::types::AgentKind::Cli,
+        let err = match open_storage_for_index(&db_path, true) {
+            Ok(_) => panic!("corrupt existing archive must fail closed"),
+            Err(err) => err.to_string(),
         };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        let conv = norm_conv(Some("c1"), vec![norm_msg(0, 10)]);
-        storage
-            .insert_conversation_tree(
-                agent_id,
-                None,
-                &crate::model::types::Conversation {
-                    id: None,
-                    agent_slug: conv.agent_slug.clone(),
-                    workspace: conv.workspace.clone(),
-                    external_id: conv.external_id.clone(),
-                    title: conv.title.clone(),
-                    source_path: conv.source_path.clone(),
-                    started_at: conv.started_at,
-                    ended_at: conv.ended_at,
-                    approx_tokens: None,
-                    metadata_json: conv.metadata.clone(),
-                    messages: conv
-                        .messages
-                        .iter()
-                        .map(|m| crate::model::types::Message {
-                            id: None,
-                            idx: m.idx,
-                            role: crate::model::types::MessageRole::User,
-                            author: m.author.clone(),
-                            created_at: m.created_at,
-                            content: m.content.clone(),
-                            extra_json: m.extra.clone(),
-                            snippets: Vec::new(),
-                        })
-                        .collect(),
-                    source_id: "local".to_string(),
-                    origin_host: None,
-                },
-            )
-            .unwrap();
-
-        let reopened = reopen_fresh_storage_for_full_rebuild(storage, &db_path).unwrap();
-        let msg_count: i64 = reopened
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM messages", &[] as &[ParamValue], |r| {
-                r.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(msg_count, 0);
+        assert!(
+            err.contains("will not replace or truncate"),
+            "diagnostic should explain archive preservation: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            original,
+            "corrupt archive bytes must be preserved for recovery"
+        );
 
         let backup_count = std::fs::read_dir(tmp.path())
             .unwrap()
@@ -32078,8 +37516,8 @@ mod tests {
             })
             .count();
         assert!(
-            backup_count >= 1,
-            "expected preserved backup before opening a fresh full-rebuild db"
+            backup_count == 0,
+            "index open must not create backup artifacts for corrupt archive"
         );
     }
 
@@ -33177,6 +38615,7 @@ mod tests {
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
                 },
+                None,
             )
         });
 
@@ -33239,6 +38678,7 @@ mod tests {
             LexicalRebuildStartupOptions {
                 defer_initial_content_fingerprint: true,
             },
+            None,
         )
         .unwrap();
         assert_eq!(rebuild.indexed_docs, 4);
@@ -33352,6 +38792,7 @@ mod tests {
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
                 },
+                None,
             )
             .unwrap();
             assert_eq!(rebuild.indexed_docs, 4);
@@ -33466,6 +38907,7 @@ mod tests {
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
                 },
+                None,
             )
             .unwrap();
             assert_eq!(rebuild.indexed_docs, 8);
@@ -33577,6 +39019,7 @@ mod tests {
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
                 },
+                None,
             )
             .unwrap();
             assert_eq!(rebuild.indexed_docs, 6);
@@ -35147,6 +40590,7 @@ mod tests {
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
                 },
+                None,
             )
             .unwrap();
             assert_eq!(rebuild.indexed_docs, 30);
@@ -35297,6 +40741,7 @@ mod tests {
                 2,
                 None,
                 LexicalRebuildStartupOptions::default(),
+                None,
             )
             .unwrap();
             assert_eq!(rebuild.indexed_docs, 4);
@@ -35820,6 +41265,296 @@ mod tests {
         assert_eq!(message_count, 2);
     }
 
+    fn write_semantic_watch_once_codex_session(path: &Path, id: &str, marker: &str) -> Result<()> {
+        let parent = path
+            .parent()
+            .context("semantic watch-once fixture path should have a parent")?;
+        std::fs::create_dir_all(parent)?;
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"timestamp":"2026-05-28T09:00:00.000Z","type":"session_meta","payload":{{"id":"{id}","cwd":"/data/projects/coding_agent_session_search"}}}}
+{{"timestamp":"2026-05-28T09:00:01.000Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{marker} user semantic"}}]}}}}
+{{"timestamp":"2026-05-28T09:00:02.000Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"{marker} assistant semantic"}}]}}}}
+"#,
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn semantic_watch_once_opts(
+        data_dir: &Path,
+        session: &Path,
+        progress: Arc<IndexingProgress>,
+    ) -> super::IndexOptions {
+        super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![session.to_path_buf()]),
+            db_path: data_dir.join("db.sqlite"),
+            data_dir: data_dir.to_path_buf(),
+            semantic: true,
+            build_hnsw: false,
+            embedder: "hash".to_string(),
+            progress: Some(progress),
+            watch_interval_secs: 30,
+        }
+    }
+
+    fn semantic_watch_once_stats(
+        progress: &Arc<IndexingProgress>,
+    ) -> Result<SemanticWatchOnceStats> {
+        let stats = progress
+            .stats
+            .lock()
+            .map_err(|err| anyhow::anyhow!("semantic watch-once stats lock poisoned: {err}"))?;
+        stats
+            .semantic_watch_once
+            .clone()
+            .context("semantic watch-once proof")
+    }
+
+    #[test]
+    #[serial]
+    fn run_index_semantic_watch_once_publishes_targeted_manifest() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let session = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("28")
+            .join("rollout-semantic-watch-once.jsonl");
+        write_semantic_watch_once_codex_session(
+            &session,
+            "semantic-watch-once-fresh",
+            "swonce-fresh",
+        )?;
+
+        let progress = Arc::new(IndexingProgress::default());
+        run_index(
+            semantic_watch_once_opts(&data_dir, &session, Arc::clone(&progress)),
+            None,
+        )?;
+
+        let stats = semantic_watch_once_stats(&progress)?;
+        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
+        anyhow::ensure!(
+            matches!(stats.reason.as_str(), "fresh_watch_once_db"),
+            "wrong reason"
+        );
+        anyhow::ensure!(matches!(stats.tier.as_str(), "fast"), "wrong tier");
+        anyhow::ensure!(matches!(stats.selected_docs, 2), "wrong selected doc count");
+        anyhow::ensure!(matches!(stats.embedded_docs, 2), "wrong embedded doc count");
+        anyhow::ensure!(
+            matches!(
+                stats.manifest_after_db_fingerprint.as_deref(),
+                Some("content-v1:1:1:2")
+            ),
+            "wrong post-publish fingerprint"
+        );
+
+        let manifest = SemanticManifest::load_or_default(&data_dir)?;
+        let artifact = manifest.fast_tier.as_ref().context("fast artifact")?;
+        anyhow::ensure!(
+            matches!(artifact.conversation_count, 1),
+            "wrong conversation count"
+        );
+        anyhow::ensure!(matches!(artifact.doc_count, 2), "wrong doc count");
+        anyhow::ensure!(
+            matches!(artifact.db_fingerprint.as_str(), "content-v1:1:1:2"),
+            "wrong artifact fingerprint"
+        );
+        let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
+        anyhow::ensure!(
+            matches!(index.record_count(), 2),
+            "wrong vector record count"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn run_index_semantic_watch_once_catches_up_append_only_prefix_manifest() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let first = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("28")
+            .join("rollout-semantic-watch-once-first.jsonl");
+        let second = first.with_file_name("rollout-semantic-watch-once-second.jsonl");
+        write_semantic_watch_once_codex_session(&first, "semantic-watch-once-first", "swonce-one")?;
+        write_semantic_watch_once_codex_session(
+            &second,
+            "semantic-watch-once-second",
+            "swonce-two",
+        )?;
+
+        let first_progress = Arc::new(IndexingProgress::default());
+        run_index(
+            semantic_watch_once_opts(&data_dir, &first, first_progress),
+            None,
+        )?;
+
+        let second_progress = Arc::new(IndexingProgress::default());
+        run_index(
+            semantic_watch_once_opts(&data_dir, &second, Arc::clone(&second_progress)),
+            None,
+        )?;
+
+        let stats = semantic_watch_once_stats(&second_progress)?;
+        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
+        anyhow::ensure!(
+            matches!(
+                stats.reason.as_str(),
+                "semantic_artifact_is_append_only_prefix"
+            ),
+            "wrong reason"
+        );
+        anyhow::ensure!(
+            matches!(
+                stats.manifest_before_db_fingerprint.as_deref(),
+                Some("content-v1:1:1:2")
+            ),
+            "wrong pre-publish fingerprint"
+        );
+        anyhow::ensure!(
+            matches!(
+                stats.manifest_after_db_fingerprint.as_deref(),
+                Some("content-v1:2:2:4")
+            ),
+            "wrong post-publish fingerprint"
+        );
+        anyhow::ensure!(matches!(stats.selected_docs, 2), "wrong selected doc count");
+        anyhow::ensure!(matches!(stats.embedded_docs, 2), "wrong embedded doc count");
+
+        let manifest = SemanticManifest::load_or_default(&data_dir)?;
+        let artifact = manifest.fast_tier.as_ref().context("fast artifact")?;
+        anyhow::ensure!(
+            matches!(artifact.conversation_count, 2),
+            "wrong conversation count"
+        );
+        anyhow::ensure!(matches!(artifact.doc_count, 4), "wrong doc count");
+        anyhow::ensure!(
+            matches!(artifact.db_fingerprint.as_str(), "content-v1:2:2:4"),
+            "wrong artifact fingerprint"
+        );
+        let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
+        anyhow::ensure!(
+            matches!(index.record_count(), 4),
+            "wrong vector record count"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn run_index_semantic_watch_once_reports_already_covered_manifest() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let session = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("28")
+            .join("rollout-semantic-watch-once-rerun.jsonl");
+        write_semantic_watch_once_codex_session(
+            &session,
+            "semantic-watch-once-rerun",
+            "swonce-rerun",
+        )?;
+
+        let first_progress = Arc::new(IndexingProgress::default());
+        run_index(
+            semantic_watch_once_opts(&data_dir, &session, first_progress),
+            None,
+        )?;
+
+        let second_progress = Arc::new(IndexingProgress::default());
+        run_index(
+            semantic_watch_once_opts(&data_dir, &session, Arc::clone(&second_progress)),
+            None,
+        )?;
+
+        let stats = semantic_watch_once_stats(&second_progress)?;
+        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
+        anyhow::ensure!(
+            matches!(stats.reason.as_str(), "semantic_artifact_already_covers_db"),
+            "wrong reason"
+        );
+        anyhow::ensure!(
+            matches!(
+                stats.manifest_before_db_fingerprint.as_deref(),
+                Some("content-v1:1:1:2")
+            ),
+            "wrong pre-publish fingerprint"
+        );
+        anyhow::ensure!(
+            matches!(
+                stats.manifest_after_db_fingerprint.as_deref(),
+                Some("content-v1:1:1:2")
+            ),
+            "wrong post-publish fingerprint"
+        );
+        anyhow::ensure!(matches!(stats.selected_docs, 0), "wrong selected doc count");
+        anyhow::ensure!(matches!(stats.embedded_docs, 0), "wrong embedded doc count");
+
+        let manifest = SemanticManifest::load_or_default(&data_dir)?;
+        let artifact = manifest.fast_tier.as_ref().context("fast artifact")?;
+        anyhow::ensure!(
+            matches!(artifact.conversation_count, 1),
+            "wrong conversation count"
+        );
+        anyhow::ensure!(matches!(artifact.doc_count, 2), "wrong doc count");
+        anyhow::ensure!(
+            matches!(artifact.db_fingerprint.as_str(), "content-v1:1:1:2"),
+            "wrong artifact fingerprint"
+        );
+        let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
+        anyhow::ensure!(
+            matches!(index.record_count(), 2),
+            "wrong vector record count"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn run_index_semantic_watch_once_fails_when_no_conversation_is_indexed() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let session = tmp.path().join("not-a-supported-watch-once-file.jsonl");
+        std::fs::write(&session, "{}\n")?;
+
+        let progress = Arc::new(IndexingProgress::default());
+        let err = match run_index(
+            semantic_watch_once_opts(&data_dir, &session, progress),
+            None,
+        ) {
+            Ok(_) => anyhow::bail!("zero-conversation semantic watch-once unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        anyhow::ensure!(
+            rendered.contains("indexed zero conversations"),
+            "unexpected error: {rendered}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn watch_event_filter_ignores_read_access_noise() {
         let event = notify::Event::new(notify::event::EventKind::Access(AccessKind::Read))
@@ -36076,6 +41811,11 @@ mod tests {
         let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "2");
         let _oom_target_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_TARGET", "thread-oom-");
         let _chunk_guard = set_env("CASS_WATCH_INGEST_CHUNK_SIZE", "4");
+        // Disable the mtime fallback for this test — we just wrote the source
+        // files, so they would all trip the active-source filter and never be
+        // ingested. The OOM-split behavior we want to verify here is unrelated
+        // to the active-source skip path.
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
 
         let data_dir = xdg.join("amp");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -36166,6 +41906,79 @@ mod tests {
         } else {
             unsafe { std::env::remove_var("XDG_DATA_HOME") };
         }
+    }
+
+    #[test]
+    #[serial]
+    fn watch_reindex_quarantine_preserves_watermark_for_retry() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-quarantine-retry");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let now_u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let created_at = i64::try_from(now_u128)
+            .unwrap_or(i64::MAX)
+            .saturating_add(10_000);
+        let amp_file = amp_dir.join("thread-watch-quarantine-retry.json");
+        std::fs::write(
+            &amp_file,
+            format!(
+                r#"{{"id":"thread-watch-quarantine-retry","messages":[{{"role":"user","text":"retry me","createdAt":{created_at}}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![amp_file],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 1);
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "quarantined watch sources must remain eligible for later retry"
+        );
+        assert!(
+            data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "watch OOM should still be recorded for operator visibility"
+        );
     }
 
     #[test]
@@ -36469,15 +42282,68 @@ mod tests {
     }
 
     #[test]
-    fn deferred_lexical_refresh_marker_round_trips_pending_and_resolved() {
+    #[serial]
+    fn watch_mode_recent_session_source_skips_without_quarantine_or_watermarking() {
+        let _active_skip_reset = ActiveSessionSkipReset;
         let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path();
+        let data_dir = tmp.path().join("recent-active-source-skip");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let amp_file = amp_dir.join("thread-recent-active-source.json");
+        std::fs::write(
+            &amp_file,
+            r#"{"id":"thread-recent-active-source","messages":[{"role":"user","text":"still streaming","createdAt":1700000000100}]}"#,
+        )
+        .unwrap();
 
-        assert!(!deferred_lexical_refresh_needed(data_dir));
-        mark_deferred_lexical_refresh_needed(data_dir, 3).unwrap();
-        assert!(deferred_lexical_refresh_needed(data_dir));
-        mark_deferred_lexical_refresh_resolved(data_dir).unwrap();
-        assert!(!deferred_lexical_refresh_needed(data_dir));
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "3600");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_file.clone()))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![amp_file.clone()],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 0);
+        let last_indexed_at = storage.lock().unwrap().get_last_indexed_at().unwrap();
+        assert_eq!(
+            last_indexed_at, None,
+            "recent active source skips must not advance last_indexed_at"
+        );
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "recent active source skips are retryable, not poison quarantine"
+        );
     }
 
     #[test]
@@ -36523,6 +42389,12 @@ mod tests {
         std::fs::create_dir_all(&xdg).unwrap();
         let prev = dotenvy::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
+        // Disable the active-source mtime fallback: the test writes the source
+        // file inline and immediately calls reindex_paths in watch mode, so
+        // every fresh write would otherwise be skipped as "still being
+        // written". The semantic-delta behavior under test is independent of
+        // the active-source filter.
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
 
         let data_dir = xdg.join("amp");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -37870,6 +43742,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_124_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         });
         state.record_pending_commit(
             Some(200),
@@ -37947,6 +43820,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_224_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         });
         state.record_pending_commit(
             Some(200),
@@ -38259,6 +44133,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_224_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         });
         persist_lexical_rebuild_state(&index_path, &state).unwrap();
 
@@ -38352,6 +44227,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_224_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         });
         persist_lexical_rebuild_state(&index_path, &stale_state).unwrap();
 
@@ -38432,6 +44308,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_111_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         });
         persist_lexical_rebuild_state(&index_path, &state).unwrap();
 
@@ -38464,6 +44341,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_222_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
 
         persist_pending_lexical_rebuild_progress(
@@ -38603,6 +44481,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_333_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
         let mut state = LexicalRebuildState::new(
             LexicalRebuildDbState {
@@ -38695,6 +44574,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_555_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
 
         commit_lexical_rebuild_progress(
@@ -38784,6 +44664,7 @@ mod tests {
             staged_shard_build_pending_jobs: 3,
             staged_shard_build_controller_reason: "backlog".to_string(),
             updated_at_ms: 1_733_000_444_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
         let base_meta_fingerprint = index_meta_fingerprint(&index_path).unwrap();
         let mut conversations_since_progress_persist = 1usize;
@@ -38802,6 +44683,7 @@ mod tests {
             8,
             &mut last_progress_persist,
             Duration::from_secs(60),
+            None,
             None,
         )
         .unwrap();
@@ -38862,6 +44744,7 @@ mod tests {
             staged_shard_build_pending_jobs: 3,
             staged_shard_build_controller_reason: "backlog".to_string(),
             updated_at_ms: 1_733_000_555_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         });
         persist_lexical_rebuild_state(&index_path, &state).unwrap();
 
@@ -38894,6 +44777,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: "builders_idle".to_string(),
             updated_at_ms: 1_733_000_666_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
         let mut conversations_since_progress_persist = 0usize;
         let mut last_progress_persist = Instant::now();
@@ -38911,6 +44795,7 @@ mod tests {
             64,
             &mut last_progress_persist,
             Duration::from_secs(60),
+            None,
             None,
         )
         .unwrap();

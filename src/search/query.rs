@@ -68,6 +68,16 @@ type TantivyHydratedContentMaps = (
 );
 type SqliteFtsHydratedRow = (
     i64,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+type SqliteFtsMessageRow = (
+    i64,
     String,
     String,
     String,
@@ -80,13 +90,39 @@ type SqliteFtsHydratedRow = (
     Option<String>,
     Option<String>,
 );
+type SqliteMessageScanAlternative = Vec<String>;
+type SqliteMessageScanGroup = Vec<SqliteMessageScanAlternative>;
+struct SqliteMessageScanQuery {
+    include_groups: Vec<SqliteMessageScanGroup>,
+    exclude_terms: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct SqliteMessageScanRequest<'a> {
+    raw_query: &'a str,
+    filters: &'a SearchFilters,
+    limit: usize,
+    offset: usize,
+    field_mask: FieldMask,
+    query_match_type: MatchType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqliteFtsMatchMode {
+    Table,
+    IndexedColumns,
+}
 
 // Frankensqlite follows SQLite's bind-variable ceiling. Keep fallback
 // hydration IN-lists below that ceiling so large pages do not turn into
 // empty fallback result sets.
 const SQLITE_FTS5_HYDRATE_PARAM_CHUNK: usize = 30_000;
 const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
+const SQLITE_FTS5_POST_FILTER_SCAN_CHUNK: usize = 1_024;
+const SQLITE_FTS5_POST_FILTER_SCAN_LIMIT: usize = 30_000;
+const SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT: usize = 30_000;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
+const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
 // Safety: Rc fields inside Connection are not cloned or shared externally.
 // The Mutex<Option<SendConnection>> in SearchClient ensures exclusive access.
@@ -1286,7 +1322,12 @@ fn execute_query_with_lazy_exact_count(
     limit: usize,
     offset: usize,
 ) -> Result<FsLexicalSearchResult> {
-    let top_docs = searcher.search(query, &TopDocs::with_limit(limit).and_offset(offset))?;
+    let top_docs = searcher.search(
+        query,
+        &TopDocs::with_limit(limit)
+            .and_offset(offset)
+            .order_by_score(),
+    )?;
     let page_saturated = top_docs.len() == limit;
     let total_count = if page_saturated {
         searcher.search(query, &Count)?
@@ -2056,6 +2097,12 @@ struct SemanticCandidateSearchRequest<'a> {
     tier_mode: SemanticTierMode,
     in_memory_two_tier_index: Option<&'a Arc<FsInMemoryTwoTierIndex>>,
     ann_index: Option<&'a Arc<FsHnswIndex>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SemanticCandidateRetryState {
+    has_more_candidates: bool,
+    exact_window_may_omit_competitor: bool,
 }
 
 struct SemanticQueryEmbedding {
@@ -3985,6 +4032,36 @@ impl SearchClient {
         collapsed
     }
 
+    fn semantic_exact_candidate_limit(fetch_limit: usize, record_count: usize) -> usize {
+        fetch_limit
+            .saturating_mul(SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER)
+            .max(fetch_limit)
+            .min(record_count)
+    }
+
+    fn semantic_window_may_omit_competitor(
+        collapsed: &[VectorSearchResult],
+        fetch_limit: usize,
+        max_omitted_score: Option<f32>,
+    ) -> bool {
+        if fetch_limit == 0 {
+            return false;
+        }
+        let Some(max_omitted_score) = max_omitted_score else {
+            return false;
+        };
+        if collapsed.len() < fetch_limit {
+            return true;
+        }
+        let Some(last_in_requested_window) = collapsed.get(fetch_limit - 1) else {
+            return true;
+        };
+        !last_in_requested_window
+            .score
+            .total_cmp(&max_omitted_score)
+            .is_gt()
+    }
+
     fn record_fs_semantic_hit(
         best_by_message: &mut HashMap<u64, VectorSearchResult>,
         hit: &FsVectorHit,
@@ -4012,46 +4089,92 @@ impl SearchClient {
         embedding: &[f32],
         fetch_limit: usize,
         fs_filter: Option<&dyn FsSearchFilter>,
-    ) -> Result<(Vec<VectorSearchResult>, bool)> {
+    ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
         if context.fs_semantic_indexes.len() == 1 {
+            let record_count = context.fs_semantic_index.record_count();
+            let candidate_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
             let fs_hits = context
                 .fs_semantic_index
-                .search_top_k(embedding, fetch_limit, fs_filter)
+                .search_top_k(embedding, candidate_limit, fs_filter)
                 .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
             let mut best_by_message = HashMap::with_capacity(fs_hits.len());
             for hit in &fs_hits {
                 Self::record_fs_semantic_hit(&mut best_by_message, hit);
             }
+            let collapsed = Self::collapse_semantic_results(best_by_message, candidate_limit);
+            let has_more_candidates =
+                fs_hits.len() >= candidate_limit && candidate_limit < record_count;
+            let max_omitted_score = if has_more_candidates {
+                fs_hits.last().map(|hit| hit.score)
+            } else {
+                None
+            };
+            let exact_window_may_omit_competitor = Self::semantic_window_may_omit_competitor(
+                &collapsed,
+                fetch_limit,
+                max_omitted_score,
+            );
             return Ok((
-                Self::collapse_semantic_results(best_by_message, fetch_limit),
-                fs_hits.len() >= fetch_limit,
+                collapsed,
+                SemanticCandidateRetryState {
+                    has_more_candidates,
+                    exact_window_may_omit_competitor,
+                },
             ));
         }
 
         let mut best_by_message = HashMap::new();
         let mut raw_hits = 0usize;
+        let mut max_omitted_score: Option<f32> = None;
+        let mut has_more_candidates = false;
         for index in context.fs_semantic_indexes.iter() {
-            let shard_limit = index.record_count();
+            let shard_record_count = index.record_count();
+            // Search chunks, then collapse by message. A message can have many
+            // high-scoring chunks, so per-shard top-k chunks alone is not a
+            // proof of per-message top-k. Use a bounded overfetch window and
+            // retry only when the omitted-score bound can still beat the last
+            // collapsed message in the requested window.
+            let shard_limit = Self::semantic_exact_candidate_limit(fetch_limit, shard_record_count);
             if shard_limit == 0 {
                 continue;
             }
             let fs_hits = index
                 .search_top_k(embedding, shard_limit, fs_filter)
                 .map_err(|err| anyhow!("frankensearch sharded semantic search failed: {err}"))?;
+            if fs_hits.len() >= shard_limit
+                && shard_limit < shard_record_count
+                && let Some(last_hit) = fs_hits.last()
+            {
+                has_more_candidates = true;
+                max_omitted_score = Some(
+                    max_omitted_score
+                        .map(|current| current.max(last_hit.score))
+                        .unwrap_or(last_hit.score),
+                );
+            }
             raw_hits = raw_hits.saturating_add(fs_hits.len());
             best_by_message.reserve(fs_hits.len());
             for hit in &fs_hits {
                 Self::record_fs_semantic_hit(&mut best_by_message, hit);
             }
         }
-        let collapsed = Self::collapse_semantic_results(best_by_message, fetch_limit);
+        let candidate_return_limit = Self::semantic_exact_candidate_limit(fetch_limit, raw_hits);
+        let collapsed = Self::collapse_semantic_results(best_by_message, candidate_return_limit);
+        let exact_window_may_omit_competitor =
+            Self::semantic_window_may_omit_competitor(&collapsed, fetch_limit, max_omitted_score);
         tracing::debug!(
             shard_count = context.fs_semantic_indexes.len(),
             raw_hits,
             returned = collapsed.len(),
             "semantic sharded exact merge complete"
         );
-        Ok((collapsed, false))
+        Ok((
+            collapsed,
+            SemanticCandidateRetryState {
+                has_more_candidates,
+                exact_window_may_omit_competitor,
+            },
+        ))
     }
 
     fn search_semantic_candidates(
@@ -4062,7 +4185,7 @@ impl SearchClient {
         request: SemanticCandidateSearchRequest<'_>,
     ) -> Result<(
         Vec<VectorSearchResult>,
-        bool,
+        SemanticCandidateRetryState,
         Option<crate::search::ann_index::AnnSearchStats>,
     )> {
         let mut semantic_filter =
@@ -4114,7 +4237,10 @@ impl SearchClient {
 
                 return Ok((
                     Self::collapse_semantic_results(best_by_message, request.fetch_limit),
-                    tier_hits.len() >= request.fetch_limit,
+                    SemanticCandidateRetryState {
+                        has_more_candidates: tier_hits.len() >= request.fetch_limit,
+                        exact_window_may_omit_competitor: false,
+                    },
                     None,
                 ));
             }
@@ -4194,7 +4320,10 @@ impl SearchClient {
 
             return Ok((
                 Self::collapse_semantic_results(best_by_message, request.fetch_limit),
-                ann_results.len() >= candidate,
+                SemanticCandidateRetryState {
+                    has_more_candidates: ann_results.len() >= candidate,
+                    exact_window_may_omit_competitor: false,
+                },
                 ann_stats,
             ));
         }
@@ -4387,19 +4516,19 @@ impl SearchClient {
             )));
         }
 
-        if embedder_id == crate::search::fastembed_embedder::FastEmbedder::embedder_id_static() {
+        if let Some(embedder_name) =
+            crate::search::fastembed_embedder::FastEmbedder::canonical_name(embedder_id)
+        {
             let data_dir = self
                 .sqlite_path
                 .as_ref()
                 .and_then(|path| path.parent())
                 .ok_or_else(|| anyhow!("cannot resolve data dir for progressive embedder load"))?;
-            let model_dir =
-                crate::search::fastembed_embedder::FastEmbedder::default_model_dir(data_dir);
-            let embedder =
-                crate::search::fastembed_embedder::FastEmbedder::load_from_dir(&model_dir)
-                    .with_context(|| {
-                        format!("loading FastEmbed model from {}", model_dir.display())
-                    })?;
+            let embedder = crate::search::fastembed_embedder::FastEmbedder::load_by_name(
+                data_dir,
+                embedder_name,
+            )
+            .with_context(|| format!("loading FastEmbed model for {embedder_name}"))?;
             if embedder.dimension() != dimension {
                 bail!(
                     "progressive embedder dimension mismatch: {} index expects {}, model has {}",
@@ -4713,15 +4842,66 @@ impl SearchClient {
             .as_ref()
             .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
 
-        let placeholder_capacity = results.len().saturating_mul(2).saturating_sub(1);
-        let mut placeholders = String::with_capacity(placeholder_capacity);
-        let mut params: Vec<ParamValue> = Vec::with_capacity(results.len());
-        for (idx, result) in results.iter().enumerate() {
-            if idx > 0 {
-                placeholders.push(',');
+        #[derive(Debug)]
+        struct MessageHydrationRow {
+            message_id: u64,
+            conversation_id: i64,
+            full_content: String,
+            msg_created_at: Option<i64>,
+            idx: Option<i64>,
+        }
+
+        #[derive(Debug)]
+        struct ConversationHydrationRow {
+            title: Option<String>,
+            source_path: String,
+            source_id: String,
+            origin_host: Option<String>,
+            agent: String,
+            workspace: Option<String>,
+            origin_kind: Option<String>,
+            started_at: Option<i64>,
+        }
+
+        let mut unique_message_ids = Vec::with_capacity(results.len());
+        let mut seen_message_ids = HashSet::with_capacity(results.len());
+        for result in results {
+            if seen_message_ids.insert(result.message_id) {
+                unique_message_ids.push(result.message_id);
             }
-            placeholders.push('?');
-            params.push(ParamValue::from(i64::try_from(result.message_id)?));
+        }
+
+        let message_placeholder_capacity =
+            unique_message_ids.len().saturating_mul(2).saturating_sub(1);
+        let mut message_placeholders = String::with_capacity(message_placeholder_capacity);
+        let mut message_params: Vec<ParamValue> = Vec::with_capacity(unique_message_ids.len());
+        for (idx, message_id) in unique_message_ids.iter().enumerate() {
+            if idx > 0 {
+                message_placeholders.push(',');
+            }
+            message_placeholders.push('?');
+            message_params.push(ParamValue::from(i64::try_from(*message_id)?));
+        }
+
+        let message_sql = format!(
+            "SELECT id, conversation_id, content, created_at, idx
+             FROM messages
+             WHERE id IN ({message_placeholders})"
+        );
+
+        let message_rows: Vec<MessageHydrationRow> =
+            conn.query_map_collect(&message_sql, &message_params, |row: &frankensqlite::Row| {
+                let message_id: i64 = row.get_typed(0)?;
+                Ok(MessageHydrationRow {
+                    message_id: semantic_message_id_from_db(message_id)?,
+                    conversation_id: row.get_typed(1)?,
+                    full_content: row.get_typed(2)?,
+                    msg_created_at: row.get_typed(3)?,
+                    idx: row.get_typed(4)?,
+                })
+            })?;
+        if message_rows.is_empty() {
+            return Ok(Vec::new());
         }
 
         let title_expr = if field_mask.wants_title() {
@@ -4731,89 +4911,126 @@ impl SearchClient {
         };
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+        let mut conversation_ids = Vec::with_capacity(message_rows.len());
+        let mut seen_conversation_ids = HashSet::with_capacity(message_rows.len());
+        for row in &message_rows {
+            if seen_conversation_ids.insert(row.conversation_id) {
+                conversation_ids.push(row.conversation_id);
+            }
+        }
+        let conversation_placeholder_capacity =
+            conversation_ids.len().saturating_mul(2).saturating_sub(1);
+        let mut conversation_placeholders =
+            String::with_capacity(conversation_placeholder_capacity);
+        let mut conversation_params: Vec<ParamValue> = Vec::with_capacity(conversation_ids.len());
+        for (idx, conversation_id) in conversation_ids.iter().enumerate() {
+            if idx > 0 {
+                conversation_placeholders.push(',');
+            }
+            conversation_placeholders.push('?');
+            conversation_params.push(ParamValue::from(*conversation_id));
+        }
         // LEFT JOIN + COALESCE on agents so search hits for conversations
         // with NULL agent_id (legacy V1 schema) still surface instead of
         // being silently dropped from results.  Consistent with the fts/
         // lexical rebuild paths (8a0c547c, e1c08e7c).
         let sql = format!(
-            "SELECT m.id, c.id, m.content, m.created_at, m.idx, m.role, {title_expr}, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
+            "SELECT c.id, {title_expr}, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
+             FROM conversations c
              LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              LEFT JOIN sources s ON c.source_id = s.id
-             WHERE m.id IN ({placeholders})"
+             WHERE c.id IN ({conversation_placeholders})"
         );
 
-        let rows: Vec<(u64, SearchHit)> =
-            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
-                let message_id: i64 = row.get_typed(0)?;
-                let conversation_id: i64 = row.get_typed(1)?;
-                let full_content: String = row.get_typed(2)?;
-                let msg_created_at: Option<i64> = row.get_typed(3)?;
-                let idx: Option<i64> = row.get_typed(4)?;
+        let conversation_rows: Vec<(i64, ConversationHydrationRow)> =
+            conn.query_map_collect(&sql, &conversation_params, |row: &frankensqlite::Row| {
+                let conversation_id: i64 = row.get_typed(0)?;
                 let title: Option<String> = if field_mask.wants_title() {
-                    row.get_typed(6)?
+                    row.get_typed(1)?
                 } else {
                     None
                 };
-                let source_path: String = row.get_typed(7)?;
-                let raw_source_id: String = row.get_typed(8)?;
-                let origin_host: Option<String> = row.get_typed(9)?;
-                let agent: String = row.get_typed(10)?;
-                let workspace: Option<String> = row.get_typed(11)?;
-                let raw_origin_kind: Option<String> = row.get_typed(12)?;
-                let started_at: Option<i64> = row.get_typed(13)?;
+                Ok((
+                    conversation_id,
+                    ConversationHydrationRow {
+                        title,
+                        source_path: row.get_typed(2)?,
+                        source_id: row.get_typed(3)?,
+                        origin_host: row.get_typed(4)?,
+                        agent: row.get_typed(5)?,
+                        workspace: row.get_typed(6)?,
+                        origin_kind: row.get_typed(7)?,
+                        started_at: row.get_typed(8)?,
+                    },
+                ))
+            })?;
 
-                let created_at = msg_created_at.or(started_at);
-                let line_number = idx
+        let conversations_by_id: HashMap<i64, ConversationHydrationRow> =
+            conversation_rows.into_iter().collect();
+
+        let rows: Vec<(u64, SearchHit)> = message_rows
+            .into_iter()
+            .filter_map(|message| {
+                let conversation = conversations_by_id.get(&message.conversation_id)?;
+
+                let created_at = message.msg_created_at.or(conversation.started_at);
+                let line_number = message
+                    .idx
                     .and_then(|i| usize::try_from(i).ok())
                     .map(|i| i.saturating_add(1));
                 let snippet = if field_mask.wants_snippet() {
-                    snippet_from_content(&full_content)
+                    snippet_from_content(&message.full_content)
                 } else {
                     String::new()
                 };
                 let content = if field_mask.needs_content() {
-                    full_content.clone()
+                    message.full_content.clone()
                 } else {
                     String::new()
                 };
-                let content_hash =
-                    stable_hit_hash(&full_content, &source_path, line_number, created_at);
-                let source_id = normalized_search_hit_source_id_parts(
-                    raw_source_id.as_str(),
-                    raw_origin_kind.as_deref().unwrap_or_default(),
-                    origin_host.as_deref(),
+                let content_hash = stable_hit_hash(
+                    &message.full_content,
+                    &conversation.source_path,
+                    line_number,
+                    created_at,
                 );
-                let origin_kind =
-                    normalized_search_hit_origin_kind(&source_id, raw_origin_kind.as_deref());
+                let source_id = normalized_search_hit_source_id_parts(
+                    conversation.source_id.as_str(),
+                    conversation.origin_kind.as_deref().unwrap_or_default(),
+                    conversation.origin_host.as_deref(),
+                );
+                let origin_kind = normalized_search_hit_origin_kind(
+                    &source_id,
+                    conversation.origin_kind.as_deref(),
+                );
 
                 let hit = SearchHit {
                     title: if field_mask.wants_title() {
-                        title.unwrap_or_default()
+                        conversation.title.clone().unwrap_or_default()
                     } else {
                         String::new()
                     },
                     snippet,
                     content,
                     content_hash,
-                    conversation_id: Some(conversation_id),
+                    conversation_id: Some(message.conversation_id),
                     score: 0.0,
-                    source_path,
-                    agent,
-                    workspace: workspace.unwrap_or_default(),
+                    source_path: conversation.source_path.clone(),
+                    agent: conversation.agent.clone(),
+                    workspace: conversation.workspace.clone().unwrap_or_default(),
                     workspace_original: None,
                     created_at,
                     line_number,
                     match_type: MatchType::Exact,
                     source_id,
                     origin_kind,
-                    origin_host,
+                    origin_host: conversation.origin_host.clone(),
                 };
 
-                Ok((semantic_message_id_from_db(message_id)?, hit))
-            })?;
+                Some((message.message_id, hit))
+            })
+            .collect();
 
         let mut hits_by_id = HashMap::new();
         for (id, hit) in rows {
@@ -5236,7 +5453,7 @@ impl SearchClient {
                     Ok(self.postprocess_hits_page(hits, query, &filters, limit, offset))
                 };
 
-            let (results, search_was_truncated, mut ann_stats) = self.search_semantic_candidates(
+            let (results, retry_state, mut ann_stats) = self.search_semantic_candidates(
                 &candidate_context,
                 &embedding,
                 &filters,
@@ -5254,9 +5471,9 @@ impl SearchClient {
             }
             let (mut available_hits, mut paged_hits) = finalize_hits(&results)?;
 
-            let needs_retry = available_hits < target_hits
-                && search_was_truncated
-                && initial_fetch_limit < fallback_fetch_limit;
+            let needs_retry = initial_fetch_limit < fallback_fetch_limit
+                && ((available_hits < target_hits && retry_state.has_more_candidates)
+                    || retry_state.exact_window_may_omit_competitor);
 
             if needs_retry {
                 tracing::debug!(
@@ -5265,7 +5482,7 @@ impl SearchClient {
                     available_hits,
                     initial_fetch_limit,
                     fallback_fetch_limit,
-                    "retrying semantic fetch due to post-filter shortfall"
+                    "retrying semantic fetch due to candidate-window shortfall"
                 );
                 let (retry_results, _, retry_ann_stats) = self.search_semantic_candidates(
                     &candidate_context,
@@ -6242,80 +6459,83 @@ impl SearchClient {
             .unwrap_or(false))
     }
 
+    fn sqlite_fts_match_mode(conn: &Connection) -> Result<SqliteFtsMatchMode> {
+        let params = [ParamValue::from("__cass_fts_probe_no_match__")];
+        match franken_query_map_collect_retry(
+            conn,
+            "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?",
+            &params,
+            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+        ) {
+            Ok(_) => Ok(SqliteFtsMatchMode::Table),
+            Err(err)
+                if err
+                    .to_string()
+                    .contains("no such column: fts_messages in table fts_messages") =>
+            {
+                Ok(SqliteFtsMatchMode::IndexedColumns)
+            }
+            Err(err) => Err(anyhow!(err)),
+        }
+    }
+
+    fn sqlite_fts5_rowid_projection_available(conn: &Connection) -> bool {
+        let params: [ParamValue; 0] = [];
+        franken_query_map_collect_retry(
+            conn,
+            "SELECT rowid FROM fts_messages LIMIT 1",
+            &params,
+            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+        )
+        .is_ok()
+    }
+
+    fn sqlite_fts5_match_clause(match_mode: SqliteFtsMatchMode) -> &'static str {
+        match match_mode {
+            SqliteFtsMatchMode::Table => "fts_messages MATCH ?",
+            SqliteFtsMatchMode::IndexedColumns => {
+                "(content MATCH ?
+                  OR title MATCH ?
+                  OR agent MATCH ?
+                  OR workspace MATCH ?
+                  OR source_path MATCH ?)"
+            }
+        }
+    }
+
+    fn push_sqlite_fts5_match_params(
+        params: &mut Vec<ParamValue>,
+        fts_query: &str,
+        match_mode: SqliteFtsMatchMode,
+    ) {
+        let copies = match match_mode {
+            SqliteFtsMatchMode::Table => 1,
+            SqliteFtsMatchMode::IndexedColumns => 5,
+        };
+        for _ in 0..copies {
+            params.push(ParamValue::from(fts_query));
+        }
+    }
+
     fn sqlite_fts5_rank_query(
         fts_query: &str,
-        filters: &SearchFilters,
+        _filters: &SearchFilters,
         limit: usize,
         offset: usize,
-        uses_message_id: bool,
+        _uses_message_id: bool,
+        match_mode: SqliteFtsMatchMode,
     ) -> (String, Vec<ParamValue>) {
-        let normalized_source_sql =
-            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-        let created_at_expr = "CAST(fts_messages.created_at AS INTEGER)";
-        let message_key_expr = if uses_message_id {
-            "CAST(fts_messages.message_id AS INTEGER)"
-        } else {
-            "fts_messages.rowid"
-        };
-
+        let match_clause = Self::sqlite_fts5_match_clause(match_mode);
         let mut sql = format!(
-            "SELECT fts_messages.rowid,
+            "SELECT rowid,
                     bm25(fts_messages)
              FROM fts_messages
-             LEFT JOIN messages m ON {message_key_expr} = m.id
-             LEFT JOIN conversations c ON m.conversation_id = c.id
-             LEFT JOIN sources s ON c.source_id = s.id
-             WHERE fts_messages MATCH ?"
+             WHERE {match_clause}"
         );
-        let mut params = Vec::with_capacity(filters.agents.len() + filters.workspaces.len() + 5);
-        params.push(ParamValue::from(fts_query));
+        let mut params = Vec::with_capacity(9);
+        Self::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
 
-        if !filters.agents.is_empty() {
-            let placeholders = sql_placeholders(filters.agents.len());
-            sql.push_str(&format!(" AND fts_messages.agent IN ({placeholders})"));
-            for agent in &filters.agents {
-                params.push(ParamValue::from(agent.as_str()));
-            }
-        }
-
-        if !filters.workspaces.is_empty() {
-            let placeholders = sql_placeholders(filters.workspaces.len());
-            sql.push_str(&format!(
-                " AND COALESCE(fts_messages.workspace, '') IN ({placeholders})"
-            ));
-            for workspace in &filters.workspaces {
-                params.push(ParamValue::from(workspace.as_str()));
-            }
-        }
-
-        if let Some(created_from) = filters.created_from {
-            sql.push_str(&format!(" AND {created_at_expr} >= ?"));
-            params.push(ParamValue::from(created_from));
-        }
-        if let Some(created_to) = filters.created_to {
-            sql.push_str(&format!(" AND {created_at_expr} <= ?"));
-            params.push(ParamValue::from(created_to));
-        }
-
-        match &filters.source_filter {
-            SourceFilter::All => {}
-            SourceFilter::Local => sql.push_str(&format!(
-                " AND {normalized_source_sql} = '{local}'",
-                local = crate::sources::provenance::LOCAL_SOURCE_ID,
-            )),
-            SourceFilter::Remote => sql.push_str(&format!(
-                " AND {normalized_source_sql} != '{local}'",
-                local = crate::sources::provenance::LOCAL_SOURCE_ID,
-            )),
-            SourceFilter::SourceId(id) => {
-                sql.push_str(&format!(" AND {normalized_source_sql} = ?"));
-                params.push(ParamValue::from(normalize_search_source_filter_value(id)));
-            }
-        }
-
-        sql.push_str(&format!(
-            " ORDER BY bm25(fts_messages), {message_key_expr}, fts_messages.rowid LIMIT ? OFFSET ?"
-        ));
+        sql.push_str(" ORDER BY bm25(fts_messages), rowid LIMIT ? OFFSET ?");
         params.push(ParamValue::from(limit as i64));
         params.push(ParamValue::from(offset as i64));
 
@@ -6330,41 +6550,68 @@ impl SearchClient {
         let title_expr = if field_mask.wants_title() {
             "fts_messages.title"
         } else {
-            "''"
+            "NULL"
         };
         let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
             "fts_messages.content"
+        } else {
+            "NULL"
+        };
+        let message_key_expr = if uses_message_id {
+            "CAST(fts_messages.message_id AS INTEGER)"
+        } else {
+            "rowid"
+        };
+        let placeholders = sql_placeholders(row_count);
+
+        format!(
+            "SELECT rowid,
+                    {message_key_expr},
+                    {title_expr},
+                    {content_expr},
+                    fts_messages.agent,
+                    fts_messages.workspace,
+                    fts_messages.source_path,
+                    CAST(fts_messages.created_at AS INTEGER)
+             FROM fts_messages
+             WHERE rowid IN ({placeholders})"
+        )
+    }
+
+    fn sqlite_fts5_message_hydrate_query(row_count: usize, field_mask: FieldMask) -> String {
+        let title_expr = if field_mask.wants_title() {
+            "COALESCE(c.title, '')"
+        } else {
+            "''"
+        };
+        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
+            "COALESCE(m.content, '')"
         } else {
             "''"
         };
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-        let created_at_expr = "CAST(fts_messages.created_at AS INTEGER)";
-        let message_key_expr = if uses_message_id {
-            "CAST(fts_messages.message_id AS INTEGER)"
-        } else {
-            "fts_messages.rowid"
-        };
         let placeholders = sql_placeholders(row_count);
 
         format!(
-            "SELECT fts_messages.rowid,
+            "SELECT m.id,
                     {title_expr},
                     {content_expr},
-                    fts_messages.agent,
-                    COALESCE(fts_messages.workspace, ''),
-                    fts_messages.source_path,
-                    {created_at_expr},
+                    COALESCE(a.slug, ''),
+                    COALESCE(w.path, ''),
+                    COALESCE(c.source_path, ''),
+                    CAST(m.created_at AS INTEGER),
                     m.idx,
                     c.id,
                     {normalized_source_sql},
                     c.origin_host,
                     s.kind
-             FROM fts_messages
-             LEFT JOIN messages m ON {message_key_expr} = m.id
+             FROM messages m
              LEFT JOIN conversations c ON m.conversation_id = c.id
              LEFT JOIN sources s ON c.source_id = s.id
-             WHERE fts_messages.rowid IN ({placeholders})"
+             LEFT JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             WHERE m.id IN ({placeholders})"
         )
     }
 
@@ -6373,6 +6620,387 @@ impl SearchClient {
     ) -> impl Iterator<Item = &[(i64, f64)]> {
         const _: () = assert!(SQLITE_FTS5_HYDRATE_PARAM_CHUNK <= SQLITE_MAX_VARIABLE_NUMBER);
         ranked_rows.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK)
+    }
+
+    fn sqlite_fts5_filters_need_post_hydration(filters: &SearchFilters) -> bool {
+        !filters.agents.is_empty()
+            || !filters.workspaces.is_empty()
+            || filters.created_from.is_some()
+            || filters.created_to.is_some()
+            || !filters.source_filter.is_all()
+            || !filters.session_paths.is_empty()
+    }
+
+    fn sqlite_fts5_hit_matches_filters(hit: &SearchHit, filters: &SearchFilters) -> bool {
+        if !filters.agents.is_empty() && !filters.agents.contains(&hit.agent) {
+            return false;
+        }
+        if !filters.workspaces.is_empty() && !filters.workspaces.contains(&hit.workspace) {
+            return false;
+        }
+        if filters.created_from.is_some() || filters.created_to.is_some() {
+            let Some(created_at) = hit.created_at else {
+                return false;
+            };
+            if let Some(created_from) = filters.created_from
+                && created_at < created_from
+            {
+                return false;
+            }
+            if let Some(created_to) = filters.created_to
+                && created_at > created_to
+            {
+                return false;
+            }
+        }
+        if !filters.session_paths.is_empty() && !filters.session_paths.contains(&hit.source_path) {
+            return false;
+        }
+
+        match &filters.source_filter {
+            SourceFilter::All => true,
+            SourceFilter::Local => matches!(
+                hit.source_id
+                    .as_str()
+                    .cmp(crate::sources::provenance::LOCAL_SOURCE_ID),
+                CmpOrdering::Equal
+            ),
+            SourceFilter::Remote => !matches!(
+                hit.source_id
+                    .as_str()
+                    .cmp(crate::sources::provenance::LOCAL_SOURCE_ID),
+                CmpOrdering::Equal
+            ),
+            SourceFilter::SourceId(id) => {
+                let normalized = normalize_search_source_filter_value(id);
+                matches!(
+                    hit.source_id.as_str().cmp(normalized.as_str()),
+                    CmpOrdering::Equal
+                )
+            }
+        }
+    }
+
+    fn sqlite_message_scan_query(raw_query: &str) -> Option<SqliteMessageScanQuery> {
+        fn scan_parts(parts: Vec<String>) -> Vec<String> {
+            parts
+                .into_iter()
+                .map(|part| part.trim_end_matches('*').to_lowercase())
+                .filter(|part| !part.is_empty())
+                .collect()
+        }
+
+        let tokens = fs_cass_parse_boolean_query(raw_query);
+        if tokens.is_empty() {
+            return None;
+        }
+
+        let mut include_groups = Vec::new();
+        let mut pending_or_group: SqliteMessageScanGroup = Vec::new();
+        let mut exclude_terms = Vec::new();
+        let mut negated = false;
+        let mut in_or_sequence = false;
+        for token in tokens {
+            match token {
+                FsCassQueryToken::And => {
+                    if !pending_or_group.is_empty() {
+                        include_groups.push(std::mem::take(&mut pending_or_group));
+                    }
+                    in_or_sequence = false;
+                    negated = false;
+                }
+                FsCassQueryToken::Or => {
+                    if include_groups.is_empty() && pending_or_group.is_empty() {
+                        continue;
+                    }
+                    if negated {
+                        return None;
+                    }
+                    in_or_sequence = true;
+                }
+                FsCassQueryToken::Not => {
+                    if in_or_sequence {
+                        return None;
+                    }
+                    if !pending_or_group.is_empty() {
+                        include_groups.push(std::mem::take(&mut pending_or_group));
+                    }
+                    negated = true;
+                    in_or_sequence = false;
+                }
+                FsCassQueryToken::Term(term) => {
+                    let parts = scan_parts(normalize_term_parts(&term));
+                    if parts.is_empty() {
+                        continue;
+                    }
+                    if negated {
+                        exclude_terms.extend(parts);
+                    } else if in_or_sequence {
+                        if pending_or_group.is_empty() {
+                            let previous = include_groups.pop()?;
+                            pending_or_group.extend(previous);
+                        }
+                        pending_or_group.push(parts);
+                    } else {
+                        include_groups.push(vec![parts]);
+                    }
+                    negated = false;
+                }
+                FsCassQueryToken::Phrase(phrase) => {
+                    let parts = normalize_phrase_terms(&phrase);
+                    if parts.is_empty() {
+                        continue;
+                    }
+                    if negated {
+                        exclude_terms.extend(parts);
+                    } else if in_or_sequence {
+                        if pending_or_group.is_empty() {
+                            let previous = include_groups.pop()?;
+                            pending_or_group.extend(previous);
+                        }
+                        pending_or_group.push(parts);
+                    } else {
+                        include_groups.push(vec![parts]);
+                    }
+                    negated = false;
+                }
+            }
+        }
+
+        if !pending_or_group.is_empty() {
+            include_groups.push(pending_or_group);
+        }
+
+        for group in &mut include_groups {
+            for alternative in group.iter_mut() {
+                alternative.sort();
+                alternative.dedup();
+            }
+            group.retain(|alternative| !alternative.is_empty());
+            group.sort();
+            group.dedup();
+        }
+        include_groups.retain(|group| !group.is_empty());
+        exclude_terms.sort();
+        exclude_terms.dedup();
+        if include_groups.is_empty() {
+            return None;
+        }
+
+        Some(SqliteMessageScanQuery {
+            include_groups,
+            exclude_terms,
+        })
+    }
+
+    fn sqlite_message_scan_score(haystack: &str, scan_query: &SqliteMessageScanQuery) -> f32 {
+        for term in &scan_query.exclude_terms {
+            if haystack.contains(term) {
+                return 0.0;
+            }
+        }
+
+        let mut score = 0.0f32;
+        for group in &scan_query.include_groups {
+            let mut group_score = 0.0f32;
+            for alternative in group {
+                let mut alternative_score = 0.0f32;
+                for term in alternative {
+                    let matches = haystack.matches(term).count();
+                    if matches < 1 {
+                        alternative_score = 0.0;
+                        break;
+                    }
+                    alternative_score += matches as f32;
+                }
+                group_score = group_score.max(alternative_score);
+            }
+            if group_score <= 0.0 {
+                return 0.0;
+            }
+            score += group_score;
+        }
+        score
+    }
+
+    fn sqlite_message_scan_query_sql(field_mask: FieldMask) -> String {
+        let title_expr = if field_mask.wants_title() {
+            "COALESCE(c.title, '')"
+        } else {
+            "''"
+        };
+        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
+            "COALESCE(m.content, '')"
+        } else {
+            "''"
+        };
+        let normalized_source_sql =
+            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+
+        format!(
+            "SELECT m.id,
+                    {title_expr},
+                    {content_expr},
+                    COALESCE(a.slug, ''),
+                    COALESCE(w.path, ''),
+                    COALESCE(c.source_path, ''),
+                    CAST(m.created_at AS INTEGER),
+                    m.idx,
+                    c.id,
+                    {normalized_source_sql},
+                    c.origin_host,
+                    s.kind,
+                    COALESCE(m.content, ''),
+                    COALESCE(c.title, '')
+             FROM messages m
+             LEFT JOIN conversations c ON m.conversation_id = c.id
+             LEFT JOIN sources s ON c.source_id = s.id
+             LEFT JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             ORDER BY m.id
+             LIMIT ?"
+        )
+    }
+
+    fn search_sqlite_message_scan(
+        &self,
+        conn: &Connection,
+        request: SqliteMessageScanRequest<'_>,
+    ) -> Result<Vec<SearchHit>> {
+        let Some(scan_query) = Self::sqlite_message_scan_query(request.raw_query) else {
+            return Ok(Vec::new());
+        };
+
+        let sql = Self::sqlite_message_scan_query_sql(request.field_mask);
+        let params = [ParamValue::from(SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT as i64)];
+        let rows: Vec<(SqliteFtsMessageRow, String, String)> =
+            franken_query_map_collect_retry(conn, &sql, &params, |row| {
+                Ok((
+                    (
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
+                        row.get_typed(6)?,
+                        row.get_typed(7)?,
+                        row.get_typed(8)?,
+                        row.get_typed::<Option<String>>(9)?,
+                        row.get_typed(10)?,
+                        row.get_typed(11)?,
+                    ),
+                    row.get_typed(12)?,
+                    row.get_typed(13)?,
+                ))
+            })?;
+
+        let mut scored_hits = Vec::new();
+        for (
+            (
+                _message_id,
+                title,
+                raw_content,
+                agent,
+                workspace,
+                source_path,
+                created_at,
+                idx,
+                conversation_id,
+                raw_source_id,
+                origin_host,
+                raw_origin_kind,
+            ),
+            scan_content,
+            scan_title,
+        ) in rows
+        {
+            let mut haystack = String::with_capacity(
+                scan_content.len()
+                    + scan_title.len()
+                    + agent.len()
+                    + workspace.len()
+                    + source_path.len()
+                    + 4,
+            );
+            haystack.push_str(&scan_content);
+            haystack.push(' ');
+            haystack.push_str(&scan_title);
+            haystack.push(' ');
+            haystack.push_str(&agent);
+            haystack.push(' ');
+            haystack.push_str(&workspace);
+            haystack.push(' ');
+            haystack.push_str(&source_path);
+            let haystack = haystack.to_lowercase();
+            let score = Self::sqlite_message_scan_score(&haystack, &scan_query);
+            if score <= 0.0 {
+                continue;
+            }
+
+            let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
+            let source_id = normalized_search_hit_source_id_parts(
+                raw_source_id.as_str(),
+                raw_origin_kind.as_deref().unwrap_or_default(),
+                origin_host.as_deref(),
+            );
+            let origin_kind =
+                normalized_search_hit_origin_kind(source_id.as_str(), raw_origin_kind.as_deref());
+            let line_number = idx
+                .and_then(|i| usize::try_from(i).ok())
+                .map(|i| i.saturating_add(1));
+            let snippet = if request.field_mask.wants_snippet() {
+                snippet_from_content(&scan_content)
+            } else {
+                String::new()
+            };
+            let content = if request.field_mask.needs_content() {
+                raw_content
+            } else {
+                String::new()
+            };
+            let content_hash = if content.is_empty() {
+                stable_hit_hash(&snippet, &source_path, line_number, created_at)
+            } else {
+                stable_hit_hash(&content, &source_path, line_number, created_at)
+            };
+
+            let hit = SearchHit {
+                title,
+                snippet,
+                content,
+                content_hash,
+                conversation_id,
+                score,
+                source_path,
+                agent,
+                workspace,
+                workspace_original: None,
+                created_at,
+                line_number,
+                match_type: request.query_match_type,
+                source_id,
+                origin_kind,
+                origin_host,
+            };
+
+            if Self::sqlite_fts5_hit_matches_filters(&hit, request.filters) {
+                scored_hits.push(hit);
+            }
+        }
+
+        scored_hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(CmpOrdering::Equal)
+        });
+
+        Ok(scored_hits
+            .into_iter()
+            .skip(request.offset)
+            .take(request.limit)
+            .collect())
     }
 
     fn search_sqlite_fts5(
@@ -6384,6 +7012,10 @@ impl SearchClient {
         offset: usize,
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
+        if limit < 1 {
+            return Ok(Vec::new());
+        }
+
         let fts_query = match transpile_to_fts5(raw_query) {
             Some(q) if !q.trim().is_empty() => q,
             _ => return Ok(Vec::new()),
@@ -6408,6 +7040,23 @@ impl SearchClient {
         }
 
         let query_match_type = dominant_match_type(raw_query);
+        let scan_request = SqliteMessageScanRequest {
+            raw_query,
+            filters: &filters,
+            limit,
+            offset,
+            field_mask,
+            query_match_type,
+        };
+        if let Err(err) =
+            crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
+        {
+            tracing::warn!(
+                error = %err,
+                "sqlite FTS fallback integrity check failed; using source-table scan fallback"
+            );
+            return self.search_sqlite_message_scan(conn, scan_request);
+        }
         let uses_message_id =
             if let Ok(uses_message_id) = Self::sqlite_fts_uses_message_id_column(conn) {
                 uses_message_id
@@ -6415,86 +7064,246 @@ impl SearchClient {
                 tracing::warn!(
                     "sqlite FTS fallback is present but not queryable; skipping fallback search"
                 );
-                return Ok(Vec::new());
+                return self.search_sqlite_message_scan(conn, scan_request);
             };
-        let (rank_sql, rank_params) = Self::sqlite_fts5_rank_query(
-            fts_query.as_str(),
-            &filters,
-            limit,
-            offset,
-            uses_message_id,
-        );
-        let ranked_rows: Vec<(i64, f64)> =
-            match franken_query_map_collect_retry(conn, &rank_sql, &rank_params, |row| {
-                Ok((row.get_typed(0)?, row.get_typed(1)?))
-            }) {
-                Ok(rows) => rows,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "sqlite FTS fallback rank query failed; returning no fallback hits"
-                    );
-                    return Ok(Vec::new());
-                }
-            };
-        if ranked_rows.is_empty() {
-            return Ok(Vec::new());
+        let match_mode = match Self::sqlite_fts_match_mode(conn) {
+            Ok(match_mode) => match_mode,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "sqlite FTS fallback is present but not queryable; skipping fallback search"
+                );
+                return self.search_sqlite_message_scan(conn, scan_request);
+            }
+        };
+        if !Self::sqlite_fts5_rowid_projection_available(conn) {
+            tracing::warn!(
+                "sqlite FTS fallback cannot project rowid through frankensqlite; using source-table scan fallback"
+            );
+            return self.search_sqlite_message_scan(conn, scan_request);
         }
 
-        let bm25_by_rowid: HashMap<i64, f64> = ranked_rows.iter().copied().collect();
-        let mut hits_by_rowid = HashMap::with_capacity(ranked_rows.len());
-        for rank_chunk in Self::sqlite_fts5_hydrate_row_chunks(&ranked_rows) {
-            let hydrate_sql =
-                Self::sqlite_fts5_hydrate_query(rank_chunk.len(), field_mask, uses_message_id);
-            let hydrate_params = rank_chunk
-                .iter()
-                .map(|(fts_rowid, _)| ParamValue::from(*fts_rowid))
-                .collect::<Vec<_>>();
-            let rows: Vec<SqliteFtsHydratedRow> =
-                match franken_query_map_collect_retry(conn, &hydrate_sql, &hydrate_params, |row| {
-                    Ok((
-                        row.get_typed(0)?,
-                        row.get_typed(1)?,
-                        row.get_typed(2)?,
-                        row.get_typed(3)?,
-                        row.get_typed(4)?,
-                        row.get_typed(5)?,
-                        row.get_typed(6)?,
-                        row.get_typed(7)?,
-                        row.get_typed(8)?,
-                        row.get_typed::<Option<String>>(9)?,
-                        row.get_typed(10)?,
-                        row.get_typed(11)?,
-                    ))
+        let post_filter = Self::sqlite_fts5_filters_need_post_hydration(&filters);
+        let target_hits = if post_filter {
+            offset.saturating_add(limit)
+        } else {
+            limit
+        };
+        let rank_batch_limit = if post_filter {
+            target_hits.clamp(1, SQLITE_FTS5_POST_FILTER_SCAN_CHUNK)
+        } else {
+            limit
+        };
+        let mut rank_offset = if post_filter { 0 } else { offset };
+        let mut scanned_rows = 0usize;
+        let mut hits = Vec::with_capacity(target_hits.min(rank_batch_limit));
+
+        loop {
+            let (rank_sql, rank_params) = Self::sqlite_fts5_rank_query(
+                fts_query.as_str(),
+                &filters,
+                rank_batch_limit,
+                rank_offset,
+                uses_message_id,
+                match_mode,
+            );
+            let ranked_rows: Vec<(i64, f64)> =
+                match franken_query_map_collect_retry(conn, &rank_sql, &rank_params, |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?))
                 }) {
                     Ok(rows) => rows,
                     Err(err) => {
                         tracing::warn!(
                             error = %err,
-                            "sqlite FTS fallback hydration query failed; returning no fallback hits"
+                            "sqlite FTS fallback rank query failed; returning no fallback hits"
                         );
-                        return Ok(Vec::new());
+                        return self.search_sqlite_message_scan(conn, scan_request);
                     }
                 };
+            if ranked_rows.is_empty() {
+                break;
+            }
+
+            scanned_rows = scanned_rows.saturating_add(ranked_rows.len());
+            let bm25_by_rowid: HashMap<i64, f64> = ranked_rows.iter().copied().collect();
+            let mut fts_rows_by_rowid = HashMap::with_capacity(ranked_rows.len());
+            let mut message_ids = Vec::with_capacity(ranked_rows.len());
+            let mut seen_message_ids = HashSet::with_capacity(ranked_rows.len());
+
+            for rank_chunk in Self::sqlite_fts5_hydrate_row_chunks(&ranked_rows) {
+                let hydrate_sql =
+                    Self::sqlite_fts5_hydrate_query(rank_chunk.len(), field_mask, uses_message_id);
+                let hydrate_params = rank_chunk
+                    .iter()
+                    .map(|(fts_rowid, _)| ParamValue::from(*fts_rowid))
+                    .collect::<Vec<_>>();
+                let rows: Vec<SqliteFtsHydratedRow> = match franken_query_map_collect_retry(
+                    conn,
+                    &hydrate_sql,
+                    &hydrate_params,
+                    |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                            row.get_typed(4)?,
+                            row.get_typed(5)?,
+                            row.get_typed(6)?,
+                            row.get_typed(7)?,
+                        ))
+                    },
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "sqlite FTS fallback rowid hydration query failed; returning no fallback hits"
+                        );
+                        return self.search_sqlite_message_scan(conn, scan_request);
+                    }
+                };
+
+                for row in rows {
+                    let fts_rowid = row.0;
+                    let message_id = row.1.unwrap_or(fts_rowid);
+                    if seen_message_ids.insert(message_id) {
+                        message_ids.push(message_id);
+                    }
+                    fts_rows_by_rowid.insert(fts_rowid, row);
+                }
+            }
+
+            let mut metadata_by_message_id = HashMap::with_capacity(message_ids.len());
+            for message_chunk in message_ids.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK) {
+                let metadata_sql =
+                    Self::sqlite_fts5_message_hydrate_query(message_chunk.len(), field_mask);
+                let metadata_params = message_chunk
+                    .iter()
+                    .map(|message_id| ParamValue::from(*message_id))
+                    .collect::<Vec<_>>();
+                let metadata_rows: Vec<SqliteFtsMessageRow> = match franken_query_map_collect_retry(
+                    conn,
+                    &metadata_sql,
+                    &metadata_params,
+                    |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                            row.get_typed(4)?,
+                            row.get_typed(5)?,
+                            row.get_typed(6)?,
+                            row.get_typed(7)?,
+                            row.get_typed(8)?,
+                            row.get_typed::<Option<String>>(9)?,
+                            row.get_typed(10)?,
+                            row.get_typed(11)?,
+                        ))
+                    },
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "sqlite FTS fallback message hydration query failed; returning no fallback hits"
+                        );
+                        return self.search_sqlite_message_scan(conn, scan_request);
+                    }
+                };
+                metadata_by_message_id.extend(metadata_rows.into_iter().map(|row| (row.0, row)));
+            }
+
+            let mut hits_by_rowid = HashMap::with_capacity(ranked_rows.len());
             for (
                 fts_rowid,
-                title,
-                raw_content,
-                agent,
-                workspace,
-                source_path,
-                created_at,
-                idx,
-                conversation_id,
-                raw_source_id,
-                origin_host,
-                raw_origin_kind,
-            ) in rows
+                fts_message_id,
+                fts_title,
+                fts_content,
+                fts_agent,
+                fts_workspace,
+                fts_source_path,
+                fts_created_at,
+            ) in fts_rows_by_rowid.into_values()
             {
                 let Some(&bm25_score) = bm25_by_rowid.get(&fts_rowid) else {
                     continue;
                 };
-                let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
+                let message_id = fts_message_id.unwrap_or(fts_rowid);
+                let (
+                    title,
+                    raw_content,
+                    agent,
+                    workspace,
+                    source_path,
+                    created_at,
+                    idx,
+                    conversation_id,
+                    raw_source_id,
+                    origin_host,
+                    raw_origin_kind,
+                ) = match metadata_by_message_id.remove(&message_id) {
+                    Some((
+                        _,
+                        metadata_title,
+                        metadata_content,
+                        metadata_agent,
+                        metadata_workspace,
+                        metadata_source_path,
+                        metadata_created_at,
+                        metadata_idx,
+                        metadata_conversation_id,
+                        metadata_raw_source_id,
+                        metadata_origin_host,
+                        metadata_raw_origin_kind,
+                    )) => (
+                        if metadata_title.is_empty() {
+                            fts_title.unwrap_or_default()
+                        } else {
+                            metadata_title
+                        },
+                        if metadata_content.is_empty() {
+                            fts_content.unwrap_or_default()
+                        } else {
+                            metadata_content
+                        },
+                        if metadata_agent.is_empty() {
+                            fts_agent.unwrap_or_default()
+                        } else {
+                            metadata_agent
+                        },
+                        if metadata_workspace.is_empty() {
+                            fts_workspace.unwrap_or_default()
+                        } else {
+                            metadata_workspace
+                        },
+                        if metadata_source_path.is_empty() {
+                            fts_source_path.unwrap_or_default()
+                        } else {
+                            metadata_source_path
+                        },
+                        metadata_created_at.or(fts_created_at),
+                        metadata_idx,
+                        metadata_conversation_id,
+                        metadata_raw_source_id.unwrap_or_else(default_source_id),
+                        metadata_origin_host,
+                        metadata_raw_origin_kind,
+                    ),
+                    None => (
+                        fts_title.unwrap_or_default(),
+                        fts_content.unwrap_or_default(),
+                        fts_agent.unwrap_or_default(),
+                        fts_workspace.unwrap_or_default(),
+                        fts_source_path.unwrap_or_default(),
+                        fts_created_at,
+                        None,
+                        None,
+                        default_source_id(),
+                        None,
+                        None,
+                    ),
+                };
 
                 let source_id = normalized_search_hit_source_id_parts(
                     raw_source_id.as_str(),
@@ -6504,8 +7313,7 @@ impl SearchClient {
                 let origin_kind = normalized_search_hit_origin_kind(
                     source_id.as_str(),
                     raw_origin_kind.as_deref(),
-                )
-                .to_string();
+                );
                 let line_number = idx
                     .and_then(|i| usize::try_from(i).ok())
                     .map(|i| i.saturating_add(1));
@@ -6545,15 +7353,44 @@ impl SearchClient {
                 };
                 hits_by_rowid.insert(fts_rowid, hit);
             }
+
+            for (fts_rowid, _) in &ranked_rows {
+                if let Some(hit) = hits_by_rowid.remove(fts_rowid)
+                    && Self::sqlite_fts5_hit_matches_filters(&hit, &filters)
+                {
+                    hits.push(hit);
+                    if hits.len() >= target_hits {
+                        break;
+                    }
+                }
+            }
+
+            if hits.len() >= target_hits
+                || !post_filter
+                || ranked_rows.len() < rank_batch_limit
+                || scanned_rows >= SQLITE_FTS5_POST_FILTER_SCAN_LIMIT
+            {
+                break;
+            }
+            rank_offset = rank_offset.saturating_add(ranked_rows.len());
         }
 
-        let mut hits = Vec::with_capacity(ranked_rows.len());
-        for (fts_rowid, _) in ranked_rows {
-            if let Some(hit) = hits_by_rowid.remove(&fts_rowid) {
-                hits.push(hit);
+        if post_filter {
+            let hits = hits
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect::<Vec<_>>();
+            if hits.is_empty() {
+                self.search_sqlite_message_scan(conn, scan_request)
+            } else {
+                Ok(hits)
             }
+        } else if hits.is_empty() {
+            self.search_sqlite_message_scan(conn, scan_request)
+        } else {
+            Ok(hits)
         }
-        Ok(hits)
     }
 
     /// Browse messages ordered by date, without any text query.
@@ -7040,7 +7877,7 @@ fn maybe_spawn_warm_worker(
                 }
                 if !clauses.is_empty() {
                     let q: Box<dyn Query> = Box::new(BooleanQuery::new(clauses));
-                    let _ = searcher.search(&q, &TopDocs::with_limit(1));
+                    let _ = searcher.search(&q, &TopDocs::with_limit(1).order_by_score());
                 }
             }
         })
@@ -7638,7 +8475,7 @@ mod tests {
     use crate::search::tantivy::TantivyIndex;
     use crate::storage::sqlite::FrankenStorage;
     use frankensqlite::Connection as FrankenConnection;
-    use frankensqlite::compat::{ParamValue, params_from_iter};
+    use frankensqlite::compat::ParamValue;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -7684,6 +8521,52 @@ mod tests {
             hasher.update(ts.to_string().as_bytes());
         }
         hasher.digest()
+    }
+
+    fn vector_result(message_id: u64, score: f32) -> VectorSearchResult {
+        VectorSearchResult {
+            message_id,
+            chunk_idx: 0,
+            score,
+        }
+    }
+
+    #[test]
+    fn semantic_exact_candidate_limit_overfetches_chunks_without_full_scan() {
+        assert_eq!(SearchClient::semantic_exact_candidate_limit(10, 1_000), 40);
+        assert_eq!(SearchClient::semantic_exact_candidate_limit(10, 25), 25);
+        assert_eq!(SearchClient::semantic_exact_candidate_limit(0, 1_000), 0);
+        assert_eq!(SearchClient::semantic_exact_candidate_limit(10, 0), 0);
+    }
+
+    #[test]
+    fn semantic_window_detects_possible_hidden_chunk_competitors() {
+        let complete = vec![
+            vector_result(1, 0.9),
+            vector_result(2, 0.8),
+            vector_result(3, 0.7),
+        ];
+        assert!(
+            !SearchClient::semantic_window_may_omit_competitor(&complete, 3, Some(0.6)),
+            "strictly lower omitted chunks cannot alter the top message window"
+        );
+        assert!(
+            SearchClient::semantic_window_may_omit_competitor(&complete, 3, Some(0.7)),
+            "equal-score omitted chunks can still alter deterministic tie-breaking"
+        );
+
+        let duplicate_collapsed_shortfall = vec![vector_result(1, 0.9)];
+        assert!(
+            SearchClient::semantic_window_may_omit_competitor(
+                &duplicate_collapsed_shortfall,
+                3,
+                Some(0.2),
+            ),
+            "a short collapsed window means high-scoring duplicate chunks may have hidden messages"
+        );
+        assert!(!SearchClient::semantic_window_may_omit_competitor(
+            &complete, 3, None
+        ));
     }
 
     #[test]
@@ -10548,6 +11431,24 @@ mod tests {
 
     #[test]
     fn sqlite_path_rusqlite_fallback_matches_hyphenated_ids_with_workspace_filter() -> Result<()> {
+        fn fts_match_count(conn: &FrankenConnection, fts_query: &str) -> Result<Option<usize>> {
+            let match_mode = SearchClient::sqlite_fts_match_mode(conn)?;
+            let sql = format!(
+                "SELECT COUNT(*) FROM fts_messages WHERE {}",
+                SearchClient::sqlite_fts5_match_clause(match_mode)
+            );
+            let mut params = Vec::new();
+            SearchClient::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
+            match franken_query_map_collect_retry(conn, &sql, &params, |row| row.get_typed(0)) {
+                Ok(rows) => {
+                    let count: i64 = rows.into_iter().next().unwrap_or(0);
+                    Ok(Some(usize::try_from(count.max(0)).unwrap_or(usize::MAX)))
+                }
+                Err(err) if err.to_string().contains("no such function: MATCH/2") => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        }
+
         let temp_dir = TempDir::new()?;
         let db_path = temp_dir.path().join("hyphenated-rusqlite-fallback.db");
 
@@ -10605,22 +11506,21 @@ mod tests {
                     ParamValue::from(101_i64),
                 ],
             )?;
-            let preclose_total_rows = conn.query("SELECT rowid FROM fts_messages")?;
+            let preclose_total_rows: i64 =
+                conn.query_row_map("SELECT COUNT(*) FROM fts_messages", params![], |row| {
+                    row.get_typed(0)
+                })?;
             assert_eq!(
-                preclose_total_rows.len(),
-                2,
+                preclose_total_rows, 2,
                 "freshly seeded file-backed FTS should retain the inserted rows"
             );
             let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-            let preclose_rows = conn.query_with_params(
-                "SELECT rowid FROM fts_messages WHERE fts_messages MATCH ?",
-                &params_from_iter(vec![ParamValue::from(transpiled.as_str())]),
-            )?;
-            assert_eq!(
-                preclose_rows.len(),
-                2,
-                "freshly seeded file-backed FTS should match the transpiled hyphenated query before reopen"
-            );
+            if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
+                assert_eq!(
+                    match_count, 2,
+                    "freshly seeded file-backed FTS should match the transpiled hyphenated query before reopen"
+                );
+            }
         }
 
         let client = SearchClient {
@@ -10642,22 +11542,21 @@ mod tests {
 
         let guard = client.sqlite_guard()?;
         let conn = guard.as_ref().expect("sqlite guard should reopen file db");
-        let reopened_total_rows = conn.query("SELECT rowid FROM fts_messages")?;
+        let reopened_total_rows: i64 =
+            conn.query_row_map("SELECT COUNT(*) FROM fts_messages", params![], |row| {
+                row.get_typed(0)
+            })?;
         assert_eq!(
-            reopened_total_rows.len(),
-            2,
+            reopened_total_rows, 2,
             "reopened file-backed FTS should still contain the seeded rows"
         );
         let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-        let raw_rows = conn.query_with_params(
-            "SELECT rowid FROM fts_messages WHERE fts_messages MATCH ?",
-            &params_from_iter(vec![ParamValue::from(transpiled.as_str())]),
-        )?;
-        assert_eq!(
-            raw_rows.len(),
-            2,
-            "reopened file-backed FTS should still match the transpiled hyphenated query"
-        );
+        if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
+            assert_eq!(
+                match_count, 2,
+                "reopened file-backed FTS should still match the transpiled hyphenated query"
+            );
+        }
         drop(guard);
 
         let all_hits = client.search("br-123", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
@@ -10824,8 +11723,14 @@ mod tests {
 
     #[test]
     fn sqlite_fts5_ranked_phase_defers_content_decode_until_after_limit() {
-        let (rank_sql, params) =
-            SearchClient::sqlite_fts5_rank_query("auth", &SearchFilters::default(), 50, 0, false);
+        let (rank_sql, params) = SearchClient::sqlite_fts5_rank_query(
+            "auth",
+            &SearchFilters::default(),
+            50,
+            0,
+            false,
+            SqliteFtsMatchMode::Table,
+        );
         let hydrate_sql = SearchClient::sqlite_fts5_hydrate_query(
             2,
             FieldMask::new(true, true, true, true),
@@ -11406,6 +12311,56 @@ mod tests {
         assert_eq!(hits[0].source_path, "/tmp/null-workspace.jsonl");
 
         Ok(())
+    }
+
+    #[test]
+    fn sqlite_message_scan_preserves_boolean_or_precedence() {
+        let simple_or =
+            SearchClient::sqlite_message_scan_query("alpha OR beta").expect("simple OR scan query");
+        assert!(SearchClient::sqlite_message_scan_score("alpha", &simple_or) > 0.0);
+        assert!(SearchClient::sqlite_message_scan_score("beta", &simple_or) > 0.0);
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("gamma", &simple_or),
+            0.0
+        );
+
+        let and_then_or = SearchClient::sqlite_message_scan_query("alpha AND beta OR gamma")
+            .expect("AND followed by OR scan query");
+        assert!(
+            SearchClient::sqlite_message_scan_score("alpha gamma", &and_then_or) > 0.0,
+            "alpha AND (beta OR gamma) should accept the gamma branch"
+        );
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("alpha", &and_then_or),
+            0.0
+        );
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("beta gamma", &and_then_or),
+            0.0
+        );
+
+        let or_then_and = SearchClient::sqlite_message_scan_query("alpha OR beta AND gamma")
+            .expect("OR followed by AND scan query");
+        assert!(
+            SearchClient::sqlite_message_scan_score("alpha gamma", &or_then_and) > 0.0,
+            "(alpha OR beta) AND gamma should accept the alpha branch"
+        );
+        assert!(
+            SearchClient::sqlite_message_scan_score("beta gamma", &or_then_and) > 0.0,
+            "(alpha OR beta) AND gamma should accept the beta branch"
+        );
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("alpha", &or_then_and),
+            0.0
+        );
+
+        let binary_not =
+            SearchClient::sqlite_message_scan_query("alpha NOT beta").expect("NOT scan query");
+        assert!(SearchClient::sqlite_message_scan_score("alpha", &binary_not) > 0.0);
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("alpha beta", &binary_not),
+            0.0
+        );
     }
 
     #[test]

@@ -5,9 +5,11 @@ use predicates::prelude::*;
 use predicates::str::contains;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::error::Error;
 use std::fs;
+use std::io::ErrorKind;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -40,23 +42,88 @@ where
 
 const SEARCH_DEMO_DATA_DIR: &str = "tests/fixtures/search_demo_data";
 
-fn isolated_search_demo_data() -> TempDir {
-    let tmp = TempDir::new().unwrap();
-    let src = Path::new(SEARCH_DEMO_DATA_DIR);
-    for entry in WalkDir::new(src) {
-        let entry = entry.unwrap();
-        let rel = entry.path().strip_prefix(src).unwrap();
-        let dst = tmp.path().join(rel);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&dst).unwrap();
-        } else {
-            if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent).unwrap();
+fn is_transient_lexical_build_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.starts_with("cass-lexical-shards."))
+    })
+}
+
+fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let mut dst = dst_root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => dst.push(part),
+            _ => {
+                return Err(Box::new(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "fixture path escaped source root",
+                )));
             }
-            fs::copy(entry.path(), &dst).unwrap();
         }
     }
-    tmp
+    Ok(dst)
+}
+
+fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let src = Path::new(SEARCH_DEMO_DATA_DIR);
+    for entry in WalkDir::new(src) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err)
+                if err
+                    .io_error()
+                    .is_some_and(|io| io.kind() == ErrorKind::NotFound)
+                    && err.path().is_some_and(is_transient_lexical_build_path) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(Box::new(err)),
+        };
+        let rel = entry.path().strip_prefix(src)?;
+        let dst = safe_fixture_destination(tmp.path(), rel)?;
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&dst)?;
+        } else {
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if let Err(err) = fs::copy(entry.path(), &dst) {
+                if err.kind() == ErrorKind::NotFound
+                    && is_transient_lexical_build_path(entry.path())
+                {
+                    continue;
+                }
+                return Err(Box::new(std::io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed to copy search demo fixture {} to {}: {err}",
+                        entry.path().display(),
+                        dst.display()
+                    ),
+                )));
+            }
+        }
+    }
+    Ok(tmp)
+}
+
+fn isolated_search_demo_data_for_current_workspace() -> Result<TempDir, Box<dyn Error>> {
+    use frankensqlite::compat::ConnectionExt;
+
+    let tmp = isolated_search_demo_data()?;
+    let current_workspace = std::env::current_dir()?.to_string_lossy().into_owned();
+    let db_path = tmp.path().join("agent_search.db");
+    let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned())?;
+    conn.execute_compat(
+        "UPDATE workspaces SET path = ?1 WHERE id = 1",
+        frankensqlite::params![current_workspace],
+    )?;
+    Ok(tmp)
 }
 
 fn decoded_cursor_offset(cursor: &str) -> u64 {
@@ -943,46 +1010,40 @@ fn html_export_aliases_route_to_export_html_command() {
 }
 
 #[test]
-fn current_session_aliases_route_to_sessions_current() {
+fn current_session_aliases_route_to_sessions_current() -> Result<(), Box<dyn Error>> {
+    let data_dir = isolated_search_demo_data_for_current_workspace()?;
+    let data_dir_arg = data_dir.path().to_string_lossy().into_owned();
+    let expected_workspace = std::env::current_dir()?.to_string_lossy().into_owned();
+
     for args in [
-        vec![
-            "current",
-            "--json",
-            "--data-dir",
-            "tests/fixtures/search_demo_data",
-        ],
+        vec!["current", "--json", "--data-dir", data_dir_arg.as_str()],
         vec![
             "current-session",
             "--json",
             "--data-dir",
-            "tests/fixtures/search_demo_data",
+            data_dir_arg.as_str(),
         ],
         vec![
             "current_session",
             "--json",
             "--data-dir",
-            "tests/fixtures/search_demo_data",
+            data_dir_arg.as_str(),
         ],
         vec![
             "sessions",
             "current",
             "--json",
             "--data-dir",
-            "tests/fixtures/search_demo_data",
+            data_dir_arg.as_str(),
         ],
         vec![
             "session",
             "current",
             "--json",
             "--data-dir",
-            "tests/fixtures/search_demo_data",
+            data_dir_arg.as_str(),
         ],
-        vec![
-            "--json",
-            "current",
-            "--data-dir",
-            "tests/fixtures/search_demo_data",
-        ],
+        vec!["--json", "current", "--data-dir", data_dir_arg.as_str()],
     ] {
         let mut cmd = base_cmd();
         cmd.args(args);
@@ -995,9 +1056,10 @@ fn current_session_aliases_route_to_sessions_current() {
         assert_eq!(sessions[0]["agent"].as_str(), Some("aider"));
         assert_eq!(
             sessions[0]["workspace"].as_str(),
-            Some("/data/projects/coding_agent_session_search")
+            Some(expected_workspace.as_str())
         );
     }
+    Ok(())
 }
 
 #[test]
@@ -1626,8 +1688,8 @@ fn introspect_repeatable_and_value_types() {
 }
 
 #[test]
-fn state_matches_status() {
-    let fixture = isolated_search_demo_data();
+fn state_matches_status() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
     let data_dir = fixture.path().to_str().unwrap();
     let mut status = base_cmd();
     status.args(["status", "--json", "--data-dir", data_dir]);
@@ -1648,11 +1710,13 @@ fn state_matches_status() {
         state_json["pending"]["sessions"]
     );
     assert_eq!(status_json["semantic"], state_json["semantic"]);
+    Ok(())
 }
 
 #[test]
-fn state_hides_empty_active_rebuild_pipeline_runtime_before_first_heartbeat() {
-    let fixture = isolated_search_demo_data();
+fn state_hides_empty_active_rebuild_pipeline_runtime_before_first_heartbeat()
+-> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
     let data_dir = fixture.path();
     let db_path = data_dir.join("agent_search.db");
     let _lock_file = hold_active_lexical_rebuild_lock(data_dir, &db_path, false, None);
@@ -1674,11 +1738,12 @@ fn state_hides_empty_active_rebuild_pipeline_runtime_before_first_heartbeat() {
     assert_eq!(json["index"]["rebuilding"], Value::Bool(true));
     assert_eq!(json["rebuild"]["active"], Value::Bool(true));
     assert_eq!(json["rebuild"]["pipeline"]["runtime"], Value::Null);
+    Ok(())
 }
 
 #[test]
-fn state_and_status_report_active_rebuild_pipeline_runtime() {
-    let fixture = isolated_search_demo_data();
+fn state_and_status_report_active_rebuild_pipeline_runtime() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
     let data_dir = fixture.path();
     let db_path = data_dir.join("agent_search.db");
     let expected_runtime = serde_json::json!({
@@ -1781,6 +1846,7 @@ fn state_and_status_report_active_rebuild_pipeline_runtime() {
         state_runtime["updated_at"].as_str(),
         Some("2024-11-30T20:55:24+00:00")
     );
+    Ok(())
 }
 
 #[test]
@@ -3026,8 +3092,8 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
 }
 
 #[test]
-fn search_cursor_manifest_marks_rebuilding_generation_best_effort() {
-    let data_dir = isolated_search_demo_data();
+fn search_cursor_manifest_marks_rebuilding_generation_best_effort() -> Result<(), Box<dyn Error>> {
+    let data_dir = isolated_search_demo_data()?;
     let db_path = data_dir.path().join("agent_search.db");
     let _lock = hold_active_lexical_rebuild_lock(data_dir.path(), &db_path, true, None);
 
@@ -3085,6 +3151,7 @@ fn search_cursor_manifest_marks_rebuilding_generation_best_effort() {
             .any(|card| card.get("decision").and_then(Value::as_str) == Some("rebuild_throttle")),
         "explanation cards should include rebuild throttle while rebuild is active"
     );
+    Ok(())
 }
 
 #[test]
@@ -3202,8 +3269,8 @@ fn search_robot_meta_reports_explicit_lexical_override() {
 }
 
 #[test]
-fn stats_json_reports_counts() {
-    let fixture = isolated_search_demo_data();
+fn stats_json_reports_counts() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
     let data_dir = fixture.path().to_str().unwrap();
     let mut cmd = base_cmd();
     cmd.args(["stats", "--json", "--data-dir", data_dir]);
@@ -3224,11 +3291,12 @@ fn stats_json_reports_counts() {
         json["by_agent"].is_array(),
         "stats should include per-agent breakdown"
     );
+    Ok(())
 }
 
 #[test]
-fn diag_json_reports_database_state() {
-    let fixture = isolated_search_demo_data();
+fn diag_json_reports_database_state() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
     let data_dir = fixture.path().to_str().unwrap();
     let mut cmd = base_cmd();
     cmd.args(["diag", "--json", "--data-dir", data_dir]);
@@ -3250,11 +3318,12 @@ fn diag_json_reports_database_state() {
         json["paths"]["data_dir"].is_string(),
         "diag should include data_dir path"
     );
+    Ok(())
 }
 
 #[test]
-fn status_json_reports_index_health() {
-    let fixture = isolated_search_demo_data();
+fn status_json_reports_index_health() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
     let data_dir = fixture.path().to_str().unwrap();
     let mut cmd = base_cmd();
     cmd.args(["status", "--json", "--data-dir", data_dir]);
@@ -3274,6 +3343,7 @@ fn status_json_reports_index_health() {
         json.get("recommended_action").is_some(),
         "status should include recommended_action field"
     );
+    Ok(())
 }
 
 #[test]
@@ -4071,9 +4141,9 @@ fn max_content_length_works_with_fields() {
 // ============================================================
 
 #[test]
-fn status_json_returns_health_info() {
+fn status_json_returns_health_info() -> Result<(), Box<dyn Error>> {
     // rob.state.status: status command should return health information as JSON
-    let fixture = isolated_search_demo_data();
+    let fixture = isolated_search_demo_data()?;
     let data_dir = fixture.path().to_str().unwrap();
     let mut cmd = base_cmd();
     cmd.args(["status", "--json", "--data-dir", data_dir]);
@@ -4104,12 +4174,13 @@ fn status_json_returns_health_info() {
         json["database"]["messages"].as_i64().unwrap() > 0,
         "Should have messages"
     );
+    Ok(())
 }
 
 #[test]
-fn status_json_reports_stale_threshold() {
+fn status_json_reports_stale_threshold() -> Result<(), Box<dyn Error>> {
     // rob.state.status: status should include stale threshold info
-    let fixture = isolated_search_demo_data();
+    let fixture = isolated_search_demo_data()?;
     let data_dir = fixture.path().to_str().unwrap();
     let mut cmd = base_cmd();
     cmd.args([
@@ -4132,6 +4203,7 @@ fn status_json_reports_stale_threshold() {
         Value::Number(60.into()),
         "Stale threshold should match argument"
     );
+    Ok(())
 }
 
 #[test]
@@ -4205,7 +4277,10 @@ fn status_missing_db_reports_not_initialized() {
 #[test]
 fn status_empty_index_dir_without_meta_still_reports_not_initialized() {
     let tmp = TempDir::new().unwrap();
-    fs::create_dir_all(tmp.path().join("index").join("v7")).unwrap();
+    fs::create_dir_all(coding_agent_search::search::tantivy::expected_index_dir(
+        tmp.path(),
+    ))
+    .unwrap();
 
     let mut cmd = base_cmd();
     cmd.args([
@@ -4636,9 +4711,9 @@ fn health_json_reports_open_error_for_unopenable_db_path() {
 }
 
 #[test]
-fn status_human_readable_output() {
+fn status_human_readable_output() -> Result<(), Box<dyn Error>> {
     // rob.state.status: status without --json should produce human-readable output
-    let fixture = isolated_search_demo_data();
+    let fixture = isolated_search_demo_data()?;
     let data_dir = fixture.path().to_str().unwrap();
     let mut cmd = base_cmd();
     cmd.args(["status", "--data-dir", data_dir]);
@@ -4655,6 +4730,7 @@ fn status_human_readable_output() {
         stdout.contains("Conversations"),
         "Should show conversation count"
     );
+    Ok(())
 }
 
 // ============================================================
@@ -5212,14 +5288,15 @@ fn subcommand_alias_query_to_search() {
 
 /// Subcommand alias: ls → stats
 #[test]
-fn subcommand_alias_ls_to_stats() {
-    let fixture = isolated_search_demo_data();
+fn subcommand_alias_ls_to_stats() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
     let data_dir = fixture.path().to_str().unwrap();
     let mut cmd = base_cmd();
     cmd.args(["ls", "--json", "--data-dir", data_dir]);
     // 'ls' should be normalized to 'stats'
     let assert = cmd.assert();
     assert.code(predicate::in_iter(vec![0, 1, 2, 3]));
+    Ok(())
 }
 
 /// Subcommand alias: docs → robot-docs
@@ -6053,12 +6130,13 @@ fn exit_code_0_success_search() {
 
 /// Exit code 0: Success for valid stats
 #[test]
-fn exit_code_0_success_stats() {
-    let fixture = isolated_search_demo_data();
+fn exit_code_0_success_stats() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
     let data_dir = fixture.path().to_str().unwrap();
     let mut cmd = base_cmd();
     cmd.args(["stats", "--json", "--data-dir", data_dir]);
     cmd.assert().code(0);
+    Ok(())
 }
 
 /// Exit code 0: Success for robot-docs

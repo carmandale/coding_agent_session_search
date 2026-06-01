@@ -188,21 +188,55 @@ fn apply_default_tantivy_writer_thread_cap() {
     }
 }
 
+/// Bound the frankensqlite per-cursor `read_witnesses` Vec so a long B-tree
+/// descent against a multi-GB index cannot balloon RSS into the multi-GB range.
+///
+/// The frankensqlite default is `0` ("unbounded") to preserve historical SSI
+/// provenance semantics. cass is a read-mostly analytical workload that does
+/// not need the per-cursor witness cache — the canonical SSI evidence still
+/// flows into the pager regardless of this cap, so the cap is safe to apply
+/// here without weakening isolation.
+///
+/// Issue #252 reproduced this regression on v0.5.1: `SELECT COUNT(*)` over a
+/// 3.3 GB index allocated ~5.5 GB RSS because the cursor's `read_witnesses`
+/// vec grew one entry per page touched. Capping at 16384 keeps the cursor
+/// cache well under a few MB while leaving the SSI source of truth intact.
+///
+/// Operators who need full per-cursor provenance can override by exporting
+/// `FSQLITE_READ_WITNESS_CAP=0` (or any value) before launching cass.
+fn apply_default_fsqlite_read_witness_cap() {
+    // The env var is parsed once by frankensqlite at first cursor construction
+    // and cached in a process-wide OnceLock, so a later `set_var` after a
+    // cursor opens would have no effect. We must set it here, in main, before
+    // any code path that touches the SQL store. Use `var_os` so we don't
+    // accidentally clobber an explicit operator override (including the empty
+    // string, which is meaningful to operators who want frankensqlite to
+    // observe and reject the value rather than fall back to our default).
+    if std::env::var_os("FSQLITE_READ_WITNESS_CAP").is_none() {
+        // SAFETY: set_var is sound at single-threaded program startup, which
+        // is exactly where this runs (main, before any runtime is built).
+        unsafe {
+            std::env::set_var("FSQLITE_READ_WITNESS_CAP", "16384");
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
-    // Check for AVX support before anything else. ONNX Runtime requires AVX
-    // instructions and will crash with SIGILL on CPUs that lack them.
-    #[cfg(target_arch = "x86_64")]
+    // Check for AVX2 support before anything else. The prebuilt ONNX Runtime
+    // binary linked by semantic builds can execute AVX2 instructions during
+    // startup on x86_64, which crashes pre-AVX2 hosts with SIGILL/STATUS_ILLEGAL_INSTRUCTION.
+    #[cfg(all(target_arch = "x86_64", feature = "semantic"))]
     {
-        if !std::arch::is_x86_feature_detected!("avx") {
+        if !std::arch::is_x86_feature_detected!("avx2") {
             eprintln!(
-                "Error: Your CPU does not support AVX instructions, which are required by cass.\n\
+                "Error: Your CPU does not support AVX2 instructions, which are required by this semantic-enabled cass build.\n\
                  \n\
-                 The ONNX Runtime dependency used for semantic search requires AVX support.\n\
-                 AVX is available on most x86_64 CPUs manufactured from ~2011 onwards\n\
-                 (Intel Sandy Bridge / AMD Bulldozer and later).\n\
+                 The ONNX Runtime dependency used for semantic search is not safe on pre-AVX2 x86_64 CPUs.\n\
+                 For Sandy Bridge, Ivy Bridge, AMD FX/Phenom/Athlon, or other pre-AVX2 hosts,\n\
+                 install the matching cass -baseline artifact instead.\n\
                  \n\
-                 Without AVX, the process would crash with a SIGILL (illegal instruction) signal.\n\
-                 Please run cass on a machine with a newer CPU that supports AVX."
+                 Without AVX2, the process would crash with a SIGILL (illegal instruction) signal.\n\
+                 Please run this build on a machine with AVX2, or use the baseline artifact."
             );
             std::process::exit(1);
         }
@@ -210,7 +244,12 @@ fn main() -> anyhow::Result<()> {
 
     // Load .env early; ignore if missing.
     dotenvy::dotenv().ok();
-    apply_default_tantivy_writer_thread_cap();
+
+    // Apply cass-tuned defaults before any code path constructs a frankensqlite
+    // cursor (which caches the FSQLITE_READ_WITNESS_CAP value once and ignores
+    // later mutations). The Health fast path below may open the SQL store, so
+    // this must run before try_run_with_parsed_fast.
+    apply_default_fsqlite_read_witness_cap();
 
     let raw_args: Vec<String> = std::env::args().collect();
     let parsed = match coding_agent_search::parse_cli(raw_args) {
@@ -218,9 +257,24 @@ fn main() -> anyhow::Result<()> {
         Err(err) => handle_fatal_error(err),
     };
 
+    let parsed = match coding_agent_search::try_run_with_parsed_fast(parsed) {
+        Ok(result) => {
+            return match result {
+                Ok(()) => Ok(()),
+                Err(err) => handle_fatal_error(err),
+            };
+        }
+        Err(parsed) => *parsed,
+    };
+
+    apply_default_tantivy_writer_thread_cap();
+
     let use_current_thread = matches!(
         parsed.cli.command,
-        Some(coding_agent_search::Commands::Search { .. })
+        Some(
+            coding_agent_search::Commands::Search { .. }
+                | coding_agent_search::Commands::Health { .. }
+        )
     );
     let runtime = if use_current_thread {
         asupersync::runtime::RuntimeBuilder::current_thread().build()?

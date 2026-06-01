@@ -7,6 +7,7 @@ pub mod connectors;
 pub mod crash_replay;
 #[cfg(unix)]
 pub mod daemon;
+pub mod dependency_drift;
 pub mod doctor;
 pub(crate) mod doctor_chokepoint;
 pub(crate) mod doctor_robot_docs;
@@ -1271,7 +1272,7 @@ pub enum Commands {
     /// Manage semantic search models
     #[command(subcommand)]
     Models(ModelsCommand),
-    /// Read-only swarm operations status
+    /// Read-only swarm operations status, work packets, and coordination lint
     #[command(subcommand)]
     Swarm(SwarmCommand),
     /// Import data from external sources
@@ -1370,6 +1371,50 @@ pub enum SwarmCommand {
         #[arg(long, default_value = "healthy")]
         fixture_id: String,
     },
+    /// Build a read-only advisory work packet for one ready bead.
+    WorkPacket {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Read provider input from a single swarm fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+
+        /// Read provider input from a swarm fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+
+        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
+        #[arg(long, default_value = "healthy")]
+        fixture_id: String,
+
+        /// Build the packet for a specific bead id instead of the first ready bead.
+        #[arg(long)]
+        bead: Option<String>,
+    },
+    /// Lint coordination hygiene without mutating Agent Mail, Beads, git, or reservations.
+    Lint {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Read provider input from a single swarm fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+
+        /// Read provider input from a swarm fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+
+        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
+        #[arg(long, default_value = "healthy")]
+        fixture_id: String,
+
+        /// Restrict findings to a specific bead id.
+        #[arg(long)]
+        bead: Option<String>,
+    },
     /// Assemble verification evidence for recent commits or a named bead.
     Evidence {
         /// Output as JSON (`--robot` also works)
@@ -1391,6 +1436,68 @@ pub enum SwarmCommand {
         /// Restrict the evidence ledger to a specific bead id.
         #[arg(long)]
         bead: Option<String>,
+    },
+    /// Summarize proof debt and read-only remediation suggestions.
+    ProofDebt {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Read provider input from a single swarm fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+
+        /// Read provider input from a swarm fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+
+        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
+        #[arg(long, default_value = "healthy")]
+        fixture_id: String,
+
+        /// Restrict the proof-debt ledger to a specific bead id.
+        #[arg(long)]
+        bead: Option<String>,
+    },
+    /// Mine recurring failure patterns and regression-test suggestions.
+    FailurePatterns {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Read provider input from a single swarm fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+
+        /// Read provider input from a swarm fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+
+        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
+        #[arg(long, default_value = "healthy")]
+        fixture_id: String,
+
+        /// Restrict suggestions to a specific bead id.
+        #[arg(long)]
+        bead: Option<String>,
+    },
+    /// Detect pinned sibling dependency drift without mutating git or running builds.
+    DependencyDrift {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Read provider input from a single swarm fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+
+        /// Read provider input from a swarm fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+
+        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
+        #[arg(long, default_value = "healthy")]
+        fixture_id: String,
     },
 }
 
@@ -1698,7 +1805,7 @@ pub enum MappingsAction {
     /// List path mappings for a source
     List {
         /// Source name
-        source: String,
+        source: Option<String>,
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -5499,6 +5606,89 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
     result
 }
 
+/// Run startup-sensitive commands before constructing the async runtime.
+///
+/// `cass health --json` is documented as a <50ms fast-readiness surface. Even
+/// the current-thread runtime setup is visible in subprocess latency tests, so
+/// keep this command on a synchronous path and leave the general async runner
+/// for commands that actually need it.
+pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<ParsedCli>> {
+    let ParsedCli {
+        cli,
+        raw_args,
+        parse_note,
+        heuristic_note,
+    } = parsed;
+
+    let Some(Commands::Health {
+        data_dir,
+        robot_meta,
+        stale_threshold,
+        json,
+    }) = cli.command.clone()
+    else {
+        return Err(Box::new(ParsedCli {
+            cli,
+            raw_args,
+            parse_note,
+            heuristic_note,
+        }));
+    };
+
+    let stdout_is_tty = io::stdout().is_terminal();
+    let stderr_is_tty = io::stderr().is_terminal();
+    configure_color(cli.color, stdout_is_tty, stderr_is_tty);
+
+    let start_ts = Utc::now();
+    let start_instant = Instant::now();
+    let command_label = describe_command(&cli);
+
+    let is_robot_mode = raw_args
+        .iter()
+        .any(|s| matches!(s.as_str(), "--json" | "--robot" | "-json" | "-robot"))
+        || cli.robot_format.is_some()
+        || robot_format_from_env().is_some();
+    let all_notes: Vec<&str> = [parse_note.as_deref(), heuristic_note.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    if !all_notes.is_empty() && !is_robot_mode {
+        eprintln!("Note: Your command was auto-corrected:");
+        for note in &all_notes {
+            eprintln!("  • {note}");
+        }
+        eprintln!("Tip: Run 'cass --help' for proper syntax.");
+    }
+
+    let structured_format = resolve_subcommand_structured_format(&cli, json);
+    let result = run_health(
+        &data_dir,
+        cli.db.clone(),
+        structured_format,
+        stale_threshold,
+        robot_meta,
+    );
+
+    if let Some(path) = &cli.trace_file {
+        let duration_ms = start_instant.elapsed().as_millis();
+        let exit_code = result.as_ref().map_or_else(|e| e.code, |()| 0);
+        if let Err(trace_err) = write_trace_line(
+            path,
+            &command_label,
+            &cli,
+            &start_ts,
+            duration_ms,
+            exit_code,
+            result.as_ref().err(),
+        ) {
+            eprintln!("trace-write error: {trace_err}");
+        }
+    }
+
+    Ok(result)
+}
+
 async fn execute_cli(
     cli: &Cli,
     wrap: WrapConfig,
@@ -5766,8 +5956,6 @@ async fn execute_cli(
         | Commands::Triage { .. }
         | Commands::View { .. }
         | Commands::Pages { .. }
-        | Commands::Mirror(..)
-        | Commands::Import(..)
         | Commands::Analytics(..) => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
@@ -7336,6 +7524,34 @@ fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
             fixture_dir.as_deref(),
             &fixture_id,
         ),
+        SwarmCommand::WorkPacket {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+            bead,
+        } => run_swarm_work_packet(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+            bead.as_deref(),
+        ),
+        SwarmCommand::Lint {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+            bead,
+        } => run_swarm_lint(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+            bead.as_deref(),
+        ),
         SwarmCommand::Evidence {
             json,
             fixture,
@@ -7349,6 +7565,46 @@ fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
             fixture_dir.as_deref(),
             &fixture_id,
             bead.as_deref(),
+        ),
+        SwarmCommand::ProofDebt {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+            bead,
+        } => run_swarm_proof_debt(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+            bead.as_deref(),
+        ),
+        SwarmCommand::FailurePatterns {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+            bead,
+        } => run_swarm_failure_patterns(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+            bead.as_deref(),
+        ),
+        SwarmCommand::DependencyDrift {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+        } => run_swarm_dependency_drift(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
         ),
     }
 }
@@ -7401,6 +7657,120 @@ fn run_swarm_status(
             .and_then(serde_json::Value::as_str)
         {
             println!("Recommended action: {action}");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_swarm_work_packet(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+    bead: Option<&str>,
+) -> CliResult<()> {
+    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
+    {
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
+            |err| CliError {
+                code: 10,
+                kind: CliErrorKind::Config.kind_str(),
+                message: err.to_string(),
+                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
+                retryable: false,
+            },
+        )?;
+        let privacy_probe = swarm_fixture_privacy_probe(&path)?;
+        let collection = set.collect_required();
+        render_swarm_work_packet_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
+    } else {
+        render_swarm_work_packet_live_partial(bead)
+    };
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!(
+            "Swarm work packet: {}",
+            payload
+                .get("summary")
+                .and_then(|summary| summary.get("recommended_action"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        if let Some(bead_id) = payload
+            .get("summary")
+            .and_then(|summary| summary.get("bead_id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            println!("Bead: {bead_id}");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_swarm_lint(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+    bead: Option<&str>,
+) -> CliResult<()> {
+    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
+    {
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
+            |err| CliError {
+                code: 10,
+                kind: CliErrorKind::Config.kind_str(),
+                message: err.to_string(),
+                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
+                retryable: false,
+            },
+        )?;
+        let privacy_probe = swarm_fixture_privacy_probe(&path)?;
+        let collection = set.collect_required();
+        render_swarm_lint_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
+    } else {
+        render_swarm_lint_live_partial(bead)
+    };
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!(
+            "Swarm coordination lint: {}",
+            payload
+                .get("summary")
+                .and_then(|summary| summary.get("recommended_action"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        if let Some(count) = payload
+            .get("summary")
+            .and_then(|summary| summary.get("finding_count"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("Findings: {count}");
         }
     }
 
@@ -7463,6 +7833,182 @@ fn run_swarm_evidence(
     Ok(())
 }
 
+fn run_swarm_proof_debt(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+    bead: Option<&str>,
+) -> CliResult<()> {
+    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
+    {
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
+            |err| CliError {
+                code: 10,
+                kind: CliErrorKind::Config.kind_str(),
+                message: err.to_string(),
+                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
+                retryable: false,
+            },
+        )?;
+        let privacy_probe = swarm_fixture_privacy_probe(&path)?;
+        let collection = set.collect_required();
+        render_swarm_proof_debt_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
+    } else {
+        render_swarm_proof_debt_live_partial(bead)
+    };
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!(
+            "Swarm proof debt: {}",
+            payload
+                .get("summary")
+                .and_then(|summary| summary.get("recommended_action"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        if let Some(count) = payload
+            .get("summary")
+            .and_then(|summary| summary.get("debt_count"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("Debt items: {count}");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_swarm_failure_patterns(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+    bead: Option<&str>,
+) -> CliResult<()> {
+    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
+    {
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
+            |err| CliError {
+                code: 10,
+                kind: CliErrorKind::Config.kind_str(),
+                message: err.to_string(),
+                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
+                retryable: false,
+            },
+        )?;
+        let privacy_probe = swarm_fixture_privacy_probe(&path)?;
+        let collection = set.collect_required();
+        render_swarm_failure_patterns_fixture(
+            set.input(),
+            &collection,
+            privacy_probe.as_ref(),
+            bead,
+        )
+    } else {
+        render_swarm_failure_patterns_live_partial(bead)
+    };
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!(
+            "Swarm failure patterns: {}",
+            payload
+                .get("summary")
+                .and_then(|summary| summary.get("recommended_action"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        if let Some(count) = payload
+            .get("summary")
+            .and_then(|summary| summary.get("pattern_count"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("Patterns: {count}");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_swarm_dependency_drift(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+) -> CliResult<()> {
+    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
+    {
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
+            |err| CliError {
+                code: 10,
+                kind: CliErrorKind::Config.kind_str(),
+                message: err.to_string(),
+                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
+                retryable: false,
+            },
+        )?;
+        let source = set
+            .input()
+            .source_value(crate::swarm_status::SwarmProviderName::DependencyDrift);
+        crate::dependency_drift::render_dependency_drift_fixture(set.input().fixture_id(), source)
+    } else {
+        crate::dependency_drift::render_dependency_drift_live()
+    };
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!(
+            "Swarm dependency drift: {}",
+            payload
+                .get("summary")
+                .and_then(|summary| summary.get("recommended_action"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        if let Some(count) = payload
+            .get("summary")
+            .and_then(|summary| summary.get("warning_count"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("Warnings: {count}");
+        }
+    }
+
+    Ok(())
+}
+
 fn resolve_swarm_fixture_path(
     fixture: Option<&Path>,
     fixture_dir: Option<&Path>,
@@ -7512,7 +8058,12 @@ fn swarm_fixture_privacy_probe(path: &Path) -> CliResult<Option<serde_json::Valu
         .cloned())
 }
 
-fn render_swarm_status_live_partial() -> serde_json::Value {
+/// Produce a swarm-status payload reflecting the current "no live providers
+/// are wired yet" reality. Pure-function, allocation-only — no I/O — so it
+/// is safe to call from the TUI surface-entry path. Used by the TUI's
+/// `CassMsg::SwarmEntered` handler to seed the cockpit on first entry
+/// when no cached snapshot has been supplied yet.
+pub fn render_swarm_status_live_partial() -> serde_json::Value {
     use crate::swarm_status::{
         REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
     };
@@ -7553,6 +8104,67 @@ fn render_swarm_status_fixture(
         input.description().unwrap_or("swarm status fixture"),
         collection,
         privacy_probe,
+        false,
+    )
+}
+
+fn render_swarm_work_packet_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
+    let status = render_swarm_status_live_partial();
+    render_swarm_work_packet_from_status(&status, bead_filter)
+}
+
+fn render_swarm_work_packet_fixture(
+    input: &crate::swarm_status::SwarmFixtureInput,
+    collection: &crate::swarm_status::SwarmSourceCollection,
+    privacy_probe: Option<&serde_json::Value>,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    let status = render_swarm_status_payload(
+        input.fixture_id(),
+        input.description().unwrap_or("swarm work-packet fixture"),
+        collection,
+        privacy_probe,
+        false,
+    );
+    render_swarm_work_packet_from_status(&status, bead_filter)
+}
+
+fn render_swarm_lint_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
+    use crate::swarm_status::{REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection};
+
+    let collection = SwarmSourceCollection {
+        snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
+            .iter()
+            .copied()
+            .map(swarm_lint_live_unavailable_snapshot)
+            .collect(),
+    };
+
+    render_swarm_lint_payload("live", &collection, None, bead_filter, true)
+}
+
+fn swarm_lint_live_unavailable_snapshot(
+    provider: crate::swarm_status::SwarmProviderName,
+) -> crate::swarm_status::SwarmSourceSnapshot {
+    crate::swarm_status::SwarmSourceSnapshot::unavailable(
+        provider,
+        format!("live:{}", provider.fixture_key()),
+        "live-provider-unimplemented",
+        format!("live provider {provider} is not wired yet; fixture-backed lint is available"),
+    )
+}
+
+fn render_swarm_lint_fixture(
+    input: &crate::swarm_status::SwarmFixtureInput,
+    collection: &crate::swarm_status::SwarmSourceCollection,
+    privacy_probe: Option<&serde_json::Value>,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    render_swarm_lint_payload(
+        input.fixture_id(),
+        collection,
+        privacy_probe,
+        bead_filter,
         false,
     )
 }
@@ -7603,6 +8215,634 @@ fn render_swarm_evidence_fixture(
         bead_filter,
         false,
     )
+}
+
+fn render_swarm_proof_debt_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
+    render_swarm_proof_debt_from_evidence(render_swarm_evidence_live_partial(bead_filter))
+}
+
+fn render_swarm_proof_debt_fixture(
+    input: &crate::swarm_status::SwarmFixtureInput,
+    collection: &crate::swarm_status::SwarmSourceCollection,
+    privacy_probe: Option<&serde_json::Value>,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    let evidence = render_swarm_evidence_payload(
+        input.fixture_id(),
+        input.description().unwrap_or("swarm proof-debt fixture"),
+        collection,
+        privacy_probe,
+        bead_filter,
+        false,
+    );
+    render_swarm_proof_debt_from_evidence(evidence)
+}
+
+fn render_swarm_failure_patterns_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
+    let evidence = render_swarm_evidence_live_partial(bead_filter);
+    render_swarm_failure_patterns_from_evidence(evidence, Vec::new())
+}
+
+fn render_swarm_failure_patterns_fixture(
+    input: &crate::swarm_status::SwarmFixtureInput,
+    collection: &crate::swarm_status::SwarmSourceCollection,
+    privacy_probe: Option<&serde_json::Value>,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    use crate::swarm_status::SwarmProviderName;
+
+    let evidence = render_swarm_evidence_payload(
+        input.fixture_id(),
+        input
+            .description()
+            .unwrap_or("swarm failure-pattern fixture"),
+        collection,
+        privacy_probe,
+        bead_filter,
+        false,
+    );
+    let evidence_source = swarm_provider_payload(collection, SwarmProviderName::Evidence);
+    let session_hits = swarm_failure_pattern_session_hits(&evidence_source, bead_filter);
+    render_swarm_failure_patterns_from_evidence(evidence, session_hits)
+}
+
+fn render_swarm_lint_payload(
+    fixture_id: &str,
+    collection: &crate::swarm_status::SwarmSourceCollection,
+    privacy_probe: Option<&serde_json::Value>,
+    bead_filter: Option<&str>,
+    live_partial: bool,
+) -> serde_json::Value {
+    use crate::swarm_status::SwarmProviderName;
+
+    let agent_mail = swarm_provider_payload(collection, SwarmProviderName::AgentMail);
+    let beads = swarm_provider_payload(collection, SwarmProviderName::Beads);
+    let evidence_source = swarm_provider_payload(collection, SwarmProviderName::Evidence);
+    let git = swarm_provider_payload(collection, SwarmProviderName::Git);
+    let messages = swarm_json_array(&agent_mail, "messages");
+    let evidence = swarm_evidence(&messages, privacy_probe, &evidence_source);
+    let partial = collection.partial() || live_partial;
+    let findings = swarm_lint_findings(&beads, &agent_mail, &git, &evidence, bead_filter, partial);
+    let error_count = swarm_lint_severity_count(&findings, "error");
+    let warning_count = swarm_lint_severity_count(&findings, "warning");
+    let info_count = swarm_lint_severity_count(&findings, "info");
+    let live_fixture = fixture_id.eq("live");
+    let busy_fixture = fixture_id.eq("busy");
+
+    serde_json::json!({
+        "schema_version": "cass.swarm.coordination_lint.v1",
+        "status": if collection.partial() { "partial" } else { "ok" },
+        "_meta": {
+            "request_id": if live_fixture {
+                "live:coordination-lint".to_string()
+            } else {
+                format!("fixture-{fixture_id}:coordination-lint")
+            },
+            "generated_at_ms": 0,
+            "elapsed_ms": if busy_fixture { 2 } else { 1 },
+            "repo": if live_fixture { "[LIVE_REPO]" } else { "[FIXTURE_REPO]" },
+            "project_key": if live_fixture { "[LIVE_REPO]" } else { "[FIXTURE_REPO]" },
+            "hostname": if live_fixture { "live-host" } else { "fixture-host" },
+            "partial": partial,
+            "warnings": swarm_meta_warnings(collection, fixture_id),
+        },
+        "providers": swarm_provider_statuses(collection),
+        "filter": {
+            "bead_id": bead_filter,
+        },
+        "summary": {
+            "finding_count": findings.len(),
+            "error_count": error_count,
+            "warning_count": warning_count,
+            "info_count": info_count,
+            "mutation_performed": false,
+            "recommended_action": swarm_lint_recommended_action(partial, error_count, warning_count, info_count),
+        },
+        "findings": findings,
+        "mutation_contract": {
+            "read_only": true,
+            "agent_mail_mutations": false,
+            "bead_mutations": false,
+            "reservation_mutations": false,
+            "git_mutations": false,
+            "safe_next_actions_are_suggestions": true,
+        },
+        "privacy": {
+            "raw_session_content_included": false,
+            "mail_body_snippets_included": false,
+            "redaction_policy": crate::pages::redact::SWARM_REDACTION_POLICY,
+            "redaction_applied": evidence
+                .get("redaction_applied")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        },
+    })
+}
+
+fn swarm_lint_findings(
+    beads: &serde_json::Value,
+    agent_mail: &serde_json::Value,
+    git: &serde_json::Value,
+    evidence: &serde_json::Value,
+    bead_filter: Option<&str>,
+    partial: bool,
+) -> Vec<serde_json::Value> {
+    let messages = swarm_json_array(agent_mail, "messages");
+    let reservations = swarm_json_array(agent_mail, "reservations");
+    let agents = swarm_json_array(agent_mail, "agents");
+    let mut findings = Vec::new();
+
+    if partial || agent_mail.is_null() {
+        findings.push(swarm_lint_finding(
+            "agent-mail-unavailable",
+            "warning",
+            "provider",
+            "agent_mail",
+            &["providers.agent_mail"],
+            "inspect-unavailable-providers",
+            "Agent Mail data is unavailable; takeover and closeout checks are advisory-only.",
+        ));
+    }
+
+    for message in messages
+        .iter()
+        .filter(|message| swarm_evidence_matches_bead(message, bead_filter))
+    {
+        if swarm_lint_message_ack_required(message) && !swarm_lint_message_acknowledged(message) {
+            let mut finding = swarm_lint_finding(
+                "unacked-required-mail",
+                "error",
+                "message",
+                &swarm_lint_message_id(message),
+                &["agent_mail.messages"],
+                "acknowledge-message-before-editing",
+                "Message requires acknowledgement and no acknowledgement evidence was found.",
+            );
+            swarm_lint_attach_snippet(&mut finding, swarm_lint_message_snippet(message));
+            findings.push(finding);
+        }
+        if let Some(snippet) = swarm_lint_unsafe_takeover_snippet(message) {
+            let mut finding = swarm_lint_finding(
+                "unsafe-takeover-language",
+                "warning",
+                "message",
+                &swarm_lint_message_id(message),
+                &["agent_mail.messages"],
+                "coordinate-with-holder-before-force-release-or-reopen",
+                "Coordination text suggests takeover or force-release before a manual review step.",
+            );
+            swarm_lint_attach_snippet(&mut finding, Some(snippet));
+            findings.push(finding);
+        }
+    }
+
+    let bead_status = swarm_lint_bead_status_map(beads);
+    swarm_lint_push_bead_findings(beads, &messages, evidence, bead_filter, &mut findings);
+    swarm_lint_push_reservation_findings(
+        &reservations,
+        &agents,
+        &bead_status,
+        bead_filter,
+        &mut findings,
+    );
+    swarm_lint_push_git_findings(git, bead_filter, &mut findings);
+
+    findings.sort_by(|left, right| {
+        swarm_lint_finding_sort_key(left).cmp(&swarm_lint_finding_sort_key(right))
+    });
+    findings
+}
+
+fn swarm_lint_push_bead_findings(
+    beads: &serde_json::Value,
+    messages: &[serde_json::Value],
+    evidence: &serde_json::Value,
+    bead_filter: Option<&str>,
+    findings: &mut Vec<serde_json::Value>,
+) {
+    let categories = [
+        ("ready", "open"),
+        ("in_progress", "in_progress"),
+        ("blocked", "blocked"),
+        ("closed", "closed"),
+    ];
+
+    for (category, expected_status) in categories {
+        for bead in swarm_json_array(beads, category)
+            .iter()
+            .filter(|bead| swarm_evidence_matches_bead(bead, bead_filter))
+        {
+            let Some(bead_id) = bead.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if let Some(status) = bead.get("status").and_then(serde_json::Value::as_str)
+                && !status.eq(expected_status)
+            {
+                findings.push(swarm_lint_finding(
+                    "bead-status-mismatch",
+                    "warning",
+                    "bead",
+                    bead_id,
+                    &[swarm_lint_bead_bucket_ref(category)],
+                    "refresh-beads-before-claim-or-closeout",
+                    "Bead appears in one status bucket while carrying a different status value.",
+                ));
+            }
+
+            match category {
+                "in_progress" if !swarm_lint_has_mail_thread(bead_id, messages, evidence) => {
+                    findings.push(swarm_lint_finding(
+                        "missing-start-mail",
+                        "warning",
+                        "bead",
+                        bead_id,
+                        &["beads.in_progress", "agent_mail.messages"],
+                        "send-agent-mail-intro-before-editing",
+                        "In-progress bead has no matching Agent Mail thread.",
+                    ));
+                }
+                "closed" => {
+                    if !swarm_lint_has_mail_thread(bead_id, messages, evidence) {
+                        findings.push(swarm_lint_finding(
+                            "missing-closeout-mail",
+                            "error",
+                            "bead",
+                            bead_id,
+                            &["beads.closed", "agent_mail.messages"],
+                            "send-closeout-mail-with-proof-summary",
+                            "Closed bead has no matching Agent Mail closeout thread.",
+                        ));
+                    }
+                    if bead
+                        .get("close_reason")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|reason| reason.trim().is_empty())
+                    {
+                        findings.push(swarm_lint_finding(
+                            "missing-close-reason",
+                            "error",
+                            "bead",
+                            bead_id,
+                            &["beads.closed"],
+                            "record-close-reason-with-proof-summary",
+                            "Closed bead has no close reason.",
+                        ));
+                    }
+                    if !swarm_lint_has_proof(bead_id, evidence) {
+                        findings.push(swarm_lint_finding(
+                            "missing-proof-reference",
+                            "error",
+                            "bead",
+                            bead_id,
+                            &["beads.closed", "evidence.recent_proofs"],
+                            "attach-rch-proof-before-or-during-closeout",
+                            "Closed bead has no linked proof artifact.",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn swarm_lint_bead_bucket_ref(category: &str) -> &'static str {
+    match category {
+        "ready" => "beads.ready",
+        "in_progress" => "beads.in_progress",
+        "blocked" => "beads.blocked",
+        "closed" => "beads.closed",
+        _ => "beads",
+    }
+}
+
+fn swarm_lint_push_reservation_findings(
+    reservations: &[serde_json::Value],
+    agents: &[serde_json::Value],
+    bead_status: &BTreeMap<String, String>,
+    bead_filter: Option<&str>,
+    findings: &mut Vec<serde_json::Value>,
+) {
+    let active_agents = swarm_lint_active_agent_map(agents);
+    for reservation in reservations
+        .iter()
+        .filter(|reservation| swarm_evidence_matches_bead(reservation, bead_filter))
+    {
+        let reason = reservation
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("[unknown-bead]");
+        let holder = reservation
+            .get("holder")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("[unknown-holder]");
+
+        if !swarm_reservation_active(reservation) {
+            findings.push(swarm_lint_finding(
+                "stale-reservation",
+                "warning",
+                "reservation",
+                reason,
+                &["agent_mail.reservations"],
+                "renew-or-release-reservation-after-coordination",
+                "Reservation has expired and should be reviewed before new work starts.",
+            ));
+        }
+
+        if swarm_reservation_active(reservation)
+            && matches!(active_agents.get(holder).copied(), Some(false))
+        {
+            findings.push(swarm_lint_finding(
+                "dead-agent-stale-reservation",
+                "warning",
+                "reservation",
+                reason,
+                &["agent_mail.reservations", "agent_mail.agents"],
+                "coordinate-before-force-release",
+                "Active reservation is held by an inactive agent.",
+            ));
+        }
+
+        match bead_status.get(reason).map(String::as_str) {
+            Some("closed") if swarm_reservation_active(reservation) => {
+                findings.push(swarm_lint_finding(
+                    "reservation-on-closed-bead",
+                    "warning",
+                    "reservation",
+                    reason,
+                    &["agent_mail.reservations", "beads.closed"],
+                    "release-reservation-after-closeout",
+                    "Active reservation is still attached to a closed bead.",
+                ))
+            }
+            None => findings.push(swarm_lint_finding(
+                "reservation-without-known-bead",
+                "info",
+                "reservation",
+                reason,
+                &["agent_mail.reservations", "beads"],
+                "inspect-reservation-reason-before-reuse",
+                "Reservation reason does not match any known bead in this snapshot.",
+            )),
+            _ => {}
+        }
+    }
+}
+
+fn swarm_lint_push_git_findings(
+    git: &serde_json::Value,
+    bead_filter: Option<&str>,
+    findings: &mut Vec<serde_json::Value>,
+) {
+    if bead_filter.is_some()
+        || !git
+            .get("dirty")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        return;
+    }
+
+    let dirty_count = git
+        .get("dirty_paths")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    findings.push(swarm_lint_finding(
+        "dirty-peer-files",
+        "warning",
+        "git",
+        "worktree",
+        &["git.dirty_paths"],
+        "inspect-dirty-paths-and-reserve-before-editing",
+        &format!("Worktree has {dirty_count} dirty path(s); avoid overlapping peer work."),
+    ));
+}
+
+fn swarm_lint_bead_status_map(beads: &serde_json::Value) -> BTreeMap<String, String> {
+    let categories = [
+        ("ready", "open"),
+        ("in_progress", "in_progress"),
+        ("blocked", "blocked"),
+        ("closed", "closed"),
+    ];
+    let mut statuses = BTreeMap::new();
+    for (category, default_status) in categories {
+        for bead in swarm_json_array(beads, category) {
+            swarm_lint_record_bead_status(&mut statuses, &bead, default_status);
+        }
+    }
+    statuses
+}
+
+fn swarm_lint_record_bead_status(
+    statuses: &mut BTreeMap<String, String>,
+    bead: &serde_json::Value,
+    default_status: &str,
+) {
+    if let Some(bead_id) = bead.get("id").and_then(serde_json::Value::as_str) {
+        statuses.insert(
+            bead_id.to_string(),
+            bead.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(default_status)
+                .to_string(),
+        );
+    }
+}
+
+fn swarm_lint_active_agent_map(agents: &[serde_json::Value]) -> BTreeMap<String, bool> {
+    agents
+        .iter()
+        .filter_map(|agent| {
+            let name = agent.get("name").and_then(serde_json::Value::as_str)?;
+            Some((name.to_string(), swarm_agent_active(agent)))
+        })
+        .collect()
+}
+
+fn swarm_lint_has_mail_thread(
+    bead_id: &str,
+    messages: &[serde_json::Value],
+    evidence: &serde_json::Value,
+) -> bool {
+    messages.iter().any(|message| {
+        message
+            .get("thread_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|thread_id| thread_id.eq(bead_id))
+    }) || evidence
+        .get("recent_threads")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|thread| {
+            thread
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|thread_id| thread_id.eq(bead_id))
+        })
+}
+
+fn swarm_lint_has_proof(bead_id: &str, evidence: &serde_json::Value) -> bool {
+    evidence
+        .get("recent_proofs")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|proof| swarm_evidence_matches_bead(proof, Some(bead_id)))
+}
+
+fn swarm_lint_message_ack_required(message: &serde_json::Value) -> bool {
+    message
+        .get("ack_required")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn swarm_lint_message_acknowledged(message: &serde_json::Value) -> bool {
+    if message
+        .get("acknowledged")
+        .or_else(|| message.get("ack"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    ["ack_ts", "acknowledged_at"]
+        .iter()
+        .filter_map(|key| message.get(*key).and_then(serde_json::Value::as_str))
+        .any(|value| !value.trim().is_empty())
+}
+
+fn swarm_lint_message_id(message: &serde_json::Value) -> String {
+    message
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .map(|id| id.to_string())
+        .or_else(|| {
+            message
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "[message]".to_string())
+}
+
+fn swarm_lint_message_snippet(message: &serde_json::Value) -> Option<String> {
+    message
+        .get("subject")
+        .and_then(serde_json::Value::as_str)
+        .map(crate::pages::redact::redact_swarm_text)
+}
+
+fn swarm_lint_unsafe_takeover_snippet(message: &serde_json::Value) -> Option<String> {
+    let subject = message
+        .get("subject")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let body_snippet = message
+        .get("body_snippet")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let combined = format!("{subject}\n{body_snippet}");
+    let lower = combined.to_ascii_lowercase();
+    let unsafe_phrase = [
+        "force release",
+        "force-release",
+        "take over",
+        "takeover",
+        "reopen stale",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase));
+    unsafe_phrase.then(|| crate::pages::redact::redact_swarm_text(subject))
+}
+
+fn swarm_lint_finding(
+    code: &str,
+    severity: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    evidence_refs: &[&str],
+    safe_next_action: &str,
+    summary: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("{code}:{subject_kind}:{subject_id}"),
+        "severity": severity,
+        "code": code,
+        "subject_kind": subject_kind,
+        "subject_id": subject_id,
+        "evidence_refs": evidence_refs,
+        "safe_next_action": safe_next_action,
+        "summary": summary,
+        "redaction_status": "metadata_only",
+    })
+}
+
+fn swarm_lint_attach_snippet(finding: &mut serde_json::Value, redacted_snippet: Option<String>) {
+    if let Some(snippet) = redacted_snippet
+        && let Some(object) = finding.as_object_mut()
+    {
+        object.insert("redacted_snippet".to_string(), serde_json::json!(snippet));
+    }
+}
+
+fn swarm_lint_severity_count(findings: &[serde_json::Value], severity: &str) -> usize {
+    findings
+        .iter()
+        .filter(|finding| {
+            finding
+                .get("severity")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|actual| actual.eq(severity))
+        })
+        .count()
+}
+
+fn swarm_lint_recommended_action(
+    partial: bool,
+    error_count: usize,
+    warning_count: usize,
+    info_count: usize,
+) -> &'static str {
+    if partial {
+        "inspect-unavailable-providers"
+    } else if error_count > 0 {
+        "fix-coordination-before-closeout"
+    } else if warning_count > 0 {
+        "coordinate-before-editing"
+    } else if info_count > 0 {
+        "review-advisories"
+    } else {
+        "coordination-clean"
+    }
+}
+
+fn swarm_lint_finding_sort_key(finding: &serde_json::Value) -> (u8, String, String) {
+    let severity = finding
+        .get("severity")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("info");
+    let code = finding
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let subject = finding
+        .get("subject_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    (swarm_lint_severity_rank(severity), code, subject)
+}
+
+fn swarm_lint_severity_rank(severity: &str) -> u8 {
+    match severity {
+        "error" => 0,
+        "warning" => 1,
+        _ => 2,
+    }
 }
 
 fn render_swarm_evidence_payload(
@@ -8704,8 +9944,8 @@ fn swarm_evidence(
 }
 
 fn swarm_privacy(fixture_id: &str, evidence: &serde_json::Value) -> serde_json::Value {
-    if fixture_id == "privacy_guardrails" {
-        return serde_json::json!({
+    let mut privacy = if fixture_id == "privacy_guardrails" {
+        serde_json::json!({
             "raw_session_content_included": false,
             "mail_body_snippets_included": false,
             "redaction_policy": crate::pages::redact::SWARM_REDACTION_POLICY,
@@ -8723,18 +9963,155 @@ fn swarm_privacy(fixture_id: &str, evidence: &serde_json::Value) -> serde_json::
                 "mailbox_snippet_omitted": 1,
                 "sensitive_path": 4
             }
-        });
+        })
+    } else {
+        serde_json::json!({
+            "raw_session_content_included": false,
+            "mail_body_snippets_included": false,
+            "redaction_policy": crate::pages::redact::SWARM_REDACTION_POLICY,
+            "redaction_applied": evidence
+                .get("redaction_applied")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            "sensitive_paths_scrubbed": 0
+        })
+    };
+
+    let exposure_preview = swarm_privacy_exposure_preview(fixture_id, &privacy);
+    if let Some(object) = privacy.as_object_mut() {
+        object.insert("exposure_preview".to_string(), exposure_preview);
     }
+    privacy
+}
+
+fn swarm_privacy_exposure_preview(
+    fixture_id: &str,
+    privacy: &serde_json::Value,
+) -> serde_json::Value {
+    let redaction_applied = privacy
+        .get("redaction_applied")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let privacy_probe = fixture_id == "privacy_guardrails";
+    let risk_categories = if privacy_probe {
+        serde_json::json!([
+            "private_paths",
+            "secret_like_values",
+            "mail_body_snippets",
+            "evidence_references",
+            "raw_session_content"
+        ])
+    } else {
+        serde_json::json!(["provider_roots", "session_content", "derived_search_assets"])
+    };
+    let redacted_samples = if redaction_applied {
+        serde_json::json!([
+            {"kind": "sensitive_path", "sample": "[REDACTED_PATH]"},
+            {"kind": "mail_body_snippet", "sample": crate::pages::redact::SWARM_MAIL_BODY_OMITTED},
+            {"kind": "secret_like_value", "sample": crate::pages::redact::SWARM_SECRET_ENV_ASSIGNMENT_REDACTED},
+            {"kind": "evidence_reference", "sample": "pack://[REDACTED_PATH]#L44"}
+        ])
+    } else {
+        serde_json::json!([])
+    };
 
     serde_json::json!({
-        "raw_session_content_included": false,
-        "mail_body_snippets_included": false,
-        "redaction_policy": crate::pages::redact::SWARM_REDACTION_POLICY,
-        "redaction_applied": evidence
-            .get("redaction_applied")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        "sensitive_paths_scrubbed": 0
+        "schema_version": "cass.privacy.exposure_preview.v1",
+        "read_only": true,
+        "mutation_performed": false,
+        "preview_scope": "swarm_status",
+        "coverage": if privacy_probe { "fixture_probe" } else { "policy_defaults" },
+        "risk_categories": risk_categories,
+        "source_classes": [
+            {
+                "class": "provider_roots",
+                "would_read": true,
+                "raw_values_included": false,
+                "risk": "medium",
+                "notes": "Provider roots and source paths are reported only after path redaction."
+            },
+            {
+                "class": "session_content",
+                "would_read": true,
+                "raw_values_included": false,
+                "risk": "high",
+                "notes": "Swarm status reports metadata and proof references; raw session text is not serialized."
+            },
+            {
+                "class": "derived_search_assets",
+                "would_read": true,
+                "raw_values_included": false,
+                "risk": "medium",
+                "notes": "SQLite and search asset readiness are summarized without dumping indexed text."
+            },
+            {
+                "class": "support_artifacts",
+                "would_read": false,
+                "raw_values_included": false,
+                "risk": "high",
+                "notes": "Support bundles and repro capsules require their own explicit command path."
+            }
+        ],
+        "candidate_actions": [
+            {
+                "action": "index",
+                "command_shape": "cass index --full --json",
+                "would_read": ["provider roots", "session files", "source metadata"],
+                "would_write": ["SQLite archive", "derived lexical index"],
+                "default_exclusions": ["raw mirror capture is not published by swarm status"],
+                "required_opt_in_flags": []
+            },
+            {
+                "action": "export-html",
+                "command_shape": "cass export-html <session> --json",
+                "would_read": ["selected session"],
+                "would_write": ["self-contained HTML export"],
+                "default_exclusions": ["skill content"],
+                "required_opt_in_flags": ["--include-skills"]
+            },
+            {
+                "action": "support-bundle",
+                "command_shape": "cass doctor --support-bundle --json",
+                "would_read": ["diagnostics", "doctor run metadata", "redacted manifests"],
+                "would_write": ["support bundle directory"],
+                "default_exclusions": ["operator-provided sensitive attachments"],
+                "required_opt_in_flags": ["--include-sensitive-attachments"]
+            },
+            {
+                "action": "repro-capsule",
+                "command_shape": "not yet exposed in cass.swarm.status.v1",
+                "would_read": ["selected failure metadata", "selected proof references"],
+                "would_write": ["none from swarm status"],
+                "default_exclusions": ["raw prompts", "raw session text", "mail body snippets"],
+                "required_opt_in_flags": []
+            }
+        ],
+        "opt_in_boundaries": [
+            {
+                "surface": "swarm status",
+                "flag": "--include-evidence",
+                "status": "unsupported",
+                "unlocks": "mail body snippets"
+            },
+            {
+                "surface": "export-html",
+                "flag": "--include-skills",
+                "status": "available",
+                "unlocks": "skill content in HTML exports"
+            },
+            {
+                "surface": "doctor support-bundle",
+                "flag": "--include-sensitive-attachments",
+                "status": "available",
+                "unlocks": "operator-provided sensitive attachments"
+            }
+        ],
+        "redacted_sample_count": redacted_samples.as_array().map_or(0, Vec::len),
+        "redacted_samples": redacted_samples,
+        "truth_limits": [
+            "Counts describe this status snapshot, not every future command.",
+            "No raw secrets, prompts, mail bodies, or absolute private paths are included in this preview."
+        ]
     })
 }
 
@@ -9128,6 +10505,1275 @@ fn swarm_evidence_recommended_action(
     }
 }
 
+fn render_swarm_proof_debt_from_evidence(evidence: serde_json::Value) -> serde_json::Value {
+    let debt_items = swarm_proof_debt_items(&evidence);
+    let remediation_queue = swarm_proof_debt_remediation_queue(&debt_items);
+    let partial = evidence
+        .get("_meta")
+        .and_then(|meta| meta.get("partial"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let suppressed_count = debt_items
+        .iter()
+        .filter(|item| swarm_proof_debt_is_suppressed(item))
+        .count();
+    let unsuppressed_count = debt_items.len().saturating_sub(suppressed_count);
+    let blocking_count = debt_items
+        .iter()
+        .filter(|item| {
+            !swarm_proof_debt_is_suppressed(item)
+                && item
+                    .get("severity")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|severity| matches!(severity, "high" | "medium"))
+        })
+        .count();
+    let highest_severity = debt_items
+        .iter()
+        .filter(|item| !swarm_proof_debt_is_suppressed(item))
+        .filter_map(|item| item.get("severity").and_then(serde_json::Value::as_str))
+        .min_by_key(|severity| swarm_proof_debt_severity_rank(severity))
+        .unwrap_or("none");
+
+    serde_json::json!({
+        "schema_version": "cass.swarm.proof_debt.v1",
+        "status": evidence.get("status").cloned().unwrap_or_else(|| serde_json::json!("partial")),
+        "_meta": swarm_proof_debt_meta(evidence.get("_meta")),
+        "providers": evidence.get("providers").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "filter": evidence.get("filter").cloned().unwrap_or_else(|| serde_json::json!({"bead_id": null})),
+        "summary": {
+            "debt_count": debt_items.len(),
+            "unsuppressed_debt_count": unsuppressed_count,
+            "suppressed_count": suppressed_count,
+            "blocking_debt_count": blocking_count,
+            "high_count": swarm_proof_debt_severity_count(&debt_items, "high"),
+            "medium_count": swarm_proof_debt_severity_count(&debt_items, "medium"),
+            "low_count": swarm_proof_debt_severity_count(&debt_items, "low"),
+            "info_count": swarm_proof_debt_severity_count(&debt_items, "info"),
+            "highest_severity": highest_severity,
+            "recommended_action": swarm_proof_debt_recommended_action(partial, blocking_count, unsuppressed_count, suppressed_count),
+            "mutation_performed": false,
+        },
+        "debt_items": debt_items,
+        "remediation_queue": remediation_queue,
+        "mutation_contract": {
+            "read_only": true,
+            "agent_mail_mutations": false,
+            "bead_mutations": false,
+            "reservation_mutations": false,
+            "git_mutations": false,
+            "safe_next_actions_are_suggestions": true,
+        },
+        "gate_contract": {
+            "fails_closed_by_default": false,
+            "explicit_gate_required": true,
+            "blocking_severities": ["high", "medium"],
+        },
+        "privacy": evidence.get("privacy").cloned().unwrap_or_else(|| serde_json::json!({
+            "raw_session_content_included": false,
+            "mail_body_snippets_included": false,
+            "redaction_policy": crate::pages::redact::SWARM_REDACTION_POLICY,
+            "redaction_applied": false,
+        })),
+    })
+}
+
+fn swarm_proof_debt_meta(meta: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut object = meta
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let request_id = object
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("proof-debt");
+    object.insert(
+        "request_id".to_string(),
+        serde_json::json!(format!("{request_id}:proof-debt")),
+    );
+    object.insert(
+        "source_schema_version".to_string(),
+        serde_json::json!("cass.swarm.evidence.v1"),
+    );
+    serde_json::Value::Object(object)
+}
+
+fn swarm_proof_debt_items(evidence: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut items = Vec::new();
+    for gap in evidence
+        .get("proof_gaps")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        items.push(swarm_proof_debt_item_from_gap(gap));
+    }
+    items.extend(swarm_proof_debt_command_items(evidence));
+    items.extend(swarm_proof_debt_closeout_mail_items(evidence));
+    items.sort_by(|left, right| {
+        swarm_proof_debt_sort_key(left).cmp(&swarm_proof_debt_sort_key(right))
+    });
+    items
+}
+
+fn swarm_proof_debt_item_from_gap(gap: &serde_json::Value) -> serde_json::Value {
+    let kind = gap
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("proof-gap");
+    let severity = gap
+        .get("severity")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| swarm_proof_debt_default_severity(kind));
+    let (subject_kind, subject_id) = swarm_proof_debt_subject(gap);
+    let suppression_reason = swarm_proof_debt_suppression_reason(gap);
+    swarm_proof_debt_item(ProofDebtItemInput {
+        kind,
+        severity,
+        subject_kind: &subject_kind,
+        subject_id: &subject_id,
+        source: gap
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("evidence.proof_gaps"),
+        summary: gap
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| swarm_proof_debt_default_summary(kind)),
+        expected_evidence: swarm_proof_debt_expected_evidence(kind),
+        observed_evidence_refs: swarm_proof_debt_observed_refs(gap),
+        freshness_state: swarm_proof_debt_freshness_state(gap),
+        confidence: "high",
+        risk: swarm_proof_debt_risk(kind, severity),
+        suppression_reason,
+    })
+}
+
+fn swarm_proof_debt_command_items(evidence: &serde_json::Value) -> Vec<serde_json::Value> {
+    swarm_proof_debt_ledger_rows(evidence, "proof")
+        .into_iter()
+        .flat_map(swarm_proof_debt_items_from_proof)
+        .collect()
+}
+
+fn swarm_proof_debt_items_from_proof(proof: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut items = Vec::new();
+    let command = proof
+        .get("command_shape")
+        .or_else(|| proof.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let lower_command = command.to_ascii_lowercase();
+    let (subject_kind, subject_id) = swarm_proof_debt_subject(proof);
+    let observed_refs = swarm_proof_debt_observed_refs(proof);
+
+    if lower_command.contains("cargo clippy")
+        && !lower_command.contains("cargo test")
+        && !lower_command.contains("cargo check")
+    {
+        items.push(swarm_proof_debt_item(ProofDebtItemInput {
+            kind: "incomplete-proof-command-set",
+            severity: "medium",
+            subject_kind: &subject_kind,
+            subject_id: &subject_id,
+            source: "evidence.recent_proofs",
+            summary: "Proof contains clippy only; expected check and focused test evidence too.",
+            expected_evidence: vec![
+                "rch cargo check proof".to_string(),
+                "focused rch cargo test proof".to_string(),
+            ],
+            observed_evidence_refs: observed_refs.clone(),
+            freshness_state: swarm_proof_debt_freshness_state(proof),
+            confidence: "high",
+            risk: "closeout may have lint proof but no compile/test proof",
+            suppression_reason: swarm_proof_debt_suppression_reason(proof),
+        }));
+    }
+
+    if proof
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        items.push(swarm_proof_debt_item(ProofDebtItemInput {
+            kind: "stale-proof",
+            severity: "medium",
+            subject_kind: &subject_kind,
+            subject_id: &subject_id,
+            source: "evidence.recent_proofs",
+            summary: "Proof is marked stale for the current subject.",
+            expected_evidence: vec!["fresh rch proof after the latest code change".to_string()],
+            observed_evidence_refs: observed_refs.clone(),
+            freshness_state: "stale".to_string(),
+            confidence: "medium",
+            risk: "closeout evidence may predate the current code state",
+            suppression_reason: swarm_proof_debt_suppression_reason(proof),
+        }));
+    }
+
+    let status = proof
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let proof_kind = proof
+        .get("proof_kind")
+        .or_else(|| proof.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let ignored = matches!(status, "ignored" | "skipped")
+        || proof
+            .get("ignored")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    let stress = proof_kind.contains("stress") || lower_command.contains("stress");
+    if ignored && stress {
+        let has_artifacts = proof
+            .get("artifact_refs")
+            .or_else(|| proof.get("artifacts"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|refs| !refs.is_empty());
+        let suppression_reason = swarm_proof_debt_suppression_reason(proof).or_else(|| {
+            has_artifacts
+                .then(|| "stress proof is intentionally ignored but artifact-backed".to_string())
+        });
+        items.push(swarm_proof_debt_item(ProofDebtItemInput {
+            kind: "ignored-stress-proof",
+            severity: if has_artifacts { "info" } else { "medium" },
+            subject_kind: &subject_kind,
+            subject_id: &subject_id,
+            source: "evidence.recent_proofs",
+            summary: if has_artifacts {
+                "Ignored stress proof has artifact references and is tracked as suppressed debt."
+            } else {
+                "Ignored stress proof is missing artifact references."
+            },
+            expected_evidence: vec![
+                "stress artifact references or explicit suppression reason".to_string(),
+            ],
+            observed_evidence_refs: observed_refs,
+            freshness_state: swarm_proof_debt_freshness_state(proof),
+            confidence: if has_artifacts { "high" } else { "medium" },
+            risk: if has_artifacts {
+                "non-blocking proof debt with retained stress artifacts"
+            } else {
+                "stress gate may have been skipped without reviewable artifacts"
+            },
+            suppression_reason,
+        }));
+    }
+
+    items
+}
+
+fn swarm_proof_debt_closeout_mail_items(evidence: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mail_threads = swarm_proof_debt_ledger_rows(evidence, "mail_thread")
+        .into_iter()
+        .filter_map(|row| {
+            row.get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<BTreeSet<_>>();
+
+    swarm_proof_debt_ledger_rows(evidence, "bead")
+        .into_iter()
+        .filter(|bead| bead.get("status").and_then(serde_json::Value::as_str) == Some("closed"))
+        .filter_map(|bead| bead.get("bead_id").and_then(serde_json::Value::as_str))
+        .filter(|bead_id| !mail_threads.contains(*bead_id))
+        .map(|bead_id| {
+            swarm_proof_debt_item(ProofDebtItemInput {
+                kind: "missing-closeout-mail",
+                severity: "medium",
+                subject_kind: "bead",
+                subject_id: bead_id,
+                source: "evidence.recent_threads",
+                summary: "Closed bead has no linked Agent Mail closeout thread.",
+                expected_evidence: vec![
+                    "Agent Mail closeout thread with proof summary".to_string(),
+                ],
+                observed_evidence_refs: vec!["ledger.kind=bead".to_string()],
+                freshness_state: "unknown".to_string(),
+                confidence: "high",
+                risk: "future agents may not see closeout context or proof refs",
+                suppression_reason: None,
+            })
+        })
+        .collect()
+}
+
+fn swarm_proof_debt_ledger_rows<'a>(
+    evidence: &'a serde_json::Value,
+    kind: &str,
+) -> Vec<&'a serde_json::Value> {
+    evidence
+        .get("ledger")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| row.get("kind").and_then(serde_json::Value::as_str) == Some(kind))
+        .collect()
+}
+
+struct ProofDebtItemInput<'a> {
+    kind: &'a str,
+    severity: &'a str,
+    subject_kind: &'a str,
+    subject_id: &'a str,
+    source: &'a str,
+    summary: &'a str,
+    expected_evidence: Vec<String>,
+    observed_evidence_refs: Vec<String>,
+    freshness_state: String,
+    confidence: &'a str,
+    risk: &'a str,
+    suppression_reason: Option<String>,
+}
+
+fn swarm_proof_debt_item(input: ProofDebtItemInput<'_>) -> serde_json::Value {
+    let subject_id = crate::pages::redact::redact_swarm_text(input.subject_id);
+    let suppressed = input.suppression_reason.is_some();
+    serde_json::json!({
+        "id": format!("proof-debt:{}:{}:{}", input.kind, input.subject_kind, subject_id),
+        "kind": input.kind,
+        "severity": input.severity,
+        "subject_kind": input.subject_kind,
+        "subject_id": subject_id,
+        "source": input.source,
+        "summary": crate::pages::redact::redact_swarm_text(input.summary),
+        "expected_evidence": input.expected_evidence,
+        "observed_evidence_refs": input.observed_evidence_refs,
+        "freshness": {
+            "state": input.freshness_state,
+        },
+        "confidence": input.confidence,
+        "risk": input.risk,
+        "suppression": {
+            "status": if suppressed { "suppressed" } else { "active" },
+            "reason": input.suppression_reason,
+        },
+        "remediation": swarm_proof_debt_remediation(input.kind, input.subject_kind, &subject_id, suppressed),
+        "redaction_status": "metadata_only",
+    })
+}
+
+fn swarm_proof_debt_subject(value: &serde_json::Value) -> (String, String) {
+    for (kind, key) in [
+        ("bead", "bead_id"),
+        ("commit", "commit_id"),
+        ("thread", "thread_id"),
+        ("path", "path"),
+        ("provider", "provider"),
+    ] {
+        if let Some(raw) = value.get(key).and_then(serde_json::Value::as_str)
+            && !raw.trim().is_empty()
+        {
+            return (kind.to_string(), raw.to_string());
+        }
+    }
+    ("subject".to_string(), "unknown".to_string())
+}
+
+fn swarm_proof_debt_default_severity(kind: &str) -> &'static str {
+    match kind {
+        "missing-proof" | "conflicting-proof" => "high",
+        "unrelated-dirty-file" | "ignored-stress-proof" => "info",
+        _ => "medium",
+    }
+}
+
+fn swarm_proof_debt_default_summary(kind: &str) -> &'static str {
+    match kind {
+        "missing-proof" => "Subject has no linked proof artifact.",
+        "missing-rch-proof" => "Subject has no linked rch proof artifact.",
+        "conflicting-proof" => "Proof status conflicts with recorded exit status.",
+        "artifact-retrieval-interrupted-after-success" => {
+            "Remote proof succeeded but local artifact retrieval was interrupted."
+        }
+        "unrelated-dirty-file" => "Dirty worktree path is unrelated to proof evidence.",
+        "ubs-baseline-warning" => "UBS warning is present and requires an allowlist decision.",
+        _ => "Proof debt was reported by the evidence source.",
+    }
+}
+
+fn swarm_proof_debt_expected_evidence(kind: &str) -> Vec<String> {
+    let expected = match kind {
+        "missing-proof" => &["rch proof artifact linked to the closed bead"][..],
+        "missing-rch-proof" => &["rch exec proof linked to the commit"],
+        "conflicting-proof" => &["consistent proof status and remote exit status"],
+        "artifact-retrieval-interrupted-after-success" => {
+            &["retrieved stdout/stderr artifacts after remote success"]
+        }
+        "unrelated-dirty-file" => &["reservation or proof link for dirty peer work"],
+        "ubs-baseline-warning" => &["UBS allowlist entry or current baseline comparison"],
+        "missing-closeout-mail" => &["Agent Mail closeout thread with proof summary"],
+        _ => &["proof artifact, freshness, and closeout metadata"],
+    };
+    expected.iter().map(|item| (*item).to_string()).collect()
+}
+
+fn swarm_proof_debt_observed_refs(value: &serde_json::Value) -> Vec<String> {
+    let mut refs = Vec::new();
+    for key in [
+        "source",
+        "evidence_ref",
+        "artifact_ref",
+        "command_shape",
+        "path",
+    ] {
+        if let Some(raw) = value.get(key).and_then(serde_json::Value::as_str) {
+            refs.push(crate::pages::redact::redact_swarm_text(raw));
+        }
+    }
+    for key in ["artifact_refs", "artifacts", "mail_thread_refs"] {
+        refs.extend(
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(crate::pages::redact::redact_swarm_text),
+        );
+    }
+    if refs.is_empty() {
+        refs.push("metadata-only".to_string());
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn swarm_proof_debt_freshness_state(value: &serde_json::Value) -> String {
+    if value
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return "stale".to_string();
+    }
+    value
+        .get("freshness")
+        .or_else(|| value.get("freshness_state"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn swarm_proof_debt_suppression_reason(value: &serde_json::Value) -> Option<String> {
+    let explicit = value
+        .get("suppressed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || value
+            .get("known_acceptable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || value
+            .get("accepted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || value
+            .get("suppression_status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| status == "suppressed");
+
+    let reason = ["suppression_reason", "accepted_reason", "allowlist_reason"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .filter(|reason| !reason.trim().is_empty())
+        .map(crate::pages::redact::redact_swarm_text);
+
+    reason.or_else(|| explicit.then(|| "suppressed by evidence policy".to_string()))
+}
+
+fn swarm_proof_debt_risk(kind: &str, severity: &str) -> &'static str {
+    match kind {
+        "missing-proof" => "closed work may not have reproducible verification evidence",
+        "missing-rch-proof" => "commit may have landed without offloaded verification",
+        "incomplete-proof-command-set" => "proof may cover linting but not compile or behavior",
+        "missing-closeout-mail" => "closeout context may be invisible to other agents",
+        "unrelated-dirty-file" => "peer work may be accidentally overwritten",
+        "ignored-stress-proof" => "stress coverage is deferred to explicit perf sweeps",
+        "ubs-baseline-warning" => "static-analysis debt must remain allowlisted and tracked",
+        _ if severity == "high" => "proof debt can invalidate closeout confidence",
+        _ => "proof debt should be reviewed before final closeout",
+    }
+}
+
+fn swarm_proof_debt_remediation(
+    kind: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    suppressed: bool,
+) -> serde_json::Value {
+    let safe_subject = swarm_work_packet_safe_arg(subject_id).unwrap_or("[SUBJECT_ID]");
+    let commands = if suppressed {
+        vec![format!(
+            "cass swarm proof-debt --json --bead {safe_subject}"
+        )]
+    } else {
+        match kind {
+            "missing-closeout-mail" => vec![format!(
+                "send Agent Mail closeout for {safe_subject} with proof refs"
+            )],
+            "unrelated-dirty-file" => vec!["git status --short".to_string()],
+            "ubs-baseline-warning" => {
+                vec!["ubs $(git diff --name-only origin/main...HEAD)".to_string()]
+            }
+            "missing-proof" | "missing-rch-proof" | "incomplete-proof-command-set"
+            | "stale-proof" => vec![
+                "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof-debt-target cargo check --all-targets".to_string(),
+                "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof-debt-target cargo test --test swarm_status_contract -- --nocapture".to_string(),
+            ],
+            _ => vec![format!(
+                "cass swarm evidence --json --bead {safe_subject}"
+            )],
+        }
+    };
+
+    serde_json::json!({
+        "action": if suppressed { "review-suppression" } else { swarm_proof_debt_action(kind) },
+        "commands": commands,
+        "subject_kind": subject_kind,
+        "requires_human_confirmation": matches!(kind, "missing-closeout-mail") || suppressed,
+        "mutates_state_if_run": matches!(kind, "missing-closeout-mail"),
+    })
+}
+
+fn swarm_proof_debt_action(kind: &str) -> &'static str {
+    match kind {
+        "missing-closeout-mail" => "send-closeout-mail-with-proof-summary",
+        "unrelated-dirty-file" => "inspect-peer-dirty-work",
+        "ubs-baseline-warning" => "verify-ubs-baseline-or-allowlist",
+        "missing-proof" | "missing-rch-proof" | "incomplete-proof-command-set" => {
+            "collect-rch-proof"
+        }
+        "stale-proof" => "refresh-proof",
+        _ => "inspect-proof-evidence",
+    }
+}
+
+fn swarm_proof_debt_remediation_queue(debt_items: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    debt_items
+        .iter()
+        .filter(|item| !swarm_proof_debt_is_suppressed(item))
+        .map(|item| {
+            serde_json::json!({
+                "debt_id": item.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "severity": item.get("severity").cloned().unwrap_or_else(|| serde_json::json!("info")),
+                "subject_kind": item.get("subject_kind").cloned().unwrap_or(serde_json::Value::Null),
+                "subject_id": item.get("subject_id").cloned().unwrap_or(serde_json::Value::Null),
+                "action": item
+                    .get("remediation")
+                    .and_then(|remediation| remediation.get("action"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "commands": item
+                    .get("remediation")
+                    .and_then(|remediation| remediation.get("commands"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+                "requires_human_confirmation": item
+                    .get("remediation")
+                    .and_then(|remediation| remediation.get("requires_human_confirmation"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!(false)),
+            })
+        })
+        .collect()
+}
+
+fn swarm_proof_debt_recommended_action(
+    partial: bool,
+    blocking_count: usize,
+    unsuppressed_count: usize,
+    suppressed_count: usize,
+) -> &'static str {
+    if partial {
+        "inspect-unavailable-providers"
+    } else if blocking_count > 0 {
+        "remediate-proof-debt"
+    } else if unsuppressed_count > 0 {
+        "review-proof-debt"
+    } else if suppressed_count > 0 {
+        "review-suppressed-proof-debt"
+    } else {
+        "proof-debt-clear"
+    }
+}
+
+fn swarm_proof_debt_severity_count(debt_items: &[serde_json::Value], severity: &str) -> usize {
+    debt_items
+        .iter()
+        .filter(|item| {
+            item.get("severity")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|actual| actual == severity)
+        })
+        .count()
+}
+
+fn swarm_proof_debt_sort_key(item: &serde_json::Value) -> (u8, bool, String, String) {
+    let severity = item
+        .get("severity")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("info");
+    let kind = item
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let subject = item
+        .get("subject_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    (
+        swarm_proof_debt_severity_rank(severity),
+        swarm_proof_debt_is_suppressed(item),
+        kind,
+        subject,
+    )
+}
+
+fn swarm_proof_debt_severity_rank(severity: &str) -> u8 {
+    match severity {
+        "high" => 0,
+        "medium" | "warning" => 1,
+        "low" => 2,
+        _ => 3,
+    }
+}
+
+fn swarm_proof_debt_is_suppressed(item: &serde_json::Value) -> bool {
+    item.get("suppression")
+        .and_then(|suppression| suppression.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("suppressed")
+}
+
+fn render_swarm_failure_patterns_from_evidence(
+    evidence: serde_json::Value,
+    session_hits: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let proof_debt_items = swarm_proof_debt_items(&evidence);
+    let signals =
+        swarm_failure_pattern_signals(&evidence, &proof_debt_items, session_hits.as_slice());
+    let patterns = swarm_failure_pattern_items(&signals);
+    let candidate_tests = swarm_failure_pattern_candidate_tests(&patterns);
+    let candidate_beads = swarm_failure_pattern_candidate_beads(&patterns);
+    let partial = evidence
+        .get("_meta")
+        .and_then(|meta| meta.get("partial"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    serde_json::json!({
+        "schema_version": "cass.swarm.failure_patterns.v1",
+        "status": evidence.get("status").cloned().unwrap_or_else(|| serde_json::json!("partial")),
+        "_meta": swarm_failure_pattern_meta(evidence.get("_meta")),
+        "providers": evidence.get("providers").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "filter": evidence.get("filter").cloned().unwrap_or_else(|| serde_json::json!({"bead_id": null})),
+        "summary": {
+            "pattern_count": patterns.len(),
+            "candidate_test_count": candidate_tests.len(),
+            "candidate_bead_count": candidate_beads.len(),
+            "high_count": swarm_failure_pattern_severity_count(&patterns, "high"),
+            "medium_count": swarm_failure_pattern_severity_count(&patterns, "medium"),
+            "low_count": swarm_failure_pattern_severity_count(&patterns, "low"),
+            "recommended_action": swarm_failure_pattern_recommended_action(partial, patterns.len()),
+            "mutation_performed": false,
+        },
+        "source_accounting": {
+            "ledger_count": evidence
+                .get("ledger")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            "proof_gap_count": evidence
+                .get("proof_gaps")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            "proof_debt_item_count": proof_debt_items.len(),
+            "session_hit_count": session_hits.len(),
+            "pattern_signal_count": signals.len(),
+        },
+        "patterns": patterns,
+        "candidate_tests": candidate_tests,
+        "candidate_beads": candidate_beads,
+        "false_positive_policy": {
+            "requires_metadata_evidence": true,
+            "requires_human_review_before_bead_creation": true,
+            "deduplicates_by_pattern_kind": true,
+            "raw_session_content_allowed": false,
+        },
+        "mutation_contract": {
+            "read_only": true,
+            "auto_create_beads": false,
+            "auto_modify_tests": false,
+            "agent_mail_mutations": false,
+            "bead_mutations": false,
+            "git_mutations": false,
+        },
+        "privacy": evidence.get("privacy").cloned().unwrap_or_else(|| serde_json::json!({
+            "raw_session_content_included": false,
+            "mail_body_snippets_included": false,
+            "redaction_policy": crate::pages::redact::SWARM_REDACTION_POLICY,
+            "redaction_applied": false,
+        })),
+    })
+}
+
+fn swarm_failure_pattern_meta(meta: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut object = meta
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let request_id = object
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("failure-patterns");
+    object.insert(
+        "request_id".to_string(),
+        serde_json::json!(format!("{request_id}:failure-patterns")),
+    );
+    object.insert(
+        "source_schema_version".to_string(),
+        serde_json::json!("cass.swarm.evidence.v1"),
+    );
+    serde_json::Value::Object(object)
+}
+
+fn swarm_failure_pattern_session_hits(
+    evidence_source: &serde_json::Value,
+    bead_filter: Option<&str>,
+) -> Vec<serde_json::Value> {
+    ["session_hits", "search_hits", "closed_sessions"]
+        .iter()
+        .flat_map(|key| {
+            evidence_source
+                .get(*key)
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(move |hit| swarm_evidence_matches_bead(hit, bead_filter))
+                .map(move |hit| swarm_failure_pattern_session_hit(key, hit))
+        })
+        .collect()
+}
+
+fn swarm_failure_pattern_session_hit(key: &str, hit: &serde_json::Value) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "source".to_string(),
+        serde_json::json!(format!("evidence.{key}")),
+    );
+    for field in [
+        "session_id",
+        "bead_id",
+        "commit_id",
+        "summary",
+        "failure_signature",
+        "command_shape",
+        "evidence_ref",
+        "created_ts",
+        "redaction_status",
+    ] {
+        if let Some(value) = hit.get(field) {
+            object.insert(field.to_string(), swarm_failure_pattern_redact_value(value));
+        }
+    }
+    object
+        .entry("redaction_status".to_string())
+        .or_insert_with(|| serde_json::json!("metadata_only"));
+    serde_json::Value::Object(object)
+}
+
+fn swarm_failure_pattern_redact_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::json!(crate::pages::redact::redact_swarm_text(text))
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(swarm_failure_pattern_redact_value)
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+#[derive(Clone)]
+struct FailurePatternSignal {
+    source: String,
+    subject_kind: String,
+    subject_id: String,
+    evidence_ref: String,
+    text: String,
+}
+
+fn swarm_failure_pattern_signals(
+    evidence: &serde_json::Value,
+    proof_debt_items: &[serde_json::Value],
+    session_hits: &[serde_json::Value],
+) -> Vec<FailurePatternSignal> {
+    let mut signals = Vec::new();
+    signals.extend(swarm_failure_pattern_records(
+        evidence
+            .get("ledger")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten(),
+        "evidence.ledger",
+    ));
+    signals.extend(swarm_failure_pattern_records(
+        evidence
+            .get("proof_gaps")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten(),
+        "evidence.proof_gaps",
+    ));
+    signals.extend(swarm_failure_pattern_records(
+        proof_debt_items.iter(),
+        "proof_debt.debt_items",
+    ));
+    signals.extend(swarm_failure_pattern_records(
+        session_hits.iter(),
+        "evidence.session_hits",
+    ));
+    signals.sort_by(|left, right| {
+        (
+            left.source.as_str(),
+            left.subject_kind.as_str(),
+            left.subject_id.as_str(),
+            left.evidence_ref.as_str(),
+        )
+            .cmp(&(
+                right.source.as_str(),
+                right.subject_kind.as_str(),
+                right.subject_id.as_str(),
+                right.evidence_ref.as_str(),
+            ))
+    });
+    signals
+}
+
+fn swarm_failure_pattern_records<'a, I>(
+    records: I,
+    default_source: &str,
+) -> Vec<FailurePatternSignal>
+where
+    I: IntoIterator<Item = &'a serde_json::Value>,
+{
+    records
+        .into_iter()
+        .map(|record| swarm_failure_pattern_signal(record, default_source))
+        .collect()
+}
+
+fn swarm_failure_pattern_signal(
+    record: &serde_json::Value,
+    default_source: &str,
+) -> FailurePatternSignal {
+    let source = record
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(default_source)
+        .to_string();
+    let (subject_kind, subject_id) = swarm_proof_debt_subject(record);
+    let evidence_ref = swarm_failure_pattern_evidence_ref(record, &source, &subject_id);
+    let text = swarm_failure_pattern_signal_text(record).to_ascii_lowercase();
+    FailurePatternSignal {
+        source,
+        subject_kind,
+        subject_id,
+        evidence_ref,
+        text,
+    }
+}
+
+fn swarm_failure_pattern_evidence_ref(
+    record: &serde_json::Value,
+    source: &str,
+    subject_id: &str,
+) -> String {
+    record
+        .get("evidence_ref")
+        .or_else(|| record.get("artifact_ref"))
+        .and_then(serde_json::Value::as_str)
+        .map(crate::pages::redact::redact_swarm_text)
+        .unwrap_or_else(|| {
+            let safe_subject = crate::pages::redact::redact_swarm_text(subject_id);
+            format!("{source}:{safe_subject}")
+        })
+}
+
+fn swarm_failure_pattern_signal_text(record: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    for key in [
+        "kind",
+        "proof_kind",
+        "status",
+        "summary",
+        "title",
+        "subject",
+        "close_reason",
+        "command_shape",
+        "failure_signature",
+        "error_kind",
+        "path",
+        "bead_id",
+        "commit_id",
+    ] {
+        if let Some(text) = record.get(key).and_then(serde_json::Value::as_str) {
+            parts.push(crate::pages::redact::redact_swarm_text(text));
+        }
+    }
+    for key in [
+        "expected_evidence",
+        "observed_evidence_refs",
+        "changed_paths",
+    ] {
+        parts.extend(
+            record
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(crate::pages::redact::redact_swarm_text),
+        );
+    }
+    parts.join(" ")
+}
+
+struct FailurePatternRule {
+    kind: &'static str,
+    severity: &'static str,
+    title: &'static str,
+    summary: &'static str,
+    keywords: &'static [&'static str],
+    suggested_test: &'static str,
+    suggested_test_target: &'static str,
+    candidate_bead_title: &'static str,
+    candidate_bead_type: &'static str,
+    candidate_bead_priority: u8,
+}
+
+fn swarm_failure_pattern_rules() -> Vec<FailurePatternRule> {
+    vec![
+        FailurePatternRule {
+            kind: "fsqlite-query-shape-regression",
+            severity: "high",
+            title: "FrankenSQLite query-shape regression",
+            summary: "Evidence mentions fsqlite planner/query-shape failures that should become targeted SQL regression tests.",
+            keywords: &[
+                "frankensqlite",
+                "fsqlite",
+                "execute_join_select",
+                "fts5",
+                "query-shape",
+                "planner",
+                "join select",
+            ],
+            suggested_test: "Add a fixture-backed SQL regression that reproduces the exact fsqlite query shape and expected rows.",
+            suggested_test_target: "tests/frankensqlite_*.rs or upstream /data/projects/frankensqlite reproducer",
+            candidate_bead_title: "Pin fsqlite query-shape regression with downstream cass fixture coverage",
+            candidate_bead_type: "test",
+            candidate_bead_priority: 1,
+        },
+        FailurePatternRule {
+            kind: "panic-surface-regression",
+            severity: "high",
+            title: "Panic or direct-indexing regression",
+            summary: "Evidence mentions panic-prone indexing or range failures that should be pinned before more refactors.",
+            keywords: &[
+                "panic",
+                "out of range",
+                "index out of bounds",
+                "range end index",
+                "direct indexing",
+                "unwrap",
+                "expect",
+            ],
+            suggested_test: "Add a negative fixture that asserts the CLI returns a structured error instead of panicking.",
+            suggested_test_target: "tests/connector_*.rs, tests/storage*.rs, or focused lib unit test",
+            candidate_bead_title: "Harden panic-prone failure path with structured-error regression coverage",
+            candidate_bead_type: "bug",
+            candidate_bead_priority: 1,
+        },
+        FailurePatternRule {
+            kind: "rch-proof-discipline-gap",
+            severity: "medium",
+            title: "Proof command bypasses rch discipline",
+            summary: "Evidence mentions cargo proof commands without the required rch wrapper.",
+            keywords: &[
+                "cargo check",
+                "cargo test",
+                "cargo clippy",
+                "local cargo",
+                "without rch",
+            ],
+            suggested_test: "Add a swarm fixture asserting proof suggestions and closeouts require rch command shapes.",
+            suggested_test_target: "tests/swarm_status_contract.rs",
+            candidate_bead_title: "Add rch-discipline regression checks for swarm proof evidence",
+            candidate_bead_type: "test",
+            candidate_bead_priority: 2,
+        },
+        FailurePatternRule {
+            kind: "robot-json-contract-gap",
+            severity: "medium",
+            title: "Robot JSON contract or golden drift",
+            summary: "Evidence mentions robot JSON, schema, or golden drift that should be frozen with contract tests.",
+            keywords: &["robot json", "robot-json", "--json", "schema", "golden"],
+            suggested_test: "Add or update robot JSON/golden contract coverage for the affected command surface.",
+            suggested_test_target: "tests/golden/robot or tests/swarm_status_contract.rs",
+            candidate_bead_title: "Freeze robot JSON contract for the reported drift surface",
+            candidate_bead_type: "test",
+            candidate_bead_priority: 2,
+        },
+        FailurePatternRule {
+            kind: "flaky-or-toxic-suite",
+            severity: "medium",
+            title: "Flaky, ignored, or toxic suite evidence",
+            summary: "Evidence mentions flaky/ignored/timeouting suites that should be isolated behind explicit proof artifacts.",
+            keywords: &[
+                "flaky",
+                "timeout",
+                "timed out",
+                "e2e_large_dataset",
+                "ignored",
+                "intermittent",
+                "stress",
+            ],
+            suggested_test: "Split the slow or flaky scenario into a focused deterministic contract plus an explicit ignored stress artifact.",
+            suggested_test_target: "tests/performance or focused integration test",
+            candidate_bead_title: "Isolate flaky suite evidence into deterministic regression and stress artifact",
+            candidate_bead_type: "test",
+            candidate_bead_priority: 2,
+        },
+        FailurePatternRule {
+            kind: "proof-closeout-gap",
+            severity: "medium",
+            title: "Missing proof or closeout evidence",
+            summary: "Evidence mentions missing proof, stale proof, or absent closeout mail for completed work.",
+            keywords: &[
+                "missing-proof",
+                "missing-rch-proof",
+                "missing-closeout-mail",
+                "stale-proof",
+                "no linked proof",
+                "no linked agent mail",
+            ],
+            suggested_test: "Add a swarm evidence fixture that turns the missing proof/closeout pattern into a stable proof-debt expectation.",
+            suggested_test_target: "tests/swarm_status_contract.rs",
+            candidate_bead_title: "Backfill recurring proof-closeout gap with contract coverage",
+            candidate_bead_type: "test",
+            candidate_bead_priority: 2,
+        },
+    ]
+}
+
+fn swarm_failure_pattern_items(signals: &[FailurePatternSignal]) -> Vec<serde_json::Value> {
+    let mut patterns = swarm_failure_pattern_rules()
+        .into_iter()
+        .filter_map(|rule| {
+            let matches = signals
+                .iter()
+                .filter(|signal| swarm_failure_pattern_signal_matches(&rule, signal))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!matches.is_empty()).then(|| swarm_failure_pattern_item(&rule, &matches))
+        })
+        .collect::<Vec<_>>();
+    patterns.sort_by(|left, right| {
+        swarm_failure_pattern_sort_key(left).cmp(&swarm_failure_pattern_sort_key(right))
+    });
+    patterns
+}
+
+fn swarm_failure_pattern_signal_matches(
+    rule: &FailurePatternRule,
+    signal: &FailurePatternSignal,
+) -> bool {
+    if rule.kind == "rch-proof-discipline-gap" {
+        return signal.text.contains("cargo ") && !signal.text.contains("rch exec");
+    }
+    rule.keywords
+        .iter()
+        .any(|keyword| signal.text.contains(keyword))
+}
+
+fn swarm_failure_pattern_item(
+    rule: &FailurePatternRule,
+    matches: &[FailurePatternSignal],
+) -> serde_json::Value {
+    let evidence_refs = swarm_failure_pattern_evidence_refs(matches);
+    let signal_count = matches.len();
+    serde_json::json!({
+        "id": format!("failure-pattern:{}", rule.kind),
+        "kind": rule.kind,
+        "severity": rule.severity,
+        "title": rule.title,
+        "summary": rule.summary,
+        "signal_count": signal_count,
+        "confidence": swarm_failure_pattern_confidence(signal_count),
+        "evidence_refs": evidence_refs,
+        "affected_subjects": swarm_failure_pattern_subjects(matches),
+        "false_positive_controls": swarm_failure_pattern_false_positive_controls(rule.kind),
+        "test_suggestion": {
+            "summary": rule.suggested_test,
+            "target": rule.suggested_test_target,
+            "requires_rch": true,
+            "privacy_boundary": "metadata-only fixtures; no raw session text",
+        },
+        "candidate_bead": {
+            "title": rule.candidate_bead_title,
+            "issue_type": rule.candidate_bead_type,
+            "priority": rule.candidate_bead_priority,
+            "labels": ["swarm", "testing", "robot-json"],
+            "auto_create": false,
+            "description": format!(
+                "{} Evidence refs are metadata-only and must be reviewed before creating a bead.",
+                rule.summary
+            ),
+        },
+        "redaction_status": "metadata_only",
+    })
+}
+
+fn swarm_failure_pattern_evidence_refs(matches: &[FailurePatternSignal]) -> Vec<String> {
+    let mut refs = matches
+        .iter()
+        .map(|signal| signal.evidence_ref.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    refs.truncate(5);
+    refs
+}
+
+fn swarm_failure_pattern_subjects(matches: &[FailurePatternSignal]) -> Vec<serde_json::Value> {
+    let mut subjects = matches
+        .iter()
+        .map(|signal| {
+            (
+                signal.subject_kind.clone(),
+                crate::pages::redact::redact_swarm_text(&signal.subject_id),
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|(kind, id)| {
+            serde_json::json!({
+                "kind": kind,
+                "id": id,
+            })
+        })
+        .collect::<Vec<_>>();
+    subjects.truncate(5);
+    subjects
+}
+
+fn swarm_failure_pattern_confidence(signal_count: usize) -> &'static str {
+    if signal_count >= 3 {
+        "high"
+    } else if signal_count == 2 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn swarm_failure_pattern_false_positive_controls(kind: &str) -> Vec<&'static str> {
+    let mut controls = vec![
+        "review metadata refs before creating or claiming any bead",
+        "require a deterministic fixture before adding a regression test",
+        "do not include raw session text in the generated artifact",
+    ];
+    match kind {
+        "rch-proof-discipline-gap" => {
+            controls.push("do not flag non-cargo commands or documentation-only examples");
+        }
+        "flaky-or-toxic-suite" => {
+            controls.push("distinguish explicitly ignored stress proofs from required gates");
+        }
+        "fsqlite-query-shape-regression" => {
+            controls.push("confirm the failing query shape against the pinned fsqlite revision");
+        }
+        _ => {}
+    }
+    controls
+}
+
+fn swarm_failure_pattern_candidate_tests(patterns: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            serde_json::json!({
+                "pattern_id": pattern.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "severity": pattern.get("severity").cloned().unwrap_or_else(|| serde_json::json!("low")),
+                "summary": pattern
+                    .get("test_suggestion")
+                    .and_then(|test| test.get("summary"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "target": pattern
+                    .get("test_suggestion")
+                    .and_then(|test| test.get("target"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "evidence_refs": pattern.get("evidence_refs").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "requires_rch": true,
+            })
+        })
+        .collect()
+}
+
+fn swarm_failure_pattern_candidate_beads(patterns: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    patterns
+        .iter()
+        .filter_map(|pattern| pattern.get("candidate_bead").cloned())
+        .collect()
+}
+
+fn swarm_failure_pattern_severity_count(patterns: &[serde_json::Value], severity: &str) -> usize {
+    patterns
+        .iter()
+        .filter(|pattern| {
+            pattern
+                .get("severity")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|actual| actual == severity)
+        })
+        .count()
+}
+
+fn swarm_failure_pattern_recommended_action(partial: bool, pattern_count: usize) -> &'static str {
+    if partial {
+        "inspect-unavailable-providers"
+    } else if pattern_count > 0 {
+        "review-regression-suggestions"
+    } else {
+        "no-recurring-patterns"
+    }
+}
+
+fn swarm_failure_pattern_sort_key(item: &serde_json::Value) -> (u8, String) {
+    let severity = item
+        .get("severity")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("low");
+    let kind = item
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    (swarm_proof_debt_severity_rank(severity), kind)
+}
+
 fn swarm_evidence_matches_bead(value: &serde_json::Value, bead_filter: Option<&str>) -> bool {
     let Some(bead_id) = bead_filter else {
         return true;
@@ -9335,6 +11981,1416 @@ fn swarm_recommendations(
         }),
     };
     vec![recommendation]
+}
+
+fn render_swarm_work_packet_from_status(
+    status: &serde_json::Value,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    let selected = swarm_work_packet_select_bead(status, bead_filter);
+    let selected_bead = selected.as_ref().map(|(_, bead)| *bead);
+    let bead_id = selected_bead
+        .and_then(|bead| bead.get("id"))
+        .and_then(serde_json::Value::as_str);
+    let safe_bead_arg = bead_id.and_then(swarm_work_packet_safe_arg);
+    let build_pressure = status
+        .get("summary")
+        .and_then(|summary| summary.get("build_pressure"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let provider_partial = status
+        .get("_meta")
+        .and_then(|meta| meta.get("partial"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let safe_to_claim = selected_bead.is_some_and(|bead| {
+        bead.get("safe_to_claim")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    });
+    let mut claim_blockers = selected_bead
+        .and_then(|bead| bead.get("claim_blockers"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let candidate_reservations = selected_bead
+        .map(swarm_work_packet_suggested_reservations)
+        .unwrap_or_default();
+    let verification = selected_bead
+        .map(|bead| swarm_work_packet_verification(bead, build_pressure))
+        .unwrap_or_else(swarm_work_packet_empty_verification);
+    let collision_simulation = swarm_work_packet_collision_simulation(
+        status,
+        selected_bead,
+        &candidate_reservations,
+        &verification,
+    );
+    for blocker in swarm_work_packet_collision_claim_blockers(&collision_simulation) {
+        if !claim_blockers.iter().any(|existing| {
+            existing
+                .as_str()
+                .is_some_and(|existing| existing == blocker.as_str())
+        }) {
+            claim_blockers.push(serde_json::json!(blocker));
+        }
+    }
+
+    let readiness_state = swarm_work_packet_readiness_state(
+        selected.is_some(),
+        bead_filter.is_some() && selected.is_none(),
+        provider_partial,
+        safe_to_claim,
+        build_pressure,
+        &claim_blockers,
+    );
+    let safe_to_start = readiness_state == "ready";
+    let recommended_action =
+        swarm_work_packet_recommended_action(readiness_state, safe_bead_arg.is_some());
+    let readiness_reasons = swarm_work_packet_readiness_reasons(
+        readiness_state,
+        selected_bead,
+        build_pressure,
+        provider_partial,
+        &claim_blockers,
+    );
+    let evidence_refs = swarm_work_packet_evidence_refs(
+        readiness_state,
+        selected.as_ref().map(|(section, _)| *section),
+    );
+    let selected_bead_json = selected_bead
+        .map(swarm_work_packet_bead_summary)
+        .unwrap_or_else(|| serde_json::json!(null));
+    let suggested_reservations = if safe_to_start {
+        candidate_reservations
+    } else {
+        Vec::new()
+    };
+    let coordination = swarm_work_packet_coordination(bead_id, safe_to_start);
+    let closeout = swarm_work_packet_closeout(bead_id);
+    let fallback_actions = swarm_work_packet_fallback_actions(
+        readiness_state,
+        bead_filter,
+        safe_bead_arg,
+        build_pressure,
+    );
+    let meta = status.get("_meta").unwrap_or(&serde_json::Value::Null);
+
+    serde_json::json!({
+        "schema_version": "cass.swarm.work_packet.v1",
+        "status": status.get("status").cloned().unwrap_or_else(|| serde_json::json!("partial")),
+        "_meta": {
+            "request_id": meta
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|request_id| format!("{request_id}:work-packet"))
+                .unwrap_or_else(|| "work-packet".to_string()),
+            "generated_at_ms": meta.get("generated_at_ms").cloned().unwrap_or_else(|| serde_json::json!(0)),
+            "elapsed_ms": meta.get("elapsed_ms").cloned().unwrap_or_else(|| serde_json::json!(1)),
+            "repo": meta.get("repo").cloned().unwrap_or_else(|| serde_json::json!("[UNKNOWN_REPO]")),
+            "project_key": meta.get("project_key").cloned().unwrap_or_else(|| serde_json::json!("[UNKNOWN_REPO]")),
+            "hostname": meta.get("hostname").cloned().unwrap_or_else(|| serde_json::json!("unknown-host")),
+            "partial": provider_partial,
+            "source_schema_version": status.get("schema_version").cloned().unwrap_or_else(|| serde_json::json!("unknown")),
+            "warnings": meta.get("warnings").cloned().unwrap_or_else(|| serde_json::json!([]))
+        },
+        "filter": {
+            "bead_id": bead_filter
+        },
+        "summary": {
+            "bead_id": bead_id,
+            "safe_to_start": safe_to_start,
+            "readiness_state": readiness_state,
+            "recommended_action": recommended_action,
+            "requires_coordination": !safe_to_start,
+            "claim_blocker_count": claim_blockers.len(),
+            "suggested_reservation_count": suggested_reservations.len(),
+            "collision_class": collision_simulation
+                .get("overall_class")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("unknown")),
+            "collision_advisory_count": collision_simulation
+                .get("advisories")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            "proof_command_count": verification
+                .get("commands")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+        },
+        "work_packet": {
+            "bead": selected_bead_json,
+            "readiness": {
+                "state": readiness_state,
+                "safe_to_start": safe_to_start,
+                "requires_human_confirmation": !safe_to_start,
+                "reasons": readiness_reasons,
+                "evidence_refs": evidence_refs,
+            },
+            "suggested_reservations": suggested_reservations,
+            "collision_simulation": collision_simulation,
+            "coordination": coordination,
+            "verification": verification,
+            "closeout": closeout,
+            "fallback_actions": fallback_actions,
+        },
+        "source_status": {
+            "summary": status.get("summary").cloned().unwrap_or_else(|| serde_json::json!({})),
+            "providers": status.get("providers").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "recommendations": status.get("recommendations").cloned().unwrap_or_else(|| serde_json::json!([])),
+        },
+        "privacy": status.get("privacy").cloned().unwrap_or_else(|| serde_json::json!({
+            "raw_session_content_included": false,
+            "mail_body_snippets_included": false,
+            "redaction_policy": "strict",
+            "redaction_applied": false
+        })),
+    })
+}
+
+fn swarm_work_packet_select_bead<'a>(
+    status: &'a serde_json::Value,
+    bead_filter: Option<&str>,
+) -> Option<(&'static str, &'a serde_json::Value)> {
+    let sections = [
+        ("beads.ready", &["beads", "ready"][..]),
+        ("beads.in_progress", &["beads", "in_progress"][..]),
+        ("beads.blocked", &["beads", "blocked"][..]),
+        ("beads.stale_candidates", &["beads", "stale_candidates"][..]),
+    ];
+
+    if let Some(filter) = bead_filter {
+        return sections.iter().find_map(|(section, path)| {
+            swarm_work_packet_array_at(status, path)?
+                .iter()
+                .find(|bead| {
+                    bead.get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| id == filter)
+                })
+                .map(|bead| (*section, bead))
+        });
+    }
+
+    let ready = swarm_work_packet_array_at(status, &["beads", "ready"])?;
+    ready
+        .iter()
+        .find(|bead| {
+            bead.get("safe_to_claim")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .or_else(|| ready.first())
+        .map(|bead| ("beads.ready", bead))
+}
+
+fn swarm_work_packet_array_at<'a>(
+    value: &'a serde_json::Value,
+    path: &[&str],
+) -> Option<&'a Vec<serde_json::Value>> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_array()
+}
+
+fn swarm_work_packet_readiness_state(
+    has_bead: bool,
+    requested_missing: bool,
+    provider_partial: bool,
+    safe_to_claim: bool,
+    build_pressure: &str,
+    claim_blockers: &[serde_json::Value],
+) -> &'static str {
+    if requested_missing {
+        "bead-not-found"
+    } else if !has_bead {
+        "no-ready-work"
+    } else if provider_partial {
+        "provider-partial"
+    } else if build_pressure == "high" {
+        "build-pressure-high"
+    } else if safe_to_claim && claim_blockers.is_empty() {
+        "ready"
+    } else {
+        "blocked"
+    }
+}
+
+fn swarm_work_packet_recommended_action(
+    readiness_state: &str,
+    has_safe_bead_arg: bool,
+) -> &'static str {
+    match readiness_state {
+        "ready" if has_safe_bead_arg => "claim-ready-bead",
+        "ready" => "inspect-bead-id",
+        "blocked" => "coordinate-before-claim",
+        "build-pressure-high" => "wait-for-rch-capacity",
+        "provider-partial" => "inspect-unavailable-providers",
+        "bead-not-found" => "inspect-bead",
+        _ => "no-ready-work",
+    }
+}
+
+fn swarm_work_packet_readiness_reasons(
+    readiness_state: &str,
+    bead: Option<&serde_json::Value>,
+    build_pressure: &str,
+    provider_partial: bool,
+    claim_blockers: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let mut reasons = Vec::new();
+    if bead.is_none() {
+        reasons.push(serde_json::json!("no-selected-bead"));
+    }
+    if provider_partial {
+        reasons.push(serde_json::json!("provider-status-partial"));
+    }
+    if build_pressure == "high" {
+        reasons.push(serde_json::json!("build-pressure-high"));
+    }
+    reasons.extend(claim_blockers.iter().cloned());
+    if readiness_state == "ready" {
+        reasons.push(serde_json::json!("ready-bead-without-claim-blockers"));
+    }
+    reasons
+}
+
+fn swarm_work_packet_evidence_refs(
+    readiness_state: &str,
+    section: Option<&'static str>,
+) -> Vec<serde_json::Value> {
+    let mut refs = Vec::new();
+    if let Some(section) = section {
+        refs.push(serde_json::json!(format!("{section}[0]")));
+    }
+    refs.push(serde_json::json!("summary.build_pressure"));
+    refs.push(serde_json::json!("providers"));
+    if matches!(readiness_state, "blocked" | "build-pressure-high") {
+        refs.push(serde_json::json!("reservations"));
+        refs.push(serde_json::json!("git.dirty_paths"));
+    }
+    refs
+}
+
+fn swarm_work_packet_bead_summary(bead: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": bead.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "title": bead.get("title").cloned().unwrap_or(serde_json::Value::Null),
+        "status": bead.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "priority": bead.get("priority").cloned().unwrap_or(serde_json::Value::Null),
+        "issue_type": bead.get("issue_type").cloned().unwrap_or(serde_json::Value::Null),
+        "labels": bead.get("labels").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "safe_to_claim": bead.get("safe_to_claim").cloned().unwrap_or_else(|| serde_json::json!(false)),
+        "claim_blockers": bead.get("claim_blockers").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "recommended_action": bead.get("recommended_action").cloned().unwrap_or(serde_json::Value::Null),
+        "owners": bead.get("owners").cloned().unwrap_or_else(|| serde_json::json!([])),
+    })
+}
+
+fn swarm_work_packet_suggested_reservations(bead: &serde_json::Value) -> Vec<serde_json::Value> {
+    let labels = swarm_work_packet_labels(bead);
+    let bead_id = bead
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("selected-bead");
+    let mut reservations = Vec::new();
+    if labels.iter().any(|label| label == "docs") {
+        reservations.push(swarm_work_packet_reservation("docs/**", bead_id, "medium"));
+    }
+    if labels.iter().any(|label| label == "robot-json") {
+        reservations.push(swarm_work_packet_reservation(
+            "tests/golden/robot*/**",
+            bead_id,
+            "medium",
+        ));
+    }
+    if labels.iter().any(|label| label == "swarm") {
+        reservations.push(swarm_work_packet_reservation("src/lib.rs", bead_id, "low"));
+        reservations.push(swarm_work_packet_reservation(
+            "tests/swarm_status_contract.rs",
+            bead_id,
+            "medium",
+        ));
+        reservations.push(swarm_work_packet_reservation(
+            "tests/fixtures/swarm_status/**",
+            bead_id,
+            "medium",
+        ));
+    }
+    if labels
+        .iter()
+        .any(|label| matches!(label.as_str(), "testing" | "e2e"))
+    {
+        reservations.push(swarm_work_packet_reservation("tests/**", bead_id, "low"));
+    }
+    reservations
+}
+
+fn swarm_work_packet_reservation(
+    path_pattern: &str,
+    bead_id: &str,
+    confidence: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "path_pattern": path_pattern,
+        "exclusive": true,
+        "reason": bead_id,
+        "source": "label-heuristic",
+        "confidence": confidence,
+    })
+}
+
+fn swarm_work_packet_labels(bead: &serde_json::Value) -> Vec<String> {
+    bead.get("labels")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn swarm_work_packet_verification(
+    bead: &serde_json::Value,
+    build_pressure: &str,
+) -> serde_json::Value {
+    let labels = swarm_work_packet_labels(bead);
+    let touched_paths = swarm_work_packet_touched_paths(bead);
+    let file_classes = swarm_work_packet_file_classes(bead, &labels, &touched_paths);
+    let command_plan = swarm_work_packet_verification_commands(&file_classes, &labels);
+    let known_exclusions = swarm_work_packet_known_exclusions(&file_classes, &touched_paths);
+    let commands: Vec<String> = command_plan
+        .iter()
+        .filter_map(|command| command.get("command").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect();
+    let rch_required = !commands.is_empty();
+
+    serde_json::json!({
+        "commands": commands,
+        "command_plan": command_plan,
+        "file_classes": file_classes,
+        "known_exclusions": known_exclusions,
+        "manual_checks": swarm_work_packet_manual_checks(&file_classes),
+        "expected_artifacts": [
+            "stdout/stderr transcript",
+            "exit status",
+            "git diff --check result",
+            "proof summary in bead closeout"
+        ],
+        "rch_required": rch_required,
+        "target_dir_hint": if rch_required { "/tmp/cass-work-packet-target" } else { "" },
+        "full_gate_required": swarm_work_packet_full_gate_required(&file_classes),
+        "rationale": if build_pressure == "high" {
+            "Defer expensive verification until build pressure drops; keep commands for the later proof pass."
+        } else {
+            swarm_work_packet_verification_rationale(&file_classes)
+        },
+    })
+}
+
+fn swarm_work_packet_empty_verification() -> serde_json::Value {
+    serde_json::json!({
+        "commands": [],
+        "command_plan": [],
+        "file_classes": [],
+        "known_exclusions": [],
+        "manual_checks": [],
+        "expected_artifacts": [],
+        "rch_required": false,
+        "target_dir_hint": "",
+        "full_gate_required": false,
+        "rationale": "No bead was selected, so no verification plan was generated.",
+    })
+}
+
+fn swarm_work_packet_collision_claim_blockers(simulation: &serde_json::Value) -> Vec<String> {
+    simulation
+        .get("assignment_blockers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn swarm_work_packet_collision_simulation(
+    status: &serde_json::Value,
+    bead: Option<&serde_json::Value>,
+    candidate_reservations: &[serde_json::Value],
+    verification: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(bead) = bead else {
+        return serde_json::json!({
+            "mode": "read_only_advisory",
+            "overall_class": "no-selected-bead",
+            "classes": [],
+            "requires_coordination": false,
+            "requires_operator_review": false,
+            "assignment_blocked": false,
+            "assignment_blockers": [],
+            "proposed_paths": [],
+            "advisories": [],
+            "inputs": {
+                "selected_bead": false,
+                "reservation_count": 0,
+                "dirty_path_count": 0,
+                "recent_commit_count": 0
+            },
+            "mutation_policy": swarm_work_packet_collision_mutation_policy(),
+        });
+    };
+
+    let bead_id = bead
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("[UNKNOWN_BEAD]");
+    let proposed_paths = swarm_work_packet_collision_proposed_paths(bead, candidate_reservations);
+    let reservations = status
+        .get("reservations")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let dirty_paths = swarm_work_packet_collision_dirty_paths(status);
+    let recent_commit_paths = swarm_work_packet_collision_recent_commit_paths(status);
+    let mut classes = BTreeSet::new();
+    let mut assignment_blockers = BTreeSet::new();
+    let mut advisories = Vec::new();
+    let mut requires_coordination = false;
+    let mut requires_operator_review = false;
+
+    for (reservation_index, reservation) in reservations.iter().enumerate() {
+        let Some(path_pattern) = reservation
+            .get("path_pattern")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Some((candidate_path, match_kind)) =
+            swarm_work_packet_collision_first_match(&proposed_paths, path_pattern)
+        else {
+            continue;
+        };
+
+        let holder = reservation
+            .get("holder")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("[UNKNOWN_HOLDER]");
+        let active = reservation
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|state| state != "expired")
+            && swarm_reservation_active(reservation);
+        let exclusive = reservation
+            .get("exclusive")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        if active && exclusive {
+            classes.insert("blocked-by-active-holder".to_string());
+            assignment_blockers.insert("active-reservation".to_string());
+            requires_coordination = true;
+            advisories.push(swarm_work_packet_collision_advisory(
+                SwarmCollisionAdvisoryInput {
+                    class: "blocked-by-active-holder",
+                    severity: "high",
+                    summary: "Proposed work overlaps an active exclusive reservation.",
+                    path: &candidate_path,
+                    compared_path: Some(path_pattern),
+                    holder: Some(holder),
+                    match_kind: &match_kind,
+                    evidence_refs: vec![
+                        format!("reservations[{reservation_index}]"),
+                        "work_packet.collision_simulation.proposed_paths".to_string(),
+                    ],
+                },
+            ));
+        } else if active {
+            classes.insert("needs-coordination".to_string());
+            assignment_blockers.insert("active-reservation".to_string());
+            requires_coordination = true;
+            advisories.push(swarm_work_packet_collision_advisory(
+                SwarmCollisionAdvisoryInput {
+                    class: "needs-coordination",
+                    severity: "medium",
+                    summary: "Proposed work overlaps an active non-exclusive reservation.",
+                    path: &candidate_path,
+                    compared_path: Some(path_pattern),
+                    holder: Some(holder),
+                    match_kind: &match_kind,
+                    evidence_refs: vec![
+                        format!("reservations[{reservation_index}]"),
+                        "work_packet.collision_simulation.proposed_paths".to_string(),
+                    ],
+                },
+            ));
+        } else {
+            classes.insert("stale-holder-review".to_string());
+            assignment_blockers.insert("stale-reservation".to_string());
+            requires_coordination = true;
+            requires_operator_review = true;
+            advisories.push(swarm_work_packet_collision_advisory(
+                SwarmCollisionAdvisoryInput {
+                    class: "stale-holder-review",
+                    severity: "medium",
+                    summary: "Proposed work overlaps an expired reservation; review before reuse.",
+                    path: &candidate_path,
+                    compared_path: Some(path_pattern),
+                    holder: Some(holder),
+                    match_kind: &match_kind,
+                    evidence_refs: vec![
+                        format!("reservations[{reservation_index}]"),
+                        "work_packet.collision_simulation.proposed_paths".to_string(),
+                    ],
+                },
+            ));
+        }
+    }
+
+    let mut dirty_overlap = false;
+    for (dirty_index, dirty_path) in dirty_paths.iter().enumerate() {
+        if let Some((candidate_path, match_kind)) =
+            swarm_work_packet_collision_first_match(&proposed_paths, dirty_path)
+        {
+            dirty_overlap = true;
+            classes.insert("needs-coordination".to_string());
+            assignment_blockers.insert("dirty-peer-work".to_string());
+            requires_coordination = true;
+            advisories.push(swarm_work_packet_collision_advisory(
+                SwarmCollisionAdvisoryInput {
+                    class: "needs-coordination",
+                    severity: "high",
+                    summary: "Proposed work overlaps peer dirty worktree state.",
+                    path: &candidate_path,
+                    compared_path: Some(dirty_path),
+                    holder: None,
+                    match_kind: &match_kind,
+                    evidence_refs: vec![
+                        format!("git.dirty_paths[{dirty_index}]"),
+                        "work_packet.collision_simulation.proposed_paths".to_string(),
+                    ],
+                },
+            ));
+        }
+    }
+    if !dirty_paths.is_empty() && !dirty_overlap {
+        advisories.push(serde_json::json!({
+            "class": "safe",
+            "kind": "peer-dirty-unrelated",
+            "severity": "info",
+            "summary": "Peer dirty paths are present but do not overlap the proposed work.",
+            "path": dirty_paths[0],
+            "match_kind": "none",
+            "holder": null,
+            "evidence_refs": ["git.dirty_paths", "work_packet.collision_simulation.proposed_paths"],
+        }));
+    }
+
+    for (commit_ref, changed_path) in &recent_commit_paths {
+        if let Some((candidate_path, match_kind)) =
+            swarm_work_packet_collision_first_match(&proposed_paths, changed_path)
+        {
+            classes.insert("needs-coordination".to_string());
+            assignment_blockers.insert("recent-commit".to_string());
+            requires_coordination = true;
+            advisories.push(swarm_work_packet_collision_advisory(
+                SwarmCollisionAdvisoryInput {
+                    class: "needs-coordination",
+                    severity: "medium",
+                    summary: "A recent commit touched the same path; inspect ownership before claiming.",
+                    path: &candidate_path,
+                    compared_path: Some(changed_path),
+                    holder: Some(commit_ref),
+                    match_kind: &match_kind,
+                    evidence_refs: vec![
+                        "git.recent_commits".to_string(),
+                        "work_packet.collision_simulation.proposed_paths".to_string(),
+                    ],
+                },
+            ));
+        }
+    }
+
+    for path in &proposed_paths {
+        if swarm_work_packet_generated_artifact_path(path) {
+            classes.insert("generated-artifact-risk".to_string());
+            requires_operator_review = true;
+            advisories.push(swarm_work_packet_collision_advisory(
+                SwarmCollisionAdvisoryInput {
+                    class: "generated-artifact-risk",
+                    severity: "medium",
+                    summary: "Proposed work includes a generated or build-output path.",
+                    path,
+                    compared_path: None,
+                    holder: None,
+                    match_kind: "generated",
+                    evidence_refs: vec![
+                        "work_packet.collision_simulation.proposed_paths".to_string(),
+                    ],
+                },
+            ));
+        }
+    }
+
+    if swarm_work_packet_collision_has_sibling_risk(&proposed_paths, verification) {
+        classes.insert("sibling-repo-risk".to_string());
+        classes.insert("needs-coordination".to_string());
+        assignment_blockers.insert("sibling-repo-risk".to_string());
+        requires_coordination = true;
+        requires_operator_review = true;
+        advisories.push(serde_json::json!({
+            "class": "sibling-repo-risk",
+            "kind": "sibling-dependency-surface",
+            "severity": "medium",
+            "summary": "Proposed work touches sibling dependency or path-dependency contract surfaces.",
+            "path": proposed_paths
+                .iter()
+                .find(|path| swarm_work_packet_sibling_path(path))
+                .cloned()
+                .unwrap_or_else(|| "Cargo.toml".to_string()),
+            "match_kind": "class",
+            "holder": null,
+            "evidence_refs": [
+                "work_packet.verification.file_classes",
+                "work_packet.collision_simulation.proposed_paths"
+            ],
+        }));
+    }
+
+    let owners = bead
+        .get("owners")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !owners.is_empty() && !classes.contains("blocked-by-active-holder") {
+        classes.insert("needs-coordination".to_string());
+        assignment_blockers.insert("owned-bead".to_string());
+        requires_coordination = true;
+        advisories.push(serde_json::json!({
+            "class": "needs-coordination",
+            "kind": "bead-owner-present",
+            "severity": "medium",
+            "summary": "Selected bead already has ownership evidence.",
+            "path": null,
+            "match_kind": "owner",
+            "holder": owners,
+            "evidence_refs": ["work_packet.bead.owners"],
+        }));
+    }
+
+    if classes.is_empty() {
+        classes.insert("safe".to_string());
+    }
+    let overall_class = swarm_work_packet_collision_overall_class(&classes);
+    let class_values = classes
+        .into_iter()
+        .map(serde_json::Value::String)
+        .collect::<Vec<_>>();
+    let blocker_values = assignment_blockers
+        .into_iter()
+        .map(serde_json::Value::String)
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "mode": "read_only_advisory",
+        "bead_id": bead_id,
+        "overall_class": overall_class,
+        "classes": class_values,
+        "requires_coordination": requires_coordination,
+        "requires_operator_review": requires_operator_review,
+        "assignment_blocked": !blocker_values.is_empty(),
+        "assignment_blockers": blocker_values,
+        "proposed_paths": proposed_paths,
+        "advisories": advisories,
+        "inputs": {
+            "selected_bead": true,
+            "reservation_count": reservations.len(),
+            "dirty_path_count": dirty_paths.len(),
+            "recent_commit_count": recent_commit_paths.len(),
+        },
+        "mutation_policy": swarm_work_packet_collision_mutation_policy(),
+    })
+}
+
+fn swarm_work_packet_collision_mutation_policy() -> serde_json::Value {
+    serde_json::json!({
+        "beads_mutated": false,
+        "agent_mail_mutated": false,
+        "git_mutated": false,
+        "reservations_mutated": false,
+        "files_rewritten": false,
+        "raw_session_content_inspected": false,
+    })
+}
+
+fn swarm_work_packet_collision_proposed_paths(
+    bead: &serde_json::Value,
+    candidate_reservations: &[serde_json::Value],
+) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    paths.extend(swarm_work_packet_touched_paths(bead));
+    paths.extend(candidate_reservations.iter().filter_map(|reservation| {
+        reservation
+            .get("path_pattern")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }));
+    paths.into_iter().collect()
+}
+
+fn swarm_work_packet_collision_dirty_paths(status: &serde_json::Value) -> Vec<String> {
+    status
+        .get("git")
+        .and_then(|git| git.get("dirty_paths"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|path| path.get("path").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn swarm_work_packet_collision_recent_commit_paths(
+    status: &serde_json::Value,
+) -> Vec<(String, String)> {
+    let mut paths = Vec::new();
+    for commit in status
+        .get("git")
+        .and_then(|git| git.get("recent_commits"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let commit_ref = commit
+            .get("hash")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| commit.get("subject").and_then(serde_json::Value::as_str))
+            .unwrap_or("recent-commit")
+            .to_string();
+        paths.extend(
+            commit
+                .get("changed_paths")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(|path| (commit_ref.clone(), path.to_string())),
+        );
+    }
+    paths
+}
+
+fn swarm_work_packet_collision_first_match(
+    proposed_paths: &[String],
+    expression: &str,
+) -> Option<(String, String)> {
+    proposed_paths
+        .iter()
+        .find(|path| swarm_work_packet_path_expressions_overlap(path, expression))
+        .map(|path| {
+            (
+                path.clone(),
+                swarm_work_packet_collision_match_kind(path, expression).to_string(),
+            )
+        })
+}
+
+fn swarm_work_packet_path_expressions_overlap(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    if swarm_path_pattern_matches(left, right) || swarm_path_pattern_matches(right, left) {
+        return true;
+    }
+    let left_prefix = swarm_work_packet_static_path_prefix(left);
+    let right_prefix = swarm_work_packet_static_path_prefix(right);
+    !left_prefix.is_empty()
+        && !right_prefix.is_empty()
+        && (left_prefix.starts_with(&right_prefix) || right_prefix.starts_with(&left_prefix))
+}
+
+fn swarm_work_packet_static_path_prefix(expression: &str) -> String {
+    let first_glob = expression
+        .char_indices()
+        .find_map(|(index, ch)| matches!(ch, '*' | '?' | '[').then_some(index))
+        .unwrap_or(expression.len());
+    expression[..first_glob]
+        .trim_end_matches("/**")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn swarm_work_packet_collision_match_kind(left: &str, right: &str) -> &'static str {
+    if left == right {
+        "exact"
+    } else if swarm_work_packet_expression_has_glob(left)
+        || swarm_work_packet_expression_has_glob(right)
+    {
+        "glob"
+    } else {
+        "path"
+    }
+}
+
+fn swarm_work_packet_expression_has_glob(expression: &str) -> bool {
+    expression
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
+}
+
+struct SwarmCollisionAdvisoryInput<'a> {
+    class: &'a str,
+    severity: &'a str,
+    summary: &'a str,
+    path: &'a str,
+    compared_path: Option<&'a str>,
+    holder: Option<&'a str>,
+    match_kind: &'a str,
+    evidence_refs: Vec<String>,
+}
+
+fn swarm_work_packet_collision_advisory(
+    input: SwarmCollisionAdvisoryInput<'_>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "class": input.class,
+        "kind": input.class,
+        "severity": input.severity,
+        "summary": input.summary,
+        "path": input.path,
+        "compared_path": input.compared_path,
+        "holder": input.holder,
+        "match_kind": input.match_kind,
+        "evidence_refs": input.evidence_refs,
+    })
+}
+
+fn swarm_work_packet_generated_artifact_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower == "target"
+        || lower.starts_with("target/")
+        || lower.contains("/target/")
+        || lower.starts_with("/tmp/cass-")
+        || lower.contains("cargo_target_dir")
+        || lower.ends_with(".profraw")
+}
+
+fn swarm_work_packet_collision_has_sibling_risk(
+    proposed_paths: &[String],
+    verification: &serde_json::Value,
+) -> bool {
+    proposed_paths
+        .iter()
+        .any(|path| swarm_work_packet_sibling_path(path))
+        || verification
+            .get("file_classes")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|class| {
+                class
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind == "sibling-dependency")
+            })
+}
+
+fn swarm_work_packet_sibling_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("../")
+        || matches!(lower.as_str(), "cargo.toml" | "cargo.lock" | "build.rs")
+        || lower.starts_with(".cargo/")
+        || lower.contains("../franken")
+        || lower.contains("../asupersync")
+        || lower.contains("../toon")
+}
+
+fn swarm_work_packet_collision_overall_class(classes: &BTreeSet<String>) -> &'static str {
+    for class in [
+        "blocked-by-active-holder",
+        "stale-holder-review",
+        "sibling-repo-risk",
+        "needs-coordination",
+        "generated-artifact-risk",
+        "safe",
+    ] {
+        if classes.contains(class) {
+            return class;
+        }
+    }
+    "safe"
+}
+
+fn swarm_work_packet_touched_paths(bead: &serde_json::Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    for key in [
+        "touched_paths",
+        "proposed_paths",
+        "changed_paths",
+        "paths",
+        "files",
+    ] {
+        paths.extend(
+            bead.get(key)
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn swarm_work_packet_file_classes(
+    bead: &serde_json::Value,
+    labels: &[String],
+    touched_paths: &[String],
+) -> Vec<serde_json::Value> {
+    let mut classes = BTreeMap::new();
+    let title = bead
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let issue_type = bead
+        .get("issue_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if labels.iter().any(|label| matches!(label.as_str(), "swarm")) {
+        swarm_work_packet_add_file_class(
+            &mut classes,
+            "swarm-contract",
+            "label:swarm",
+            "focused swarm coordination contract",
+        );
+    }
+    if labels
+        .iter()
+        .any(|label| matches!(label.as_str(), "robot-json"))
+    {
+        swarm_work_packet_add_file_class(
+            &mut classes,
+            "golden-json",
+            "label:robot-json",
+            "robot JSON or robot docs contract",
+        );
+    }
+    if labels.iter().any(|label| matches!(label.as_str(), "docs"))
+        || matches!(issue_type.as_str(), "docs")
+    {
+        swarm_work_packet_add_file_class(
+            &mut classes,
+            "docs",
+            "label-or-type:docs",
+            "documentation-only surface",
+        );
+    }
+    if labels.iter().any(|label| matches!(label.as_str(), "beads")) {
+        swarm_work_packet_add_file_class(
+            &mut classes,
+            "beads-only",
+            "label:beads",
+            "tracker-only metadata",
+        );
+    }
+
+    for path in touched_paths {
+        let normalized = path.trim();
+        if normalized.is_empty() {
+            continue;
+        }
+        let lower = normalized.to_ascii_lowercase();
+        let evidence = normalized;
+
+        if lower.contains("e2e_large_dataset") {
+            swarm_work_packet_add_file_class(
+                &mut classes,
+                "large-e2e-excluded",
+                evidence,
+                "known expensive large-dataset e2e surface",
+            );
+        }
+        if lower.ends_with(".rs") && lower.starts_with("src/") {
+            swarm_work_packet_add_file_class(
+                &mut classes,
+                "rust-source",
+                evidence,
+                "Rust production source",
+            );
+        }
+        if lower.ends_with(".rs") && lower.starts_with("tests/") {
+            swarm_work_packet_add_file_class(
+                &mut classes,
+                "rust-test",
+                evidence,
+                "Rust test source",
+            );
+        }
+        if lower.starts_with("tests/golden/") || lower.ends_with(".golden") {
+            swarm_work_packet_add_file_class(
+                &mut classes,
+                "golden-json",
+                evidence,
+                "golden contract artifact",
+            );
+        }
+        if lower.starts_with("docs/")
+            || matches!(
+                lower.as_str(),
+                "readme.md" | "agents.md" | "changelog.md" | "install.md"
+            )
+        {
+            swarm_work_packet_add_file_class(
+                &mut classes,
+                "docs",
+                evidence,
+                "documentation surface",
+            );
+        }
+        if lower.starts_with(".beads/") || matches!(lower.as_str(), ".beads/beads.jsonl") {
+            swarm_work_packet_add_file_class(
+                &mut classes,
+                "beads-only",
+                evidence,
+                "tracker metadata",
+            );
+        }
+        if matches!(lower.as_str(), "cargo.toml" | "cargo.lock" | "build.rs")
+            || lower.starts_with(".cargo/")
+        {
+            swarm_work_packet_add_file_class(
+                &mut classes,
+                "sibling-dependency",
+                evidence,
+                "Cargo or sibling dependency contract",
+            );
+        }
+        if lower.starts_with("src/ui/")
+            || lower.starts_with("tests/snapshots/")
+            || lower.contains("tui")
+            || lower.contains("ftui")
+        {
+            swarm_work_packet_add_file_class(
+                &mut classes,
+                "ui-snapshot",
+                evidence,
+                "TUI or UI snapshot surface",
+            );
+        }
+    }
+
+    if title.contains("sibling") || title.contains("dependency pin") {
+        swarm_work_packet_add_file_class(
+            &mut classes,
+            "sibling-dependency",
+            "title:sibling-dependency",
+            "Cargo or sibling dependency contract",
+        );
+    }
+    if labels
+        .iter()
+        .any(|label| matches!(label.as_str(), "testing" | "e2e" | "test"))
+        || matches!(issue_type.as_str(), "test")
+    {
+        swarm_work_packet_add_file_class(
+            &mut classes,
+            "rust-test",
+            "label-or-type:testing",
+            "test-focused change",
+        );
+    }
+
+    const ORDER: &[&str] = &[
+        "rust-source",
+        "rust-test",
+        "swarm-contract",
+        "golden-json",
+        "docs",
+        "beads-only",
+        "sibling-dependency",
+        "ui-snapshot",
+        "large-e2e-excluded",
+    ];
+    ORDER
+        .iter()
+        .filter_map(|kind| classes.remove(*kind))
+        .collect()
+}
+
+fn swarm_work_packet_add_file_class(
+    classes: &mut BTreeMap<String, serde_json::Value>,
+    kind: &str,
+    evidence: &str,
+    summary: &str,
+) {
+    let entry = classes.entry(kind.to_string()).or_insert_with(|| {
+        serde_json::json!({
+            "kind": kind,
+            "summary": summary,
+            "evidence": [],
+        })
+    });
+    if let Some(evidence_items) = entry
+        .get_mut("evidence")
+        .and_then(serde_json::Value::as_array_mut)
+        && !evidence_items
+            .iter()
+            .any(|item| item.as_str().is_some_and(|item| item.cmp(evidence).is_eq()))
+    {
+        evidence_items.push(serde_json::json!(evidence));
+    }
+}
+
+fn swarm_work_packet_verification_commands(
+    file_classes: &[serde_json::Value],
+    labels: &[String],
+) -> Vec<serde_json::Value> {
+    let has_class = |kind: &str| swarm_work_packet_has_file_class(file_classes, kind);
+    let mut commands = Vec::new();
+
+    if has_class("swarm-contract") {
+        commands.push(swarm_work_packet_command_step(
+            "focused-swarm-contract",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-swarm-work-packet-target cargo test --test swarm_status_contract -- --nocapture",
+            "Swarm work-packet/status contract changed or is directly relevant.",
+        ));
+    }
+    if has_class("golden-json") {
+        commands.push(swarm_work_packet_command_step(
+            "robot-golden-contract",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs",
+            "Robot JSON or robot docs contracts need deterministic golden coverage.",
+        ));
+    }
+    if has_class("docs") && !has_class("golden-json") {
+        commands.push(swarm_work_packet_command_step(
+            "robot-docs-contract",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-docs-target cargo test --test golden_robot_docs",
+            "Documentation changes that touch robot-facing help should keep docs goldens stable.",
+        ));
+    }
+    if has_class("sibling-dependency") {
+        commands.push(swarm_work_packet_command_step(
+            "sibling-dependency-contract",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation",
+            "Sibling dependency pins or build.rs contract checks changed.",
+        ));
+    }
+    if has_class("ui-snapshot") {
+        commands.push(swarm_work_packet_command_step(
+            "tui-snapshot-contract",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-tui-target cargo test --test tui_flows",
+            "TUI flow or snapshot surface changed.",
+        ));
+    }
+
+    let code_changed = file_classes.is_empty()
+        || has_class("rust-source")
+        || has_class("rust-test")
+        || has_class("swarm-contract")
+        || has_class("sibling-dependency")
+        || has_class("ui-snapshot")
+        || labels
+            .iter()
+            .any(|label| matches!(label.as_str(), "testing"));
+    if code_changed {
+        commands.push(swarm_work_packet_command_step(
+            "cargo-check-all-targets",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo check --all-targets",
+            "Rust code or tests changed; compile every target before closeout.",
+        ));
+        commands.push(swarm_work_packet_command_step(
+            "clippy-all-targets",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo clippy --all-targets -- -D warnings",
+            "Repo gate treats warnings as errors.",
+        ));
+        commands.push(swarm_work_packet_command_step(
+            "fmt-check",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo fmt --check",
+            "Formatting must stay stable.",
+        ));
+    }
+
+    commands
+}
+
+fn swarm_work_packet_command_step(kind: &str, command: &str, rationale: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "command": command,
+        "rationale": rationale,
+        "uses_rch": command.starts_with("rch exec -- env "),
+    })
+}
+
+fn swarm_work_packet_known_exclusions(
+    file_classes: &[serde_json::Value],
+    touched_paths: &[String],
+) -> Vec<serde_json::Value> {
+    if !swarm_work_packet_has_file_class(file_classes, "large-e2e-excluded")
+        && !touched_paths
+            .iter()
+            .any(|path| path.to_ascii_lowercase().contains("e2e_large_dataset"))
+    {
+        return Vec::new();
+    }
+
+    vec![serde_json::json!({
+        "pattern": "e2e_large_dataset",
+        "reason": "Known expensive routine gate; run only when explicitly fixing that suite.",
+        "recommended_alternative": "Use focused unit/integration tests plus cargo check/clippy/fmt for unrelated changes.",
+    })]
+}
+
+fn swarm_work_packet_manual_checks(file_classes: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut checks = Vec::new();
+    if swarm_work_packet_has_file_class(file_classes, "beads-only") {
+        checks.push(serde_json::json!({
+            "kind": "beads-flush",
+            "command": "br sync --flush-only",
+            "rationale": "Tracker-only changes need JSONL export before commit.",
+        }));
+    }
+    if swarm_work_packet_has_file_class(file_classes, "golden-json") {
+        checks.push(serde_json::json!({
+            "kind": "golden-diff-review",
+            "command": "git diff -- tests/golden tests/fixtures",
+            "rationale": "Every golden change must be reviewed before commit.",
+        }));
+    }
+    checks
+}
+
+fn swarm_work_packet_full_gate_required(file_classes: &[serde_json::Value]) -> bool {
+    file_classes.iter().any(|class| {
+        class
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "rust-source" | "rust-test" | "swarm-contract" | "sibling-dependency"
+                )
+            })
+    })
+}
+
+fn swarm_work_packet_verification_rationale(file_classes: &[serde_json::Value]) -> &'static str {
+    if file_classes.is_empty() {
+        "No touched-file hints were provided; fall back to the minimal safe repo gate when code changes are possible."
+    } else if swarm_work_packet_has_file_class(file_classes, "beads-only")
+        && file_classes.len() == 1
+    {
+        "Tracker-only work does not need an rch cargo proof; flush Beads state and review the JSONL diff."
+    } else {
+        "Use the narrowest file-class playbook first, then standard all-target gates when Rust code or contracts changed."
+    }
+}
+
+fn swarm_work_packet_has_file_class(file_classes: &[serde_json::Value], kind: &str) -> bool {
+    file_classes.iter().any(|class| {
+        class
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|actual| actual.cmp(kind).is_eq())
+    })
+}
+
+fn swarm_work_packet_coordination(bead_id: Option<&str>, safe_to_start: bool) -> serde_json::Value {
+    let bead_arg = bead_id
+        .and_then(swarm_work_packet_safe_arg)
+        .unwrap_or("[BEAD_ID]");
+    serde_json::json!({
+        "agent_mail_subject": format!("[coord] Claiming {bead_arg}"),
+        "body_template": format!(
+            "Claiming `{bead_arg}`. Scope, file reservations, and proof commands come from `cass swarm work-packet --json --bead {bead_arg}`."
+        ),
+        "ack_required": false,
+        "send_before_editing": safe_to_start,
+        "evidence_refs": ["work_packet.readiness", "work_packet.suggested_reservations"],
+    })
+}
+
+fn swarm_work_packet_closeout(bead_id: Option<&str>) -> serde_json::Value {
+    let bead_arg = bead_id
+        .and_then(swarm_work_packet_safe_arg)
+        .unwrap_or("[BEAD_ID]");
+    serde_json::json!({
+        "beads_command": format!("br close {bead_arg} --json"),
+        "agent_mail_required": true,
+        "proof_refs_required": true,
+        "commit_subject_template": format!("type(scope): summary ({bead_arg})"),
+    })
+}
+
+fn swarm_work_packet_fallback_actions(
+    readiness_state: &str,
+    bead_filter: Option<&str>,
+    safe_bead_arg: Option<&str>,
+    build_pressure: &str,
+) -> Vec<serde_json::Value> {
+    match readiness_state {
+        "ready" => vec![serde_json::json!({
+            "kind": "claim",
+            "command": safe_bead_arg
+                .map(|bead| format!("br update {bead} --status in_progress --json"))
+                .unwrap_or_else(|| "br show [BEAD_ID] --json".to_string()),
+            "requires_human_confirmation": false,
+        })],
+        "blocked" => vec![serde_json::json!({
+            "kind": "coordinate",
+            "command": safe_bead_arg
+                .map(|bead| format!("br show {bead} --json"))
+                .unwrap_or_else(|| "br ready --json".to_string()),
+            "requires_human_confirmation": true,
+        })],
+        "build-pressure-high" => vec![serde_json::json!({
+            "kind": "wait-for-capacity",
+            "command": "rch status",
+            "requires_human_confirmation": false,
+            "observed_build_pressure": build_pressure,
+        })],
+        "bead-not-found" => vec![serde_json::json!({
+            "kind": "inspect-bead",
+            "command": bead_filter
+                .and_then(swarm_work_packet_safe_arg)
+                .map(|bead| format!("br show {bead} --json"))
+                .unwrap_or_else(|| "br ready --json".to_string()),
+            "requires_human_confirmation": false,
+        })],
+        "provider-partial" => vec![serde_json::json!({
+            "kind": "inspect-status",
+            "command": "cass swarm status --json",
+            "requires_human_confirmation": false,
+        })],
+        _ => vec![serde_json::json!({
+            "kind": "list-ready",
+            "command": "br ready --json",
+            "requires_human_confirmation": false,
+        })],
+    }
+}
+
+fn swarm_work_packet_safe_arg(value: &str) -> Option<&str> {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 fn swarm_age_seconds(ts: &str) -> Option<u64> {
@@ -10025,13 +14081,19 @@ fn open_franken_cli_read_db(
                 Err(raw_readonly_err) => {
                     let raw_readonly_retryable =
                         crate::storage::sqlite::retryable_franken_anyhow(&raw_readonly_err);
+                    let message = format!(
+                        "Failed to open {reason} database at {}: readonly storage open failed ({err}); raw readonly open failed ({raw_readonly_err})",
+                        path.display()
+                    );
+                    if let Some(fts_err) =
+                        crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
+                    {
+                        return Err(fts_messages_integrity_cli_error(reason, fts_err.into()));
+                    }
                     return Err(CliError {
                         code: 9,
                         kind: CliErrorKind::DbOpen.kind_str(),
-                        message: format!(
-                            "Failed to open {reason} database at {}: readonly storage open failed ({err}); raw readonly open failed ({raw_readonly_err})",
-                            path.display()
-                        ),
+                        message,
                         hint: None,
                         retryable: readonly_retryable || raw_readonly_retryable,
                     });
@@ -10159,6 +14221,24 @@ fn close_franken_cli_read_db(
         conn.close_best_effort_in_place();
     }
     Ok(())
+}
+
+fn fts_messages_integrity_cli_error(surface: &str, err: anyhow::Error) -> CliError {
+    CliError {
+        code: 5,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("{surface} cannot continue: {err:#}"),
+        hint: Some(crate::storage::sqlite::FTS_MESSAGES_CORRUPTION_RECOVERY_HINT.to_string()),
+        retryable: false,
+    }
+}
+
+fn validate_fts_messages_integrity_for_cli(
+    conn: &frankensqlite::Connection,
+    surface: &str,
+) -> CliResult<()> {
+    crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
+        .map_err(|err| fts_messages_integrity_cli_error(surface, err))
 }
 
 fn franken_query_row_map_retry<T, F>(
@@ -10635,7 +14715,7 @@ fn run_analytics_validate(
                                 "kind": "rebuild_track_b_failed",
                                 "check_ids": decision.check_ids,
                                 "reason": format!(
-                                    "rebuild_token_daily_stats returned error: {e}. The token_usage ledger may itself be corrupt — try 'cass index --full --force-rebuild'."
+                                    "rebuild_token_daily_stats returned error: {e}. The token_usage ledger may itself be corrupt — run 'cass doctor check --json' and repair or restore the canonical archive before rebuilding derived assets."
                                 ),
                             }));
                         }
@@ -10975,6 +15055,7 @@ const CLI_DIAG_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 struct StateDbSnapshot {
     conversation_count: i64,
     message_count: i64,
+    last_scan_ts: Option<i64>,
     last_indexed_at: Option<i64>,
     opened: bool,
     open_error: Option<String>,
@@ -11015,9 +15096,26 @@ fn probe_state_db(
     use frankensqlite::params;
 
     snapshot.opened = true;
+    if let Err(err) = crate::storage::sqlite::validate_fts_messages_integrity_for_connection(&conn)
+    {
+        snapshot.opened = false;
+        snapshot.open_error = Some(err.to_string());
+        snapshot.open_retryable = false;
+        snapshot.counts_skipped = true;
+        let _ = close_franken_cli_read_db(conn, db_path, reason);
+        return snapshot;
+    }
     snapshot.last_indexed_at = franken_query_row_map_retry(
         &conn,
         "SELECT value FROM meta WHERE key = 'last_indexed_at'",
+        params![],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<i64>().ok());
+    snapshot.last_scan_ts = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_scan_ts'",
         params![],
         |r| r.get_typed::<String>(0),
     )
@@ -11271,6 +15369,18 @@ fn error_chain_indicates_retryable_storage_contention(chain: &str) -> bool {
     crate::storage::sqlite::retryable_storage_error_message(chain)
 }
 
+fn error_chain_indicates_index_disk_headroom_blocked(chain: &str) -> bool {
+    chain.contains("canonical archive disk headroom check failed")
+}
+
+fn error_chain_indicates_orphan_fk_cleanup_blocked(chain: &str) -> bool {
+    chain.contains("orphan FK self-heal failed for canonical cass archive")
+}
+
+fn error_chain_indicates_archive_health_blocked(chain: &str) -> bool {
+    chain.contains("will not replace or truncate the SQLite source of truth")
+}
+
 fn index_storage_contention_cli_error(chain: &str) -> CliError {
     CliError {
         code: 7,
@@ -11281,6 +15391,89 @@ fn index_storage_contention_cli_error(chain: &str) -> CliError {
                 .to_string(),
         ),
         retryable: true,
+    }
+}
+
+fn index_archive_health_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 5,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("index refused to modify an unhealthy canonical archive: {chain}"),
+        hint: Some(
+            "Run 'cass doctor check --json' for a read-only diagnosis; do not use index --full/--force-rebuild as a corruption repair path."
+                .to_string(),
+        ),
+        retryable: false,
+    }
+}
+
+fn index_disk_headroom_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 14,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("index refused to start because disk headroom is too low: {chain}"),
+        hint: Some(
+            "Free space on the filesystem that holds the cass data directory, then retry indexing. Run 'cass doctor check --json' for a read-only health report."
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+fn index_orphan_fk_cleanup_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 5,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("index stopped before writing because orphan-FK cleanup failed: {chain}"),
+        hint: Some(
+            "Run 'cass doctor check --json', free disk/memory pressure if reported, then retry indexing after the canonical archive is readable."
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+#[cfg(test)]
+mod index_error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn orphan_fk_cleanup_failure_is_retryable_after_operator_remediation() {
+        let err = index_orphan_fk_cleanup_cli_error(
+            "orphan FK self-heal failed for canonical cass archive at /tmp/cass.db: out of memory",
+        );
+
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, CliErrorKind::Storage.kind_str());
+        assert!(err.retryable);
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("free disk/memory pressure")),
+            "hint should name the resource-pressure retry path: {err:?}"
+        );
+    }
+
+    #[test]
+    fn archive_health_failure_remains_non_retryable_index_repair() {
+        let err = index_archive_health_cli_error(
+            "canonical cass archive at /tmp/cass.db is not safe for indexing: malformed. cass index will not replace or truncate the SQLite source of truth.",
+        );
+
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, CliErrorKind::Storage.kind_str());
+        assert!(!err.retryable);
+    }
+
+    #[test]
+    fn disk_headroom_failure_is_retryable_after_space_is_freed() {
+        let err = index_disk_headroom_cli_error(
+            "canonical archive disk headroom check failed for /data: available=1 bytes, required=2 bytes",
+        );
+
+        assert_eq!(err.code, 14);
+        assert_eq!(err.kind, CliErrorKind::Storage.kind_str());
+        assert!(err.retryable);
     }
 }
 
@@ -11414,27 +15607,12 @@ fn state_meta_json_for_health(
     )
 }
 
-fn status_should_skip_db_open(db_path: &Path) -> bool {
-    std::fs::metadata(db_path).ok().is_some_and(|metadata| {
-        metadata.is_file() && metadata.len() > STATUS_COUNT_SCAN_MAX_DB_BYTES
-    })
-}
-
 fn state_meta_json_for_status(
     data_dir: &Path,
     db_path: &Path,
     stale_threshold: u64,
 ) -> serde_json::Value {
-    let skip_db_open = status_should_skip_db_open(db_path);
-    state_meta_json_inner(
-        data_dir,
-        db_path,
-        stale_threshold,
-        true,
-        None,
-        skip_db_open,
-        true,
-    )
+    state_meta_json_inner(data_dir, db_path, stale_threshold, true, None, false, true)
 }
 
 /// `coding_agent_session_search-d0rmo`: variant of `state_meta_json`
@@ -11468,10 +15646,17 @@ fn state_meta_json_inner(
     let db_exists = db_path.exists();
     let index_run = probe_index_run_lock(data_dir, db_path);
 
-    let now_secs = SystemTime::now()
+    // F4 (cass tech debt): capture the wall clock at full millisecond
+    // precision so the stall-detection comparison against
+    // `last_progress_at_ms` is no longer second-quantised inside
+    // `asset_state::lexical_state_from_observations`. `now_secs` is
+    // retained as a convenience for the existing age-in-seconds math
+    // (the public status JSON surfaces `age_seconds`, not `age_ms`).
+    let now_ms_i64: i64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0);
+    let now_secs = (now_ms_i64.max(0) as u64) / 1000;
 
     let db_metadata = fs::metadata(db_path).ok();
     let db_size_bytes = db_metadata.as_ref().map(|m| m.len());
@@ -11523,6 +15708,7 @@ fn state_meta_json_inner(
     };
     let conversation_count = db_snapshot.conversation_count;
     let message_count = db_snapshot.message_count;
+    let last_scan_ts = db_snapshot.last_scan_ts;
     let mut last_indexed_at = db_snapshot.last_indexed_at;
     let db_opened = db_snapshot.opened;
     let db_open_error = db_snapshot.open_error;
@@ -11541,15 +15727,27 @@ fn state_meta_json_inner(
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
     }
+    let status_semantic_policy = crate::search::policy::SemanticPolicy::resolve(
+        &crate::search::policy::CliSemanticOverrides::default(),
+    );
+    let semantic_preference = if status_semantic_policy
+        .quality_tier_embedder
+        .trim()
+        .eq_ignore_ascii_case("hash")
+    {
+        crate::search::asset_state::SemanticPreference::HashFallback
+    } else {
+        crate::search::asset_state::SemanticPreference::DefaultModel
+    };
     let mut assets = crate::search::asset_state::inspect_search_assets(
         crate::search::asset_state::InspectSearchAssetsInput {
             data_dir,
             db_path,
             stale_threshold,
             last_indexed_at_ms: last_indexed_at,
-            now_secs,
+            now_ms: now_ms_i64,
             maintenance: index_run.clone(),
-            semantic_preference: crate::search::asset_state::SemanticPreference::DefaultModel,
+            semantic_preference,
             db_available: db_opened,
             compute_lexical_fingerprint: include_counts,
             inspect_semantic,
@@ -11567,6 +15765,9 @@ fn state_meta_json_inner(
                     .mode
                     .is_some_and(crate::search::asset_state::SearchMaintenanceMode::rebuild_active)
                     && index_run.active,
+                stalled: false,
+                last_progress_age_ms: None,
+                last_progress_at_ms: index_run.last_progress_at_ms,
                 watch_active: index_run
                     .mode
                     .is_some_and(crate::search::asset_state::SearchMaintenanceMode::watch_active)
@@ -11609,6 +15810,8 @@ fn state_meta_json_inner(
                 hnsw_path: None,
                 hnsw_ready: false,
                 progressive_ready: false,
+                quality_tier_published: false,
+                semantic_only_search_available: false,
                 hint: Some(
                     "Repair semantic assets when convenient; lexical search remains available."
                         .to_string(),
@@ -11620,6 +15823,21 @@ fn state_meta_json_inner(
             },
         }
     });
+    if !assets.lexical.rebuilding
+        && last_scan_ts.is_some_and(|scan_ts| {
+            last_indexed_at
+                .map(|indexed_at| scan_ts > indexed_at.saturating_add(1_000))
+                .unwrap_or(true)
+        })
+    {
+        assets.lexical.status = "stale";
+        assets.lexical.fresh = false;
+        assets.lexical.stale = true;
+        assets.lexical.status_reason = Some(
+            "last_scan_ts is newer than last_indexed_at; a prior scan advanced without a completed projection into the searchable index"
+                .to_string(),
+        );
+    }
     let not_initialized = cass_not_initialized(
         db_exists,
         lexical_index_initialized,
@@ -11639,6 +15857,8 @@ fn state_meta_json_inner(
         assets.semantic.hnsw_path = None;
         assets.semantic.hnsw_ready = false;
         assets.semantic.progressive_ready = false;
+        assets.semantic.quality_tier_published = false;
+        assets.semantic.semantic_only_search_available = false;
         assets.semantic.hint = Some(
             "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic'."
                 .to_string(),
@@ -11650,7 +15870,11 @@ fn state_meta_json_inner(
     }
     let lexical = &assets.lexical;
     let semantic = &assets.semantic;
-    let lexical_rebuild_pipeline = crate::indexer::lexical_rebuild_pipeline_settings_snapshot();
+    let lexical_rebuild_pipeline = if skip_db_open {
+        crate::indexer::lexical_rebuild_pipeline_settings_snapshot_passive()
+    } else {
+        crate::indexer::lexical_rebuild_pipeline_settings_snapshot()
+    };
     let lexical_rebuild_pipeline_runtime = if lexical.rebuilding {
         crate::indexer::load_active_lexical_rebuild_pipeline_runtime(&index_path, db_path)
             .ok()
@@ -11798,6 +16022,7 @@ fn state_meta_json_inner(
             "stale": lexical.stale,
             "stale_threshold_seconds": stale_threshold,
             "rebuilding": lexical.rebuilding,
+            "stalled": lexical.stalled,
             "activity_at": lexical.activity_at_ms.map(|ts| {
                 chrono::DateTime::from_timestamp_millis(ts)
                     .unwrap_or_else(chrono::Utc::now)
@@ -11837,6 +16062,18 @@ fn state_meta_json_inner(
         },
         "rebuild": {
             "active": lexical.rebuilding,
+            // `stalled=true` means active=true but the indexing thread
+            // has not made forward progress for at least
+            // CASS_REBUILD_STALL_DETECT_SECS (default 120s), even though
+            // the lock-file heartbeat is still being refreshed. Surface
+            // this distinctly from `active` so operators (and the TUI)
+            // can tell a slow-but-progressing rebuild apart from a
+            // wedged one. Regression #258.
+            "stalled": lexical.stalled,
+            "last_progress_at": lexical.last_progress_at_ms.and_then(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
+            }),
+            "last_progress_age_ms": lexical.last_progress_age_ms,
             "orphaned": index_run.orphaned,
             "pid": index_run.pid,
             "mode": index_run.mode.map(|mode| mode.as_lock_value()),
@@ -11872,6 +16109,19 @@ fn state_meta_json_inner(
             "hnsw_path": semantic.hnsw_path.as_ref().map(|path| path.display().to_string()),
             "hnsw_ready": semantic.hnsw_ready,
             "progressive_ready": semantic.progressive_ready,
+            // cass#256: surface whether this binary was built with the
+            // `semantic` Cargo feature. `false` means the prebuilt
+            // Microsoft ONNX Runtime is NOT linked (the baseline build
+            // for pre-AVX2 CPUs); semantic search modes will return an
+            // explicit error and hybrid degrades to lexical.
+            "feature_compiled_in": cfg!(feature = "semantic"),
+            // Sub-fix 3 for cass#257 — additive fields that report
+            // quality-tier readiness independently of the
+            // progressive/hybrid stack so `--mode semantic` consumers
+            // see "yes, you can search" even while the fast tier or
+            // lexical surface is still building.
+            "quality_tier_published": semantic.quality_tier_published,
+            "semantic_only_search_available": semantic.semantic_only_search_available,
             "hint": semantic.hint,
             "fast_tier": {
                 "present": semantic.fast_tier.present,
@@ -11986,6 +16236,18 @@ fn rebuild_progress_summary_json(state: &serde_json::Value) -> serde_json::Value
         .get("active")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let stalled = rebuild
+        .get("stalled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let last_progress_at = rebuild
+        .get("last_progress_at")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let last_progress_age_ms = rebuild
+        .get("last_progress_age_ms")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let processed = rebuild
         .get("processed_conversations")
         .and_then(|value| value.as_u64());
@@ -12007,6 +16269,11 @@ fn rebuild_progress_summary_json(state: &serde_json::Value) -> serde_json::Value
 
     serde_json::json!({
         "active": active,
+        // Issue #258: surface `stalled` distinctly so health/status
+        // consumers can tell a wedged indexer apart from a slow rebuild.
+        "stalled": stalled,
+        "last_progress_at": last_progress_at,
+        "last_progress_age_ms": last_progress_age_ms,
         "mode": value_or_null(rebuild.get("mode")),
         "phase": value_or_null(rebuild.get("phase")),
         "processed_conversations": processed,
@@ -13000,6 +17267,24 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Swarm(SwarmCommand::Status { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Swarm(SwarmCommand::WorkPacket { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Swarm(SwarmCommand::Lint { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Swarm(SwarmCommand::Evidence { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Swarm(SwarmCommand::ProofDebt { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Swarm(SwarmCommand::FailurePatterns { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Swarm(SwarmCommand::DependencyDrift { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
         Commands::Models(ModelsCommand::Status { json }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -13238,6 +17523,9 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  cass search \"your query\" --robot     # Search with JSON output",
         "  cass pack \"your query\" --robot --max-tokens 12000  # Cited handoff pack",
         "  cass pack \"your query\" --robot --max-tokens 4000 --max-evidence 8  # Tight paste budget",
+        "  cass swarm status --json            # Read-only Beads/Agent Mail/git/rch swarm snapshot",
+        "  cass swarm work-packet --json       # Advisory claim packet; does not claim or reserve",
+        "  cass swarm dependency-drift --json  # Read-only sibling pin/drift sentinel",
         "  cass search \"bug fix\" --today --robot  # Search today's sessions only",
         "  cass search \"api\" --week --agent codex --robot  # Last 7 days, codex only",
         "  cass stats --json                    # Get index statistics",
@@ -13255,7 +17543,8 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  1. cass index --full --json   # First-time setup (index all sessions)",
         "  2. cass search \"query\" --robot  # Search with JSON output",
         "  3. cass pack \"query\" --robot --max-tokens 12000  # Cited handoff evidence",
-        "  4. cass view <source_path> -n <line> --json  # Follow up on a cited result",
+        "  4. cass swarm status --json  # Inspect shared-work safety before claiming repo work",
+        "  5. cass view <source_path> -n <line> --json  # Follow up on a cited result",
         "  Pack warnings expose freshness, semantic fallback, and privacy redactions.",
         "",
         "OUTPUT:",
@@ -13264,7 +17553,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  Use -v/--verbose with --json to enable INFO logs if needed",
         "",
         "Agent preflight: triage | ready | preflight",
-        "Core subcommands: search | pack | sessions | stats | view | index | health | capabilities | introspect | robot-docs <topic>",
+        "Core subcommands: search | pack | sessions | stats | view | index | health | swarm | capabilities | introspect | robot-docs <topic>",
         "Topics: commands | env | paths | schemas | guide | exit-codes | examples | contracts | wrap | sources",
         "Exit codes: 0 ok; 1 health; 2 usage; 3 missing index/db; 7 lock/busy",
         "More: cass capabilities --json | cass robot-docs examples | cass robot-docs exit-codes",
@@ -13313,6 +17602,18 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --require-evidence  Return a JSON error envelope instead of an empty successful pack.".to_string(),
             "    --explain-selection  Include score components and omission diagnostics for audits.".to_string(),
             "    Output includes health, freshness, privacy, evidence, omitted, and warnings fields.".to_string(),
+            "  cass swarm status --json [--repo PATH] [--include-evidence]".to_string(),
+            "    Read-only swarm operations snapshot over Beads, Agent Mail metadata, git, rch/build pressure, cass readiness, and proof evidence.".to_string(),
+            "    Reports ready/in-progress/blocked beads, stale candidates, reservations, active agents, proof gaps, and safe next actions.".to_string(),
+            "    Stale detection is advisory only; status never claims, reopens, force-releases, runs builds, rewrites files, or deletes data.".to_string(),
+            "  cass swarm work-packet --json [--bead ID]".to_string(),
+            "    Advisory packet for one possible work slice: readiness, suggested reservations, coordination copy, verification commands, and closeout checklist.".to_string(),
+            "    It does not update Beads, send Agent Mail, create file reservations, or run the proof commands.".to_string(),
+            "  cass swarm lint --json [--bead ID]".to_string(),
+            "    Read-only protocol lint for missing start/closeout mail, unacked messages, stale reservations, bead-status mismatches, and proof gaps.".to_string(),
+            "  cass swarm dependency-drift --json".to_string(),
+            "    Read-only sibling dependency sentinel over Cargo.toml pins, optional local checkout HEAD/dirty state, strict validation commands, and release-risk recommendations.".to_string(),
+            "    It never fetches remotes, edits manifests, updates Beads, sends Agent Mail, runs builds, deletes files, or changes git state.".to_string(),
             "  cass stats [--json] [--data-dir DIR]".to_string(),
             "  cass triage [--json] [--stale-threshold N] [--data-dir DIR]".to_string(),
             "    One-shot agent preflight: readiness, next_command, recommended_commands, docs, schemas, workflows, and recoveries.".to_string(),
@@ -13390,6 +17691,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass export-html <path> [--output-dir DIR] [--json]  Self-contained HTML export (optional encryption).".to_string(),
             "  cass pages [--export-only DIR] [--verify PATH] [--agents A1,A2]  Encrypted searchable archive for static hosting.".to_string(),
             "  cass sources [agents list|exclude|include] [setup|list|sync] [--json]  Manage remote sources + agent exclusions.".to_string(),
+            "  cass swarm [status|work-packet|lint] --json  Read-only shared-repo operations guidance; complements Beads, Agent Mail, rch, and cass pack.".to_string(),
             "  cass analytics [status|tokens|tools|models|rebuild|validate] [--json]  Token / tool / model analytics.".to_string(),
             "  cass import [...]                Import conversation data from external sources.".to_string(),
             "  cass daemon [...]                Run the semantic model daemon (Unix only).".to_string(),
@@ -13428,6 +17730,10 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_STREAMING_CONSUMER_COMMIT_SECS=<N>  base streaming-consumer Tantivy commit cadence (default 5)".to_string(),
             "  CASS_SEMANTIC_BATCH_SIZE=<N>             embedder batch size (default 128)".to_string(),
             "  CASS_SEMANTIC_PREP_PARALLEL=1            opt in to rayon-parallel canonicalize+hash prep (default off: serial is measurably faster on the common cheap-embedder path)".to_string(),
+            "  CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS=30000  warn when one embedder batch exceeds the cass#257-derived 30s healthy-run threshold".to_string(),
+            "  CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS=300000  abort after a returned embedder batch exceeds the cass#257-derived 5m watchdog threshold; 0 disables".to_string(),
+            "  CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT=10000 cap models backfill checkpoints at whole-conversation prefixes near 10k selected messages; 0 disables".to_string(),
+            "  CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT=8388608 cap models backfill checkpoints at whole-conversation prefixes near 8MiB selected content; 0 disables".to_string(),
             "  CASS_STREAMING_CONSUMER_COMBINE=0        DISABLE flat-combining drain in run_streaming_consumer (Card 3; DEFAULT: on). Any non-off value (unset, 1, true, yes, on) leaves combining enabled.".to_string(),
             "  CASS_STREAMING_COMBINE_MAX=<N>           max messages per combined drain (clamped 1..1024, default 64)".to_string(),
             "  CASS_STREAMING_COMBINE_MAX_BYTES=<N>     byte cap per combined drain (clamped 1MiB..STREAMING_MAX, default half)".to_string(),
@@ -13470,6 +17776,11 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Doctor repairs: start with `cass doctor check --json`; use repair dry-run fingerprints for apply; support bundles and failure contexts report artifact_manifest_path/event_log_path instead of putting logs in stdout.".to_string(),
             "  Doctor validation: use `scripts/e2e/doctor_v2.sh list|describe|run --json`; `--artifact-dir` creates a fresh run child, and run-summary.json lists scenario ids, labels, mutation class, log paths, failure_context path, and rerun command.".to_string(),
             "  Doctor failure reports: attach the redacted failure_context.json plus manifest/commands/events artifacts; do not attach raw session logs, exact source paths, or live archive copies by default.".to_string(),
+            "  Swarm status: `cass swarm status --json` is read-only. It composes Beads, Agent Mail metadata, git, build pressure, cass health/status, and proof refs without claiming work or releasing reservations.".to_string(),
+            "  Swarm stale review: stale_candidate_count is advisory. Coordinate through Beads and Agent Mail before reopening, force-releasing, or taking over another agent's work.".to_string(),
+            "  Swarm packets: `cass swarm work-packet --json --bead ID` suggests reservations, proof commands, and closeout copy; agents must still create reservations, update Beads, run rch proofs, and summarize artifacts.".to_string(),
+            "  Swarm evidence handoff: use `cass pack \"query\" --robot` when status points at prior sessions or proof refs; pack is a bounded cited handoff, not a replacement for Beads or Agent Mail.".to_string(),
+            "  Dependency drift: `cass swarm dependency-drift --json` checks manifest pins against optional sibling checkout state and reports strict validation commands without fetching or mutating.".to_string(),
             "  Args: accepts --robot-docs=topic and misplaced globals; detailed errors with examples on parse failure".to_string(),
             "  Source control: use `cass robot-docs sources` for remote sync/setup plus persistent agent-harness exclusions".to_string(),
             "  TUI drill-in contract: Enter on selected hit opens detail modal (Messages tab); Enter with no selected hit falls back to query submit behavior".to_string(),
@@ -13596,6 +17907,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Color auto off when non-TTY unless forced.".to_string(),
             "  Use --quiet to silence info logs in robot runs.".to_string(),
             "  JSON errors only to stderr.".to_string(),
+            "  Swarm status/work-packet/lint are read-only advisory surfaces: they do not claim beads, send mail, reserve files, force-release, run builds, mutate git, or delete data.".to_string(),
+            "  Swarm stale detection is advisory; takeover-like actions require explicit coordination and human/agent confirmation outside cass.".to_string(),
+            "  Swarm evidence defaults are privacy-safe: raw session content and full mail bodies are omitted unless a future explicit redacted evidence opt-in allows snippets.".to_string(),
         ],
         RobotTopic::Wrap => vec![
             "wrap:".to_string(),
@@ -14635,15 +18949,25 @@ mod search_lexical_self_heal_tests {
             .open(&lock_path)
             .expect("open index-run lock");
         fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold active index-run lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
+        let metadata = format!(
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
             std::process::id(),
             1_733_000_111_000_i64,
             db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        );
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            lock_file.set_len(0).expect("truncate index-run lock");
+            lock_file
+                .seek(SeekFrom::Start(0))
+                .expect("rewind index-run lock");
+            lock_file
+                .write_all(metadata.as_bytes())
+                .expect("write index-run lock metadata");
+            lock_file.flush().expect("flush index-run lock metadata");
+        }
+        crate::search::asset_state::write_index_run_lock_metadata_sidecar(&lock_path, &metadata)
+            .expect("write index-run lock metadata sidecar");
         lock_file
     }
 
@@ -15148,7 +19472,9 @@ fn run_cli_search(
     mode: Option<crate::search::query::SearchMode>,
     semantic_opts: SemanticSearchOptions,
 ) -> CliResult<()> {
-    use crate::search::model_manager::{load_hash_semantic_context, load_semantic_context};
+    use crate::search::model_manager::{
+        load_hash_semantic_context, load_semantic_context, load_semantic_context_for_embedder,
+    };
     use crate::search::query::{
         QueryExplanation, SearchClient, SearchClientOptions, SearchFilters, SearchMode,
     };
@@ -15341,7 +19667,10 @@ fn run_cli_search(
                     index_path.display(),
                     db_path.display()
                 ),
-                Some("Run 'cass index --full' to recreate the local archive database.".to_string()),
+                Some(
+                    "Restore the canonical archive from backup if historical coverage matters; otherwise run 'cass index --full' to create a new archive from currently available source sessions."
+                        .to_string(),
+                ),
             )
         } else {
             (
@@ -15390,10 +19719,19 @@ fn run_cli_search(
 
         // Use embedder registry for model selection (bd-2mbe)
         let registry = EmbedderRegistry::new(&data_dir);
-        let requested_model = semantic_opts.model.as_deref();
+        let env_model = dotenvy::var("CASS_SEMANTIC_EMBEDDER")
+            .ok()
+            .and_then(|value| {
+                if value.trim().eq_ignore_ascii_case("hash") {
+                    Some("hash")
+                } else {
+                    crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
+                }
+            });
+        let requested_model = semantic_opts.model.as_deref().or(env_model);
 
         // Validate requested model if specified
-        if let Some(model_name) = requested_model
+        if let Some(model_name) = semantic_opts.model.as_deref()
             && let Err(e) = registry.validate(model_name)
         {
             return Err(CliError {
@@ -15414,6 +19752,8 @@ fn run_cli_search(
 
         let setup = if prefer_hash {
             load_hash_semantic_context(&data_dir, &db_path)
+        } else if let Some(model_name) = requested_model {
+            load_semantic_context_for_embedder(&data_dir, &db_path, model_name)
         } else {
             load_semantic_context(&data_dir, &db_path)
         };
@@ -15603,60 +19943,98 @@ fn run_cli_search(
                 retryable: true,
             })?,
         SearchMode::Semantic => {
-            let (hits, ann_stats) = client
-                .search_semantic_with_tier(
+            // cass#256: in the `-baseline` build (the `semantic` Cargo
+            // feature is disabled), `--mode semantic` returns a clear
+            // CLI envelope rather than reaching code that would expect a
+            // working ORT runtime. Hybrid degrades to lexical via the
+            // existing fail-open path; lexical-only mode is unaffected.
+            #[cfg(not(feature = "semantic"))]
+            {
+                // Suppress unused-binding warnings in the baseline arm:
+                // every input is consumed by the documented error envelope.
+                let _ = (
+                    approximate,
+                    &semantic_opts,
+                    &filters,
+                    &field_mask,
                     query,
-                    filters.clone(),
                     search_limit,
                     search_offset,
-                    field_mask,
-                    approximate,
-                    semantic_opts.tier_mode,
-                )
-                .map_err(|e| {
-                    let err_str = e.to_string();
-                    if err_str.contains("HNSW index") {
-                        CliError {
-                            code: 15,
-                            kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                            message: "Approximate search unavailable (HNSW index missing)".to_string(),
-                            hint: Some(
-                                "Run 'cass index --semantic --build-hnsw' to build the ANN index, or omit --approximate"
+                );
+                let _ = client;
+                Err::<crate::search::query::SearchResult, CliError>(CliError {
+                    code: 15,
+                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                    message:
+                        "semantic search is not available in this build (cass was built without the `semantic` Cargo feature; this is the `-baseline` artifact for pre-AVX2 CPUs; cass#256)"
+                            .to_string(),
+                    hint: Some(
+                        "Re-run with `--mode lexical` (or omit `--mode` and accept the default hybrid-preferred mode, which fails open to lexical), or install the full release artifact (e.g. `cass-windows-amd64.zip` / `cass-linux-amd64.tar.gz`) on a host with AVX2 support."
+                            .to_string(),
+                    ),
+                    retryable: false,
+                })?
+            }
+            #[cfg(feature = "semantic")]
+            {
+                let (hits, ann_stats) = client
+                    .search_semantic_with_tier(
+                        query,
+                        filters.clone(),
+                        search_limit,
+                        search_offset,
+                        field_mask,
+                        approximate,
+                        semantic_opts.tier_mode,
+                    )
+                    .map_err(|e| {
+                        let err_str = e.to_string();
+                        if err_str.contains("HNSW index") {
+                            CliError {
+                                code: 15,
+                                kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                                message: "Approximate search unavailable (HNSW index missing)"
                                     .to_string(),
-                            ),
-                            retryable: false,
+                                hint: Some(
+                                    "Run 'cass index --semantic --build-hnsw' to build the ANN index, or omit --approximate"
+                                        .to_string(),
+                                ),
+                                retryable: false,
+                            }
+                        } else if err_str.contains("unavailable")
+                            || err_str.contains("no embedder")
+                        {
+                            CliError {
+                                code: 15,
+                                kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                                message: "Semantic search not available".to_string(),
+                                hint: Some(
+                                    "Run 'cass tui' and press Alt+S to set up semantic search, or omit --mode semantic when lexical evidence is acceptable"
+                                        .to_string(),
+                                ),
+                                retryable: false,
+                            }
+                        } else {
+                            CliError {
+                                code: 9,
+                                kind: CliErrorKind::Search.kind_str(),
+                                message: format!("semantic search failed: {e}"),
+                                hint: Some(
+                                    "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
+                                        .to_string(),
+                                ),
+                                retryable: true,
+                            }
                         }
-                    } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
-                        CliError {
-                            code: 15,
-                            kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                            message: "Semantic search not available".to_string(),
-                            hint: Some(
-                                "Run 'cass tui' and press Alt+S to set up semantic search, or omit --mode semantic when lexical evidence is acceptable"
-                                    .to_string(),
-                            ),
-                            retryable: false,
-                        }
-                    } else {
-                        CliError {
-                            code: 9,
-                            kind: CliErrorKind::Search.kind_str(),
-                            message: format!("semantic search failed: {e}"),
-                            hint: Some(
-                                "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
-                                    .to_string(),
-                            ),
-                            retryable: true,
-                        }
-                    }
-                })?;
-            crate::search::query::SearchResult {
-                hits,
-                wildcard_fallback: false,
-                cache_stats: crate::search::query::CacheStats::default(),
-                suggestions: Vec::new(),
-                ann_stats,
-                total_count: None,
+                    })?;
+                crate::search::query::SearchResult {
+                    hits,
+                    wildcard_fallback: false,
+                    cache_stats: crate::search::query::CacheStats::default(),
+                    suggestions: Vec::new(),
+                    ann_stats,
+                    total_count: None,
+                }
             }
         }
         SearchMode::Hybrid => match client.search_hybrid(
@@ -16539,7 +20917,10 @@ fn pack_missing_index_error(
                 index_path.display(),
                 db_path.display()
             ),
-            Some("Run 'cass index --full' to recreate the local archive database.".to_string()),
+            Some(
+                "Restore the canonical archive from backup if historical coverage matters; otherwise run 'cass index --full' to create a new archive from currently available source sessions."
+                    .to_string(),
+            ),
         )
     } else {
         (
@@ -18947,10 +23328,19 @@ fn output_robot_results(
     Ok(())
 }
 
+#[cfg(test)]
 fn source_filter_where_clause(
     source_filter: Option<&crate::sources::provenance::SourceFilter>,
 ) -> (String, Option<String>) {
-    let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+    source_filter_where_clause_with_columns(source_filter, "c.source_id", "c.origin_host")
+}
+
+fn source_filter_where_clause_with_columns(
+    source_filter: Option<&crate::sources::provenance::SourceFilter>,
+    source_id_sql: &str,
+    origin_host_sql: &str,
+) -> (String, Option<String>) {
+    let normalized_source_sql = normalized_source_identity_sql_expr(source_id_sql, origin_host_sql);
     match source_filter {
         None | Some(crate::sources::provenance::SourceFilter::All) => (String::new(), None),
         Some(crate::sources::provenance::SourceFilter::Local) => (
@@ -19002,7 +23392,23 @@ fn append_source_filter_condition(
     params: &mut Vec<frankensqlite::compat::ParamValue>,
     source_filter: &crate::sources::provenance::SourceFilter,
 ) {
-    let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+    append_source_filter_condition_with_columns(
+        sql,
+        params,
+        source_filter,
+        "c.source_id",
+        "c.origin_host",
+    );
+}
+
+fn append_source_filter_condition_with_columns(
+    sql: &mut String,
+    params: &mut Vec<frankensqlite::compat::ParamValue>,
+    source_filter: &crate::sources::provenance::SourceFilter,
+    source_id_sql: &str,
+    origin_host_sql: &str,
+) {
+    let normalized_source_sql = normalized_source_identity_sql_expr(source_id_sql, origin_host_sql);
     match source_filter {
         crate::sources::provenance::SourceFilter::All => {}
         crate::sources::provenance::SourceFilter::Local => {
@@ -19045,13 +23451,29 @@ fn run_stats(
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let conn = open_franken_cli_read_db(db_path.clone(), "stats", Duration::from_secs(30))?;
+    validate_fts_messages_integrity_for_cli(&conn, "stats")?;
+    let conversation_columns = doctor_table_columns(&conn, "conversations");
+    let source_id_sql = if conversation_columns.contains("source_id") {
+        "c.source_id"
+    } else {
+        "'local'"
+    };
+    let origin_host_sql = if conversation_columns.contains("origin_host") {
+        "c.origin_host"
+    } else {
+        "NULL"
+    };
 
     // Parse source filter (P3.7)
     let source_filter = source.map(SourceFilter::parse);
 
     // Build WHERE clause for source filtering
     let (source_where, source_param): (String, Option<String>) =
-        source_filter_where_clause(source_filter.as_ref());
+        source_filter_where_clause_with_columns(
+            source_filter.as_ref(),
+            source_id_sql,
+            origin_host_sql,
+        );
 
     // Helper: build params slice from optional source param
     let make_params = |param: &Option<String>| -> Vec<ParamValue> {
@@ -19165,7 +23587,7 @@ fn run_stats(
     // Get per-source breakdown if requested (P3.7)
     let source_rows: Vec<(String, i64, i64)> = if by_source {
         let normalized_source_sql =
-            normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+            normalized_source_identity_sql_expr(source_id_sql, origin_host_sql);
         let source_sql = format!(
             "SELECT {normalized_source_sql} as source_id, COUNT(DISTINCT c.id) as convs, COUNT(m.id) as msgs
              FROM conversations c
@@ -23418,12 +27840,16 @@ fn doctor_canonical_blake3(prefix: &str, value: serde_json::Value) -> String {
 }
 
 fn doctor_redacted_path(path: &str, data_dir: &Path) -> String {
+    fn portable_display(path: &Path) -> String {
+        path.display().to_string().replace('\\', "/")
+    }
+
     let path_ref = Path::new(path);
     if let Ok(relative) = path_ref.strip_prefix(data_dir) {
         if relative.as_os_str().is_empty() {
             return "[cass-data]".to_string();
         }
-        return format!("[cass-data]/{}", relative.display());
+        return format!("[cass-data]/{}", portable_display(relative));
     }
     path_ref
         .file_name()
@@ -23541,13 +27967,38 @@ fn doctor_forensic_bundle_id(operation_id: &str, created_at_ms: i64) -> String {
 }
 
 fn doctor_forensic_relative_path_is_safe(relative_path: &Path) -> bool {
-    !relative_path.as_os_str().is_empty()
+    let raw = relative_path.as_os_str().to_string_lossy();
+    !raw.is_empty()
+        && !raw.contains('\\')
+        && !raw.contains(':')
         && !relative_path.is_absolute()
         && relative_path.components().all(|component| match component {
             std::path::Component::Normal(name) => doctor_portable_relative_component_is_safe(name),
             std::path::Component::CurDir => true,
             _ => false,
         })
+}
+
+fn doctor_forensic_portable_child_path(prefix: &str, child: &Path) -> Option<PathBuf> {
+    if prefix.is_empty() || prefix.contains('\\') || prefix.contains(':') {
+        return None;
+    }
+    let mut relative = String::with_capacity(prefix.len() + 64);
+    relative.push_str(prefix);
+    for component in child.components() {
+        match component {
+            std::path::Component::Normal(name)
+                if doctor_portable_relative_component_is_safe(name) =>
+            {
+                relative.push('/');
+                relative.push_str(name.to_str()?);
+            }
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    let relative = PathBuf::from(relative);
+    doctor_forensic_relative_path_is_safe(&relative).then_some(relative)
 }
 
 fn doctor_portable_relative_component_is_safe(name: &std::ffi::OsStr) -> bool {
@@ -23919,6 +28370,7 @@ fn doctor_forensic_write_json_artifact(
             target_path.display()
         )
     })?;
+    drop(target);
     let checksum = file_blake3_hex(&target_path)?;
     artifacts.push(doctor_forensic_generated_artifact(
         artifact_kind,
@@ -24135,7 +28587,11 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&raw_manifest_root) else {
                 continue;
             };
-            let relative = Path::new("raw-mirror-manifests").join(relative_to_root);
+            let Some(relative) =
+                doctor_forensic_portable_child_path("raw-mirror-manifests", relative_to_root)
+            else {
+                continue;
+            };
             copy_artifact!("raw_mirror_manifest", path, &relative, false, None);
         }
     } else {
@@ -24168,7 +28624,11 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&lexical_manifest_root) else {
                 continue;
             };
-            let relative = Path::new("index-manifests").join(relative_to_root);
+            let Some(relative) =
+                doctor_forensic_portable_child_path("index-manifests", relative_to_root)
+            else {
+                continue;
+            };
             copy_artifact!("lexical_generation_manifest", path, &relative, false, None);
         }
     } else {
@@ -32393,7 +36853,7 @@ fn doctor_candidate_live_inventory(
 fn doctor_candidate_relative_path(candidate_dir: &Path, path: &Path) -> Option<String> {
     path.strip_prefix(candidate_dir)
         .ok()
-        .map(|relative| relative.display().to_string())
+        .map(doctor_path_to_slash_string)
 }
 
 fn doctor_candidate_artifact_class(relative_path: &str) -> DoctorAssetClass {
@@ -36778,7 +41238,7 @@ fn run_doctor_gc(
     let mut quarantined: Vec<String> = Vec::new();
     let quarantine_root = data_dir.join("doctor").join("quarantine").join("runs");
     std::fs::create_dir_all(&quarantine_root).map_err(|e| CliError {
-        code: 73,
+        code: 14,
         kind: "io",
         message: format!(
             "failed to create quarantine dir {}: {e}",
@@ -41872,13 +46332,28 @@ fn doctor_probe_mutation_lock(data_dir: &Path) -> DoctorMutationLockObservation 
             let _ = fs2::FileExt::unlock(&file);
             DoctorMutationLockObservation::Available { path, metadata }
         }
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(err) if doctor_lock_probe_error_is_active(&err) => {
             DoctorMutationLockObservation::Active { path, metadata }
         }
         Err(err) => DoctorMutationLockObservation::Unavailable {
             path,
             reason: format!("failed to probe doctor mutation lock ownership: {err}"),
         },
+    }
+}
+
+fn doctor_lock_probe_error_is_active(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        err.raw_os_error() == Some(33)
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -41915,7 +46390,7 @@ fn doctor_acquire_mutation_lock(
 
     if let Err(err) = fs2::FileExt::try_lock_exclusive(&file) {
         let metadata = doctor_read_lock_metadata(&file);
-        if err.kind() == std::io::ErrorKind::WouldBlock {
+        if doctor_lock_probe_error_is_active(&err) {
             return Err(DoctorMutationLockObservation::Active { path, metadata });
         }
         return Err(DoctorMutationLockObservation::Unavailable {
@@ -41979,7 +46454,7 @@ fn doctor_acquire_existing_mutation_lock_without_metadata(
 
     if let Err(err) = fs2::FileExt::try_lock_exclusive(&file) {
         let metadata = doctor_read_lock_metadata(&file);
-        if err.kind() == std::io::ErrorKind::WouldBlock {
+        if doctor_lock_probe_error_is_active(&err) {
             return Err(DoctorMutationLockObservation::Active { path, metadata });
         }
         return Err(DoctorMutationLockObservation::Unavailable {
@@ -48523,9 +52998,22 @@ fn sync_file(path: &Path, label: &str) -> Result<(), String> {
             path.display()
         ));
     }
-    std::fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|err| format!("failed to sync {label} {}: {err}", path.display()))
+
+    #[cfg(windows)]
+    {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| format!("failed to sync {label} {}: {err}", path.display()))
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| format!("failed to sync {label} {}: {err}", path.display()))
+    }
 }
 
 fn sync_directory(path: &Path) -> Result<(), String> {
@@ -48535,9 +53023,17 @@ fn sync_directory(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    std::fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|err| format!("failed to sync directory {}: {err}", path.display()))
+
+    #[cfg(windows)]
+    {
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| format!("failed to sync directory {}: {err}", path.display()))
+    }
 }
 
 fn doctor_rename_file(source_path: &Path, target_path: &Path) -> io::Result<()> {
@@ -50294,16 +54790,19 @@ mod doctor_asset_taxonomy_tests {
             .open(&lock_path)
             .expect("open lock file");
         fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path={}\nmode=index\njob_id=lexical-refresh-test\njob_kind=lexical_refresh\nphase=rebuilding",
+        let metadata = format!(
+            "pid={}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path={}\nmode=index\njob_id=lexical-refresh-test\njob_kind=lexical_refresh\nphase=rebuilding\n",
             std::process::id(),
             1_733_001_111_000_i64,
             1_733_001_112_000_i64,
             db_path.display()
-        )
-        .expect("write lock metadata");
+        );
+        lock_file
+            .write_all(metadata.as_bytes())
+            .expect("write lock metadata");
         lock_file.flush().expect("flush lock metadata");
+        crate::search::asset_state::write_index_run_lock_metadata_sidecar(&lock_path, &metadata)
+            .expect("write lock metadata sidecar");
 
         let snapshot = probe_index_run_lock(data_dir, &db_path);
         let doctor_lock = DoctorMutationLockObservation::Absent {
@@ -51161,7 +55660,7 @@ mod doctor_asset_taxonomy_tests {
     }
 
     #[test]
-    fn doctor_relative_path_guard_rejects_cross_platform_escape_forms() {
+    fn doctor_relative_path_guard_rejects_cross_platform_escape_forms() -> Result<(), String> {
         for safe in [
             "doctor/receipts/repair.json",
             "raw-mirror/v1/manifests/session.json",
@@ -51196,6 +55695,33 @@ mod doctor_asset_taxonomy_tests {
                 "cross-platform unsafe relative path should be rejected: {unsafe_path:?}"
             );
         }
+
+        let Some(portable) = doctor_forensic_portable_child_path(
+            "raw-mirror-manifests",
+            Path::new("nested/manifest.json"),
+        ) else {
+            return Err("portable child path should be accepted".to_string());
+        };
+        if !portable
+            .to_string_lossy()
+            .as_ref()
+            .eq("raw-mirror-manifests/nested/manifest.json")
+        {
+            return Err("portable child path should use slash-separated archive form".to_string());
+        }
+        if doctor_forensic_portable_child_path(
+            "raw-mirror-manifests",
+            Path::new("../manifest.json"),
+        )
+        .is_some()
+        {
+            return Err("portable child paths must not admit traversal".to_string());
+        }
+        if doctor_forensic_portable_child_path("raw\\mirror", Path::new("manifest.json")).is_some()
+        {
+            return Err("portable child path prefixes must stay cross-platform safe".to_string());
+        }
+        Ok(())
     }
 
     #[test]
@@ -53524,7 +58050,7 @@ mod doctor_asset_taxonomy_tests {
             extra_file_artifacts: &[],
         });
 
-        assert_eq!(bundle.status, "captured");
+        assert_eq!(bundle.status, "captured", "{bundle:#?}");
         assert!(
             bundle
                 .path
@@ -60011,6 +64537,11 @@ fn run_status(
         .and_then(|r| r.get("active"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let rebuild_stalled = state
+        .get("rebuild")
+        .and_then(|r| r.get("stalled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let rebuild_processed = state
         .get("rebuild")
         .and_then(|r| r.get("processed_conversations"))
@@ -60078,13 +64609,27 @@ fn run_status(
         .and_then(|q| q.get("quarantined_conversations"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let recent_quarantined_conversations = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("recent_quarantined_conversations"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let ingest_quarantine_critical = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("circuit_breaker_active"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let ingest_quarantine_recommended_action = state
         .get("ingest_quarantine")
         .and_then(|q| q.get("recommended_action"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     let mut warnings = Vec::<String>::new();
-    if quarantined_conversations > 0 {
+    if ingest_quarantine_critical {
+        warnings.push(format!(
+            "{recent_quarantined_conversations} recent conversation quarantine(s) triggered the ingest quarantine circuit breaker; search coverage is suspect until the watcher/source path is inspected"
+        ));
+    } else if quarantined_conversations > 0 {
         warnings.push(format!(
             "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; search remains usable for the rest of the archive"
         ));
@@ -60099,9 +64644,19 @@ fn run_status(
         && index_exists
         && index_fresh
         && !rebuild_active
-        && !index_empty_with_messages;
-    let status = if rebuild_active {
+        && !index_empty_with_messages
+        && !ingest_quarantine_critical;
+    // Stalled rebuilds are reported as a distinct status so operators
+    // can tell a wedged indexer apart from a slow-but-progressing one
+    // (issue #258). `stalled` implies `rebuild_active=true`, but it
+    // *overrides* the "rebuilding" status because health is not
+    // monotonically improving — the operator must intervene.
+    let status = if rebuild_stalled {
+        "stalled"
+    } else if rebuild_active {
         "rebuilding"
+    } else if ingest_quarantine_critical {
+        "unhealthy"
     } else if healthy {
         "healthy"
     } else if not_initialized {
@@ -60117,18 +64672,22 @@ fn run_status(
         None
     };
 
-    let recommended_action = if rebuild_active {
+    let recommended_action = if rebuild_stalled {
+        Some("Index rebuild is wedged; see `cass status --json | jq .rebuild` for the stall age and capture a stack trace with `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` for issue #258".to_string())
+    } else if rebuild_active {
         Some("Index rebuild is already in progress".to_string())
     } else if not_initialized {
         Some(cass_not_initialized_recommended_action())
     } else if !db_exists {
         Some("Run 'cass index --full' to create the database".to_string())
     } else if !db_available {
-        Some("Run 'cass doctor --fix' or 'cass index --full' to recover the database".to_string())
+        Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database".to_string())
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
     } else if index_empty_with_messages {
         Some("Run 'cass index --full' to populate the empty search index".to_string())
+    } else if ingest_quarantine_critical {
+        ingest_quarantine_recommended_action
     } else if is_stale || pending_sessions > 0 {
         let pending_msg = if pending_sessions > 0 {
             format!(" ({pending_sessions} sessions pending)")
@@ -60164,7 +64723,11 @@ fn run_status(
         let topology_budget =
             serde_json::to_value(crate::topology_budget::inspect_host_topology_budget())
                 .unwrap_or(serde_json::Value::Null);
-        let status_collects_coverage = db_exists && !status_should_skip_db_open(&db_path);
+        // Commit fe3972dc deliberately dropped status_should_skip_db_open and
+        // its STATUS_COUNT_SCAN_MAX_DB_BYTES short-circuit; the policy is now
+        // "always probe via DB open" — see the commit message. This call site
+        // was missed in that cleanup; inlining the now-unconditional `true`.
+        let status_collects_coverage = db_exists;
         let (coverage_risk, coverage_source, coverage_checked) = if status_collects_coverage {
             (
                 collect_doctor_coverage_risk_summary(&data_dir, &db_path),
@@ -60229,7 +64792,7 @@ fn run_status(
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
-            "health_level": if healthy && quarantined_conversations > 0 { "degraded" } else { status },
+            "health_level": if ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
             "initialized": !not_initialized,
             "explanation": explanation,
             "warnings": warnings,
@@ -60427,6 +64990,11 @@ fn run_triage(
         .and_then(|rebuild| rebuild.get("active"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let rebuild_stalled = state
+        .get("rebuild")
+        .and_then(|rebuild| rebuild.get("stalled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let db_exists = state
         .get("database")
         .and_then(|database| database.get("exists"))
@@ -60462,7 +65030,9 @@ fn run_triage(
         && index_fresh
         && !rebuild_active
         && !index_empty_with_messages;
-    let status = if rebuild_active {
+    let status = if rebuild_stalled {
+        "stalled"
+    } else if rebuild_active {
         "rebuilding"
     } else if healthy {
         "healthy"
@@ -60478,14 +65048,19 @@ fn run_triage(
     } else {
         None
     };
-    let recommended_action = if rebuild_active {
+    let recommended_action = if rebuild_stalled {
+        Some(
+            "Index rebuild is wedged; capture diagnostics for issue #258 and restart the watcher"
+                .to_string(),
+        )
+    } else if rebuild_active {
         Some("Index rebuild is already in progress".to_string())
     } else if not_initialized {
         Some(cass_not_initialized_recommended_action())
     } else if !db_exists {
         Some("Run 'cass index --full' to create the database".to_string())
     } else if !db_available {
-        Some("Run 'cass doctor --fix' or 'cass index --full' to recover the database".to_string())
+        Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database".to_string())
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
     } else if index_empty_with_messages {
@@ -60616,6 +65191,11 @@ fn run_health(
         .and_then(|r| r.get("active"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let rebuild_stalled = state
+        .get("rebuild")
+        .and_then(|r| r.get("stalled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let db_exists = state
         .get("database")
         .and_then(|d| d.get("exists"))
@@ -60647,13 +65227,27 @@ fn run_health(
         .and_then(|q| q.get("quarantined_conversations"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let recent_quarantined_conversations = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("recent_quarantined_conversations"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let ingest_quarantine_critical = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("circuit_breaker_active"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let ingest_quarantine_recommended_action = state
         .get("ingest_quarantine")
         .and_then(|q| q.get("recommended_action"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     let mut warnings = Vec::<String>::new();
-    if quarantined_conversations > 0 {
+    if ingest_quarantine_critical {
+        warnings.push(format!(
+            "{recent_quarantined_conversations} recent conversation quarantine(s) triggered the ingest quarantine circuit breaker; lexical search coverage is suspect until the watcher/source path is inspected"
+        ));
+    } else if quarantined_conversations > 0 {
         warnings.push(format!(
             "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; lexical search remains usable for non-quarantined sessions"
         ));
@@ -60668,7 +65262,8 @@ fn run_health(
         && index_exists
         && index_fresh
         && !rebuild_active
-        && !index_empty_with_messages;
+        && !index_empty_with_messages
+        && !ingest_quarantine_critical;
     let explanation = if not_initialized {
         Some(cass_not_initialized_explanation(&data_dir))
     } else {
@@ -60686,11 +65281,11 @@ fn run_health(
     } else if not_initialized {
         Some(cass_not_initialized_recommended_action())
     } else if db_degraded {
-        Some("Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.".to_string())
-    } else if healthy && quarantined_conversations > 0 {
+        Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database.".to_string())
+    } else if ingest_quarantine_critical || (healthy && quarantined_conversations > 0) {
         ingest_quarantine_recommended_action
     } else if !healthy {
-        Some("Run 'cass index --full' to rebuild the index/database.".to_string())
+        Some("Run 'cass status --json' for the exact readiness gap; run 'cass index --full' only for missing or stale derived search assets.".to_string())
     } else {
         semantic_recommended_action(&state, not_initialized)
     };
@@ -60717,16 +65312,28 @@ fn run_health(
     if index_exists && !index_fresh && !not_initialized {
         errors.push("index stale".to_string());
     }
-    if rebuild_active {
+    if rebuild_stalled {
+        errors.push(
+            "index rebuild stalled — indexing thread is not making forward progress (issue #258)"
+                .to_string(),
+        );
+    } else if rebuild_active {
         errors.push("index rebuild in progress".to_string());
     }
     if index_empty_with_messages {
         errors.push("index empty but database has messages — run 'cass index --full'".to_string());
     }
+    if ingest_quarantine_critical {
+        errors.push("ingest quarantine circuit breaker active".to_string());
+    }
 
     // Determine status string for structured output.
-    let status = if rebuild_active {
+    let status = if rebuild_stalled {
+        "stalled"
+    } else if rebuild_active {
         "rebuilding"
+    } else if ingest_quarantine_critical {
+        "unhealthy"
     } else if healthy {
         "healthy"
     } else if not_initialized {
@@ -60755,7 +65362,7 @@ fn run_health(
         // (or confirm that it is not). The snapshot is a cheap read of an
         // in-memory ring buffer plus a handful of atomics; it does not fail.
         let responsiveness =
-            serde_json::to_value(crate::indexer::responsiveness::telemetry_snapshot())
+            serde_json::to_value(crate::indexer::responsiveness::telemetry_snapshot_passive())
                 .unwrap_or(serde_json::Value::Null);
         // Parallel-WAL shadow observer (Card 1, shadow-only phase). Present
         // in every health response; `active=false` when the env isn't set.
@@ -60806,7 +65413,7 @@ fn run_health(
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
-            "health_level": if healthy && quarantined_conversations > 0 { "degraded" } else { status },
+            "health_level": if ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
             "initialized": !not_initialized,
             "explanation": explanation,
             "warnings": warnings,
@@ -60875,7 +65482,13 @@ fn run_health(
         for err in &errors {
             println!("  - {err}");
         }
-        println!("Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.");
+        if let Some(action) = &recommended_action {
+            println!("{action}");
+        } else {
+            println!(
+                "Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database."
+            );
+        }
     } else {
         println!("✗ Unhealthy ({latency_ms}ms)");
         if !db_exists {
@@ -60890,7 +65503,11 @@ fn run_health(
         if index_empty_with_messages {
             println!("  - index has 0 documents but database has messages");
         }
-        println!("Run 'cass index --full' or 'cass index --watch' to create index.");
+        if let Some(action) = &recommended_action {
+            println!("{action}");
+        } else {
+            println!("Run 'cass status --json' for the exact readiness gap.");
+        }
     }
 
     let final_error = if healthy {
@@ -60922,7 +65539,7 @@ fn run_health(
                     .unwrap_or("could not open database")
             ),
             hint: Some(
-                "Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.".to_string(),
+                "Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database.".to_string(),
             ),
             retryable: false,
         })
@@ -60931,7 +65548,10 @@ fn run_health(
             code: 1,
             kind: CliErrorKind::Health.kind_str(),
             message: "Health check failed".to_string(),
-            hint: Some("Run 'cass index --full' to rebuild the index/database.".to_string()),
+            hint: Some(
+                "Run 'cass status --json' for the exact readiness gap; run 'cass index --full' only for missing or stale derived search assets."
+                    .to_string(),
+            ),
             retryable: true,
         })
     };
@@ -61269,8 +65889,26 @@ mod cli_read_db_tests {
         storage
             .set_last_indexed_at(1_733_000_000_000)
             .expect("set last_indexed_at");
+        storage
+            .set_last_scan_ts(1_732_999_999_000)
+            .expect("set last_scan_ts");
         drop(storage);
         (temp, db_path)
+    }
+
+    fn write_index_lock_metadata(lock_path: &Path, lock_file: &mut std::fs::File, metadata: &str) {
+        use std::io::{Seek, SeekFrom, Write};
+
+        lock_file.set_len(0).expect("truncate index lock metadata");
+        lock_file
+            .seek(SeekFrom::Start(0))
+            .expect("rewind index lock metadata");
+        lock_file
+            .write_all(metadata.as_bytes())
+            .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+        crate::search::asset_state::write_index_run_lock_metadata_sidecar(lock_path, metadata)
+            .expect("write lock metadata sidecar");
     }
 
     #[test]
@@ -61349,6 +65987,7 @@ mod cli_read_db_tests {
 
         assert!(snapshot.opened, "state probe should open the database");
         assert_eq!(snapshot.last_indexed_at, Some(1_733_000_000_000));
+        assert_eq!(snapshot.last_scan_ts, Some(1_732_999_999_000));
         assert!(snapshot.counts_skipped, "count scan should remain disabled");
         assert_eq!(snapshot.conversation_count, 0);
         assert_eq!(snapshot.message_count, 0);
@@ -61360,7 +65999,7 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn status_state_skips_open_for_large_regular_db_probe() {
+    fn status_state_probes_large_regular_db_instead_of_trusting_index_mtime() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("agent_search.db");
         let file = std::fs::File::create(&db_path).expect("create sparse db placeholder");
@@ -61375,19 +66014,47 @@ mod cli_read_db_tests {
             .expect("database state");
 
         assert_eq!(database.get("exists").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(database.get("opened").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(
             database.get("open_skipped").and_then(|v| v.as_bool()),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
-            database.get("counts_skipped").and_then(|v| v.as_bool()),
-            Some(true)
+            database.get("opened").and_then(|v| v.as_bool()),
+            Some(false)
         );
         assert!(
             database
                 .get("open_error")
-                .is_some_and(serde_json::Value::is_null)
+                .and_then(|v| v.as_str())
+                .is_some_and(|err| !err.is_empty())
+        );
+    }
+
+    #[test]
+    fn status_state_marks_scan_ahead_of_projection_stale() {
+        let (temp, db_path) = seed_cli_db();
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+            storage
+                .set_last_scan_ts(1_733_000_010_000)
+                .expect("set scan ahead");
+        }
+
+        let state = state_meta_json_for_status(temp.path(), &db_path, 60);
+        let index = state
+            .get("index")
+            .and_then(serde_json::Value::as_object)
+            .expect("index state");
+
+        assert_eq!(index.get("fresh").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(index.get("stale").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(index.get("status").and_then(|v| v.as_str()), Some("stale"));
+        assert!(
+            index
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .is_some_and(|reason| reason.contains("last_scan_ts is newer")),
+            "status reason should identify the scan/projection gap: {index:?}"
         );
     }
 
@@ -61587,6 +66254,22 @@ mod cli_read_db_tests {
 
     #[test]
     #[serial]
+    fn semantic_index_embedder_policy_env_overrides_fastembed_default() {
+        let _embedder = set_env("CASS_SEMANTIC_EMBEDDER", "snowflake-arctic-s");
+
+        assert_eq!(
+            resolve_semantic_index_embedder("fastembed"),
+            "snowflake-arctic-s"
+        );
+        assert_eq!(
+            resolve_semantic_index_embedder("minilm"),
+            "snowflake-arctic-s"
+        );
+        assert_eq!(resolve_semantic_index_embedder("hash"), "hash");
+    }
+
+    #[test]
+    #[serial]
     fn state_meta_json_reports_lexical_rebuild_pipeline_settings() {
         let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
         let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "9");
@@ -61782,15 +66465,16 @@ mod cli_read_db_tests {
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
-            std::process::id(),
-            1_733_000_111_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_111_000_i64,
+                db_path.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         let runtime = &state["rebuild"]["pipeline"]["runtime"];
@@ -61900,15 +66584,16 @@ mod cli_read_db_tests {
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
-            std::process::id(),
-            1_733_000_111_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_111_000_i64,
+                db_path.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
@@ -61958,15 +66643,16 @@ mod cli_read_db_tests {
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
-            std::process::id(),
-            1_733_000_111_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_111_000_i64,
+                db_path.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
@@ -62024,15 +66710,16 @@ mod cli_read_db_tests {
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
-            std::process::id(),
-            1_733_000_111_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_111_000_i64,
+                db_path.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
@@ -62061,18 +66748,16 @@ mod cli_read_db_tests {
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}
-started_at_ms={}
-db_path={}
-mode=index",
-            std::process::id(),
-            1_733_000_556_000_i64,
-            db_path_variant.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_556_000_i64,
+                db_path_variant.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
@@ -62098,18 +66783,16 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}
-started_at_ms={}
-db_path={}
-mode=index",
-            std::process::id(),
-            1_733_000_557_000_i64,
-            db_path_variant.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_557_000_i64,
+                db_path_variant.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["exists"].as_bool(), Some(false));
@@ -62137,16 +66820,15 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}
-started_at_ms={}
-mode=index",
-            std::process::id(),
-            1_733_000_558_000_i64
-        )
-        .expect("write legacy lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_558_000_i64
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
@@ -62196,15 +66878,16 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
-            std::process::id(),
-            1_733_000_555_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_555_000_i64,
+                db_path.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
@@ -62236,15 +66919,16 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=watch",
-            std::process::id(),
-            1_733_000_777_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=watch\n",
+                std::process::id(),
+                1_733_000_777_000_i64,
+                db_path.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["pending"]["watch_active"].as_bool(), Some(true));
@@ -62316,22 +67000,23 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            concat!(
-                "pid={}\n",
-                "started_at_ms={}\n",
-                "updated_at_ms={}\n",
-                "db_path={}\n",
-                "mode=index\n"
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                concat!(
+                    "pid={}\n",
+                    "started_at_ms={}\n",
+                    "updated_at_ms={}\n",
+                    "db_path={}\n",
+                    "mode=index\n"
+                ),
+                std::process::id(),
+                1_733_000_555_000_i64,
+                1_733_000_666_000_i64,
+                db_path.display()
             ),
-            std::process::id(),
-            1_733_000_555_000_i64,
-            1_733_000_666_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["status"].as_str(), Some("error"));
@@ -62422,6 +67107,7 @@ mode=index",
     fn active_index_run_details_reads_matching_lock_metadata() {
         let (temp, db_path) = seed_cli_db();
         let lock_path = temp.path().join("index-run.lock");
+        let pid = std::process::id();
         let mut lock_file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -62430,19 +67116,20 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}",
-            4242_u32,
-            1_733_001_111_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\n",
+                pid,
+                1_733_001_111_000_i64,
+                db_path.display()
+            ),
+        );
 
         let details =
             active_index_run_details(temp.path(), &db_path).expect("matching active index run");
-        assert_eq!(details.pid, Some(4242));
+        assert_eq!(details.pid, Some(pid));
         assert_eq!(details.started_at_ms, Some(1_733_001_111_000));
         assert_eq!(details.data_dir, temp.path());
         assert_eq!(details.db_path, db_path);
@@ -62457,6 +67144,7 @@ mode=index",
         let (temp, db_path) = seed_cli_db();
         let other_db_path = temp.path().join("other-agent-search.db");
         let lock_path = temp.path().join("index-run.lock");
+        let pid = std::process::id();
         let mut lock_file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -62465,19 +67153,20 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}",
-            31337_u32,
-            1_733_001_222_000_i64,
-            other_db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\n",
+                pid,
+                1_733_001_222_000_i64,
+                other_db_path.display()
+            ),
+        );
 
         let details = active_index_run_details(temp.path(), &db_path)
             .expect("active lock in same data dir should still be reported");
-        assert_eq!(details.pid, Some(31337));
+        assert_eq!(details.pid, Some(pid));
         assert_eq!(details.db_path, other_db_path);
     }
 
@@ -63058,6 +67747,8 @@ pub(crate) fn run_doctor_impl(
         match doctor_acquire_mutation_lock(&data_dir, &db_path) {
             Ok((guard, observation)) => {
                 _doctor_lock_guard = Some(guard);
+                _doctor_db_open_bypass_guard =
+                    Some(crate::storage::sqlite::enter_doctor_mutation_db_open_bypass());
                 observation
             }
             Err(observation) => observation,
@@ -64260,6 +68951,9 @@ pub(crate) fn run_doctor_impl(
                     match doctor_acquire_mutation_lock(&data_dir, &db_path) {
                         Ok((guard, observation)) => {
                             _doctor_lock_guard = Some(guard);
+                            _doctor_db_open_bypass_guard = Some(
+                                crate::storage::sqlite::enter_doctor_mutation_db_open_bypass(),
+                            );
                             operation_state = build_doctor_operation_state_report(
                                 &data_dir,
                                 &db_path,
@@ -66759,6 +71453,26 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Batch size for semantic embedding work.",
         ),
         env_var_capability(
+            "CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS",
+            Some("30000"),
+            "Warn when one semantic embedder batch exceeds the cass#257-derived 30s healthy-run threshold.",
+        ),
+        env_var_capability(
+            "CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS",
+            Some("300000"),
+            "Abort after a returned semantic embedder batch exceeds the cass#257-derived 5m watchdog threshold; 0 disables.",
+        ),
+        env_var_capability(
+            "CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT",
+            Some("10000"),
+            "Soft cap for cass models backfill checkpoints at whole-conversation prefixes near 10k selected messages; 0 disables.",
+        ),
+        env_var_capability(
+            "CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT",
+            Some("8388608"),
+            "Soft cap for cass models backfill checkpoints at whole-conversation prefixes near 8MiB selected content; 0 disables.",
+        ),
+        env_var_capability(
             "CASS_RESPONSIVENESS_DISABLE",
             Some("0"),
             "Set to 1 to disable the indexer responsiveness governor.",
@@ -67898,9 +72612,11 @@ fn response_schema_index_state() -> serde_json::Value {
             "stale": { "type": "boolean" },
             "stale_threshold_seconds": { "type": "integer" },
             "rebuilding": { "type": "boolean" },
+            "stalled": { "type": "boolean" },
             "activity_at": { "type": ["string", "null"] },
             "documents": { "type": ["integer", "null"] },
             "empty_with_messages": { "type": "boolean" },
+            "quarantined_conversations": { "type": "integer" },
             "fingerprint": {
                 "type": "object",
                 "properties": {
@@ -67920,6 +72636,24 @@ fn response_schema_index_state() -> serde_json::Value {
                     "page_size_compatible": { "type": ["boolean", "null"] }
                 }
             }
+        }
+    })
+}
+
+fn response_schema_ingest_quarantine() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "status": { "type": "string" },
+            "quarantined_conversations": { "type": "integer" },
+            "recent_quarantined_conversations": { "type": "integer" },
+            "recent_window_seconds": { "type": "integer" },
+            "circuit_breaker_limit": { "type": "integer" },
+            "circuit_breaker_active": { "type": "boolean" },
+            "quarantine_files": { "type": "array", "items": { "type": "string" } },
+            "newest_last_attempt_at_ms": { "type": ["integer", "null"] },
+            "recommended_action": { "type": ["string", "null"] }
         }
     })
 }
@@ -68020,6 +72754,9 @@ fn response_schema_rebuild_state() -> serde_json::Value {
             "job_id": { "type": ["string", "null"] },
             "job_kind": { "type": ["string", "null"] },
             "phase": { "type": ["string", "null"] },
+            "stalled": { "type": "boolean" },
+            "last_progress_at": { "type": ["string", "null"] },
+            "last_progress_age_ms": { "type": ["integer", "null"] },
             "started_at": { "type": ["string", "null"] },
             "updated_at": { "type": ["string", "null"] },
             "processed_conversations": { "type": ["integer", "null"] },
@@ -68039,6 +72776,17 @@ fn response_schema_rebuild_progress() -> serde_json::Value {
         "type": "object",
         "properties": {
             "active": { "type": "boolean" },
+            // `stalled=true` means the rebuild is nominally active but
+            // the indexing thread has not posted forward progress for
+            // longer than CASS_REBUILD_STALL_DETECT_SECS (default 120s)
+            // — even though the lock heartbeat is still being
+            // refreshed. Distinguishes a wedged indexer from a
+            // slow-but-progressing one. Regression #258.
+            "stalled": { "type": "boolean" },
+            // RFC3339 timestamp of the last forward-progress event
+            // posted by the indexing thread itself.
+            "last_progress_at": { "type": ["string", "null"] },
+            "last_progress_age_ms": { "type": ["integer", "null"] },
             "mode": { "type": ["string", "null"] },
             "phase": { "type": ["string", "null"] },
             "processed_conversations": { "type": ["integer", "null"] },
@@ -68079,6 +72827,9 @@ fn response_schema_semantic_state() -> serde_json::Value {
             "hnsw_path": { "type": ["string", "null"] },
             "hnsw_ready": { "type": "boolean" },
             "progressive_ready": { "type": "boolean" },
+            "feature_compiled_in": { "type": "boolean" },
+            "quality_tier_published": { "type": "boolean" },
+            "semantic_only_search_available": { "type": "boolean" },
             "hint": { "type": ["string", "null"] },
             "fast_tier": {
                 "type": "object",
@@ -68317,6 +73068,7 @@ fn response_schema_state_meta() -> serde_json::Value {
             "pending": response_schema_pending_state(),
             "rebuild": response_schema_rebuild_state(),
             "semantic": response_schema_semantic_state(),
+            "ingest_quarantine": response_schema_ingest_quarantine(),
             "policy_registry": response_schema_policy_registry(),
             "_meta": {
                 "type": "object",
@@ -71130,8 +75882,10 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "properties": {
                 "status": { "type": "string" },
                 "healthy": { "type": "boolean" },
+                "health_level": { "type": "string" },
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },
+                "warnings": { "type": "array", "items": { "type": "string" } },
                 "data_dir": { "type": "string" },
                 "recommended_action": { "type": ["string", "null"] },
                 "recommended_commands": response_schema_recommended_commands(),
@@ -71141,6 +75895,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "rebuild": response_schema_rebuild_state(),
                 "rebuild_progress": response_schema_rebuild_progress(),
                 "semantic": response_schema_semantic_state(),
+                "ingest_quarantine": response_schema_ingest_quarantine(),
                 "policy_registry": response_schema_policy_registry(),
                 "topology_budget": response_schema_topology_budget(),
                 "doctor_summary": response_schema_doctor_v2_summary("status-summary"),
@@ -71280,8 +76035,10 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "properties": {
                 "status": { "type": "string" },
                 "healthy": { "type": "boolean" },
+                "health_level": { "type": "string" },
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },
+                "warnings": { "type": "array", "items": { "type": "string" } },
                 "data_dir": { "type": "string" },
                 "recommended_action": { "type": ["string", "null"] },
                 "recommended_commands": response_schema_recommended_commands(),
@@ -71291,6 +76048,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "rebuild": response_schema_rebuild_state(),
                 "rebuild_progress": response_schema_rebuild_progress(),
                 "semantic": response_schema_semantic_state(),
+                "ingest_quarantine": response_schema_ingest_quarantine(),
                 "policy_registry": response_schema_policy_registry(),
                 "topology_budget": response_schema_topology_budget(),
                 "doctor_summary": response_schema_doctor_v2_summary("status-summary"),
@@ -71513,6 +76271,8 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "db_path": { "type": ["string", "null"] },
                 "conversations": { "type": ["integer", "null"] },
                 "messages": { "type": ["integer", "null"] },
+                "quarantined_conversations": { "type": "integer" },
+                "lexical_update_deferred": { "type": "boolean" },
                 "indexing_stats": response_schema_opaque_object(),
                 "error": { "type": ["string", "null"] }
             }
@@ -71664,8 +76424,10 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "properties": {
                 "status": { "type": "string" },
                 "healthy": { "type": "boolean" },
+                "health_level": { "type": "string" },
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },
+                "warnings": { "type": "array", "items": { "type": "string" } },
                 "data_dir": { "type": "string" },
                 "recommended_action": { "type": ["string", "null"] },
                 "recommended_commands": response_schema_recommended_commands(),
@@ -71680,6 +76442,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "remote_source_sync": response_schema_doctor_remote_source_sync_runtime_summary(),
                 "coverage_risk": response_schema_doctor_coverage_risk(),
                 "policy_registry": response_schema_policy_registry(),
+                "ingest_quarantine": response_schema_ingest_quarantine(),
                 "responsiveness": {
                     "type": "object",
                     "description": "Machine-responsiveness governor telemetry. Explains why the indexer is running at reduced fan-out and what pressure triggered any recent shrinkage.",
@@ -73070,7 +77833,8 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "backup-filter-excludes-cass-evidence"
-                    && risk.path.ends_with("raw-mirror/v1")
+                    && std::path::Path::new(&risk.path)
+                        .ends_with(std::path::Path::new("raw-mirror").join("v1"))
                     && risk
                         .evidence
                         .iter()
@@ -73100,7 +77864,11 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "repo-ignore-excludes-cass-evidence"
-                    && risk.path.ends_with("cass-data/raw-mirror/v1")
+                    && std::path::Path::new(&risk.path).ends_with(
+                        std::path::Path::new("cass-data")
+                            .join("raw-mirror")
+                            .join("v1"),
+                    )
                     && risk
                         .evidence
                         .iter()
@@ -73152,7 +77920,11 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "repo-ignore-excludes-cass-evidence"
-                    && risk.path.ends_with("cass-data-link/raw-mirror/v1")
+                    && std::path::Path::new(&risk.path).ends_with(
+                        std::path::Path::new("cass-data-link")
+                            .join("raw-mirror")
+                            .join("v1"),
+                    )
             }),
             "logical symlinked data-dir placement should still be checked against repo ignores: {risks:#?}"
         );
@@ -73214,7 +77986,8 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(
                 |risk| risk.risk_kind == "sources-config-excludes-cass-evidence"
-                    && risk.path.ends_with("raw-mirror/v1")
+                    && std::path::Path::new(&risk.path)
+                        .ends_with(std::path::Path::new("raw-mirror").join("v1"))
             ),
             "sources config exclusion-like entries should be surfaced with uncertainty: {risks:#?}"
         );
@@ -73532,7 +78305,7 @@ fn parse_followup_jsonl_messages(
 
 fn infer_followup_agent_and_workspace(path: &Path) -> (Option<String>, Option<String>) {
     let path_str = path.to_string_lossy();
-    let path_lower = path_str.to_ascii_lowercase();
+    let path_lower = path_str.to_ascii_lowercase().replace('\\', "/");
 
     let agent_name = [
         (".local/share/opencode", "opencode"),
@@ -73953,13 +78726,24 @@ fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
 
     // Index run lock file — if heartbeating, tells the reporter another
     // process may actually be holding the writer.
-    let lock_path = data_dir.join("index_run.lock");
+    let lock_path = data_dir.join("index-run.lock");
     if lock_path.exists() {
         let mut lock = serde_json::Map::new();
         lock.insert(
             "path".into(),
             serde_json::json!(lock_path.display().to_string()),
         );
+        if let Ok(meta) = std::fs::metadata(&lock_path) {
+            lock.insert("size_bytes".into(), serde_json::json!(meta.len()));
+            if let Ok(modified) = meta.modified()
+                && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+            {
+                lock.insert(
+                    "modified_ms".into(),
+                    serde_json::json!(duration.as_millis() as u64),
+                );
+            }
+        }
         if let Ok(contents) = std::fs::read_to_string(&lock_path) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
                 lock.insert("content".into(), parsed);
@@ -73971,6 +78755,137 @@ fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
     }
 
     serde_json::Value::Object(out)
+}
+
+const INDEX_STALL_HINT: &str = concat!(
+    "Indexer made no forward progress for the configured stall window. ",
+    "Capture a stack trace with `sudo cat /proc/$(pgrep -f 'cass index')/stack` ",
+    "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
+    "and attach to issue #244 (indexing-phase wedges) or #258 (watch_startup wedges where the lock-file ",
+    "heartbeat keeps refreshing while one thread spins). Set CASS_INDEX_STALL_DETECT_SECS=0 to disable."
+);
+
+fn index_stall_threshold(progress_interval: Duration) -> Option<Duration> {
+    let stall_threshold_secs = dotenvy::var("CASS_INDEX_STALL_DETECT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(120);
+    if stall_threshold_secs == 0 {
+        None
+    } else {
+        let min = progress_interval.saturating_add(Duration::from_secs(1));
+        Some(Duration::from_secs(stall_threshold_secs).max(min))
+    }
+}
+
+struct IndexStallWatchdog {
+    data_dir: PathBuf,
+    threshold: Option<Duration>,
+    last_phase: usize,
+    last_current: usize,
+    last_progress_advance: std::time::Instant,
+    stall_reported_for_phase: Option<usize>,
+}
+
+impl IndexStallWatchdog {
+    fn new(data_dir: PathBuf, progress_interval: Duration) -> Self {
+        Self {
+            data_dir,
+            threshold: index_stall_threshold(progress_interval),
+            last_phase: usize::MAX,
+            last_current: 0,
+            last_progress_advance: std::time::Instant::now(),
+            stall_reported_for_phase: None,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        index_progress: &indexer::IndexingProgress,
+        elapsed_ms: u128,
+    ) -> Option<serde_json::Value> {
+        let phase_code = index_progress
+            .phase
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let current = index_progress
+            .current
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        if phase_code != self.last_phase {
+            self.last_phase = phase_code;
+            self.last_current = current;
+            self.last_progress_advance = std::time::Instant::now();
+            self.stall_reported_for_phase = None;
+            return None;
+        }
+
+        if current != self.last_current {
+            self.last_progress_advance = std::time::Instant::now();
+            self.last_current = current;
+            return None;
+        }
+
+        let threshold = self.threshold?;
+        // Historically this gated on `phase_code != 0` so the watchdog
+        // never fired during the "preparing" phase (phase=0). Issue #258
+        // is exactly that: the v0.6.2 watcher wedged at startup before
+        // ever advancing to Scanning/Indexing, the watchdog stayed
+        // silent for 4+ hours, and operators had no signal that the
+        // indexer was stuck. The fix is to also fire on phase=0 wedges
+        // — a startup that takes >120 s with no progress is, by any
+        // sensible definition, a stall worth reporting. The repeat
+        // guard `stall_reported_for_phase == Some(phase_code)` still
+        // prevents log spam from a single stalled phase.
+        if self.stall_reported_for_phase == Some(phase_code) {
+            return None;
+        }
+        if self.last_progress_advance.elapsed() < threshold {
+            return None;
+        }
+
+        let stall_elapsed_ms = self.last_progress_advance.elapsed().as_millis();
+        let mut payload = index_progress.snapshot_json(elapsed_ms);
+        if let serde_json::Value::Object(ref mut m) = payload {
+            m.insert("event".into(), serde_json::json!("stall_detected"));
+            m.insert(
+                "ts_ms".into(),
+                serde_json::json!(chrono::Utc::now().timestamp_millis()),
+            );
+            m.insert(
+                "stall_elapsed_ms".into(),
+                serde_json::json!(stall_elapsed_ms as u64),
+            );
+            m.insert(
+                "stall_threshold_secs".into(),
+                serde_json::json!(threshold.as_secs()),
+            );
+            m.insert(
+                "diagnostics".into(),
+                collect_stall_diagnostics(&self.data_dir),
+            );
+            m.insert("hint".into(), serde_json::json!(INDEX_STALL_HINT));
+        }
+        self.stall_reported_for_phase = Some(phase_code);
+        Some(payload)
+    }
+}
+
+fn index_stall_warning_lines(payload: &serde_json::Value) -> (String, String) {
+    let phase = payload
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let elapsed_secs = payload
+        .get("stall_elapsed_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+        / 1000;
+    let summary = format!(
+        "Warning: cass index made no {phase} progress for {elapsed_secs}s; stall diagnostics follow."
+    );
+    let diagnostics = serde_json::to_string(payload)
+        .unwrap_or_else(|err| format!(r#"{{"event":"stall_detected","serialize_error":"{err}"}}"#));
+    (summary, diagnostics)
 }
 
 #[cfg(test)]
@@ -74004,11 +78919,8 @@ mod stall_diagnostics_tests {
             r#"{"completed": true, "committed_conversation_id": 42}"#,
         )
         .expect("write checkpoint");
-        std::fs::write(
-            tmp.path().join("index_run.lock"),
-            r#"{"pid": 12345, "mode": "index"}"#,
-        )
-        .expect("write lock");
+        std::fs::write(tmp.path().join("index-run.lock"), "pid=12345\nmode=index\n")
+            .expect("write lock");
         // Synthetic Tantivy-like segment so we exercise the segment counter.
         std::fs::write(index_dir.join("abcd.idx"), b"x").expect("write segment");
 
@@ -74028,7 +78940,14 @@ mod stall_diagnostics_tests {
             "parsed checkpoint JSON should round-trip"
         );
         let lock = obj["index_run_lock"].as_object().expect("lock object");
-        assert_eq!(lock["content"]["pid"], serde_json::json!(12345));
+        assert_eq!(lock["size_bytes"], serde_json::json!(21));
+        assert!(lock.contains_key("modified_ms"));
+        assert!(
+            lock["content_raw"]
+                .as_str()
+                .expect("content_raw string")
+                .contains("pid=12345")
+        );
     }
 
     #[test]
@@ -74047,6 +78966,63 @@ mod stall_diagnostics_tests {
         assert!(entry.contains_key("content_omitted"));
         assert!(!entry.contains_key("content"));
         assert_eq!(entry["size_bytes"], serde_json::json!(big.len() as u64));
+    }
+
+    /// Regression for #258: `IndexStallWatchdog` previously short-
+    /// circuited on `phase_code == 0` (the "preparing" phase before
+    /// Scanning/Indexing), so any startup wedge that never advanced
+    /// past phase=0 was invisible. The v0.6.2 watcher reporter saw
+    /// 4+ hours of silence on exactly that path. The watchdog now
+    /// fires whenever no progress is observed within the threshold,
+    /// regardless of phase.
+    #[test]
+    fn watchdog_fires_on_phase_zero_startup_wedge() {
+        use super::IndexStallWatchdog;
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut watchdog =
+            IndexStallWatchdog::new(tmp.path().to_path_buf(), Duration::from_millis(50));
+        // Force a tiny stall threshold so the test does not need to
+        // sleep 120 s. Using a smaller-than-default value still
+        // exercises the same code path because
+        // `index_stall_threshold` floors at `progress_interval + 1s`,
+        // but for the unit test we drive the watchdog by directly
+        // tampering with `last_progress_advance`.
+        watchdog.threshold = Some(Duration::from_millis(1));
+        // Simulate "indexer just started, phase=0, current=0". Force
+        // last_progress_advance into the past so the threshold has
+        // already elapsed by the time we call `observe`.
+        watchdog.last_phase = 0;
+        watchdog.last_current = 0;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        // Caller has not touched phase/current — still 0/0.
+        assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.current.load(Ordering::Relaxed), 0);
+
+        let payload = watchdog.observe(&progress, 100);
+        let payload = payload.expect(
+            "phase=0 wedges past the stall threshold must emit a stall_detected event (#258)",
+        );
+        let obj = payload.as_object().expect("event payload is an object");
+        assert_eq!(obj["event"], serde_json::json!("stall_detected"));
+        assert!(
+            obj.contains_key("stall_elapsed_ms"),
+            "watchdog event missing stall_elapsed_ms",
+        );
+
+        // Second observe call with no progress must be silenced by
+        // the per-phase repeat guard.
+        let repeat = watchdog.observe(&progress, 200);
+        assert!(
+            repeat.is_none(),
+            "watchdog must not spam repeated events for the same phase",
+        );
     }
 }
 
@@ -74074,6 +79050,7 @@ fn run_index_with_data(
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let embedder = resolve_semantic_index_embedder(&embedder);
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -74321,6 +79298,7 @@ fn run_index_with_data(
         let mut last_current = usize::MAX;
         let mut last_agents = usize::MAX;
         let mut last_update = std::time::Instant::now();
+        let mut stall_watchdog = IndexStallWatchdog::new(data_dir.clone(), progress_interval);
 
         loop {
             // Check if indexer finished
@@ -74405,6 +79383,14 @@ fn run_index_with_data(
                 last_update = now;
             }
 
+            if let Some(payload) =
+                stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
+            {
+                let (summary, diagnostics) = index_stall_warning_lines(&payload);
+                pb.println(summary);
+                pb.println(diagnostics);
+            }
+
             std::thread::sleep(Duration::from_millis(50));
         }
 
@@ -74422,6 +79408,7 @@ fn run_index_with_data(
         let mut last_agents = 0;
         let mut last_current = 0;
         let mut last_scan_current = 0;
+        let mut stall_watchdog = IndexStallWatchdog::new(data_dir.clone(), progress_interval);
 
         loop {
             if index_handle.is_finished() {
@@ -74469,6 +79456,14 @@ fn run_index_with_data(
                 last_current = current;
             }
 
+            if let Some(payload) =
+                stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
+            {
+                let (summary, diagnostics) = index_stall_warning_lines(&payload);
+                eprintln!("{summary}");
+                eprintln!("{diagnostics}");
+            }
+
             std::thread::sleep(Duration::from_millis(200));
         }
     } else if emit_progress_events {
@@ -74481,29 +79476,7 @@ fn run_index_with_data(
         let mut last_emit = std::time::Instant::now()
             .checked_sub(progress_interval)
             .unwrap_or_else(std::time::Instant::now);
-
-        // Stall-detection watchdog (issue #196). Latches a one-shot
-        // `stall_detected` event on stderr when `current` hasn't advanced for
-        // `stall_threshold` during an active (non-idle) phase. The watchdog is
-        // observability-only: it never cancels the run or touches shared
-        // indexer state. Threshold is tunable via
-        // `CASS_INDEX_STALL_DETECT_SECS` (0 disables; default 120s). We clamp
-        // below at `progress_interval` so the emitter has a chance to publish
-        // at least one progress event before the stall fires.
-        let stall_threshold_secs = dotenvy::var("CASS_INDEX_STALL_DETECT_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(120);
-        let stall_threshold = if stall_threshold_secs == 0 {
-            None
-        } else {
-            let min = progress_interval.saturating_add(Duration::from_secs(1));
-            Some(Duration::from_secs(stall_threshold_secs).max(min))
-        };
-        let mut last_current: usize = 0;
-        let mut last_progress_advance = std::time::Instant::now();
-        let mut stall_reported_for_phase: Option<usize> = None;
-        let stall_diagnostics_data_dir = data_dir.clone();
+        let mut stall_watchdog = IndexStallWatchdog::new(data_dir.clone(), progress_interval);
 
         // Finish-aware poll cadence: 100ms for snappy shutdown, but only emit a
         // `progress` event at `progress_interval`.
@@ -74513,7 +79486,6 @@ fn run_index_with_data(
             }
 
             let phase_code = index_progress.phase.load(Ordering::Relaxed);
-            let current = index_progress.current.load(Ordering::Relaxed);
             let elapsed_ms = start.elapsed().as_millis();
 
             // Always emit on phase transitions, independent of the interval, so
@@ -74530,11 +79502,6 @@ fn run_index_with_data(
                 emit_event(payload);
                 last_phase = phase_code;
                 last_emit = std::time::Instant::now();
-                // Phase change is forward progress for the watchdog's purpose,
-                // even if `current` is reset to 0 in the new phase.
-                last_progress_advance = std::time::Instant::now();
-                last_current = current;
-                stall_reported_for_phase = None;
             } else if last_emit.elapsed() >= progress_interval {
                 let mut payload = index_progress.snapshot_json(elapsed_ms);
                 if let serde_json::Value::Object(ref mut m) = payload {
@@ -74548,52 +79515,8 @@ fn run_index_with_data(
                 last_emit = std::time::Instant::now();
             }
 
-            if current != last_current {
-                last_progress_advance = std::time::Instant::now();
-                last_current = current;
-            }
-
-            // Only arm the watchdog in active phases (scanning=1 or
-            // indexing=2). phase_code == 0 is preparing/idle and staying at
-            // current=0 there is expected. Latch once per phase so we don't
-            // spam stderr on long stalls.
-            if let Some(threshold) = stall_threshold
-                && phase_code != 0
-                && stall_reported_for_phase != Some(phase_code)
-                && last_progress_advance.elapsed() >= threshold
-            {
-                let stall_elapsed_ms = last_progress_advance.elapsed().as_millis();
-                let mut payload = index_progress.snapshot_json(elapsed_ms);
-                if let serde_json::Value::Object(ref mut m) = payload {
-                    m.insert("event".into(), serde_json::json!("stall_detected"));
-                    m.insert(
-                        "ts_ms".into(),
-                        serde_json::json!(chrono::Utc::now().timestamp_millis()),
-                    );
-                    m.insert(
-                        "stall_elapsed_ms".into(),
-                        serde_json::json!(stall_elapsed_ms as u64),
-                    );
-                    m.insert(
-                        "stall_threshold_secs".into(),
-                        serde_json::json!(threshold.as_secs()),
-                    );
-                    m.insert(
-                        "diagnostics".into(),
-                        collect_stall_diagnostics(&stall_diagnostics_data_dir),
-                    );
-                    m.insert(
-                        "hint".into(),
-                        serde_json::json!(concat!(
-                            "Indexer made no forward progress for the configured stall window. ",
-                            "Capture a stack trace with `sudo cat /proc/$(pgrep -f 'cass index')/stack` ",
-                            "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
-                            "and attach to issue #196. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable."
-                        )),
-                    );
-                }
+            if let Some(payload) = stall_watchdog.observe(&index_progress, elapsed_ms) {
                 emit_event(payload);
-                stall_reported_for_phase = Some(phase_code);
             }
 
             std::thread::sleep(Duration::from_millis(100));
@@ -74601,7 +79524,15 @@ fn run_index_with_data(
     } else {
         // No progress display (json mode with events disabled, or plain=none):
         // just wait for completion.
+        let mut stall_watchdog = IndexStallWatchdog::new(data_dir.clone(), progress_interval);
         while !index_handle.is_finished() {
+            if let Some(payload) =
+                stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
+            {
+                let (summary, diagnostics) = index_stall_warning_lines(&payload);
+                eprintln!("{summary}");
+                eprintln!("{diagnostics}");
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -74621,6 +79552,15 @@ fn run_index_with_data(
                 let err = details.to_cli_error();
                 active_index_error = Some(details);
                 return err;
+            }
+            if error_chain_indicates_index_disk_headroom_blocked(&chain) {
+                return index_disk_headroom_cli_error(&chain);
+            }
+            if error_chain_indicates_orphan_fk_cleanup_blocked(&chain) {
+                return index_orphan_fk_cleanup_cli_error(&chain);
+            }
+            if error_chain_indicates_archive_health_blocked(&chain) {
+                return index_archive_health_cli_error(&chain);
             }
             if error_chain_indicates_retryable_storage_contention(&chain) {
                 return index_storage_contention_cli_error(&chain);
@@ -74658,6 +79598,19 @@ fn run_index_with_data(
     let elapsed_ms = start.elapsed().as_millis();
 
     if let Err(err) = &res {
+        // Surface every index failure at ERROR level so `cass index --watch`
+        // (which runs without --json) can no longer exit with code 9 silently,
+        // leaving the operator with no explanation in the watch log (issue #250,
+        // coding_agent_session_search-u7r1z). stdout stays data-only; this
+        // diagnostic line goes to stderr via tracing.
+        tracing::error!(
+            code = err.code,
+            kind = %err.kind,
+            retryable = err.retryable,
+            "cass index failed (exit {}): {}",
+            err.code,
+            err.message
+        );
         if let Some(fmt) = structured_format {
             let mut payload = cli_error_json_payload(err, elapsed_ms);
             if let Some(active_index) = &active_index_error {
@@ -74675,8 +79628,6 @@ fn run_index_with_data(
                 emit_event(event);
             }
             output_structured_value(payload, fmt)?;
-        } else {
-            tracing::debug!(?err, "index command failed");
         }
     } else if let Some(fmt) = structured_format {
         // Derive result counts from the indexer's own progress tracking rather
@@ -74922,6 +79873,12 @@ pub fn default_data_dir() -> PathBuf {
         let trimmed = dir.trim();
         if !trimmed.is_empty() {
             return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(dir) = dotenvy::var("XDG_DATA_HOME") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("coding-agent-search");
         }
     }
     directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search")
@@ -76631,6 +81588,7 @@ mod clipboard_helper_tests {
     /// previous failure mode was a silent success that dropped the
     /// export on the floor.
     #[test]
+    #[cfg(not(windows))]
     fn returns_err_when_no_tool_is_available() {
         // Save and clear PATH so spawn() can't find pbcopy/wl-copy/xclip
         // /xsel/clip. Restore on exit even if the assertion panics.
@@ -77010,27 +81968,26 @@ fn run_export_html(
     let messages: Vec<Message> = raw_messages
         .iter()
         .enumerate()
-        .filter_map(|(i, msg)| {
+        .flat_map(|(i, msg)| {
             let role = extract_role(msg);
-            let content = extract_text_content(msg);
             let ts = extract_message_timestamp(msg);
             let timestamp = ts
                 .and_then(|ts| chrono::Utc.timestamp_millis_opt(ts).single())
                 .map(|dt| dt.to_rfc3339());
 
-            // Extract tool call info if present
-            let tool_call = if include_tools {
-                extract_tool_call(msg)
+            // Extract all structured tool blocks if present. A single Claude
+            // message can contain multiple tool_use blocks; preserve each one
+            // as its own renderer message so grouping can attach all results.
+            let tool_calls = if include_tools {
+                extract_tool_calls(msg)
             } else {
-                None
+                Vec::new()
             };
 
-            // If we have a tool_call, strip the redundant "[Tool: X]" prefix from content
-            // since the tool call details are shown separately in the HTML export
-            let content = if tool_call.is_some() {
-                strip_tool_marker(&content)
+            let content = if !tool_calls.is_empty() {
+                strip_tool_marker(&extract_text_content_without_tool_blocks(msg))
             } else {
-                content
+                extract_text_content(msg)
             };
 
             // --- Drop entire messages that are skill injections (unless opted in) ---
@@ -77040,26 +81997,26 @@ fn run_export_html(
             // to parse, redact, or pattern-match the content. Just skip it.
             if !include_skills {
                 if content.contains("Base directory for this skill:") {
-                    return None;
+                    return Vec::new();
                 }
                 // System reminders contain skill listings, hook metadata, and other
                 // internal context. Drop entire messages that are system-reminder blocks.
                 if content.contains("<system-reminder>") {
-                    return None;
+                    return Vec::new();
                 }
                 // Skill listing dumps (injected by hooks)
                 if content
                     .contains("The following skills are available for use with the Skill tool:")
                 {
-                    return None;
+                    return Vec::new();
                 }
                 // Vercel plugin hook injections with skill metadata
                 if content.contains("skillInjection:") && content.contains("matchedSkills") {
-                    return None;
+                    return Vec::new();
                 }
                 // Hook injection blocks (contain skill names, patterns, metadata)
                 if content.contains("<!-- skillInjection:") {
-                    return None;
+                    return Vec::new();
                 }
             }
 
@@ -77068,29 +82025,48 @@ fn run_export_html(
             // Only user, assistant, system, tool, and unknown are valid message roles.
             match role.as_str() {
                 "user" | "assistant" | "system" | "tool" | "unknown" => {}
-                _ => return None,
+                _ => return Vec::new(),
             }
 
             // Skip empty messages: no content AND no tool call AND unknown role
             // This filters out malformed/empty entries that would look broken
-            if content.is_empty() && tool_call.is_none() && role == "unknown" {
-                return None;
+            if content.is_empty() && tool_calls.is_empty() && role == "unknown" {
+                return Vec::new();
             }
 
             // Also skip messages that are completely empty (no content, no tool call)
             // but keep tool calls even if content is empty (shows the tool interaction)
-            if content.is_empty() && tool_call.is_none() {
-                return None;
+            if content.is_empty() && tool_calls.is_empty() {
+                return Vec::new();
             }
 
-            Some(Message {
-                role,
-                content,
-                timestamp,
-                tool_call,
-                index: Some(i),
-                author: None,
-            })
+            if tool_calls.is_empty() {
+                return vec![Message {
+                    role,
+                    content,
+                    timestamp,
+                    tool_call: None,
+                    index: Some(i),
+                    author: None,
+                }];
+            }
+
+            tool_calls
+                .into_iter()
+                .enumerate()
+                .map(|(tool_index, tool_call)| Message {
+                    role: role.clone(),
+                    content: if tool_index == 0 {
+                        content.clone()
+                    } else {
+                        String::new()
+                    },
+                    timestamp: timestamp.clone(),
+                    tool_call: Some(tool_call),
+                    index: Some(i),
+                    author: None,
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -77420,12 +82396,22 @@ fn run_export_html(
     Ok(())
 }
 
-/// Extract tool call information from a message for HTML export.
+fn stringify_tool_value(value: &serde_json::Value) -> String {
+    if value.is_object() || value.is_array() {
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    } else if let Some(s) = value.as_str() {
+        s.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Extract all tool call/result blocks from a message for HTML export.
 ///
 /// Supports multiple formats:
 /// 1. Claude/Anthropic format: `content` array with `type: "tool_use"` or `type: "tool_result"` blocks
 /// 2. Cursor/generic format: `type: "tool"` at top level with `message.tool_name`, `message.tool_input`, `message.tool_output`
-fn extract_tool_call(msg: &serde_json::Value) -> Option<html_export::ToolCall> {
+fn extract_tool_calls(msg: &serde_json::Value) -> Vec<html_export::ToolCall> {
     // Format 2: Cursor/generic format - check for top-level type: "tool"
     if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str())
         && msg_type == "tool"
@@ -77438,25 +82424,9 @@ fn extract_tool_call(msg: &serde_json::Value) -> Option<html_export::ToolCall> {
             .and_then(|n| n.as_str())
             .unwrap_or("tool");
 
-        let tool_input = inner.get("tool_input").map(|i| {
-            if i.is_object() || i.is_array() {
-                serde_json::to_string_pretty(i).unwrap_or_default()
-            } else if let Some(s) = i.as_str() {
-                s.to_string()
-            } else {
-                i.to_string()
-            }
-        });
+        let tool_input = inner.get("tool_input").map(stringify_tool_value);
 
-        let tool_output = inner.get("tool_output").map(|o| {
-            if o.is_object() || o.is_array() {
-                serde_json::to_string_pretty(o).unwrap_or_default()
-            } else if let Some(s) = o.as_str() {
-                s.to_string()
-            } else {
-                o.to_string()
-            }
-        });
+        let tool_output = inner.get("tool_output").map(stringify_tool_value);
 
         // Determine status from explicit status field or presence of output
         let status_str = inner
@@ -77473,12 +82443,14 @@ fn extract_tool_call(msg: &serde_json::Value) -> Option<html_export::ToolCall> {
             _ => None,
         };
 
-        return Some(html_export::ToolCall {
+        return vec![html_export::ToolCall {
             name: tool_name.to_string(),
             input: tool_input.unwrap_or_default(),
             output: tool_output,
             status,
-        });
+            correlation_id: extract_tool_correlation_id(inner)
+                .or_else(|| extract_tool_correlation_id(msg)),
+        }];
     }
 
     // Format 1: Claude/Anthropic format - content array with tool_use/tool_result blocks
@@ -77487,45 +82459,32 @@ fn extract_tool_call(msg: &serde_json::Value) -> Option<html_export::ToolCall> {
         .and_then(|m| m.get("content"))
         .or_else(|| msg.get("content"));
 
+    let mut tool_calls = Vec::new();
     if let Some(arr) = content.and_then(|c| c.as_array()) {
         for block in arr {
             if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
                 match block_type {
                     "tool_use" => {
                         let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                        let input = block.get("input").map(|i| {
-                            if i.is_object() || i.is_array() {
-                                serde_json::to_string_pretty(i).unwrap_or_default()
-                            } else if let Some(s) = i.as_str() {
-                                s.to_string()
-                            } else {
-                                i.to_string()
-                            }
-                        });
-                        return Some(html_export::ToolCall {
+                        let input = block.get("input").map(stringify_tool_value);
+                        tool_calls.push(html_export::ToolCall {
                             name: name.to_string(),
                             input: input.unwrap_or_default(),
                             output: None,
                             // For exported conversations, don't show "pending" for tool invocations
                             // without explicit status - the output may be in a separate message
                             status: None,
+                            correlation_id: extract_tool_correlation_id(block),
                         });
                     }
                     "tool_result" => {
-                        let content = block.get("content").map(|c| {
-                            if c.is_object() || c.is_array() {
-                                serde_json::to_string_pretty(c).unwrap_or_default()
-                            } else if let Some(s) = c.as_str() {
-                                s.to_string()
-                            } else {
-                                c.to_string()
-                            }
-                        });
-                        return Some(html_export::ToolCall {
+                        let content = block.get("content").map(stringify_tool_value);
+                        tool_calls.push(html_export::ToolCall {
                             name: "tool_result".to_string(),
                             input: String::new(),
                             output: content,
                             status: Some(html_export::ToolStatus::Success),
+                            correlation_id: extract_tool_correlation_id(block),
                         });
                     }
                     _ => {}
@@ -77534,7 +82493,19 @@ fn extract_tool_call(msg: &serde_json::Value) -> Option<html_export::ToolCall> {
         }
     }
 
-    None
+    tool_calls
+}
+
+fn extract_tool_correlation_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("tool_use_id")
+        .or_else(|| value.get("tool_call_id"))
+        .or_else(|| value.get("call_id"))
+        .or_else(|| value.get("id"))
+        .and_then(|id| id.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 // ============================================================================
@@ -77650,6 +82621,13 @@ pub fn classify_message(msg: &html_export::Message, _format: AgentFormat) -> Mes
 
     match role {
         "user" => {
+            if msg
+                .tool_call
+                .as_ref()
+                .is_some_and(|tc| tc.name == "tool_result" && tc.output.is_some())
+            {
+                return MessageClassification::ToolResult;
+            }
             if has_content {
                 MessageClassification::UserContent
             } else {
@@ -77681,38 +82659,27 @@ pub fn classify_message(msg: &html_export::Message, _format: AgentFormat) -> Mes
     }
 }
 
-/// Extract correlation ID from a message for tool call/result matching.
-///
-/// Different formats use different correlation mechanisms:
-/// - Claude Code: tool_use_id in content blocks
-/// - Codex: function call name
-/// - Generic: message index fallback
+/// Extract provider correlation ID from a message for tool call/result matching.
 pub fn extract_correlation_id(msg: &html_export::Message, format: AgentFormat) -> Option<String> {
     use tracing::trace;
 
-    // First, try to use the tool call name as a simple correlation
-    // This works for most formats as a baseline
-    if let Some(ref tc) = msg.tool_call {
-        let corr_id = match format {
-            AgentFormat::ClaudeCode => {
-                // Claude uses tool_use_id but we don't have access to raw JSON here
-                // Fall back to tool name + index
-                Some(format!("claude-{}", tc.name))
-            }
-            AgentFormat::Codex => {
-                // Codex correlates by function name
-                Some(format!("codex-{}", tc.name))
-            }
-            AgentFormat::Cursor => Some(format!("cursor-{}", tc.name)),
-            AgentFormat::OpenCode => Some(format!("opencode-{}", tc.name)),
-            AgentFormat::Generic => Some(format!("generic-{}", tc.name)),
-        };
-        trace!(correlation_id = ?corr_id, tool_name = %tc.name, "Extracted correlation ID");
-        return corr_id;
+    if let Some(ref tc) = msg.tool_call
+        && let Some(corr_id) = tc.correlation_id.clone()
+    {
+        trace!(
+            correlation_id = %corr_id,
+            tool_name = %tc.name,
+            "Extracted provider tool correlation ID"
+        );
+        return Some(corr_id);
     }
 
-    // For tool results without explicit tool_call, use index as fallback
-    msg.index.map(|idx| format!("index-{}", idx))
+    trace!(
+        format = ?format,
+        has_tool_call = msg.tool_call.is_some(),
+        "No provider tool correlation ID present"
+    );
+    None
 }
 
 /// Flush the current group into the groups vector if it exists.
@@ -80408,6 +85375,7 @@ mod message_grouping_tests {
                 input: tool_input.to_string(),
                 output: None,
                 status: None,
+                correlation_id: None,
             }),
             index: None,
             author: None,
@@ -80425,6 +85393,7 @@ mod message_grouping_tests {
                 input: String::new(),
                 output: Some(output.to_string()),
                 status: Some(status),
+                correlation_id: None,
             }),
             index: None,
             author: None,
@@ -80495,6 +85464,127 @@ mod message_grouping_tests {
         assert_eq!(groups.len(), 1, "Should group assistant + tool into one");
         assert_eq!(groups[0].group_type, MessageGroupType::Assistant);
         assert_eq!(groups[0].tool_calls.len(), 1, "Should have 1 tool call");
+    }
+
+    #[test]
+    fn claude_tool_use_id_correlates_tool_result_for_html_export() {
+        let call_json = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_readme",
+                    "name": "Read",
+                    "input": { "file_path": "README.md" }
+                }]
+            }
+        });
+        let result_json = serde_json::json!({
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_readme",
+                    "content": "readme contents"
+                }]
+            }
+        });
+
+        let call = extract_tool_calls(&call_json)
+            .into_iter()
+            .next()
+            .expect("tool_use block");
+        let result = extract_tool_calls(&result_json)
+            .into_iter()
+            .next()
+            .expect("tool_result block");
+        assert_eq!(call.correlation_id.as_deref(), Some("toolu_readme"));
+        assert_eq!(result.correlation_id.as_deref(), Some("toolu_readme"));
+
+        let groups = group_messages_for_export(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: "Let me read the file.".to_string(),
+                timestamp: None,
+                tool_call: Some(call),
+                index: Some(0),
+                author: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: "readme contents".to_string(),
+                timestamp: None,
+                tool_call: Some(result),
+                index: Some(1),
+                author: None,
+            },
+        ]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tool_calls.len(), 1);
+        assert_eq!(
+            groups[0].tool_calls[0]
+                .result
+                .as_ref()
+                .map(|result| result.content.as_str()),
+            Some("readme contents")
+        );
+    }
+
+    #[test]
+    fn claude_multiple_tool_uses_are_preserved_for_html_export() {
+        let call_json = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "I'll inspect both files." },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_readme",
+                        "name": "Read",
+                        "input": { "file_path": "README.md" }
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_agents",
+                        "name": "Read",
+                        "input": { "file_path": "AGENTS.md" }
+                    }
+                ]
+            }
+        });
+
+        let calls = extract_tool_calls(&call_json);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].correlation_id.as_deref(), Some("toolu_readme"));
+        assert_eq!(calls[1].correlation_id.as_deref(), Some("toolu_agents"));
+        assert_eq!(
+            extract_text_content_without_tool_blocks(&call_json),
+            "I'll inspect both files."
+        );
+
+        let groups = group_messages_for_export(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: extract_text_content_without_tool_blocks(&call_json),
+                timestamp: None,
+                tool_call: Some(calls[0].clone()),
+                index: Some(0),
+                author: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: String::new(),
+                timestamp: None,
+                tool_call: Some(calls[1].clone()),
+                index: Some(0),
+                author: None,
+            },
+        ]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tool_calls.len(), 2);
+        assert_eq!(groups[0].primary.content, "I'll inspect both files.");
     }
 
     #[test]
@@ -81273,6 +86363,65 @@ fn extract_message_timestamp(msg: &serde_json::Value) -> Option<i64> {
                 .and_then(|p| p.get("timestamp"))
                 .and_then(crate::connectors::parse_timestamp)
         })
+}
+
+fn extract_text_content_without_tool_blocks(msg: &serde_json::Value) -> String {
+    fn flatten_without_tool_blocks(content: &serde_json::Value) -> Option<String> {
+        if let Some(s) = content.as_str() {
+            return (!s.is_empty()).then(|| s.to_string());
+        }
+
+        let arr = content.as_array()?;
+        let mut result = String::new();
+        for item in arr {
+            let item_type = item.get("type").and_then(|v| v.as_str());
+            if matches!(item_type, Some("tool_use" | "tool_result")) {
+                continue;
+            }
+
+            let part = if let Some(text) = item.as_str() {
+                Some(text.to_string())
+            } else if matches!(item_type, None | Some("text" | "input_text")) {
+                item.get("text")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            } else {
+                None
+            };
+
+            let Some(part) = part else {
+                continue;
+            };
+            if part.is_empty() {
+                continue;
+            }
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&part);
+        }
+
+        (!result.is_empty()).then_some(result)
+    }
+
+    if let Some(content) = msg.get("content")
+        && let Some(text) = flatten_without_tool_blocks(content)
+    {
+        return text;
+    }
+    if let Some(inner) = msg.get("message")
+        && let Some(content) = inner.get("content")
+        && let Some(text) = flatten_without_tool_blocks(content)
+    {
+        return text;
+    }
+    if let Some(payload) = msg.get("payload")
+        && let Some(content) = payload.get("content")
+        && let Some(text) = flatten_without_tool_blocks(content)
+    {
+        return text;
+    }
+    String::new()
 }
 
 fn extract_text_content(msg: &serde_json::Value) -> String {
@@ -83706,7 +88855,12 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         let Some(manifest) = ModelManifest::for_embedder(name) else {
             continue;
         };
-        let Some(model_dir) = FastEmbedder::model_dir_for(&data_dir, name) else {
+        let model_dir = if active_registry_name == Some(*name) {
+            FastEmbedder::runtime_model_dir_for(&data_dir, name)
+        } else {
+            FastEmbedder::model_dir_for(&data_dir, name)
+        };
+        let Some(model_dir) = model_dir else {
             continue;
         };
         let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
@@ -84483,6 +89637,34 @@ fn parse_models_backfill_tier(raw: &str) -> CliResult<crate::search::semantic_ma
     }
 }
 
+fn resolve_semantic_index_embedder(raw: &str) -> String {
+    let requested = raw.trim();
+    if !matches!(requested, "fastembed" | "minilm") {
+        return requested.to_string();
+    }
+
+    let policy = crate::search::policy::SemanticPolicy::resolve(
+        &crate::search::policy::CliSemanticOverrides::default(),
+    );
+    if policy
+        .quality_tier_embedder
+        .trim()
+        .eq_ignore_ascii_case("hash")
+    {
+        return "hash".to_string();
+    }
+    let Some(policy_embedder) = crate::search::fastembed_embedder::FastEmbedder::canonical_name(
+        &policy.quality_tier_embedder,
+    ) else {
+        return requested.to_string();
+    };
+    if policy_embedder == "minilm" {
+        requested.to_string()
+    } else {
+        policy_embedder.to_string()
+    }
+}
+
 fn run_models_backfill(
     tier_raw: &str,
     embedder_override: Option<&str>,
@@ -84533,12 +89715,19 @@ fn run_models_backfill(
             TierKind::Fast => "hash".to_string(),
             TierKind::Quality => "fastembed".to_string(),
         });
-    if !matches!(embedder_type.as_str(), "hash" | "fastembed") {
+    let embedder_type = resolve_semantic_index_embedder(&embedder_type);
+    let embedder_valid = embedder_type == "hash"
+        || crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
+            .is_some();
+    if !embedder_valid {
         return Err(CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!("Unknown embedder '{}'.", embedder_type),
-            hint: Some("Use --embedder hash or --embedder fastembed".into()),
+            hint: Some(
+                "Use --embedder hash, --embedder fastembed, or a registered model name such as snowflake-arctic-s"
+                    .into(),
+            ),
             retryable: false,
         });
     }
@@ -84614,7 +89803,10 @@ fn run_models_backfill(
                 "Failed to fingerprint cass database {}: {e}",
                 db_path.display()
             ),
-            hint: Some("Run 'cass index --full --force-rebuild' if the archive is corrupt".into()),
+            hint: Some(
+                "Run 'cass doctor check --json' if the archive is corrupt; index --force-rebuild only rebuilds derived assets from a healthy canonical archive."
+                    .into(),
+            ),
             retryable: true,
         })?;
     let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
@@ -84631,7 +89823,10 @@ fn run_models_backfill(
         hint: Some("Check permissions under the cass data directory".into()),
         retryable: true,
     })?;
-    let model_manifest = ModelManifest::minilm_v2();
+    let model_manifest =
+        crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
+            .and_then(ModelManifest::for_embedder)
+            .unwrap_or_else(ModelManifest::minilm_v2);
     let model_revision = if embedder_type == "hash" {
         "hash".to_string()
     } else {
@@ -84644,13 +89839,23 @@ fn run_models_backfill(
         hint: Some(if embedder_type == "fastembed" {
             "Run 'cass models install -y' or retry with --embedder hash".into()
         } else {
-            "Use --embedder hash or --embedder fastembed".into()
+            "Use --embedder hash or install the selected embedder model".into()
         }),
-        retryable: embedder_type == "fastembed",
+        retryable: embedder_type != "hash",
     })?;
 
+    // Sub-fix 1 for cass#257: open a JSONL progress sink whose
+    // destination is taken from `CASS_SEMANTIC_PROGRESS_JSONL`. The
+    // sink is silent when the env var is unset, so behaviour for
+    // existing operators is unchanged. The sink threads through to
+    // selection / packet replay / embed / staging / checkpoint /
+    // publish events.
+    let progress_sink = crate::indexer::semantic_progress::SemanticProgressSink::open(
+        tier.as_str(),
+        indexer.embedder_id(),
+    );
     let outcome = indexer
-        .run_backfill_from_storage(
+        .run_capped_backfill_from_storage_with_sink(
             &storage,
             &data_dir,
             &mut manifest,
@@ -84660,6 +89865,7 @@ fn run_models_backfill(
                 model_revision,
                 max_conversations: effective_batch_conversations,
             },
+            &progress_sink,
         )
         .map_err(|e| CliError {
             code: 5,
@@ -85214,7 +90420,7 @@ fn run_mappings_command(action: MappingsAction, cli: &Cli) -> CliResult<()> {
     match action {
         MappingsAction::List { source, json } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_mappings_list(&source, structured_format)?;
+            run_mappings_list(source.as_deref(), structured_format)?;
         }
         MappingsAction::Add {
             source,
@@ -85239,7 +90445,10 @@ fn run_mappings_command(action: MappingsAction, cli: &Cli) -> CliResult<()> {
 }
 
 /// List path mappings for a source (P6.3)
-fn run_mappings_list(source_name: &str, output_format: Option<RobotFormat>) -> CliResult<()> {
+fn run_mappings_list(
+    source_name: Option<&str>,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
     use crate::sources::config::SourcesConfig;
 
     let config = SourcesConfig::load().map_err(|e| CliError {
@@ -85247,14 +90456,6 @@ fn run_mappings_list(source_name: &str, output_format: Option<RobotFormat>) -> C
         kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: None,
-        retryable: false,
-    })?;
-
-    let source = config.find_source(source_name).ok_or_else(|| CliError {
-        code: 12,
-        kind: CliErrorKind::Source.kind_str(),
-        message: format!("Source '{}' not found", source_name),
-        hint: Some("Use 'cass sources list' to see available sources".into()),
         retryable: false,
     })?;
 
@@ -85266,36 +90467,81 @@ fn run_mappings_list(source_name: &str, output_format: Option<RobotFormat>) -> C
         }
     });
 
-    if let Some(_fmt) = structured_format {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "source": source_name,
-                "mappings": source.path_mappings,
-            }))
-            .unwrap_or_default()
-        );
+    let sources = if let Some(source_name) = source_name {
+        let source = config.find_source(source_name).ok_or_else(|| CliError {
+            code: 12,
+            kind: CliErrorKind::Source.kind_str(),
+            message: format!("Source '{}' not found", source_name),
+            hint: Some("Use 'cass sources list' to see available sources".into()),
+            retryable: false,
+        })?;
+        vec![source]
     } else {
-        println!("Path mappings for source '{}':", source_name);
-        println!();
+        config.sources.iter().collect()
+    };
 
-        if source.path_mappings.is_empty() {
-            println!("  No path mappings configured.");
-            println!();
-            println!("Add mappings with:");
+    if let Some(_fmt) = structured_format {
+        if let Some(source_name) = source_name {
+            let Some(source) = sources.first() else {
+                return Err(CliError {
+                    code: 12,
+                    kind: CliErrorKind::Source.kind_str(),
+                    message: format!("Source '{}' not found", source_name),
+                    hint: Some("Use 'cass sources list' to see available sources".into()),
+                    retryable: false,
+                });
+            };
             println!(
-                "  cass sources mappings add {} --from /remote/path --to /local/path",
-                source_name
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "source": source_name,
+                    "mappings": &source.path_mappings,
+                }))
+                .unwrap_or_default()
             );
         } else {
-            for (idx, mapping) in source.path_mappings.iter().enumerate() {
-                println!("  [{}] {} → {}", idx, mapping.from, mapping.to);
-                if let Some(ref agents) = mapping.agents {
-                    println!("      agents: {}", agents.join(", "));
+            let source_mappings: Vec<_> = sources
+                .iter()
+                .map(|source| {
+                    serde_json::json!({
+                        "source": source.name,
+                        "mappings": &source.path_mappings,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "sources": source_mappings,
+                }))
+                .unwrap_or_default()
+            );
+        }
+    } else if sources.is_empty() {
+        println!("No sources configured.");
+    } else {
+        for source in sources {
+            println!("Path mappings for source '{}':", source.name);
+            println!();
+
+            if source.path_mappings.is_empty() {
+                println!("  No path mappings configured.");
+                println!();
+                println!("Add mappings with:");
+                println!(
+                    "  cass sources mappings add {} --from /remote/path --to /local/path",
+                    source.name
+                );
+            } else {
+                for (idx, mapping) in source.path_mappings.iter().enumerate() {
+                    println!("  [{}] {} -> {}", idx, mapping.from, mapping.to);
+                    if let Some(ref agents) = mapping.agents {
+                        println!("      agents: {}", agents.join(", "));
+                    }
                 }
             }
+            println!();
         }
-        println!();
     }
 
     Ok(())

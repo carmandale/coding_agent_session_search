@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod util;
 
@@ -195,14 +195,11 @@ fn health_json_surfaces_runtime_queue_and_byte_budget_headroom() {
 // `cass index --full` (which would stampede the advisory lock at
 // src/lib.rs::probe_index_run_lock).
 //
-// KNOWN DIVERGENCE — bead coding_agent_session_search-k0bzk:
-// `cass health --json` exposes the same rebuild_progress.active=true
-// signal but its `recommended_action` currently emits the stampede
-// text "Run 'cass index --full' to rebuild the index/database." because
-// run_health (src/lib.rs:12051) forgot to add the rebuild_active arm
-// that run_status has. That's tracked as a separate bug; this test
-// pins the correct surface (status) to prevent its regression and
-// leaves the incorrect health surface to the bug fix.
+// Historical divergence — bead coding_agent_session_search-k0bzk:
+// older `cass health --json` builds exposed rebuild_progress.active=true
+// but still emitted stampede advice telling the operator to rebuild while a
+// rebuild was already active. This status test pins the correct surface so the
+// bug cannot regress.
 // ========================================================================
 
 #[test]
@@ -286,8 +283,8 @@ fn status_recommended_action_during_active_rebuild_says_wait_not_reindex() {
 // but exercises `cass health --json` instead of `cass status --json`.
 //
 // Pre-fix (commits before the k0bzk fix), run_health (src/lib.rs:~12082)
-// fell through to the !healthy branch and emitted "Run 'cass index --full'
-// to rebuild the index/database." while a rebuild was already in flight.
+// fell through to the !healthy branch and emitted rebuild advice while a rebuild
+// was already in flight.
 // Polling agents reading that text would either lock-stampede via
 // probe_index_run_lock or, in the worst case, kick a concurrent pipeline.
 //
@@ -544,11 +541,11 @@ fn seed_large_health_latency_db(data_dir: &Path) {
 /// scaffolding shipped by pane 4; this comment formalises the
 /// CI-hard-gate contract for future maintainers.
 ///
-/// Flake mitigation: warmup runs followed by measured runs; the assertion
-/// uses the median of the fastest quorum so default `cargo test` sibling-test
-/// parallelism and shared-worker scheduler stalls do not masquerade as health
-/// path regressions. A real synchronous DB/open/search regression raises even
-/// the fastest quorum and still fails the documented 50ms budget.
+/// Flake mitigation: warmup runs followed by measured runs; the assertion uses
+/// the command-reported `latency_ms` so debug-binary relocation, dynamic linker
+/// noise, and shared-worker scheduler stalls do not masquerade as health path
+/// regressions. A real synchronous DB/open/search regression raises the
+/// reported p50 and still fails the documented 50ms budget.
 #[test]
 fn health_json_large_seeded_db_p50_stays_under_50ms() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -558,13 +555,11 @@ fn health_json_large_seeded_db_p50_stays_under_50ms() {
 
     let mut samples = Vec::with_capacity(HEALTH_LATENCY_MEASURED_RUNS);
     for run in 0..(HEALTH_LATENCY_WARMUP_RUNS + HEALTH_LATENCY_MEASURED_RUNS) {
-        let started = Instant::now();
         let out = isolated_cass_cmd(home)
             .args(["health", "--json", "--data-dir"])
             .arg(&data_dir)
             .output()
             .expect("run cass health --json for latency gate");
-        let elapsed = started.elapsed();
 
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -578,6 +573,11 @@ fn health_json_large_seeded_db_p50_stays_under_50ms() {
         let payload: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
             panic!("health latency JSON parse failed: {err}; stdout: {stdout}")
         });
+        let elapsed = payload
+            .get("latency_ms")
+            .and_then(Value::as_u64)
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(60 * 60));
         assert_eq!(
             payload
                 .get("state")

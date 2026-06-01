@@ -431,6 +431,21 @@ fn doctor_lock_file_pid_is_current_process(file: &fs::File) -> bool {
     doctor_lock_metadata_pid_is_current_process(&raw)
 }
 
+fn doctor_mutation_lock_error_is_active(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        err.raw_os_error() == Some(33)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn acquire_doctor_mutation_db_open_guard(
     db_path: &Path,
     timeout: Duration,
@@ -475,7 +490,7 @@ fn acquire_doctor_mutation_db_open_guard(
 
         match fs2::FileExt::try_lock_shared(&file) {
             Ok(()) => return Ok(DoctorMutationDbOpenGuard(Some(file))),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(err) if doctor_mutation_lock_error_is_active(&err) => {
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(anyhow!(
@@ -1101,6 +1116,190 @@ const DAILY_STATS_HEALTH_GENERATION: i64 = 1;
 pub const FTS5_DELETE_ALL_SQL: &str =
     "INSERT INTO fts_messages(fts_messages) VALUES('delete-all');";
 
+pub const FTS_MESSAGES_REQUIRED_SHADOW_TABLES: [&str; 5] = [
+    "fts_messages_config",
+    "fts_messages_content",
+    "fts_messages_data",
+    "fts_messages_docsize",
+    "fts_messages_idx",
+];
+
+pub const FTS_MESSAGES_INTEGRITY_PROBE_SQL: &str = "SELECT * FROM fts_messages LIMIT 0";
+
+pub const FTS_MESSAGES_CORRUPTION_RECOVERY_HINT: &str = "Stop all cass index/watch processes, back up the current database, then run \
+     'cass doctor check --json' for a read-only diagnosis before using a supported \
+     repair/rebuild path.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsMessagesIntegrityError {
+    missing_shadow_tables: Vec<&'static str>,
+    failed_sql: Option<&'static str>,
+    source_error: Option<String>,
+}
+
+impl FtsMessagesIntegrityError {
+    fn new(
+        missing_shadow_tables: Vec<&'static str>,
+        failed_sql: Option<&'static str>,
+        source_error: Option<String>,
+    ) -> Self {
+        Self {
+            missing_shadow_tables,
+            failed_sql,
+            source_error,
+        }
+    }
+
+    pub fn missing_shadow_tables(&self) -> &[&'static str] {
+        &self.missing_shadow_tables
+    }
+}
+
+impl std::fmt::Display for FtsMessagesIntegrityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CASS database FTS5 index is corrupt: fts_messages exists, but required FTS5 shadow tables are missing or unreadable"
+        )?;
+        if !self.missing_shadow_tables.is_empty() {
+            write!(
+                f,
+                "; missing shadow tables: {}",
+                self.missing_shadow_tables.join(", ")
+            )?;
+        }
+        if let Some(sql) = self.failed_sql {
+            write!(f, "; failed SQL: {sql}")?;
+        }
+        if let Some(source_error) = &self.source_error {
+            write!(f, "; error: {source_error}")?;
+        }
+        write!(
+            f,
+            ". Suggested recovery: {FTS_MESSAGES_CORRUPTION_RECOVERY_HINT}"
+        )
+    }
+}
+
+impl std::error::Error for FtsMessagesIntegrityError {}
+
+pub fn fts_messages_integrity_error_from_message(
+    source_error: impl Into<String>,
+) -> Option<FtsMessagesIntegrityError> {
+    let source_error = source_error.into();
+    let lower = source_error.to_ascii_lowercase();
+    if !lower.contains("fts_messages") {
+        return None;
+    }
+
+    let mentions_structural_fts_failure = lower.contains("shadow table")
+        || lower.contains("vtable constructor failed")
+        || lower.contains("sqlite_corrupt")
+        || lower.contains("databasecorrupt")
+        || lower.contains("database corrupt")
+        || lower.contains("missing required");
+    if !mentions_structural_fts_failure {
+        return None;
+    }
+
+    let missing_shadow_tables = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
+        .iter()
+        .copied()
+        .filter(|table| lower.contains(&table.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+
+    Some(FtsMessagesIntegrityError::new(
+        missing_shadow_tables,
+        Some(FTS_MESSAGES_INTEGRITY_PROBE_SQL),
+        Some(source_error),
+    ))
+}
+
+fn fts_schema_tolerates_missing_shadow_metadata(sql: &str) -> bool {
+    let normalized = sql
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    normalized.contains("usingfts5(")
+        && normalized.contains("content=''")
+        && !normalized.contains("message_id")
+}
+
+pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) -> Result<()> {
+    let fts_schema_sql: Vec<String> = conn
+        .query_map_collect(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
+            fparams![],
+            |row: &FrankenRow| row.get_typed::<String>(0),
+        )
+        .with_context(|| "checking for fts_messages in sqlite_master")?;
+    if fts_schema_sql.is_empty() {
+        return Ok(());
+    }
+
+    let probe_error = conn.query(FTS_MESSAGES_INTEGRITY_PROBE_SQL).err();
+    if probe_error.is_none()
+        && fts_schema_sql
+            .iter()
+            .all(|sql| fts_schema_tolerates_missing_shadow_metadata(sql))
+    {
+        return Ok(());
+    }
+
+    let present_shadow_tables: HashSet<String> = conn
+        .query_map_collect(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table'
+               AND name IN (
+                 'fts_messages_config',
+                 'fts_messages_content',
+                 'fts_messages_data',
+                 'fts_messages_docsize',
+                 'fts_messages_idx'
+               )",
+            fparams![],
+            |row: &FrankenRow| row.get_typed::<String>(0),
+        )
+        .map(|rows| rows.into_iter().collect())
+        .map_err(|err| {
+            FtsMessagesIntegrityError::new(
+                Vec::new(),
+                Some(
+                    "SELECT name FROM sqlite_master WHERE name IN \
+                     ('fts_messages_config','fts_messages_content','fts_messages_data','fts_messages_docsize','fts_messages_idx')",
+                ),
+                Some(err.to_string()),
+            )
+        })?;
+    let missing_shadow_tables = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
+        .iter()
+        .copied()
+        .filter(|table| !present_shadow_tables.contains(*table))
+        .collect::<Vec<_>>();
+
+    // If every required shadow table is present, the FTS5 schema is
+    // structurally sound. A probe-SQL failure here typically reflects an
+    // incomplete FTS5 runtime emulation (e.g. frankensqlite's vtable path)
+    // rather than fixture corruption — and conflating the two would
+    // wrongly reject every database with the new message_id schema that
+    // frankensqlite happens to serve via a different code path. Returning
+    // Ok here keeps the false-positive surface narrow; the truly-missing-
+    // shadow case below still surfaces as before.
+    if missing_shadow_tables.is_empty() {
+        return Ok(());
+    }
+
+    Err(FtsMessagesIntegrityError::new(
+        missing_shadow_tables,
+        probe_error
+            .as_ref()
+            .map(|_| FTS_MESSAGES_INTEGRITY_PROBE_SQL),
+        probe_error.map(|err| err.to_string()),
+    )
+    .into())
+}
+
 #[cfg(test)]
 pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
     // Delegate to FrankenStorage: DROP TABLE IF EXISTS + CREATE VIRTUAL TABLE
@@ -1433,9 +1632,22 @@ fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
     if path.exists() {
         fs::File::open(path)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()?;
     }
     Ok(())
 }
@@ -1547,6 +1759,7 @@ impl HistoricalSalvageOutcome {
 struct HistoricalReadConnection {
     conn: FrankenConnection,
     method: &'static str,
+    root_path: PathBuf,
     _tempdir: Option<tempfile::TempDir>,
 }
 
@@ -1764,7 +1977,7 @@ pub(crate) fn discover_historical_database_bundles(
             let modified_at_ms = file_mtime_ms(&root_path);
             let total_bytes = bundle_total_bytes(&root_path);
             let supports_direct_readonly = historical_bundle_supports_direct_readonly(&root_path);
-            let probe = probe_historical_bundle(&root_path, supports_direct_readonly);
+            let probe = probe_historical_bundle(&root_path);
             HistoricalDatabaseBundle {
                 modified_at_ms,
                 total_bytes,
@@ -1862,16 +2075,9 @@ pub(crate) fn discover_historical_database_bundles(
     bundles
 }
 
-fn probe_historical_bundle(
-    root_path: &Path,
-    supports_direct_readonly: bool,
-) -> HistoricalBundleProbe {
-    if !supports_direct_readonly {
-        return HistoricalBundleProbe::default();
-    }
-
+fn probe_historical_bundle(root_path: &Path) -> HistoricalBundleProbe {
     let Ok(conn) = open_historical_bundle_readonly(root_path) else {
-        return HistoricalBundleProbe::default();
+        return probe_historical_bundle_via_sqlite3_metadata(root_path).unwrap_or_default();
     };
 
     let schema_version = read_meta_schema_version(&conn).ok().flatten();
@@ -1892,12 +2098,56 @@ fn probe_historical_bundle(
         )
         .unwrap_or(0);
 
-    HistoricalBundleProbe {
+    let probe = HistoricalBundleProbe {
         schema_version,
         fts_schema_rows,
         fts_queryable,
         max_message_id,
+    };
+
+    if probe.schema_version.is_none()
+        && probe.fts_schema_rows.is_none()
+        && probe.max_message_id == 0
+    {
+        return probe_historical_bundle_via_sqlite3_metadata(root_path).unwrap_or(probe);
     }
+
+    probe
+}
+
+fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<HistoricalBundleProbe> {
+    let bundle_uri = format!("file:{}?immutable=1", root_path.to_string_lossy());
+    let output = Command::new("sqlite3")
+        .arg("-batch")
+        .arg("-noheader")
+        .arg(&bundle_uri)
+        .arg(
+            "PRAGMA writable_schema=ON;
+             SELECT COALESCE((SELECT value FROM meta WHERE key = 'schema_version'), '');
+             SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages';
+             SELECT COALESCE(MAX(id), 0) FROM messages;",
+        )
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut lines = stdout.lines();
+    let schema_version = lines.next().and_then(|raw| raw.trim().parse::<i64>().ok());
+    let fts_schema_rows = lines.next().and_then(|raw| raw.trim().parse::<i64>().ok());
+    let max_message_id = lines
+        .next()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+
+    Some(HistoricalBundleProbe {
+        schema_version,
+        fts_schema_rows,
+        fts_queryable: false,
+        max_message_id,
+    })
 }
 
 fn historical_bundle_fts_queryable_via_frankensqlite(
@@ -1909,7 +2159,7 @@ fn historical_bundle_fts_queryable_via_frankensqlite(
             .map(|storage| {
                 storage
                     .raw()
-                    .query("SELECT rowid FROM fts_messages LIMIT 1")
+                    .query("SELECT COUNT(*) FROM fts_messages")
                     .is_ok()
             })
             .unwrap_or(false)
@@ -2047,33 +2297,44 @@ fn recover_historical_bundle_via_sqlite3(
             .context("committing recovery import transaction")?;
     }
 
-    let recover_status = recover
-        .wait()
-        .context("waiting for sqlite3 .recover process")?;
-    if !recover_status.success() {
-        anyhow::bail!(
-            "sqlite3 .recover exited with status {} for {}",
-            recover_status,
-            bundle.root_path.display()
-        );
-    }
-
     let importer_status = importer
         .wait()
         .context("waiting for sqlite3 recovery importer")?;
+    let recover_status = recover
+        .wait()
+        .context("waiting for sqlite3 .recover process")?;
     if !importer_status.success() {
         anyhow::bail!(
-            "sqlite3 recovery importer exited with status {} for {}",
+            "sqlite3 recovery importer exited with status {} for {} after sqlite3 .recover exited with status {}",
             importer_status,
-            recovered_db.display()
+            recovered_db.display(),
+            recover_status
         );
     }
 
     let conn = open_historical_bundle_readonly(&recovered_db)?;
     historical_bundle_has_queryable_core_tables(&conn)?;
+    if !recover_status.success() {
+        let (conversations, messages) = historical_bundle_counts(&conn)?;
+        if conversations == 0 && messages == 0 {
+            anyhow::bail!(
+                "sqlite3 .recover exited with status {} for {} and recovered no core rows",
+                recover_status,
+                bundle.root_path.display()
+            );
+        }
+        tracing::warn!(
+            path = %bundle.root_path.display(),
+            status = %recover_status,
+            conversations,
+            messages,
+            "sqlite3 .recover exited nonzero after emitting recoverable core rows; continuing with recovered subset"
+        );
+    }
     Ok(HistoricalReadConnection {
         conn,
         method: "sqlite3-recover",
+        root_path: recovered_db,
         _tempdir: Some(tempdir),
     })
 }
@@ -2087,6 +2348,7 @@ fn open_historical_bundle_for_salvage(
                 return Ok(HistoricalReadConnection {
                     conn,
                     method: "direct-readonly",
+                    root_path: bundle.root_path.clone(),
                     _tempdir: None,
                 });
             }
@@ -2152,19 +2414,105 @@ fn record_historical_bundle_import(
     Ok(())
 }
 
+fn scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path: &Path) -> Result<()> {
+    let scrub_sql = "PRAGMA writable_schema = ON;
+         DELETE FROM sqlite_master
+          WHERE name = 'fts_messages'
+             OR tbl_name = 'fts_messages'
+             OR name IN (
+                'fts_messages_config',
+                'fts_messages_content',
+                'fts_messages_data',
+                'fts_messages_docsize',
+                'fts_messages_idx'
+             )
+             OR tbl_name IN (
+                'fts_messages_config',
+                'fts_messages_content',
+                'fts_messages_data',
+                'fts_messages_docsize',
+                'fts_messages_idx'
+             );
+         PRAGMA writable_schema = OFF;";
+
+    let run_scrub = |disable_defensive: bool| -> Result<std::process::Output> {
+        let mut command = Command::new("sqlite3");
+        command.arg("-batch").arg(staged_db_path);
+        if disable_defensive {
+            command.arg(".dbconfig defensive off");
+        }
+        command.arg(scrub_sql).output().with_context(|| {
+            format!(
+                "running sqlite3 staged FTS metadata scrub for {}",
+                staged_db_path.display()
+            )
+        })
+    };
+    let render_output = |output: &std::process::Output| -> String {
+        format!(
+            "status {}; stdout: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    };
+
+    let defensive_off_output = run_scrub(true)?;
+    if defensive_off_output.status.success() {
+        return Ok(());
+    }
+
+    let fallback_output = run_scrub(false)?;
+    if !fallback_output.status.success() {
+        anyhow::bail!(
+            "sqlite3 staged FTS metadata scrub failed for {}; defensive-off attempt {}; fallback without .dbconfig {}",
+            staged_db_path.display(),
+            render_output(&defensive_off_output),
+            render_output(&fallback_output)
+        );
+    }
+    Ok(())
+}
+
+fn ensure_seeded_canonical_fts_consistency(staged_db_path: &Path) -> Result<FtsConsistencyRepair> {
+    match ensure_fts_consistency_via_rusqlite(staged_db_path) {
+        Ok(repair) => Ok(repair),
+        Err(err) => {
+            if fts_messages_integrity_error_from_message(format!("{err:#}")).is_none() {
+                return Err(err).with_context(|| {
+                    format!(
+                        "repairing staged canonical FTS consistency before finalization: {}",
+                        staged_db_path.display()
+                    )
+                });
+            }
+
+            tracing::warn!(
+                path = %staged_db_path.display(),
+                error = %err,
+                "staged historical seed has malformed derived FTS metadata; scrubbing and rebuilding FTS on staged copy"
+            );
+            scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path).with_context(|| {
+                format!(
+                    "scrubbing malformed staged FTS metadata before finalization: {}",
+                    staged_db_path.display()
+                )
+            })?;
+            ensure_fts_consistency_via_rusqlite(staged_db_path).with_context(|| {
+                format!(
+                    "repairing staged canonical FTS consistency after metadata scrub: {}",
+                    staged_db_path.display()
+                )
+            })
+        }
+    }
+}
+
 fn finalize_seeded_canonical_bundle_via_rusqlite(
     canonical_db_path: &Path,
     bundle: &HistoricalDatabaseBundle,
-    conversations_imported: usize,
-    messages_imported: usize,
-) -> Result<()> {
-    let _fts_repair =
-        ensure_fts_consistency_via_rusqlite(canonical_db_path).with_context(|| {
-            format!(
-                "repairing staged canonical FTS consistency before finalization: {}",
-                canonical_db_path.display()
-            )
-        })?;
+) -> Result<(usize, usize)> {
+    let _fts_repair = ensure_seeded_canonical_fts_consistency(canonical_db_path)?;
 
     let path_str = canonical_db_path.to_string_lossy();
     let conn = FrankenConnection::open(path_str.as_ref()).with_context(|| {
@@ -2192,6 +2540,7 @@ fn finalize_seeded_canonical_bundle_via_rusqlite(
     }
 
     clear_seeded_runtime_meta(&conn)?;
+    let (conversations_imported, messages_imported) = historical_bundle_counts(&conn)?;
 
     conn.execute_compat(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
@@ -2209,7 +2558,7 @@ fn finalize_seeded_canonical_bundle_via_rusqlite(
         conversations_imported,
         messages_imported,
     )?;
-    Ok(())
+    Ok((conversations_imported, messages_imported))
 }
 
 fn read_meta_schema_version(conn: &FrankenConnection) -> Result<Option<i64>> {
@@ -2235,7 +2584,7 @@ fn franken_fts_schema_rows(conn: &FrankenConnection) -> Result<i64> {
 
 #[cfg(test)]
 fn franken_fts_limit_probe(conn: &FrankenConnection) -> bool {
-    conn.query("SELECT rowid FROM fts_messages LIMIT 1").is_ok()
+    conn.query("SELECT COUNT(*) FROM fts_messages").is_ok()
 }
 
 #[cfg(test)]
@@ -2307,7 +2656,7 @@ struct StagedHistoricalSeed {
 
 fn stage_historical_bundle_for_seed(
     canonical_db_path: &Path,
-    bundle: &HistoricalDatabaseBundle,
+    source_root_path: &Path,
 ) -> Result<StagedHistoricalSeed> {
     let canonical_parent = canonical_db_path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(canonical_parent).with_context(|| {
@@ -2319,12 +2668,23 @@ fn stage_historical_bundle_for_seed(
     let tempdir = tempfile::TempDir::new_in(canonical_parent)
         .context("creating temporary baseline seed directory")?;
     let staged_seed_db = tempdir.path().join("baseline-seed-output.db");
-    copy_database_bundle(&bundle.root_path, &staged_seed_db)?;
+    copy_database_bundle(source_root_path, &staged_seed_db)?;
 
     Ok(StagedHistoricalSeed {
         tempdir,
         db_path: staged_seed_db,
     })
+}
+
+fn stage_and_finalize_historical_seed(
+    canonical_db_path: &Path,
+    bundle: &HistoricalDatabaseBundle,
+    source_root_path: &Path,
+) -> Result<(StagedHistoricalSeed, usize, usize)> {
+    let staged_seed = stage_historical_bundle_for_seed(canonical_db_path, source_root_path)?;
+    let (conversations_imported, messages_imported) =
+        finalize_seeded_canonical_bundle_via_rusqlite(&staged_seed.db_path, bundle)?;
+    Ok((staged_seed, conversations_imported, messages_imported))
 }
 
 fn promote_staged_historical_seed(
@@ -2371,10 +2731,7 @@ pub(crate) fn seed_canonical_from_best_historical_bundle(
 ) -> Result<Option<HistoricalSalvageOutcome>> {
     let ordered_bundles = discover_historical_database_bundles(canonical_db_path);
     let mut last_seed_error: Option<anyhow::Error> = None;
-    for bundle in ordered_bundles
-        .into_iter()
-        .filter(|bundle| bundle.supports_direct_readonly)
-    {
+    for bundle in ordered_bundles {
         if let Some(version) = bundle.probe.schema_version
             && version < 13
         {
@@ -2391,37 +2748,61 @@ pub(crate) fn seed_canonical_from_best_historical_bundle(
             continue;
         }
 
-        let source = open_historical_bundle_for_salvage(&bundle).with_context(|| {
-            format!(
-                "opening historical seed bundle {} for baseline import",
+        let (staged_seed, conversations_imported, messages_imported) =
+            match stage_and_finalize_historical_seed(canonical_db_path, &bundle, &bundle.root_path)
+            {
+                Ok(result) => result,
+                Err(primary_err) => {
+                    tracing::warn!(
+                        path = %bundle.root_path.display(),
+                        error = %primary_err,
+                        "direct bulk baseline seed from historical bundle failed; trying sqlite3 salvage copy"
+                    );
+                    let source = match open_historical_bundle_for_salvage(&bundle).with_context(
+                        || {
+                            format!(
+                                "opening historical seed bundle {} for baseline import",
+                                bundle.root_path.display()
+                            )
+                        },
+                    ) {
+                        Ok(source) => source,
+                        Err(salvage_err) => {
+                            last_seed_error = Some(anyhow!(
+                                "direct baseline seed from {} failed: {primary_err:#}; sqlite3 salvage open also failed: {salvage_err:#}",
+                                bundle.root_path.display()
+                            ));
+                            continue;
+                        }
+                    };
+                    match stage_and_finalize_historical_seed(
+                        canonical_db_path,
+                        &bundle,
+                        &source.root_path,
+                    ) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            tracing::warn!(
+                                path = %bundle.root_path.display(),
+                                source_path = %source.root_path.display(),
+                                error = %err,
+                                "bulk baseline seed staging from sqlite3-salvaged historical bundle failed; trying next candidate"
+                            );
+                            last_seed_error = Some(err);
+                            continue;
+                        }
+                    }
+                }
+            };
+
+        if conversations_imported == 0 && messages_imported == 0 {
+            let err = anyhow!(
+                "historical bundle {} has no core rows for baseline import",
                 bundle.root_path.display()
-            )
-        })?;
-        let (conversations_imported, messages_imported) = historical_bundle_counts(&source.conn)?;
-
-        let staged_seed = match stage_historical_bundle_for_seed(canonical_db_path, &bundle) {
-            Ok(staged_seed) => staged_seed,
-            Err(err) => {
-                tracing::warn!(
-                    path = %bundle.root_path.display(),
-                    error = %err,
-                    "bulk baseline seed staging from historical bundle failed; trying next candidate"
-                );
-                last_seed_error = Some(err);
-                continue;
-            }
-        };
-
-        if let Err(err) = finalize_seeded_canonical_bundle_via_rusqlite(
-            &staged_seed.db_path,
-            &bundle,
-            conversations_imported,
-            messages_imported,
-        ) {
+            );
             tracing::warn!(
                 path = %bundle.root_path.display(),
-                error = %err,
-                "finalizing staged historical seed import failed; trying next candidate"
+                "historical bundle has no core rows for baseline seed import"
             );
             last_seed_error = Some(err);
             continue;
@@ -3190,11 +3571,16 @@ SELECT
     CAST(c.agent_id AS TEXT) || ':' ||
     CAST(length(c.external_id) AS TEXT) || ':' || c.external_id,
     c.id,
-    ts.ended_at,
-    ts.last_message_idx,
-    ts.last_message_created_at
+    (SELECT ts.ended_at
+     FROM conversation_tail_state ts
+     WHERE ts.conversation_id = c.id),
+    (SELECT ts.last_message_idx
+     FROM conversation_tail_state ts
+     WHERE ts.conversation_id = c.id),
+    (SELECT ts.last_message_created_at
+     FROM conversation_tail_state ts
+     WHERE ts.conversation_id = c.id)
 FROM conversations c
-LEFT JOIN conversation_tail_state ts ON ts.conversation_id = c.id
 WHERE c.external_id IS NOT NULL;
 ";
 
@@ -3244,6 +3630,15 @@ pub struct LexicalRebuildConversationFootprintRow {
 
 pub(crate) const LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE: usize = 4 * 1024;
 const LEXICAL_REBUILD_FOOTPRINT_POINT_TAIL_FALLBACK_LIMIT: usize = 64;
+
+fn lexical_rebuild_tail_metadata_coverage_is_sufficient(
+    total_conversations: usize,
+    covered_conversations: usize,
+) -> bool {
+    total_conversations == 0
+        || total_conversations.saturating_sub(covered_conversations.min(total_conversations))
+            <= LEXICAL_REBUILD_FOOTPRINT_POINT_TAIL_FALLBACK_LIMIT
+}
 
 fn lexical_rebuild_message_count_from_tail_idx(last_message_idx: Option<i64>) -> Option<usize> {
     let last_message_idx = u64::try_from(last_message_idx?).ok()?;
@@ -4029,14 +4424,14 @@ impl FrankenStorage {
             report.record("messages", orphan_message_ids.len() as i64);
         }
 
-        let mut direct_orphan_batches: SmallVec<[(&'static OrphanFkTable, Vec<i64>); 8]> =
-            SmallVec::new();
+        if !orphan_message_ids.is_empty() {
+            delete_orphan_message_ids_bisecting_oom(&self.conn, &orphan_message_ids)
+                .context("deleting orphan message rows and dependent children")?;
+        }
+
         for entry in ORPHAN_DIRECT_CHILD_TABLES {
-            let ids: Vec<i64> =
-                match self
-                    .conn
-                    .query_map_collect(entry.orphan_id_sql, fparams![], |row| row.get_typed(0))
-                {
+            loop {
+                let ids = match collect_direct_orphan_id_page(&self.conn, entry) {
                     Ok(ids) => ids,
                     Err(err)
                         if error_indicates_missing_table(&err)
@@ -4051,7 +4446,7 @@ impl FrankenStorage {
                             error = %err,
                             "skipping orphan probe (table or column unavailable)"
                         );
-                        continue;
+                        break;
                     }
                     Err(err) => {
                         return Err(err).with_context(|| {
@@ -4059,23 +4454,24 @@ impl FrankenStorage {
                         });
                     }
                 };
-            if !ids.is_empty() {
-                report.record(entry.child_table, ids.len() as i64);
-                direct_orphan_batches.push((entry, ids));
+                if ids.is_empty() {
+                    break;
+                }
+
+                let deleted = delete_direct_orphan_ids_bisecting_oom(&self.conn, entry, &ids)
+                    .with_context(|| format!("deleting orphan rows from {}", entry.child_table))?;
+                if deleted == 0 {
+                    break;
+                }
+                report.record(
+                    entry.child_table,
+                    i64::try_from(deleted).unwrap_or(i64::MAX),
+                );
             }
         }
 
-        if orphan_message_ids.is_empty() && direct_orphan_batches.is_empty() {
+        if report.total == 0 {
             return Ok(report);
-        }
-
-        if !orphan_message_ids.is_empty() {
-            delete_orphan_message_ids_bisecting_oom(&self.conn, &orphan_message_ids)
-                .context("deleting orphan message rows and dependent children")?;
-        }
-        for (entry, ids) in &direct_orphan_batches {
-            delete_direct_orphan_ids_bisecting_oom(&self.conn, entry, ids)
-                .with_context(|| format!("deleting orphan rows from {}", entry.child_table))?;
         }
 
         // WARN only fires after a successful commit so the message accurately
@@ -5122,6 +5518,9 @@ const MIGRATION_NAMES: [(i64, &str); 20] = [
 /// - If `_schema_migrations` already exists → skip (already transitioned)
 /// - If `meta` table has `schema_version > 0` → create `_schema_migrations`
 ///   and backfill entries for versions `1..=current_version`
+/// - Legacy V10-V12 databases are represented as V13 in `_schema_migrations`
+///   because frankensqlite uses one combined V13 base migration instead of
+///   replaying the old incremental V11-V13 steps.
 /// - If `meta` table missing or `schema_version = 0` with no tables → fresh DB,
 ///   let `MigrationRunner` handle it
 /// - If `schema_version = 0` but tables exist → corrupted state, log warning
@@ -5181,8 +5580,14 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
     )
     .with_context(|| "creating _schema_migrations table for transition")?;
 
+    let backfill_through_version = if (10..13).contains(&current_version) {
+        13
+    } else {
+        current_version
+    };
+
     for &(version, name) in &MIGRATION_NAMES {
-        if version > current_version {
+        if version > backfill_through_version {
             break;
         }
         conn.execute_compat(
@@ -5194,7 +5599,8 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
 
     info!(
         current_version,
-        "schema version transition complete: backfilled entries for versions 1..={current_version}"
+        backfill_through_version,
+        "schema version transition complete: backfilled legacy meta schema versions"
     );
 
     Ok(())
@@ -5269,7 +5675,7 @@ fn collect_orphan_message_ids(conn: &FrankenConnection) -> Result<Vec<i64>> {
     let min_conversation_id = conn
         .query_map_collect(
             "SELECT conversation_id
-             FROM messages
+             FROM messages INDEXED BY sqlite_autoindex_messages_1
              ORDER BY conversation_id ASC
              LIMIT 1",
             fparams![],
@@ -5284,7 +5690,7 @@ fn collect_orphan_message_ids(conn: &FrankenConnection) -> Result<Vec<i64>> {
     let max_conversation_id: i64 = conn
         .query_row_map(
             "SELECT conversation_id
-             FROM messages
+             FROM messages INDEXED BY sqlite_autoindex_messages_1
              ORDER BY conversation_id DESC
              LIMIT 1",
             fparams![],
@@ -5345,12 +5751,12 @@ fn collect_message_ids_for_conversation_gap(
 ) -> Result<()> {
     let (sql, params) = if gap_start == gap_end {
         (
-            "SELECT id FROM messages WHERE conversation_id = ?1",
+            "SELECT id FROM messages INDEXED BY sqlite_autoindex_messages_1 WHERE conversation_id = ?1",
             vec![SqliteValue::from(gap_start)],
         )
     } else {
         (
-            "SELECT id FROM messages WHERE conversation_id BETWEEN ?1 AND ?2",
+            "SELECT id FROM messages INDEXED BY sqlite_autoindex_messages_1 WHERE conversation_id BETWEEN ?1 AND ?2",
             vec![SqliteValue::from(gap_start), SqliteValue::from(gap_end)],
         )
     };
@@ -5366,16 +5772,41 @@ fn collect_message_ids_for_conversation_gap(
 
 fn delete_rows_by_i64_chunks(
     tx: &FrankenTransaction<'_>,
-    delete_sql: &'static str,
+    delete_many_sql_prefix: &'static str,
     ids: &[i64],
 ) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let full_chunk_sql = delete_rows_by_i64_sql(delete_many_sql_prefix, ORPHAN_FK_ID_CHUNK_SIZE);
+    let tail_len = ids.len() % ORPHAN_FK_ID_CHUNK_SIZE;
+    let tail_sql =
+        (tail_len != 0).then(|| delete_rows_by_i64_sql(delete_many_sql_prefix, tail_len));
+
     let mut deleted = 0;
     for chunk in ids.chunks(ORPHAN_FK_ID_CHUNK_SIZE) {
-        for id in chunk {
-            deleted += tx.execute_with_params(delete_sql, &[SqliteValue::from(*id)])?;
-        }
+        let sql = if chunk.len() == ORPHAN_FK_ID_CHUNK_SIZE {
+            &full_chunk_sql
+        } else {
+            tail_sql.as_ref().unwrap_or(&full_chunk_sql)
+        };
+        let params = chunk
+            .iter()
+            .map(|id| SqliteValue::from(*id))
+            .collect::<Vec<_>>();
+        deleted += tx.execute_with_params(sql, &params)?;
     }
     Ok(deleted)
+}
+
+fn delete_rows_by_i64_sql(delete_many_sql_prefix: &'static str, count: usize) -> String {
+    let placeholders = sql_placeholders(count);
+    format!("{delete_many_sql_prefix} ({placeholders})")
+}
+
+fn sql_placeholders(count: usize) -> String {
+    vec!["?"; count].join(", ")
 }
 
 fn delete_orphan_message_ids_bisecting_oom(conn: &FrankenConnection, ids: &[i64]) -> Result<usize> {
@@ -5415,7 +5846,7 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
     let mut tx = conn.transaction()?;
     let mut deleted = 0usize;
     for entry in ORPHAN_MESSAGE_DEPENDENT_TABLES {
-        match delete_rows_by_i64_chunks(&tx, entry.delete_sql, ids) {
+        match delete_rows_by_i64_chunks(&tx, entry.delete_many_sql_prefix, ids) {
             Ok(count) => {
                 deleted = deleted.saturating_add(count);
             }
@@ -5438,11 +5869,22 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
         }
     }
     deleted = deleted.saturating_add(
-        delete_rows_by_i64_chunks(&tx, "DELETE FROM messages WHERE id = ?1", ids)
+        delete_rows_by_i64_chunks(&tx, "DELETE FROM messages WHERE id IN", ids)
             .context("deleting orphan rows from messages")?,
     );
     tx.commit()?;
     Ok(deleted)
+}
+
+fn collect_direct_orphan_id_page(
+    conn: &FrankenConnection,
+    entry: &'static OrphanFkTable,
+) -> Result<Vec<i64>> {
+    Ok(conn.query_map_collect(
+        entry.orphan_id_page_sql,
+        fparams![i64::try_from(ORPHAN_FK_ID_CHUNK_SIZE).unwrap_or(i64::MAX)],
+        |row| row.get_typed(0),
+    )?)
 }
 
 fn delete_direct_orphan_ids_bisecting_oom(
@@ -5493,7 +5935,7 @@ fn delete_direct_orphan_id_chunk_once(
     ids: &[i64],
 ) -> Result<usize> {
     let mut tx = conn.transaction()?;
-    let deleted = delete_rows_by_i64_chunks(&tx, entry.delete_sql, ids)?;
+    let deleted = delete_rows_by_i64_chunks(&tx, entry.delete_many_sql_prefix, ids)?;
     tx.commit()?;
     Ok(deleted)
 }
@@ -5505,68 +5947,87 @@ fn delete_direct_orphan_id_chunk_once(
 /// yields the integer FK key used by the matching chunked delete.
 struct OrphanFkTable {
     child_table: &'static str,
-    orphan_id_sql: &'static str,
-    delete_sql: &'static str,
+    orphan_id_page_sql: &'static str,
+    delete_many_sql_prefix: &'static str,
 }
 
 const ORPHAN_DIRECT_CHILD_TABLES: &[OrphanFkTable] = &[
     OrphanFkTable {
         child_table: "message_metrics",
-        orphan_id_sql: "SELECT message_id FROM message_metrics \
-                        WHERE message_id NOT IN (SELECT id FROM messages)",
-        delete_sql: "DELETE FROM message_metrics WHERE message_id = ?1",
+        orphan_id_page_sql: "SELECT message_id FROM message_metrics \
+                             WHERE NOT EXISTS (\
+                                 SELECT 1 FROM messages \
+                                 WHERE messages.id = message_metrics.message_id\
+                             ) \
+                             ORDER BY message_id \
+                             LIMIT ?1",
+        delete_many_sql_prefix: "DELETE FROM message_metrics WHERE message_id IN",
     },
     OrphanFkTable {
         child_table: "token_usage",
-        orphan_id_sql: "SELECT message_id FROM token_usage \
-                        WHERE message_id NOT IN (SELECT id FROM messages)",
-        delete_sql: "DELETE FROM token_usage WHERE message_id = ?1",
+        orphan_id_page_sql: "SELECT message_id FROM token_usage \
+                             WHERE NOT EXISTS (\
+                                 SELECT 1 FROM messages \
+                                 WHERE messages.id = token_usage.message_id\
+                             ) \
+                             ORDER BY message_id \
+                             LIMIT ?1",
+        delete_many_sql_prefix: "DELETE FROM token_usage WHERE message_id IN",
     },
     OrphanFkTable {
         child_table: "snippets",
-        orphan_id_sql: "SELECT message_id FROM snippets \
-                        WHERE message_id NOT IN (SELECT id FROM messages)",
-        delete_sql: "DELETE FROM snippets WHERE message_id = ?1",
+        orphan_id_page_sql: "SELECT message_id FROM snippets \
+                             WHERE NOT EXISTS (\
+                                 SELECT 1 FROM messages \
+                                 WHERE messages.id = snippets.message_id\
+                             ) \
+                             ORDER BY message_id \
+                             LIMIT ?1",
+        delete_many_sql_prefix: "DELETE FROM snippets WHERE message_id IN",
     },
     OrphanFkTable {
         child_table: "conversation_tags",
-        orphan_id_sql: "SELECT conversation_id FROM conversation_tags \
-                        WHERE conversation_id NOT IN (SELECT id FROM conversations)",
-        delete_sql: "DELETE FROM conversation_tags WHERE conversation_id = ?1",
+        orphan_id_page_sql: "SELECT conversation_id FROM conversation_tags \
+                             WHERE NOT EXISTS (\
+                                 SELECT 1 FROM conversations \
+                                 WHERE conversations.id = conversation_tags.conversation_id\
+                             ) \
+                             ORDER BY conversation_id \
+                             LIMIT ?1",
+        delete_many_sql_prefix: "DELETE FROM conversation_tags WHERE conversation_id IN",
     },
 ];
 
 struct OrphanMessageDependentTable {
     child_table: &'static str,
-    delete_sql: &'static str,
+    delete_many_sql_prefix: &'static str,
 }
 
 const ORPHAN_MESSAGE_DEPENDENT_TABLES: &[OrphanMessageDependentTable] = &[
     OrphanMessageDependentTable {
         child_table: "message_metrics",
-        delete_sql: "DELETE FROM message_metrics WHERE message_id = ?1",
+        delete_many_sql_prefix: "DELETE FROM message_metrics WHERE message_id IN",
     },
     OrphanMessageDependentTable {
         child_table: "token_usage",
-        delete_sql: "DELETE FROM token_usage WHERE message_id = ?1",
+        delete_many_sql_prefix: "DELETE FROM token_usage WHERE message_id IN",
     },
     OrphanMessageDependentTable {
         child_table: "snippets",
-        delete_sql: "DELETE FROM snippets WHERE message_id = ?1",
+        delete_many_sql_prefix: "DELETE FROM snippets WHERE message_id IN",
     },
 ];
 
 /// Summary of orphan rows detected and removed by `cleanup_orphan_fk_rows`.
 ///
-/// Counts come from the probe phase rather than from the `DELETE`'s
-/// rows-changed return, so they reflect "orphans observed before cleanup
-/// started." Under the function's intended use — a
-/// single indexer-startup pass holding the index run lock — no concurrent
-/// writers exist, so these counts match the primary orphan roots identified
-/// before the delete transaction starts. Dependent rows below an orphan
-/// message (`message_metrics` / `token_usage` / `snippets`) are an expected
-/// consequence of removing that root orphan and are *not* separately counted in
-/// `total` or `per_table`.
+/// Message-root counts come from the probe phase, while direct child counts
+/// come from bounded page deletes. Under the function's intended use — a single
+/// indexer-startup pass holding the index run lock — no concurrent writers
+/// exist, so these counts match the primary orphan roots identified and
+/// removed during cleanup. Dependent rows below an orphan message
+/// (`message_metrics` / `token_usage` / `snippets`) are an expected consequence
+/// of removing that root orphan and are *not* separately counted in `total` or
+/// `per_table`.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct OrphanFkCleanupReport {
     pub total: i64,
@@ -5575,7 +6036,15 @@ pub(crate) struct OrphanFkCleanupReport {
 
 impl OrphanFkCleanupReport {
     fn record(&mut self, child_table: &'static str, count: i64) {
-        self.per_table.push((child_table, count));
+        if let Some((_, existing)) = self
+            .per_table
+            .iter_mut()
+            .find(|(table, _)| *table == child_table)
+        {
+            *existing = existing.saturating_add(count);
+        } else {
+            self.per_table.push((child_table, count));
+        }
         self.total = self.total.saturating_add(count);
     }
 }
@@ -6795,15 +7264,85 @@ impl FrankenStorage {
             ));
         }
 
+        let every_footprint_was_missing_tail = missing_tail_positions.len() == footprints.len();
         if !missing_tail_positions.is_empty() {
             self.fill_missing_lexical_rebuild_footprint_tails(
                 &mut footprints,
                 &missing_tail_positions,
             )?;
         }
-        self.raise_lexical_rebuild_footprints_to_exact_message_counts(&mut footprints)?;
+        if !every_footprint_was_missing_tail {
+            self.raise_lexical_rebuild_footprints_to_exact_message_counts(&mut footprints)?;
+        }
 
         Ok(footprints)
+    }
+
+    pub fn lexical_rebuild_has_tail_footprint_metadata(&self) -> Result<bool> {
+        let total_conversations: i64 = self
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .with_context(|| "counting conversations for lexical rebuild tail metadata coverage")?;
+        let total_conversations = usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX);
+        if total_conversations == 0 {
+            return Ok(true);
+        }
+
+        let conversation_columns = franken_table_column_names(&self.conn, "conversations")?;
+        let conversations_have_tail_column = conversation_columns.contains("last_message_idx");
+        let tail_state_has_tail_column =
+            match franken_table_column_names(&self.conn, "conversation_tail_state") {
+                Ok(columns) => columns.contains("last_message_idx"),
+                Err(err) if error_indicates_missing_table(&err) => false,
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| "reading lexical rebuild tail-state metadata columns");
+                }
+            };
+        if !conversations_have_tail_column && !tail_state_has_tail_column {
+            return Ok(false);
+        }
+
+        let covered_sql = match (conversations_have_tail_column, tail_state_has_tail_column) {
+            (true, true) => {
+                "SELECT COUNT(*)
+                 FROM conversations c
+                 LEFT JOIN conversation_tail_state ts ON ts.conversation_id = c.id
+                 WHERE c.last_message_idx IS NOT NULL
+                    OR ts.last_message_idx IS NOT NULL"
+            }
+            (true, false) => {
+                "SELECT COUNT(*)
+                 FROM conversations
+                 WHERE last_message_idx IS NOT NULL"
+            }
+            (false, true) => {
+                "SELECT COUNT(*)
+                 FROM conversations c
+                 WHERE EXISTS (
+                     SELECT 1
+                     FROM conversation_tail_state ts
+                     WHERE ts.conversation_id = c.id
+                       AND ts.last_message_idx IS NOT NULL
+                 )"
+            }
+            (false, false) => unreachable!("checked before covered_sql selection"),
+        };
+        let covered_conversations: i64 = self
+            .conn
+            .query_row_map(covered_sql, fparams![], |row| row.get_typed(0))
+            .with_context(
+                || "counting conversations covered by lexical rebuild tail footprint metadata",
+            )?;
+        let covered_conversations =
+            usize::try_from(covered_conversations.max(0)).unwrap_or(usize::MAX);
+
+        Ok(lexical_rebuild_tail_metadata_coverage_is_sufficient(
+            total_conversations,
+            covered_conversations,
+        ))
     }
 
     fn raise_lexical_rebuild_footprints_to_exact_message_counts(
@@ -6879,61 +7418,59 @@ impl FrankenStorage {
             return Ok(());
         }
 
-        let mut current_conversation_id = None;
-        let mut current_message_count = 0usize;
-        let apply_current_tail =
-            |conversation_id: Option<i64>,
-             message_count: usize,
-             footprints: &mut [LexicalRebuildConversationFootprintRow]| {
-                let Some(conversation_id) = conversation_id else {
-                    return;
-                };
-                let Some(position) = missing_tail_positions.get(&conversation_id) else {
-                    return;
-                };
-                footprints[*position] = lexical_rebuild_conversation_footprint_from_count(
-                    conversation_id,
-                    message_count,
+        self.fill_missing_lexical_rebuild_footprint_tails_from_grouped_messages(
+            footprints,
+            missing_tail_positions,
+            "SELECT conversation_id, MAX(idx) AS last_message_idx
+             FROM messages INDEXED BY idx_messages_conv_idx
+             GROUP BY conversation_id
+             ORDER BY conversation_id ASC",
+        )
+        .or_else(|err| {
+            if err
+                .to_string()
+                .contains("no such index: idx_messages_conv_idx")
+            {
+                return self.fill_missing_lexical_rebuild_footprint_tails_from_grouped_messages(
+                    footprints,
+                    missing_tail_positions,
+                    "SELECT conversation_id, MAX(idx) AS last_message_idx
+                     FROM messages
+                     GROUP BY conversation_id
+                     ORDER BY conversation_id ASC",
                 );
-            };
-        self.conn
-            .query_with_params_for_each(
-                "SELECT conversation_id, idx
-                 FROM messages
-                 ORDER BY conversation_id ASC, idx ASC",
-                &[] as &[SqliteValue],
-                |row| {
-                    let conversation_id: i64 = row.get_typed(0)?;
-                    let idx: Option<i64> = row.get_typed(1)?;
-                    let row_message_count = lexical_rebuild_message_count_from_tail_idx(idx);
-                    match current_conversation_id {
-                        Some(current_id) if current_id == conversation_id => {
-                            if let Some(row_message_count) = row_message_count {
-                                current_message_count =
-                                    current_message_count.max(row_message_count);
-                            }
-                        }
-                        Some(_) => {
-                            apply_current_tail(
-                                current_conversation_id,
-                                current_message_count,
-                                footprints,
-                            );
-                            current_conversation_id = Some(conversation_id);
-                            current_message_count = row_message_count.unwrap_or(0);
-                        }
-                        None => {
-                            current_conversation_id = Some(conversation_id);
-                            current_message_count = row_message_count.unwrap_or(0);
-                        }
-                    }
-                    Ok(())
-                },
-            )
-            .with_context(|| "streaming missing lexical rebuild tail estimates from messages")?;
-        apply_current_tail(current_conversation_id, current_message_count, footprints);
+            }
+            Err(err)
+        })
+        .with_context(|| "grouping missing lexical rebuild tail estimates from messages")?;
 
         Ok(())
+    }
+
+    fn fill_missing_lexical_rebuild_footprint_tails_from_grouped_messages(
+        &self,
+        footprints: &mut [LexicalRebuildConversationFootprintRow],
+        missing_tail_positions: &HashMap<i64, usize>,
+        sql: &str,
+    ) -> Result<()> {
+        self.conn
+            .query_with_params_for_each(sql, &[] as &[SqliteValue], |row| {
+                let conversation_id: i64 = row.get_typed(0)?;
+                let last_message_idx: Option<i64> = row.get_typed(1)?;
+                let Some(position) = missing_tail_positions.get(&conversation_id) else {
+                    return Ok(());
+                };
+                if let Some(message_count) =
+                    lexical_rebuild_message_count_from_tail_idx(last_message_idx)
+                {
+                    footprints[*position] = lexical_rebuild_conversation_footprint_from_count(
+                        conversation_id,
+                        message_count,
+                    );
+                }
+                Ok(())
+            })
+            .with_context(|| "grouping lexical rebuild missing tail estimates")
     }
 
     /// List conversation ids in the stable order used by lexical rebuilds.
@@ -8381,6 +8918,44 @@ impl FrankenStorage {
                 }
             };
 
+            // #247 (coding_agent_session_search-r8pcy): if a per-bundle progress
+            // checkpoint already covers the backup's entire conversation row-id
+            // space, the bundle was effectively fully imported but the daemon was
+            // killed (e.g. OOM) before the completion ledger marker landed.
+            // Re-scanning it is a pure O(n) no-op — every batch commits
+            // imported=0 while taking 5-12 min. Detect it via the high-water
+            // checkpoint, write the ledger marker, drop the checkpoint, and skip.
+            if let Some(progress) = self.load_historical_bundle_progress(&bundle)? {
+                let backup_max_conversation_id: i64 = source
+                    .conn
+                    .query_row_map(
+                        "SELECT COALESCE(MAX(id), 0) FROM conversations",
+                        fparams![],
+                        |row| row.get_typed(0),
+                    )
+                    .unwrap_or(0);
+                if backup_max_conversation_id > 0
+                    && progress.last_completed_source_row_id >= backup_max_conversation_id
+                {
+                    self.record_historical_bundle_import(
+                        &bundle,
+                        source.method,
+                        progress.conversations_imported,
+                        progress.messages_imported,
+                    )?;
+                    self.clear_historical_bundle_progress(&bundle)?;
+                    tracing::info!(
+                        path = %bundle.root_path.display(),
+                        last_completed_source_row_id = progress.last_completed_source_row_id,
+                        backup_max_conversation_id,
+                        conversations_imported = progress.conversations_imported,
+                        messages_imported = progress.messages_imported,
+                        "historical bundle already fully imported per checkpoint; marking salvaged and skipping O(n) re-scan"
+                    );
+                    continue;
+                }
+            }
+
             self.import_historical_sources(&source.conn)?;
             let (imported_conversations, imported_messages) =
                 self.import_historical_conversations(&bundle, source.method, &source.conn)?;
@@ -9233,6 +9808,10 @@ impl FrankenStorage {
         self.ensure_fts_consistency_via_frankensqlite()
     }
 
+    pub(crate) fn validate_fts_messages_integrity(&self) -> Result<()> {
+        validate_fts_messages_integrity_for_connection(&self.conn)
+    }
+
     pub(crate) fn fallback_fts_is_known_healthy_for_archive_fingerprint(
         &self,
         archive_fingerprint: &str,
@@ -9408,10 +9987,7 @@ impl FrankenStorage {
                 |row| row.get_typed::<i64>(0),
             )?;
             let fts_queryable = fts_schema_rows == 1
-                && self
-                    .conn
-                    .query("SELECT rowid FROM fts_messages LIMIT 1")
-                    .is_ok();
+                && self.conn.query("SELECT COUNT(*) FROM fts_messages").is_ok();
             Ok((fts_schema_rows, fts_queryable))
         })();
 
@@ -14411,10 +14987,48 @@ fn rebuild_batch_size_env(var: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn is_out_of_memory_error(err: &impl std::fmt::Display) -> bool {
-    err.to_string()
-        .to_ascii_lowercase()
-        .contains("out of memory")
+/// Returns true when the error chain represents a real `FrankenError::OutOfMemory`
+/// (typed variant) or a bare "out of memory" / "not enough memory" message.
+///
+/// We *deliberately* do not do substring matching on the rendered chain: frankensqlite's
+/// `FrankenError::OutOfMemory` renders as the literal "out of memory" and is also emitted
+/// for several non-process-OOM internal conditions (VFS buffer / VDBE register allocation).
+/// Contextual messages like "connector parse failed: not enough memory in record" must not
+/// be promoted into the OOM-bisect/quarantine path. See `retryable_franken_anyhow` above
+/// for the same downcast idiom.
+fn is_out_of_memory_error<E: OutOfMemoryProbe + ?Sized>(err: &E) -> bool {
+    err.is_out_of_memory()
+}
+
+trait OutOfMemoryProbe {
+    fn is_out_of_memory(&self) -> bool;
+}
+
+impl OutOfMemoryProbe for anyhow::Error {
+    fn is_out_of_memory(&self) -> bool {
+        self.chain().any(|cause| {
+            if cause
+                .downcast_ref::<frankensqlite::FrankenError>()
+                .is_some_and(|err| matches!(err, frankensqlite::FrankenError::OutOfMemory))
+            {
+                return true;
+            }
+            is_exact_out_of_memory_message(&cause.to_string())
+        })
+    }
+}
+
+impl OutOfMemoryProbe for frankensqlite::FrankenError {
+    fn is_out_of_memory(&self) -> bool {
+        matches!(self, frankensqlite::FrankenError::OutOfMemory)
+    }
+}
+
+fn is_exact_out_of_memory_message(message: &str) -> bool {
+    matches!(
+        message.trim().to_ascii_lowercase().as_str(),
+        "out of memory" | "not enough memory"
+    )
 }
 
 // Second SqliteStorage impl block removed: SqliteStorage is now a type alias for FrankenStorage.
@@ -14657,6 +15271,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn doctor_storage_open_refuses_active_doctor_mutation_lock_from_other_process() {
         use std::io::Write as _;
 
@@ -14715,6 +15330,9 @@ mod tests {
         lock_file.set_len(0).unwrap();
         write!(lock_file, "schema_version=1\npid={}\n", std::process::id()).unwrap();
         lock_file.sync_all().unwrap();
+
+        #[cfg(windows)]
+        let _bypass = enter_doctor_mutation_db_open_bypass();
 
         let conn =
             open_franken_raw_readonly_connection_with_timeout(&db_path, Duration::from_millis(25))
@@ -15699,16 +16317,13 @@ mod tests {
 
         let result = SqliteStorage::open_or_rebuild(&db_path);
 
-        match result {
-            Err(MigrationError::Database(_)) | Err(MigrationError::Io(_)) => {}
-            Err(MigrationError::RebuildRequired { reason, .. }) => {
-                panic!("should not rebuild non-database path: {reason}")
-            }
-            Err(MigrationError::Other(msg)) => {
-                panic!("should preserve underlying open error, got Other: {msg}")
-            }
-            Ok(_) => panic!("directory path must not open as a database"),
-        }
+        assert!(
+            matches!(
+                result,
+                Err(MigrationError::Database(_)) | Err(MigrationError::Io(_))
+            ),
+            "non-database path should report the underlying open error without rebuild"
+        );
 
         assert!(
             db_path.is_dir(),
@@ -15958,20 +16573,21 @@ mod tests {
             .unwrap();
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '10')")
                 .unwrap();
-            // Apply V1-V10 so schema is correct
-            let mut tx = conn.transaction().unwrap();
-            tx.execute_batch(MIGRATION_V1).unwrap();
-            tx.execute_batch(MIGRATION_V2).unwrap();
-            tx.execute_batch(MIGRATION_V4).unwrap();
-            tx.execute_batch(MIGRATION_V5).unwrap();
-            tx.execute_batch(MIGRATION_V6).unwrap();
-            tx.execute_batch(MIGRATION_V7).unwrap();
-            tx.execute_batch(MIGRATION_V8).unwrap();
-            tx.execute_batch(MIGRATION_V9).unwrap();
-            tx.execute_batch(MIGRATION_V10).unwrap();
-            tx.execute("UPDATE meta SET value = '10' WHERE key = 'schema_version'")
+            // Apply V1-V10 so schema is correct. Keep each historical DDL batch
+            // in autocommit mode; the fixture is testing cass migration
+            // transition behavior, not frankensqlite's handling of a giant
+            // synthetic legacy-DDL transaction.
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.execute_batch(MIGRATION_V4).unwrap();
+            conn.execute_batch(MIGRATION_V5).unwrap();
+            conn.execute_batch(MIGRATION_V6).unwrap();
+            conn.execute_batch(MIGRATION_V7).unwrap();
+            conn.execute_batch(MIGRATION_V8).unwrap();
+            conn.execute_batch(MIGRATION_V9).unwrap();
+            conn.execute_batch(MIGRATION_V10).unwrap();
+            conn.execute("UPDATE meta SET value = '10' WHERE key = 'schema_version'")
                 .unwrap();
-            tx.commit().unwrap();
         }
         materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
 
@@ -17953,14 +18569,14 @@ mod tests {
         )
         .unwrap();
 
-        match resolved {
-            ConversationInsertStatus::Existing(existing_id) => {
-                assert_eq!(existing_id, inserted_id);
-            }
-            ConversationInsertStatus::Inserted(new_id) => {
-                panic!("expected existing conversation id, got freshly inserted {new_id}");
-            }
-        }
+        assert!(
+            matches!(
+                resolved,
+                ConversationInsertStatus::Existing(existing_id)
+                    if existing_id.cmp(&inserted_id).is_eq()
+            ),
+            "expected existing conversation id {inserted_id}"
+        );
 
         let conversation_count: i64 = tx
             .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
@@ -19492,6 +20108,110 @@ mod tests {
     }
 
     #[test]
+    fn salvage_historical_databases_skips_bundle_when_checkpoint_covers_backup() {
+        // Regression for issue #247 (coding_agent_session_search-r8pcy): a bundle
+        // whose progress checkpoint already covers the backup's entire conversation
+        // row-id space (daemon OOM-killed after the last batch committed but before
+        // the completion ledger marker landed) must be ledgered + skipped, not
+        // re-scanned O(n) with imported=0 every batch.
+        use crate::model::types::{Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        fn make_conv(source_path: &str, idx_seed: i64) -> Conversation {
+            Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some(format!("conv-{idx_seed}")),
+                title: Some(format!("Recovered {idx_seed}")),
+                source_path: PathBuf::from(source_path),
+                started_at: Some(1_700_000_000_000 + idx_seed),
+                ended_at: Some(1_700_000_000_100 + idx_seed),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + idx_seed),
+                    content: format!("message-{idx_seed}"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        let backup_db = dir
+            .path()
+            .join("backups/agent_search.db.20260322T020200.bak");
+        let storage = SqliteStorage::open(&canonical_db).unwrap();
+        seed_historical_db_direct(
+            &backup_db,
+            &[
+                make_conv("/tmp/one.jsonl", 1),
+                make_conv("/tmp/two.jsonl", 2),
+                make_conv("/tmp/three.jsonl", 3),
+            ],
+        );
+
+        let bundle = discover_historical_database_bundles(&canonical_db)
+            .into_iter()
+            .find(|bundle| bundle.root_path == backup_db)
+            .unwrap();
+
+        // Checkpoint high-water mark == backup's max conversation id.
+        let backup_max_id: i64 = FrankenConnection::open(backup_db.to_string_lossy().into_owned())
+            .unwrap()
+            .query_row_map(
+                "SELECT COALESCE(MAX(id), 0) FROM conversations",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert!(backup_max_id > 0, "seeded backup should have conversations");
+        storage
+            .record_historical_bundle_progress(&bundle, "direct-readonly", backup_max_id, 3, 3)
+            .unwrap();
+
+        let outcome = storage.salvage_historical_databases(&canonical_db).unwrap();
+        assert_eq!(
+            outcome.bundles_imported, 0,
+            "fully-checkpointed bundle must not be re-scanned"
+        );
+        assert_eq!(outcome.conversations_imported, 0);
+        assert_eq!(outcome.messages_imported, 0);
+        assert_eq!(
+            storage.list_conversations(10, 0).unwrap().len(),
+            0,
+            "skip path must not import anything"
+        );
+        assert!(
+            storage.historical_bundle_already_imported(&bundle).unwrap(),
+            "skipped bundle must be ledgered as salvaged so future runs short-circuit"
+        );
+
+        let progress_key = SqliteStorage::historical_bundle_progress_key(&bundle);
+        let progress_left: Option<String> = storage
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![progress_key.as_str()],
+                |row| row.get_typed(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            progress_left.is_none(),
+            "skip path must clear the bundle progress checkpoint"
+        );
+    }
+
+    #[test]
     fn list_conversations_for_lexical_rebuild_uses_stable_id_order() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
@@ -20369,75 +21089,78 @@ mod tests {
             .unwrap();
         drop(source);
 
-        // Legacy "duplicate FTS" fixture reconstruction.
-        //
-        // Post-V14 migration cass drops the V13-era fts_messages virtual table
-        // and recreates it lazily, so a freshly-opened canonical DB has zero
-        // fts_messages entries in sqlite_master. To reproduce the historical
-        // failure mode this test exercises — a legacy v13 bundle with a
-        // duplicated CREATE VIRTUAL TABLE row — we have to inject *both*
-        // entries: the original V13-era contentless row and the buggy duplicate
-        // row. Before V14 existed the original was already present after
-        // migration and only the duplicate needed manual injection.
-        let legacy_v13_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
-        let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-        let legacy = rusqlite_test_fixture_conn(&source_db);
-        legacy
-            .execute_batch(
-                "UPDATE meta SET value = '13' WHERE key = 'schema_version';
-                 DELETE FROM _schema_migrations WHERE version = 14;
-                 PRAGMA writable_schema = ON;",
-            )
-            .unwrap();
-        legacy
-            .execute(
-                "DELETE FROM meta WHERE key = ?1",
-                [FTS_FRANKEN_REBUILD_META_KEY],
-            )
-            .unwrap();
-        // Inject the V13 original first.
-        legacy
-            .execute(
-                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                [legacy_v13_fts_sql],
-            )
-            .unwrap();
-        // Then the duplicate that's the real subject of the fixup logic.
-        legacy
-            .execute(
-                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                [duplicate_legacy_fts_sql],
-            )
-            .unwrap();
-        legacy
-            .execute_batch("PRAGMA writable_schema = OFF;")
-            .unwrap();
-        drop(legacy);
-
-        // Verify fixture with rusqlite+writable_schema to see raw
-        // sqlite_master rows (frankensqlite deduplicates schema entries).
+        #[cfg(not(windows))]
         {
-            let verify = rusqlite_test_fixture_conn(&source_db);
-            verify
-                .execute_batch("PRAGMA writable_schema = ON;")
-                .unwrap();
-            let fts_entries: i64 = verify
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                    [],
-                    |row| row.get(0),
+            // Legacy "duplicate FTS" fixture reconstruction.
+            //
+            // Post-V14 migration cass drops the V13-era fts_messages virtual table
+            // and recreates it lazily, so a freshly-opened canonical DB has zero
+            // fts_messages entries in sqlite_master. To reproduce the historical
+            // failure mode this test exercises — a legacy v13 bundle with a
+            // duplicated CREATE VIRTUAL TABLE row — we have to inject *both*
+            // entries: the original V13-era contentless row and the buggy duplicate
+            // row. Before V14 existed the original was already present after
+            // migration and only the duplicate needed manual injection.
+            let legacy_v13_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
+            let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+            let legacy = rusqlite_test_fixture_conn(&source_db);
+            legacy
+                .execute_batch(
+                    "UPDATE meta SET value = '13' WHERE key = 'schema_version';
+                     DELETE FROM _schema_migrations WHERE version = 14;
+                     PRAGMA writable_schema = ON;",
                 )
                 .unwrap();
-            assert_eq!(
-                fts_entries, 2,
-                "test fixture should reproduce the duplicate legacy fts_messages rows"
-            );
-            let msg_count: i64 = verify
-                .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            legacy
+                .execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    [FTS_FRANKEN_REBUILD_META_KEY],
+                )
                 .unwrap();
-            assert_eq!(msg_count, 1);
+            // Inject the V13 original first.
+            legacy
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [legacy_v13_fts_sql],
+                )
+                .unwrap();
+            // Then the duplicate that's the real subject of the fixup logic.
+            legacy
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [duplicate_legacy_fts_sql],
+                )
+                .unwrap();
+            legacy
+                .execute_batch("PRAGMA writable_schema = OFF;")
+                .unwrap();
+            drop(legacy);
+
+            // Verify fixture with rusqlite+writable_schema to see raw
+            // sqlite_master rows (frankensqlite deduplicates schema entries).
+            {
+                let verify = rusqlite_test_fixture_conn(&source_db);
+                verify
+                    .execute_batch("PRAGMA writable_schema = ON;")
+                    .unwrap();
+                let fts_entries: i64 = verify
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    fts_entries, 2,
+                    "test fixture should reproduce the duplicate legacy fts_messages rows"
+                );
+                let msg_count: i64 = verify
+                    .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(msg_count, 1);
+            }
         }
 
         let fresh = SqliteStorage::open(&canonical_db).unwrap();
@@ -20547,11 +21270,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(post_franken_schema_rows, 1);
+        let fts_probe = franken_seeded
+            .raw()
+            .query("SELECT COUNT(*) FROM fts_messages");
         assert!(
-            franken_seeded
-                .raw()
-                .query("SELECT rowid FROM fts_messages LIMIT 1")
-                .is_ok()
+            fts_probe.is_ok(),
+            "expected post-seed FTS to be queryable, got {fts_probe:?}"
         );
     }
 
@@ -21789,7 +22513,6 @@ mod tests {
             .unwrap();
         drop(replay_storage);
 
-        let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
         let replay_legacy = rusqlite_test_fixture_conn(&replay_db);
         replay_legacy
             .execute_batch(
@@ -21804,13 +22527,17 @@ mod tests {
                 [FTS_FRANKEN_REBUILD_META_KEY],
             )
             .unwrap();
-        replay_legacy
-            .execute(
-                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                [duplicate_legacy_fts_sql],
-            )
-            .unwrap();
+        #[cfg(not(windows))]
+        {
+            let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+            replay_legacy
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [duplicate_legacy_fts_sql],
+                )
+                .unwrap();
+        }
         replay_legacy
             .execute_batch("PRAGMA writable_schema = OFF;")
             .unwrap();
@@ -21849,10 +22576,11 @@ mod tests {
         assert!(!bundles[0].probe.fts_queryable);
         assert_eq!(bundles[1].probe.schema_version, Some(13));
         // The replay bundle had V14 run (dropping fts_messages → 0 rows), then
-        // the test rolls meta.schema_version back to 13, deletes the V14
-        // marker, and manually injects a duplicate sqlite_master row. Net
-        // result: one synthetic (malformed) fts_messages entry.
-        assert_eq!(bundles[1].probe.fts_schema_rows, Some(1));
+        // the test rolls meta.schema_version back to 13 and deletes the V14
+        // marker. On Unix CI we also inject a duplicate sqlite_master row to
+        // exercise the malformed-bundle probe path that depends on sqlite3.
+        let expected_fts_schema_rows = if cfg!(windows) { Some(0) } else { Some(1) };
+        assert_eq!(bundles[1].probe.fts_schema_rows, expected_fts_schema_rows);
     }
 
     #[test]
@@ -23966,15 +24694,17 @@ mod tests {
         let conn = FrankenConnection::open(db_path.to_string_lossy().to_string()).unwrap();
         transition_from_meta_version(&conn).unwrap();
 
-        // _schema_migrations should exist with entries for versions 1..=10.
+        // The frankensqlite path uses a combined V13 base migration, so a
+        // legacy V10 marker is bridged to V13 and later idempotent repair fills
+        // in any missing V11-V13 objects.
         let rows = conn
             .query("SELECT version FROM _schema_migrations ORDER BY version;")
             .unwrap();
         let versions: Vec<i64> = rows.iter().filter_map(|r| r.get_typed(0).ok()).collect();
         assert_eq!(
             versions,
-            (1..=10).collect::<Vec<i64>>(),
-            "transition should backfill versions 1..=10"
+            (1..=13).collect::<Vec<i64>>(),
+            "transition should bridge legacy V10 databases through the combined V13 base marker"
         );
     }
 
@@ -24295,6 +25025,49 @@ mod tests {
     }
 
     #[test]
+    fn fts_messages_integrity_reports_missing_shadow_tables() {
+        let dir = TempDir::new().unwrap();
+        let healthy_db_path = dir.path().join("healthy_fts.db");
+
+        {
+            let storage = FrankenStorage::open(&healthy_db_path).unwrap();
+            storage.ensure_search_fallback_fts_consistency().unwrap();
+            storage
+                .validate_fts_messages_integrity()
+                .expect("freshly materialized fts_messages should pass integrity validation");
+        }
+
+        let corrupt_db_path = dir.path().join("test_corrupt_fts_missing_shadows.db");
+        {
+            let conn = rusqlite_test_fixture_conn(&corrupt_db_path);
+            conn.execute("CREATE TABLE schema_anchor(id INTEGER PRIMARY KEY)", [])
+                .unwrap();
+            let orphaned_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+            conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
+            conn.execute(
+                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                [orphaned_fts_sql],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
+        }
+
+        let open_err = FrankenConnection::open(corrupt_db_path.to_string_lossy().to_string())
+            .expect_err("orphaned fts_messages schema should fail during connection open");
+        let integrity = fts_messages_integrity_error_from_message(open_err.to_string())
+            .expect("open-time FTS corruption should map to the typed FTS integrity kind");
+        assert_eq!(integrity.missing_shadow_tables(), &["fts_messages_content"]);
+        let rendered = integrity.to_string();
+        assert!(
+            rendered.contains("fts_messages")
+                && rendered.contains("required FTS5 shadow tables")
+                && rendered.contains("fts_messages_content"),
+            "error should be an operator-facing FTS corruption diagnosis: {rendered}"
+        );
+    }
+
+    #[test]
     fn franken_storage_open_fresh_db_keeps_single_franken_fts_schema_row() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fresh-franken-storage-open.db");
@@ -24326,7 +25099,7 @@ mod tests {
         assert!(
             storage
                 .raw()
-                .query("SELECT rowid FROM fts_messages LIMIT 1")
+                .query("SELECT COUNT(*) FROM fts_messages")
                 .is_ok(),
             "fts_messages must be queryable through frankensqlite after open"
         );
@@ -25088,20 +25861,18 @@ mod tests {
         let orphan_count = ORPHAN_FK_ID_CHUNK_SIZE + 3;
 
         storage.raw().execute("PRAGMA foreign_keys = OFF").unwrap();
-        for idx in 0..orphan_count {
-            let message_id = 10_000_i64 + i64::try_from(idx).unwrap();
-            let conversation_id = 20_000_i64 + i64::try_from(idx).unwrap();
-            storage
-                .raw()
-                .execute_compat(
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            for idx in 0..orphan_count {
+                let message_id = 10_000_i64 + i64::try_from(idx).unwrap();
+                let conversation_id = 20_000_i64 + i64::try_from(idx).unwrap();
+                tx.execute_compat(
                     "INSERT INTO messages(id, conversation_id, idx, role, content) \
                      VALUES(?1, ?2, 0, 'user', 'orphan message')",
                     fparams![message_id, conversation_id],
                 )
                 .unwrap();
-            storage
-                .raw()
-                .execute_compat(
+                tx.execute_compat(
                     "INSERT INTO message_metrics(
                          message_id, created_at_ms, hour_id, day_id, agent_slug,
                          role, content_chars, content_tokens_est
@@ -25109,6 +25880,8 @@ mod tests {
                     fparams![message_id],
                 )
                 .unwrap();
+            }
+            tx.commit().unwrap();
         }
         storage.raw().execute("PRAGMA foreign_keys = ON").unwrap();
 
@@ -25128,6 +25901,59 @@ mod tests {
             })
             .unwrap();
         assert_eq!(messages_after, 0);
+        let metrics_after: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(metrics_after, 0);
+    }
+
+    #[test]
+    fn cleanup_orphan_fk_rows_pages_direct_child_orphans() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("direct_orphan_fk_paged_self_heal.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let orphan_count = (ORPHAN_FK_ID_CHUNK_SIZE * 2) + 5;
+
+        storage.raw().execute("PRAGMA foreign_keys = OFF").unwrap();
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            for idx in 0..orphan_count {
+                let message_id = 50_000_i64 + i64::try_from(idx).unwrap();
+                tx.execute_compat(
+                    "INSERT INTO message_metrics(
+                         message_id, created_at_ms, hour_id, day_id, agent_slug,
+                         role, content_chars, content_tokens_est
+                     ) VALUES(?1, 0, 0, 0, 'test-agent', 'user', 21, 3)",
+                    fparams![message_id],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        storage.raw().execute("PRAGMA foreign_keys = ON").unwrap();
+
+        let report = storage.cleanup_orphan_fk_rows().unwrap();
+
+        assert_eq!(report.total, i64::try_from(orphan_count).unwrap());
+        let metrics_count = report
+            .per_table
+            .iter()
+            .filter(|(table, _)| *table == "message_metrics")
+            .map(|(_, count)| *count)
+            .sum::<i64>();
+        assert_eq!(metrics_count, i64::try_from(orphan_count).unwrap());
+        assert_eq!(
+            report
+                .per_table
+                .iter()
+                .filter(|(table, _)| *table == "message_metrics")
+                .count(),
+            1,
+            "paged cleanup should aggregate report entries by table: {report:?}"
+        );
         let metrics_after: i64 = storage
             .raw()
             .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {

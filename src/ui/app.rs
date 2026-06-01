@@ -148,7 +148,7 @@ use ftui::widgets::hint_ranker::{HintContext, HintRanker, RankerConfig};
 use ftui::widgets::json_view::{JsonToken, JsonView};
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::{RenderItem, StatefulWidget, VirtualizedList, VirtualizedListState};
-use ftui_extras::markdown::MarkdownRenderer;
+use ftui_extras::markdown::{MarkdownRenderer, is_likely_markdown};
 
 // ---------------------------------------------------------------------------
 // Re-export ftui primitives through the adapter
@@ -2066,6 +2066,9 @@ fn ensure_parent_chain_has_no_symlinks(path: &Path) -> anyhow::Result<()> {
             Ok(metadata) => {
                 let file_type = metadata.file_type();
                 if file_type.is_symlink() {
+                    if is_allowed_system_symlink_ancestor(&ancestor) {
+                        continue;
+                    }
                     return Err(anyhow::anyhow!(
                         "latency trace output directory must not contain symlinks: {}",
                         ancestor.display()
@@ -2089,6 +2092,16 @@ fn ensure_parent_chain_has_no_symlinks(path: &Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn is_allowed_system_symlink_ancestor(path: &Path) -> bool {
+    path == Path::new("/var") || path == Path::new("/tmp")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_allowed_system_symlink_ancestor(_path: &Path) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -5165,6 +5178,9 @@ pub struct CassApp {
     pub focus_region: FocusRegion,
     /// FocusGraph-based navigation manager.
     pub focus_manager: FocusManager,
+    /// Last Enter-routing branch, recorded for deterministic tests.
+    #[cfg(test)]
+    last_enter_routing_decision: Option<(&'static str, &'static str)>,
     /// Cursor position within the query string (byte offset).
     pub cursor_pos: usize,
     /// Cursor position within query history.
@@ -5508,6 +5524,8 @@ impl Default for CassApp {
             input_buffer: String::new(),
             focus_region: FocusRegion::default(),
             focus_manager: FocusManager::new(),
+            #[cfg(test)]
+            last_enter_routing_decision: None,
             cursor_pos: 0,
             history_cursor: None,
             query_history: VecDeque::with_capacity(50),
@@ -9696,12 +9714,10 @@ impl CassApp {
         // If we have a cached conversation, render full messages
         if let Some(cv) = cached_detail {
             let md_width = inner_width.saturating_sub(4);
-            let md_renderer = MarkdownRenderer::new(styles.markdown_theme())
-                .with_syntax_theme(styles.syntax_highlight_theme())
-                .rule_width(md_width)
-                .table_max_width(md_width);
+            let mut md_renderer = None;
 
             let msg_count = cv.messages.len();
+            let plain_text_style = styles.style(style_system::STYLE_TEXT_PRIMARY);
             let subtle_style = styles.style(style_system::STYLE_TEXT_SUBTLE);
             let mut msg_offsets: Vec<(u32, crate::model::types::MessageRole)> =
                 Vec::with_capacity(msg_count);
@@ -9823,11 +9839,27 @@ impl CassApp {
                     // A trim() here breaks valid leading-indented markdown such as code blocks.
                     let content = msg.content.as_str();
                     if !content.trim().is_empty() {
-                        let rendered = md_renderer.render(content);
-                        for line in rendered.into_iter() {
+                        if is_likely_markdown(content).indicators == 0 {
                             let mut spans = vec![ftui::text::Span::styled("\u{258c} ", gutter_s)];
-                            spans.extend(line.spans().iter().cloned());
-                            lines.push(ftui::text::Line::from_spans(spans));
+                            for line in content.lines() {
+                                spans.push(ftui::text::Span::styled(line, plain_text_style));
+                                lines.push(ftui::text::Line::from_spans(spans));
+                                spans = vec![ftui::text::Span::styled("\u{258c} ", gutter_s)];
+                            }
+                        } else {
+                            let renderer = md_renderer.get_or_insert_with(|| {
+                                MarkdownRenderer::new(styles.markdown_theme())
+                                    .with_syntax_theme(styles.syntax_highlight_theme())
+                                    .rule_width(md_width)
+                                    .table_max_width(md_width)
+                            });
+                            let rendered = renderer.render(content);
+                            for line in rendered.into_iter() {
+                                let mut spans =
+                                    vec![ftui::text::Span::styled("\u{258c} ", gutter_s)];
+                                spans.extend(line.spans().iter().cloned());
+                                lines.push(ftui::text::Line::from_spans(spans));
+                            }
                         }
                     }
                 }
@@ -15006,7 +15038,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
         match std::fs::rename(temp_path, final_path) {
             Ok(()) => sync_parent_directory(final_path),
             Err(first_err)
-                if final_path.exists()
+                if path_entry_exists(final_path)
                     && matches!(
                         first_err.kind(),
                         std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
@@ -15014,7 +15046,6 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
             {
                 let backup_path = unique_atomic_sidecar_path(final_path, "bak", "tui_state.json");
                 std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
-                    let _ = std::fs::remove_file(temp_path);
                     format!(
                         "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
                         backup_path.display(),
@@ -15024,15 +15055,11 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
                     )
                 })?;
                 match std::fs::rename(temp_path, final_path) {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&backup_path);
-                        sync_parent_directory(final_path)
-                    }
+                    Ok(()) => sync_parent_directory(final_path),
                     Err(second_err) => {
                         let restore_result = std::fs::rename(&backup_path, final_path);
                         match restore_result {
                             Ok(()) => {
-                                let _ = std::fs::remove_file(temp_path);
                                 sync_parent_directory(final_path)?;
                                 Err(format!(
                                     "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
@@ -15070,10 +15097,13 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
     }
 }
 
-fn sync_file_path(path: &Path) -> Result<(), String> {
-    std::fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| format!("failed syncing {}: {e}", path.display()))
+#[cfg(any(windows, test))]
+fn path_entry_exists(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => false,
+        Err(_) => true,
+    }
 }
 
 #[cfg(not(windows))]
@@ -15116,17 +15146,41 @@ fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) ->
     ))
 }
 
+fn write_persisted_state_temp_file(path: &Path, payload: &[u8]) -> Result<PathBuf, String> {
+    for _ in 0..100 {
+        let tmp_path = unique_atomic_temp_path(path);
+        match write_persisted_state_temp_file_at(&tmp_path, payload) {
+            Ok(()) => return Ok(tmp_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("failed writing {}: {err}", tmp_path.display())),
+        }
+    }
+
+    Err(format!(
+        "failed to allocate unique TUI state temp path for {}",
+        path.display()
+    ))
+}
+
+fn write_persisted_state_temp_file_at(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(payload)?;
+    file.sync_all()
+}
+
 fn save_persisted_state_to_path(path: &Path, state: &PersistedState) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed creating {}: {e}", parent.display()))?;
     }
-    let tmp_path = unique_atomic_temp_path(path);
     let payload = serde_json::to_vec_pretty(&persisted_state_file_from_state(state))
         .map_err(|e| format!("failed serializing state: {e}"))?;
-    std::fs::write(&tmp_path, payload)
-        .map_err(|e| format!("failed writing {}: {e}", tmp_path.display()))?;
-    sync_file_path(&tmp_path)?;
+    let tmp_path = write_persisted_state_temp_file(path, &payload)?;
     replace_file_from_temp(&tmp_path, path)?;
     Ok(())
 }
@@ -17664,6 +17718,11 @@ impl super::ftui_adapter::Model for CassApp {
                 // Re-entrant Enter while detail is already open should be a no-op.
                 // This avoids stacking duplicate focus traps on rapid key repeats.
                 if self.show_detail_modal {
+                    #[cfg(test)]
+                    {
+                        self.last_enter_routing_decision =
+                            Some(("detail_modal_noop", "modal_already_open"));
+                    }
                     tracing::debug!(
                         route = "detail_modal_noop",
                         reason = "modal_already_open",
@@ -17677,6 +17736,11 @@ impl super::ftui_adapter::Model for CassApp {
                 // Enter should prioritize opening the selected hit in context.
                 // If there is no active hit, fall back to query submit behavior.
                 let Some(selected_hit) = selected_hit else {
+                    #[cfg(test)]
+                    {
+                        self.last_enter_routing_decision =
+                            Some(("query_submit_fallback", "no_selected_hit"));
+                    }
                     tracing::debug!(
                         route = "query_submit_fallback",
                         reason = "no_selected_hit",
@@ -17688,6 +17752,10 @@ impl super::ftui_adapter::Model for CassApp {
                 };
                 // Ensure Enter lands on the contextual conversation view.
                 self.detail_tab = DetailTab::Messages;
+                #[cfg(test)]
+                {
+                    self.last_enter_routing_decision = Some(("detail_modal_open", "selected_hit"));
+                }
                 tracing::debug!(
                     route = "detail_modal_open",
                     reason = "selected_hit",
@@ -20645,6 +20713,20 @@ impl super::ftui_adapter::Model for CassApp {
                     ftui::Cmd::none()
                 };
                 self.clear_loading_context(LoadingContext::Analytics);
+                // Seed the cockpit on first entry so the surface always has
+                // something to render rather than the empty-cache placeholder.
+                // `render_swarm_status_live_partial` is pure (no I/O), so it is
+                // safe to call from the surface-entry path — the bead
+                // (coding_agent_session_search-oh96l.6) forbids heavy doctor
+                // scans, rch, git fetches, and Agent Mail mutations on render.
+                // Subsequent refreshes will land via explicit user action or a
+                // bounded background tick once a live aggregator is wired.
+                if self.swarm_cockpit.snapshot.is_none() {
+                    let payload = crate::render_swarm_status_live_partial();
+                    self.swarm_cockpit = SwarmCockpitState::from_snapshot(
+                        SwarmCockpitSnapshot::from_status_payload(&payload),
+                    );
+                }
                 transition_cmd
             }
 
@@ -22567,9 +22649,13 @@ fn write_export_bytes_no_overwrite(
         {
             Ok(mut file) => {
                 if let Err(err) = file.write_all(payload) {
-                    // Avoid leaving a partially written export behind.
-                    let _ = std::fs::remove_file(&candidate);
-                    return Err(format!("Failed to write export: {err}"));
+                    return Err(export_write_error("writing", &candidate, err));
+                }
+                if let Err(err) = file.sync_all() {
+                    return Err(export_write_error("syncing", &candidate, err));
+                }
+                if let Err(err) = sync_parent_directory(&candidate) {
+                    return Err(export_write_error("finalizing", &candidate, err));
                 }
                 return Ok(candidate);
             }
@@ -22592,6 +22678,10 @@ fn write_export_bytes_no_overwrite(
         1024,
         output_path.display()
     ))
+}
+
+fn export_write_error(action: &str, path: &Path, err: impl std::fmt::Display) -> String {
+    format!("Failed {action} export {}: {err}", path.display())
 }
 
 fn tui_prefers_direct_followup_file(hit: &SearchHit) -> bool {
@@ -24094,6 +24184,21 @@ mod tests {
         String::from_utf8(sink.lock().map(|b| b.clone()).unwrap_or_default()).unwrap_or_default()
     }
 
+    fn captured_enter_route(
+        logs: &str,
+        route_markers: (&str, &str),
+        reason_markers: (&str, &str),
+    ) -> Option<bool> {
+        if !logs.contains("enter routing decision") {
+            return None;
+        }
+
+        Some(
+            (logs.contains(route_markers.0) || logs.contains(route_markers.1))
+                && (logs.contains(reason_markers.0) || logs.contains(reason_markers.1)),
+        )
+    }
+
     struct ActionOverrideGuard {
         prev_config: Option<SourcesConfig>,
         prev_editor_command: Option<String>,
@@ -24781,6 +24886,98 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.parent(), final_path.parent());
         assert_eq!(second.parent(), final_path.parent());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_temp_write_refuses_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let protected = tmp.path().join("protected-state.json");
+        let temp_path = tmp.path().join(".tui_state.json.tmp");
+
+        std::fs::write(&protected, b"protected").expect("write protected target");
+        symlink(&protected, &temp_path).expect("create temp symlink");
+
+        let err = write_persisted_state_temp_file_at(&temp_path, br#"{"version":1}"#)
+            .expect_err("existing temp symlink must be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&protected).expect("read protected target"),
+            b"protected"
+        );
+        assert!(
+            std::fs::symlink_metadata(&temp_path)
+                .expect("temp path metadata")
+                .file_type()
+                .is_symlink(),
+            "failed temp write should leave the existing symlink untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_replace_replaces_symlink_without_following()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new()?;
+        let final_path = tmp.path().join("tui_state.json");
+        let protected = tmp.path().join("protected-state.json");
+        let temp_path = tmp.path().join(".tui_state.json.tmp");
+
+        std::fs::write(&protected, b"protected")?;
+        symlink(&protected, &final_path)?;
+        std::fs::write(&temp_path, br#"{"version":1}"#)?;
+
+        replace_file_from_temp(&temp_path, &final_path).map_err(std::io::Error::other)?;
+
+        if !matches!(
+            std::fs::read(&protected)?.as_slice().cmp(b"protected"),
+            std::cmp::Ordering::Equal
+        ) {
+            return Err("replace modified the symlink target".into());
+        }
+        if std::fs::symlink_metadata(&final_path)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("replace followed the symlink instead of publishing at the path".into());
+        }
+        if !matches!(
+            std::fs::read(&final_path)?
+                .as_slice()
+                .cmp(br#"{"version":1}"#),
+            std::cmp::Ordering::Equal
+        ) {
+            return Err("replace did not publish the temporary state bytes".into());
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_path_entry_exists_detects_dangling_symlink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new()?;
+        let path = tmp.path().join("tui_state.json");
+        let missing_target = tmp.path().join("missing-state.json");
+
+        symlink(&missing_target, &path)?;
+
+        if path.exists() {
+            return Err("Path::exists stopped following the missing target".into());
+        }
+        if !path_entry_exists(&path) {
+            return Err("replacement fallback missed the symlink path entry itself".into());
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -26832,13 +27029,27 @@ mod tests {
         });
 
         assert!(
-            logs.contains("route=\"query_submit_fallback\""),
-            "expected query-submit fallback diagnostic marker, logs={logs}"
+            matches!(
+                app.last_enter_routing_decision,
+                Some(("query_submit_fallback", "no_selected_hit"))
+            ),
+            "expected query-submit fallback routing branch"
         );
-        assert!(
-            logs.contains("reason=\"no_selected_hit\""),
-            "expected fallback reason marker, logs={logs}"
-        );
+        // Tracing subscriber capture can miss this event or include unrelated
+        // output in full-suite runs; the routing branch above is authoritative.
+        if let Some(has_route) = captured_enter_route(
+            &logs,
+            (
+                "route=\"query_submit_fallback\"",
+                "route=query_submit_fallback",
+            ),
+            ("reason=\"no_selected_hit\"", "reason=no_selected_hit"),
+        ) {
+            assert!(
+                has_route,
+                "expected query-submit fallback diagnostic markers, logs={logs}"
+            );
+        }
     }
 
     #[test]
@@ -26860,13 +27071,24 @@ mod tests {
         });
 
         assert!(
-            logs.contains("route=\"detail_modal_open\""),
-            "expected modal-open diagnostic marker, logs={logs}"
+            matches!(
+                app.last_enter_routing_decision,
+                Some(("detail_modal_open", "selected_hit"))
+            ) && app.show_detail_modal,
+            "expected selected hit to open detail modal through the modal-open routing branch"
         );
-        assert!(
-            logs.contains("reason=\"selected_hit\""),
-            "expected selected-hit reason marker, logs={logs}"
-        );
+        // Tracing subscriber capture can miss this event or include unrelated
+        // output in full-suite runs; the routing branch above is authoritative.
+        if let Some(has_route) = captured_enter_route(
+            &logs,
+            ("route=\"detail_modal_open\"", "route=detail_modal_open"),
+            ("reason=\"selected_hit\"", "reason=selected_hit"),
+        ) {
+            assert!(
+                has_route,
+                "expected modal-open diagnostic markers, logs={logs}"
+            );
+        }
     }
 
     #[test]
@@ -35515,7 +35737,9 @@ not jsonl",
     }
 
     #[test]
+    #[serial]
     fn open_all_queued_small_batch_opens_directly() {
+        clear_test_editor_invocations();
         let mut app = app_with_hits(3);
         let _ = app.update(CassMsg::SelectAllToggled);
         assert_eq!(app.selected.len(), 3);
@@ -35526,6 +35750,7 @@ not jsonl",
         // Selection cleared after attempt
         assert!(app.selected.is_empty());
         assert!(!app.open_confirm_armed);
+        let _ = take_test_editor_invocations();
     }
 
     #[test]

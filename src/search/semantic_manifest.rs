@@ -24,11 +24,12 @@
 //! - **[`model_manager`]**: Detects model availability; this module records
 //!   which model was used to build each artifact.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use super::policy::{
@@ -40,7 +41,35 @@ use super::policy::{
 
 /// Current manifest format version.  Bump when the JSON schema changes in a
 /// backwards-incompatible way.
-pub const MANIFEST_FORMAT_VERSION: u32 = 1;
+/// Manifest format version.
+///
+/// History:
+/// - **v1** (pre-cass#257): `BuildCheckpoint` resume cursor is the
+///   conversation offset only.
+/// - **v2** (cass#257 sub-fix 2): `BuildCheckpoint` may additionally
+///   carry `last_message_id`, an inclusive canonical message PK
+///   advanced by every batch. Resume strictly skips messages ≤ this
+///   cursor so an interrupted bounded run never re-embeds work it
+///   already staged. The new field is `Option<i64>` with
+///   `#[serde(default)]`, so the JSON-on-disk shape only differs when
+///   at least one batch persisted the cursor — a freshly-created
+///   manifest still parses cleanly under v1 readers.
+///
+/// **Compatibility:**
+/// - **Old binary reading v2 manifest:** clean `UnsupportedVersion`
+///   error from `load()`; operator sees a clear "manifest version
+///   $V is newer than max-supported $MAX" message and can upgrade.
+/// - **New binary reading v1 manifest:** loads fine. `last_message_id`
+///   defaults to `None`; resume falls back to the conversation offset
+///   with a one-shot warning that resume granularity is coarser than
+///   ideal until the next checkpoint save bumps the on-disk shape.
+pub const MANIFEST_FORMAT_VERSION: u32 = 2;
+
+/// Highest manifest-version emitted by pre-cass#257 binaries; loading
+/// this is fully supported, but resume granularity will be coarser
+/// until a fresh checkpoint is saved. Kept as a named constant so the
+/// fallback warning quotes a stable number.
+pub const MANIFEST_FORMAT_VERSION_PRE_LAST_MESSAGE_CURSOR: u32 = 1;
 
 /// Filename for the durable manifest.
 pub const MANIFEST_FILENAME: &str = "semantic_manifest.json";
@@ -390,11 +419,11 @@ impl SemanticShardManifest {
         let json = serde_json::to_string_pretty(self).map_err(|e| ManifestError::Serialize {
             source: e.to_string(),
         })?;
-        let tmp_path = unique_manifest_temp_path(&path);
-        let mut file = fs::File::create(&tmp_path).map_err(|e| ManifestError::Io {
-            path: tmp_path.clone(),
-            source: e.to_string(),
-        })?;
+        let (tmp_path, mut file) =
+            create_unique_manifest_temp_file(&path).map_err(|e| ManifestError::Io {
+                path: path.clone(),
+                source: e.to_string(),
+            })?;
         file.write_all(json.as_bytes())
             .map_err(|e| ManifestError::Io {
                 path: tmp_path.clone(),
@@ -563,6 +592,14 @@ impl SemanticShardManifest {
 // ─── Build checkpoint ──────────────────────────────────────────────────────
 
 /// Resumable position for an interrupted semantic build.
+///
+/// Sub-fix 2 for cass#257 added the optional `last_message_id` cursor.
+/// Resume strictly advances past this cursor when present, so that a
+/// rerun of an interrupted bounded backfill never re-embeds messages
+/// that already made it into the staged index. Pre-#257 binaries wrote
+/// checkpoints without the field (it deserializes to `None` via
+/// `#[serde(default)]`), and modern binaries fall back to the
+/// conversation offset when `last_message_id` is absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildCheckpoint {
     /// Which tier is being built.
@@ -585,6 +622,14 @@ pub struct BuildCheckpoint {
     pub chunking_version: u32,
     /// Unix timestamp (ms) when this checkpoint was saved.
     pub saved_at_ms: i64,
+    /// Highest canonical message PK embedded in this run so far.
+    ///
+    /// Added in cass#257 (sub-fix 2). `None` for checkpoints written
+    /// by pre-#257 binaries; new code falls back to `last_offset`
+    /// (conversation-granularity) when this is absent. New code
+    /// strictly resumes past this cursor when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_id: Option<i64>,
 }
 
 impl BuildCheckpoint {
@@ -707,6 +752,13 @@ impl SemanticManifest {
 
     /// Load the manifest from disk.  Returns `None` if the file doesn't
     /// exist, `Err` if it exists but is corrupt.
+    ///
+    /// **Migration notes (cass#257 sub-fix 2):** a v1 manifest written
+    /// by a pre-#257 binary loads cleanly — `last_message_id` defaults
+    /// to `None` and resume falls back to the conversation offset.
+    /// A one-shot warning surfaces on first load so an operator sees
+    /// that resume granularity is coarser than ideal until the next
+    /// checkpoint save lands and the on-disk shape upgrades.
     pub fn load(data_dir: &Path) -> Result<Option<Self>, ManifestError> {
         let path = Self::path(data_dir);
         let bytes = match fs::read(&path) {
@@ -731,6 +783,25 @@ impl SemanticManifest {
                 found: manifest.manifest_version,
                 max_supported: MANIFEST_FORMAT_VERSION,
             });
+        }
+
+        // Backwards-compatible: a v1 manifest with an active checkpoint
+        // means a previous interrupted backfill saved without the
+        // `last_message_id` cursor. Warn so an operator monitoring an
+        // overnight run knows resume granularity is conversation-coarse
+        // until the next checkpoint save bumps the on-disk shape.
+        if manifest.manifest_version <= MANIFEST_FORMAT_VERSION_PRE_LAST_MESSAGE_CURSOR
+            && manifest
+                .checkpoint
+                .as_ref()
+                .is_some_and(|cp| cp.last_message_id.is_none())
+        {
+            tracing::warn!(
+                manifest_version = manifest.manifest_version,
+                supported_version = MANIFEST_FORMAT_VERSION,
+                path = %path.display(),
+                "semantic checkpoint manifest predates last_message_id cursor (cass#257 sub-fix 2); resume will fall back to conversation offset until the next checkpoint save"
+            );
         }
 
         Ok(Some(manifest))
@@ -775,11 +846,11 @@ impl SemanticManifest {
         })?;
 
         // Atomic write: temp file → rename.
-        let tmp_path = unique_manifest_temp_path(&path);
-        let mut file = fs::File::create(&tmp_path).map_err(|e| ManifestError::Io {
-            path: tmp_path.clone(),
-            source: e.to_string(),
-        })?;
+        let (tmp_path, mut file) =
+            create_unique_manifest_temp_file(&path).map_err(|e| ManifestError::Io {
+                path: path.clone(),
+                source: e.to_string(),
+            })?;
         file.write_all(json.as_bytes())
             .map_err(|e| ManifestError::Io {
                 path: tmp_path.clone(),
@@ -1082,7 +1153,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn unique_manifest_temp_path(path: &Path) -> PathBuf {
+fn unique_manifest_temp_path(path: &Path, attempt: u32, random: u64) -> PathBuf {
     static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     let file_name = path
@@ -1091,15 +1162,39 @@ fn unique_manifest_temp_path(path: &Path) -> PathBuf {
         .unwrap_or(MANIFEST_FILENAME);
     let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     path.with_file_name(format!(
-        ".{file_name}.tmp.{}.{}.{}",
-        std::process::id(),
+        ".{file_name}.tmp.{attempt}.{}.{}.{random:016x}",
         now_ms(),
         nonce
     ))
 }
 
+fn create_unique_manifest_temp_file(path: &Path) -> std::io::Result<(PathBuf, fs::File)> {
+    for attempt in 0..100 {
+        let random = random_manifest_path_nonce()?;
+        let tmp_path = unique_manifest_temp_path(path, attempt, random);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(file) => return Ok((tmp_path, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "could not create a unique temporary manifest file for {} after 100 attempts",
+            path.display()
+        ),
+    ))
+}
+
 #[cfg(windows)]
-fn unique_manifest_backup_path(path: &Path) -> PathBuf {
+fn unique_manifest_backup_path(path: &Path) -> std::io::Result<PathBuf> {
+    let random = random_manifest_path_nonce()?;
     static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     let file_name = path
@@ -1107,12 +1202,18 @@ fn unique_manifest_backup_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or(MANIFEST_FILENAME);
     let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    path.with_file_name(format!(
-        ".{file_name}.bak.{}.{}.{}",
-        std::process::id(),
-        now_ms(),
-        nonce
-    ))
+    Ok(path.with_file_name(format!(
+        ".{file_name}.bak.{}.{nonce}.{random:016x}",
+        now_ms()
+    )))
+}
+
+fn random_manifest_path_nonce() -> std::io::Result<u64> {
+    let mut random_bytes = [0u8; 8];
+    SystemRandom::new()
+        .fill(&mut random_bytes)
+        .map_err(|_| std::io::Error::other("failed to generate manifest temp path nonce"))?;
+    Ok(u64::from_le_bytes(random_bytes))
 }
 
 fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
@@ -1121,13 +1222,13 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Resul
         match fs::rename(temp_path, final_path) {
             Ok(()) => sync_parent_directory(final_path),
             Err(first_err)
-                if final_path.exists()
+                if replacement_path_entry_exists(final_path)?
                     && matches!(
                         first_err.kind(),
                         std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
                     ) =>
             {
-                let backup_path = unique_manifest_backup_path(final_path);
+                let backup_path = unique_manifest_backup_path(final_path)?;
                 fs::rename(final_path, &backup_path).map_err(|backup_err| {
                     let _ = fs::remove_file(temp_path);
                     std::io::Error::other(format!(
@@ -1174,6 +1275,21 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Resul
     #[cfg(not(windows))]
     {
         fs::rename(temp_path, final_path)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn replacement_path_entry_exists(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => Ok(false),
+        Err(err) => Err(std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed inspecting semantic manifest replacement target {}: {err}",
+                path.display()
+            ),
+        )),
     }
 }
 
@@ -1280,6 +1396,7 @@ mod tests {
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
             saved_at_ms: 1_700_000_030_000,
+            last_message_id: None,
         }
     }
 
@@ -1388,6 +1505,83 @@ mod tests {
         assert!(loaded.fast_tier.is_none());
         assert!(loaded.quality_tier.is_some());
         assert_eq!(loaded.backlog.total_conversations, 99);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_replacement_path_entry_exists_detects_dangling_symlink() -> Result<(), String> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let link_path = SemanticManifest::path(temp.path());
+        let manifest_dir = link_path
+            .parent()
+            .ok_or_else(|| "semantic manifest path should have a parent directory".to_string())?;
+        fs::create_dir_all(manifest_dir).map_err(|e| e.to_string())?;
+        let missing_target = manifest_dir.join("missing-semantic-manifest.json");
+
+        symlink(&missing_target, &link_path).map_err(|e| e.to_string())?;
+
+        if link_path.exists() {
+            return Err("dangling manifest symlink unexpectedly resolved".to_string());
+        }
+        if !replacement_path_entry_exists(&link_path).map_err(|e| e.to_string())? {
+            return Err(format!(
+                "semantic manifest replacement entry check missed dangling symlink {}",
+                link_path.display()
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_temp_file_creation_is_exclusive_and_unique() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let final_path = SemanticManifest::path(temp.path());
+        let manifest_dir = final_path
+            .parent()
+            .ok_or_else(|| "semantic manifest path should have a parent directory".to_string())?;
+        fs::create_dir_all(manifest_dir).map_err(|e| e.to_string())?;
+
+        let (first_path, mut first_file) =
+            create_unique_manifest_temp_file(&final_path).map_err(|e| e.to_string())?;
+        first_file.write_all(b"first").map_err(|e| e.to_string())?;
+        let (second_path, mut second_file) =
+            create_unique_manifest_temp_file(&final_path).map_err(|e| e.to_string())?;
+        second_file
+            .write_all(b"second")
+            .map_err(|e| e.to_string())?;
+
+        if first_path == second_path {
+            return Err("exclusive temp creation reused the same path".to_string());
+        }
+        if !first_path.exists() {
+            return Err(format!(
+                "first temp file is missing: {}",
+                first_path.display()
+            ));
+        }
+        if !second_path.exists() {
+            return Err(format!(
+                "second temp file is missing: {}",
+                second_path.display()
+            ));
+        }
+        if first_path.parent() != Some(manifest_dir) {
+            return Err(format!(
+                "first temp path escaped manifest directory: {}",
+                first_path.display()
+            ));
+        }
+        if second_path.parent() != Some(manifest_dir) {
+            return Err(format!(
+                "second temp path escaped manifest directory: {}",
+                second_path.display()
+            ));
+        }
+
+        Ok(())
     }
 
     #[test]
