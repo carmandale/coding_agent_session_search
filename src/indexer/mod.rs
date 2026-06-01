@@ -98,8 +98,6 @@ const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 const PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT: usize = 256;
 const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
-const WATCH_PREEMPTIVE_LEXICAL_DEFER_DB_BYTES_DEFAULT: u64 = 2_u64 * 1024 * 1024 * 1024;
-const DEFERRED_LEXICAL_REFRESH_MARKER: &str = "lexical-refresh-needed.json";
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SESSION_SOURCE_SKIP_OBSERVED: AtomicBool = AtomicBool::new(false);
@@ -817,27 +815,16 @@ pub struct IndexingStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_watch_once: Option<SemanticWatchOnceStats>,
     /// Conversations skipped by ingest quarantine during this run.
-    #[serde(skip_serializing_if = "is_zero_usize")]
     pub quarantined_conversations: usize,
     /// True when SQLite ingest succeeded but inline lexical updates were
     /// deferred and the caller must rebuild lexical assets from the archive.
-    #[serde(skip_serializing_if = "is_false_bool")]
     pub lexical_update_deferred: bool,
-}
-
-fn is_zero_usize(value: &usize) -> bool {
-    *value == 0
-}
-
-fn is_false_bool(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CanonicalMutationCounts {
     inserted_conversations: usize,
     inserted_messages: usize,
-    lexical_deferred_conversations: usize,
 }
 
 impl CanonicalMutationCounts {
@@ -849,16 +836,11 @@ impl CanonicalMutationCounts {
             inserted_messages: self
                 .inserted_messages
                 .saturating_add(other.inserted_messages),
-            lexical_deferred_conversations: self
-                .lexical_deferred_conversations
-                .saturating_add(other.lexical_deferred_conversations),
         }
     }
 
     fn changed(self) -> bool {
-        self.inserted_conversations > 0
-            || self.inserted_messages > 0
-            || self.lexical_deferred_conversations > 0
+        self.inserted_conversations > 0 || self.inserted_messages > 0
     }
 }
 
@@ -2214,51 +2196,6 @@ fn should_preflight_existing_tantivy_reader(
     !resume_lexical_rebuild && !full_rebuild
 }
 
-fn preflight_existing_tantivy_state(index_path: &Path) -> Result<(bool, Option<usize>)> {
-    // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
-    // IMPORTANT: This must stay aligned with TantivyIndex::open_or_create() rebuild triggers.
-    let schema_hash_path = index_path.join("schema_hash.json");
-    let schema_matches = schema_hash_path.exists()
-        && std::fs::read_to_string(&schema_hash_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|json| {
-                json.get("schema_hash")
-                    .and_then(|v| v.as_str())
-                    .map(schema_hash_matches)
-            })
-            .unwrap_or(false);
-
-    // Treat missing schema hash as rebuild (open_or_create will wipe/recreate).
-    let mut tantivy_requires_rebuild =
-        !crate::search::tantivy::searchable_index_exists(index_path) || !schema_matches;
-    let mut observed_tantivy_docs = None;
-
-    // Preflight open: if the cass-compatible Tantivy reader can't open, force a
-    // rebuild so we do a full scan and reindex messages into the new index
-    // (SQLite is incremental-only by default).
-    if !tantivy_requires_rebuild {
-        match crate::search::tantivy::searchable_index_summary(index_path) {
-            Ok(Some(summary)) => {
-                observed_tantivy_docs = Some(summary.docs);
-            }
-            Ok(None) => {
-                tantivy_requires_rebuild = true;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %index_path.display(),
-                    "tantivy open preflight failed; forcing rebuild"
-                );
-                tantivy_requires_rebuild = true;
-            }
-        }
-    }
-
-    Ok((tantivy_requires_rebuild, observed_tantivy_docs))
-}
-
 fn should_probe_live_tantivy_docs_for_post_full_scan_skip(
     full_rebuild: bool,
     rebuild_was_required: bool,
@@ -2319,27 +2256,6 @@ fn should_skip_noop_final_lexical_checkpoint_refresh(
         && initial_checkpoint_status.has_completed_checkpoint
 }
 
-fn should_skip_exact_completed_final_lexical_checkpoint_refresh(
-    exact_completed_lexical_checkpoint: bool,
-    performed_scan: bool,
-    exact_total_counts: Option<(usize, usize)>,
-) -> bool {
-    exact_completed_lexical_checkpoint && !performed_scan && exact_total_counts.is_some()
-}
-
-fn exact_total_counts_for_final_lexical_checkpoint(
-    progress_exact_total_counts: Option<(usize, usize)>,
-    authoritative_rebuild_exact_total_counts: Option<(usize, usize)>,
-    performed_scan: bool,
-    canonical_mutations: CanonicalMutationCounts,
-) -> Option<(usize, usize)> {
-    if performed_scan || canonical_mutations.changed() {
-        authoritative_rebuild_exact_total_counts.filter(|_| !canonical_mutations.changed())
-    } else {
-        authoritative_rebuild_exact_total_counts.or(progress_exact_total_counts)
-    }
-}
-
 fn should_skip_post_full_scan_authoritative_rebuild(
     full_rebuild: bool,
     rebuild_was_required: bool,
@@ -2354,118 +2270,6 @@ fn should_skip_post_full_scan_authoritative_rebuild(
         && !scan_canonical_mutations.changed()
         && initial_checkpoint_status.has_completed_checkpoint
         && initial_checkpoint_status.completed_indexed_docs == observed_tantivy_docs
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DeferredLexicalRefreshFinalizationContext<'a> {
-    full_refresh: bool,
-    force_rebuild: bool,
-    watch_enabled: bool,
-    has_watch_once_paths: bool,
-    semantic: bool,
-    build_hnsw: bool,
-    deferred_refresh_needed: bool,
-    historical_salvage_conversations_imported: usize,
-    salvage_messages_imported: usize,
-    tantivy_requires_rebuild: bool,
-    incremental_canonical_repair_planned: bool,
-    initial_checkpoint_status: &'a MatchingLexicalRebuildStateStatus,
-    observed_tantivy_docs: Option<usize>,
-}
-
-fn should_finalize_deferred_lexical_refresh_without_scan(
-    context: DeferredLexicalRefreshFinalizationContext<'_>,
-) -> bool {
-    context.deferred_refresh_needed
-        && !context.full_refresh
-        && !context.force_rebuild
-        && !context.watch_enabled
-        && !context.has_watch_once_paths
-        && !context.semantic
-        && !context.build_hnsw
-        && context.historical_salvage_conversations_imported == 0
-        && context.salvage_messages_imported == 0
-        && !context.tantivy_requires_rebuild
-        && !context.incremental_canonical_repair_planned
-        && context.initial_checkpoint_status.has_completed_checkpoint
-        && context.initial_checkpoint_status.completed_indexed_docs == context.observed_tantivy_docs
-}
-
-fn can_attempt_deferred_lexical_refresh_finalization_before_maintenance(
-    opts: &IndexOptions,
-) -> bool {
-    !opts.full
-        && !opts.force_rebuild
-        && !opts.watch
-        && opts
-            .watch_once_paths
-            .as_ref()
-            .is_none_or(|paths| paths.is_empty())
-        && !opts.semantic
-        && !opts.build_hnsw
-}
-
-fn finalize_deferred_lexical_refresh_before_maintenance_if_ready(
-    opts: &IndexOptions,
-    storage: &FrankenStorage,
-    index_path: &Path,
-) -> Result<bool> {
-    if !can_attempt_deferred_lexical_refresh_finalization_before_maintenance(opts)
-        || !deferred_lexical_refresh_needed(&opts.data_dir)
-    {
-        return Ok(false);
-    }
-
-    let total_conversations = count_total_conversations_exact(storage)?;
-    if total_conversations == 0 {
-        return Ok(false);
-    }
-    let checkpoint_status = matching_lexical_rebuild_state_status_if_present(index_path, || {
-        lexical_rebuild_db_state_with_total_conversations(
-            storage,
-            &opts.db_path,
-            total_conversations,
-        )
-    })?;
-    let (tantivy_requires_rebuild, observed_tantivy_docs) =
-        preflight_existing_tantivy_state(index_path)?;
-    if !should_finalize_deferred_lexical_refresh_without_scan(
-        DeferredLexicalRefreshFinalizationContext {
-            full_refresh: opts.full,
-            force_rebuild: opts.force_rebuild,
-            watch_enabled: opts.watch,
-            has_watch_once_paths: false,
-            semantic: opts.semantic,
-            build_hnsw: opts.build_hnsw,
-            deferred_refresh_needed: true,
-            historical_salvage_conversations_imported: 0,
-            salvage_messages_imported: 0,
-            tantivy_requires_rebuild,
-            incremental_canonical_repair_planned: false,
-            initial_checkpoint_status: &checkpoint_status,
-            observed_tantivy_docs,
-        },
-    ) {
-        return Ok(false);
-    }
-
-    let now_ms = FrankenStorage::now_millis();
-    persist_final_index_run_metadata(storage, &opts.db_path, false, now_ms, now_ms)?;
-    crate::search::tantivy::refresh_searchable_index_modified_time(index_path)?;
-    mark_deferred_lexical_refresh_resolved(&opts.data_dir)?;
-    record_lexical_population_strategy_if_unset(
-        opts.progress.as_ref(),
-        LexicalPopulationStrategy::IncrementalInline,
-        "deferred_lexical_refresh_finalized_before_startup_maintenance",
-    );
-    reset_progress_to_idle(opts.progress.as_ref());
-    tracing::info!(
-        db_path = %opts.db_path.display(),
-        observed_tantivy_docs,
-        completed_indexed_docs = checkpoint_status.completed_indexed_docs,
-        "finalized deferred lexical refresh from matching completed checkpoint before startup maintenance"
-    );
-    Ok(true)
 }
 
 struct RunIndexProgressReset {
@@ -8382,7 +8186,6 @@ struct IncrementalCanonicalLexicalRepairContext {
     targeted_watch_once_only: bool,
     salvage_messages_imported: usize,
     canonical_messages: usize,
-    completed_checkpoint_indexed_docs: Option<usize>,
     tantivy_requires_rebuild: bool,
     observed_tantivy_docs: Option<usize>,
     /// True when a completed lexical-rebuild checkpoint records this exact
@@ -8427,16 +8230,6 @@ fn choose_incremental_canonical_lexical_repair_plan(
         || context.targeted_watch_once_only
         || context.salvage_messages_imported > 0
         || context.canonical_messages == 0
-    {
-        return None;
-    }
-
-    if !context.tantivy_requires_rebuild
-        && let (Some(observed_tantivy_docs), Some(completed_checkpoint_indexed_docs)) = (
-            context.observed_tantivy_docs,
-            context.completed_checkpoint_indexed_docs,
-        )
-        && observed_tantivy_docs == completed_checkpoint_indexed_docs
     {
         return None;
     }
@@ -12614,7 +12407,6 @@ pub fn run_index(
             .is_some_and(|paths| !paths.is_empty());
 
     let mut exact_completed_lexical_checkpoint = false;
-    let mut authoritative_rebuild_exact_total_counts: Option<(usize, usize)> = None;
     let mut skipped_noop_full_scan_authoritative_rebuild = false;
     let mut targeted_watch_once_only_run = false;
     let t_index = if resume_lexical_rebuild {
@@ -12657,10 +12449,6 @@ pub fn run_index(
             stats.total_conversations = initial_canonical_sessions_before_salvage;
         }
         if let Some(observed_messages) = rebuild.observed_messages {
-            if rebuild.exact_checkpoint_persisted {
-                authoritative_rebuild_exact_total_counts =
-                    Some((initial_canonical_sessions_before_salvage, observed_messages));
-            }
             record_exact_total_counts_in_progress(
                 opts.progress.as_ref(),
                 initial_canonical_sessions_before_salvage,
@@ -12779,8 +12567,6 @@ pub fn run_index(
             targeted_watch_once_only,
             salvage_messages_imported: historical_salvage.messages_imported,
             canonical_messages: 0,
-            completed_checkpoint_indexed_docs: initial_matching_lexical_checkpoint
-                .completed_indexed_docs,
             tantivy_requires_rebuild,
             observed_tantivy_docs,
             // Placeholder: validating the published index opens the DB read-only
@@ -12836,51 +12622,6 @@ pub fn run_index(
             None
         };
 
-        let deferred_finalization_context = DeferredLexicalRefreshFinalizationContext {
-            full_refresh: opts.full,
-            force_rebuild: opts.force_rebuild,
-            watch_enabled: opts.watch,
-            has_watch_once_paths: has_explicit_watch_once_paths,
-            semantic: opts.semantic,
-            build_hnsw: opts.build_hnsw,
-            deferred_refresh_needed: deferred_lexical_refresh_needed(&opts.data_dir),
-            historical_salvage_conversations_imported: historical_salvage.conversations_imported,
-            salvage_messages_imported: historical_salvage.messages_imported,
-            tantivy_requires_rebuild,
-            incremental_canonical_repair_planned: incremental_canonical_lexical_repair.is_some(),
-            initial_checkpoint_status: &initial_matching_lexical_checkpoint,
-            observed_tantivy_docs,
-        };
-        if should_finalize_deferred_lexical_refresh_without_scan(deferred_finalization_context) {
-            let now_ms = FrankenStorage::now_millis();
-            persist_final_index_run_metadata(
-                &storage,
-                &opts.db_path,
-                false,
-                scan_start_ts,
-                now_ms,
-            )?;
-            crate::search::tantivy::refresh_searchable_index_modified_time(&index_path)?;
-            mark_deferred_lexical_refresh_resolved(&opts.data_dir)?;
-            record_lexical_population_strategy_if_unset(
-                opts.progress.as_ref(),
-                LexicalPopulationStrategy::IncrementalInline,
-                "deferred_lexical_refresh_finalized_from_completed_checkpoint",
-            );
-            reset_progress_to_idle(opts.progress.as_ref());
-            tracing::info!(
-                db_path = %opts.db_path.display(),
-                observed_tantivy_docs,
-                completed_indexed_docs = initial_matching_lexical_checkpoint.completed_indexed_docs,
-                "finalized deferred lexical refresh from matching completed checkpoint without broad scan"
-            );
-            return close_storage_after_index(
-                storage,
-                &opts.db_path,
-                "deferred lexical refresh no-op finalization",
-            );
-        }
-
         if should_repair_daily_stats_after_historical_salvage(
             checked_daily_stats_pre_scan,
             opts.full,
@@ -12933,10 +12674,6 @@ pub fn run_index(
                 stats.total_conversations = rebuild_convs;
             }
             if let Some(observed_messages) = rebuild.observed_messages {
-                if rebuild.exact_checkpoint_persisted {
-                    authoritative_rebuild_exact_total_counts =
-                        Some((rebuild_convs, observed_messages));
-                }
                 record_exact_total_counts_in_progress(
                     opts.progress.as_ref(),
                     rebuild_convs,
@@ -12985,10 +12722,6 @@ pub fn run_index(
                 )?;
                 exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
                 if let Some(observed_messages) = rebuild.observed_messages {
-                    if rebuild.exact_checkpoint_persisted {
-                        authoritative_rebuild_exact_total_counts =
-                            Some((rebuild_convs, observed_messages));
-                    }
                     record_exact_total_counts_in_progress(
                         opts.progress.as_ref(),
                         rebuild_convs,
@@ -13170,9 +12903,7 @@ pub fn run_index(
                         .commit()?;
                 }
 
-                let scan_deferred_lexical_updates = scan_lexical_update_deferred
-                    || scan_canonical_mutations.lexical_deferred_conversations > 0;
-                if !scan_deferred_lexical_updates
+                if !scan_lexical_update_deferred
                     && (opts.full || historical_salvage.messages_imported > 0)
                 {
                     let post_scan_observed_tantivy_docs =
@@ -13216,13 +12947,6 @@ pub fn run_index(
                         );
                         skipped_noop_full_scan_authoritative_rebuild = true;
                     } else {
-                        if scan_deferred_lexical_updates {
-                            tracing::warn!(
-                                db_path = %opts.db_path.display(),
-                                lexical_deferred_conversations = scan_canonical_mutations.lexical_deferred_conversations,
-                                "rebuilding Tantivy from the authoritative canonical database after streaming ingest deferred lexical updates"
-                            );
-                        }
                         drop(t_index.take());
                         let rebuild_convs = count_total_conversations_exact(&storage)?;
                         let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
@@ -13238,10 +12962,6 @@ pub fn run_index(
                         // connectors discovered; the DB rebuild is the source of
                         // truth for full-index runs.
                         if let Some(observed_messages) = rebuild.observed_messages {
-                            if rebuild.exact_checkpoint_persisted {
-                                authoritative_rebuild_exact_total_counts =
-                                    Some((rebuild_convs, observed_messages));
-                            }
                             record_exact_total_counts_in_progress(
                                 opts.progress.as_ref(),
                                 rebuild_convs,
@@ -13435,18 +13155,8 @@ pub fn run_index(
             now_ms,
         )?;
     }
-    let progress_exact_total_counts = exact_total_counts_from_progress(opts.progress.as_ref());
-    let exact_total_counts = exact_total_counts_for_final_lexical_checkpoint(
-        progress_exact_total_counts,
-        authoritative_rebuild_exact_total_counts,
-        performed_scan,
-        scan_canonical_mutations,
-    );
-    if should_skip_exact_completed_final_lexical_checkpoint_refresh(
-        exact_completed_lexical_checkpoint,
-        performed_scan,
-        exact_total_counts,
-    ) {
+    let exact_total_counts = exact_total_counts_from_progress(opts.progress.as_ref());
+    if exact_completed_lexical_checkpoint && exact_total_counts.is_some() {
         tracing::info!(
             db_path = %opts.db_path.display(),
             "skipping final lexical checkpoint refresh because the authoritative rebuild already persisted exact completed state"
@@ -13554,10 +13264,6 @@ pub fn run_index(
             canonical_only_full_rebuild,
             "skipping frankensqlite-owned fallback FTS rebuild because this full run only rebuilt Tantivy from the existing canonical database"
         );
-    }
-
-    if !targeted_watch_once_only_run {
-        mark_deferred_lexical_refresh_resolved(&opts.data_dir)?;
     }
 
     reset_progress_to_idle(opts.progress.as_ref());
@@ -16220,7 +15926,7 @@ static LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 #[cfg(test)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[allow(dead_code)]
 struct LexicalPublishInjectedRenameFailureGuard {
     previous: Option<LexicalPublishInjectedRenameFailure>,
 }
@@ -16237,7 +15943,7 @@ impl Drop for LexicalPublishInjectedRenameFailureGuard {
 }
 
 #[cfg(test)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[allow(dead_code)]
 fn inject_lexical_publish_rename_failure_once(
     site: LexicalPublishRenameSite,
     raw_os_error: i32,
@@ -19252,7 +18958,6 @@ fn ingest_batch_detailed(
         canonical_mutations: CanonicalMutationCounts {
             inserted_conversations: batch_outcome.inserted_conversations,
             inserted_messages: batch_outcome.inserted_messages,
-            lexical_deferred_conversations: 0,
         },
         quarantined_conversations: 0,
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
@@ -19439,55 +19144,6 @@ fn ingest_batch_with_semantic_delta(
     defer_checkpoints: bool,
     semantic_delta: Option<&mut WatchSemanticDelta>,
 ) -> Result<persist::PersistBatchOutcome> {
-    ingest_batch_with_semantic_delta_inner(
-        storage,
-        t_index,
-        data_dir,
-        convs,
-        progress,
-        lexical_strategy,
-        defer_checkpoints,
-        semantic_delta,
-        false,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ingest_batch_with_semantic_delta_deferred_lexical(
-    storage: &FrankenStorage,
-    t_index: Option<&mut TantivyIndex>,
-    data_dir: &Path,
-    convs: &[NormalizedConversation],
-    progress: &Option<Arc<IndexingProgress>>,
-    lexical_strategy: LexicalPopulationStrategy,
-    defer_checkpoints: bool,
-    semantic_delta: Option<&mut WatchSemanticDelta>,
-) -> Result<persist::PersistBatchOutcome> {
-    ingest_batch_with_semantic_delta_inner(
-        storage,
-        t_index,
-        data_dir,
-        convs,
-        progress,
-        lexical_strategy,
-        defer_checkpoints,
-        semantic_delta,
-        true,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ingest_batch_with_semantic_delta_inner(
-    storage: &FrankenStorage,
-    t_index: Option<&mut TantivyIndex>,
-    data_dir: &Path,
-    convs: &[NormalizedConversation],
-    progress: &Option<Arc<IndexingProgress>>,
-    lexical_strategy: LexicalPopulationStrategy,
-    defer_checkpoints: bool,
-    semantic_delta: Option<&mut WatchSemanticDelta>,
-    force_defer_lexical_updates: bool,
-) -> Result<persist::PersistBatchOutcome> {
     let trace_span = robot_trace_ingest_start(
         "ingest_batch_with_semantic_delta",
         convs,
@@ -19495,24 +19151,22 @@ fn ingest_batch_with_semantic_delta_inner(
         defer_checkpoints,
     );
     let batch_result = if semantic_delta.is_some() {
-        persist::persist_conversations_batched_with_semantic_delta_and_raw_mirror_links_inner(
+        persist::persist_conversations_batched_with_semantic_delta_and_raw_mirror_links(
             storage,
             t_index,
             data_dir,
             convs,
             lexical_strategy,
             defer_checkpoints,
-            force_defer_lexical_updates,
         )
     } else {
-        persist::persist_conversations_batched_with_raw_mirror_links_inner(
+        persist::persist_conversations_batched_with_raw_mirror_links(
             storage,
             t_index,
             data_dir,
             convs,
             lexical_strategy,
             defer_checkpoints,
-            force_defer_lexical_updates,
         )
     };
     let batch_outcome = match batch_result {
@@ -19549,7 +19203,6 @@ struct WatchIngestBatchOutcome {
     batch_outcome: persist::PersistBatchOutcome,
     processed_conversations: usize,
     quarantined_conversations: usize,
-    lexical_deferred_conversations: usize,
     max_payload_watermark_ms: Option<i64>,
 }
 
@@ -19562,9 +19215,6 @@ impl WatchIngestBatchOutcome {
         self.quarantined_conversations = self
             .quarantined_conversations
             .saturating_add(other.quarantined_conversations);
-        self.lexical_deferred_conversations = self
-            .lexical_deferred_conversations
-            .saturating_add(other.lexical_deferred_conversations);
         if let Some(ts) = other.max_payload_watermark_ms {
             self.max_payload_watermark_ms = Some(
                 self.max_payload_watermark_ms
@@ -19583,88 +19233,8 @@ fn ingest_watch_batch_with_oom_split(
     progress: &Option<Arc<IndexingProgress>>,
     defer_checkpoints: bool,
     capture_semantic_delta: bool,
-    preemptively_defer_lexical_updates: bool,
 ) -> Result<WatchIngestBatchOutcome> {
     debug_assert!(!convs.is_empty());
-
-    if preemptively_defer_lexical_updates {
-        let deferred_result = {
-            let mut semantic_delta = WatchSemanticDelta::default();
-            ingest_batch_with_semantic_delta_deferred_lexical(
-                storage,
-                Some(t_index),
-                data_dir,
-                convs,
-                progress,
-                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
-                defer_checkpoints,
-                capture_semantic_delta.then_some(&mut semantic_delta),
-            )
-        };
-        return match deferred_result {
-            Ok(batch_outcome) => Ok(WatchIngestBatchOutcome {
-                batch_outcome,
-                processed_conversations: convs.len(),
-                quarantined_conversations: 0,
-                lexical_deferred_conversations: convs.len(),
-                max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
-            }),
-            Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
-                let split_at = convs.len() / 2;
-                tracing::warn!(
-                    conversations = convs.len(),
-                    left = split_at,
-                    right = convs.len().saturating_sub(split_at),
-                    error = %error,
-                    "watch ingest deferred-lexical batch ran out of memory; retrying as smaller batches"
-                );
-                let mut merged = ingest_watch_batch_with_oom_split(
-                    storage,
-                    t_index,
-                    data_dir,
-                    &convs[..split_at],
-                    progress,
-                    defer_checkpoints,
-                    capture_semantic_delta,
-                    true,
-                )?;
-                let right = ingest_watch_batch_with_oom_split(
-                    storage,
-                    t_index,
-                    data_dir,
-                    &convs[split_at..],
-                    progress,
-                    defer_checkpoints,
-                    capture_semantic_delta,
-                    true,
-                )?;
-                merged.merge(right);
-                Ok(merged)
-            }
-            Err(error) if error_is_out_of_memory(&error) => {
-                let conv = &convs[0];
-                record_watch_poison_conversation(data_dir, conv, &error)?;
-                if let Some(progress) = progress {
-                    progress.current.fetch_add(1, Ordering::Relaxed);
-                }
-                tracing::warn!(
-                    agent = %conv.agent_slug,
-                    external_id = conv.external_id.as_deref().unwrap_or(""),
-                    source_path = %conv.source_path.display(),
-                    error = %error,
-                    "single watch conversation ran out of memory even with lexical updates preemptively deferred; quarantined and advancing watch progress"
-                );
-                Ok(WatchIngestBatchOutcome {
-                    batch_outcome: persist::PersistBatchOutcome::default(),
-                    processed_conversations: 1,
-                    quarantined_conversations: 1,
-                    lexical_deferred_conversations: 0,
-                    max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
-                })
-            }
-            Err(error) => Err(error),
-        };
-    }
 
     let batch_result = if should_inject_watch_ingest_test_oom(convs) {
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
@@ -19690,7 +19260,6 @@ fn ingest_watch_batch_with_oom_split(
             batch_outcome,
             processed_conversations: convs.len(),
             quarantined_conversations: 0,
-            lexical_deferred_conversations: 0,
             max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
         }),
         Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
@@ -19710,7 +19279,6 @@ fn ingest_watch_batch_with_oom_split(
                 progress,
                 defer_checkpoints,
                 capture_semantic_delta,
-                false,
             )?;
             let right = ingest_watch_batch_with_oom_split(
                 storage,
@@ -19720,55 +19288,12 @@ fn ingest_watch_batch_with_oom_split(
                 progress,
                 defer_checkpoints,
                 capture_semantic_delta,
-                false,
             )?;
             merged.merge(right);
             Ok(merged)
         }
         Err(error) if error_is_out_of_memory(&error) => {
             let conv = &convs[0];
-            let retry_result = {
-                let mut semantic_delta = WatchSemanticDelta::default();
-                ingest_batch_with_semantic_delta_deferred_lexical(
-                    storage,
-                    Some(t_index),
-                    data_dir,
-                    convs,
-                    progress,
-                    LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
-                    defer_checkpoints,
-                    capture_semantic_delta.then_some(&mut semantic_delta),
-                )
-            };
-            match retry_result {
-                Ok(batch_outcome) => {
-                    tracing::warn!(
-                        agent = %conv.agent_slug,
-                        external_id = conv.external_id.as_deref().unwrap_or(""),
-                        source_path = %conv.source_path.display(),
-                        error = %error,
-                        "single watch conversation ran out of memory during lexical maintenance; persisted canonical DB rows with lexical updates deferred"
-                    );
-                    return Ok(WatchIngestBatchOutcome {
-                        batch_outcome,
-                        processed_conversations: 1,
-                        quarantined_conversations: 0,
-                        lexical_deferred_conversations: 1,
-                        max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
-                    });
-                }
-                Err(retry_error) if error_is_out_of_memory(&retry_error) => {
-                    tracing::warn!(
-                        agent = %conv.agent_slug,
-                        external_id = conv.external_id.as_deref().unwrap_or(""),
-                        source_path = %conv.source_path.display(),
-                        original_error = %error,
-                        retry_error = %retry_error,
-                        "single watch conversation still ran out of memory with lexical updates deferred"
-                    );
-                }
-                Err(retry_error) => return Err(retry_error),
-            }
             record_watch_poison_conversation(data_dir, conv, &error)?;
             if let Some(progress) = progress {
                 progress.current.fetch_add(1, Ordering::Relaxed);
@@ -20625,61 +20150,15 @@ fn ingest_quarantine_circuit_limit() -> usize {
 }
 
 #[cfg(test)]
-fn test_oom_target_matches(convs: &[NormalizedConversation], env_key: &str) -> bool {
-    let Ok(target) = dotenvy::var(env_key) else {
-        return true;
-    };
-    let target = target.trim();
-    if target.is_empty() {
-        return true;
-    }
-
-    convs.iter().any(|conv| {
-        conv.external_id
-            .as_deref()
-            .is_some_and(|external_id| external_id.contains(target))
-            || conv.source_path.to_string_lossy().contains(target)
-    })
-}
-
-#[cfg(test)]
 fn should_inject_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool {
     dotenvy::var("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|min| {
-            min > 0
-                && convs.len() >= min
-                && test_oom_target_matches(convs, "CASS_TEST_WATCH_INGEST_OOM_TARGET")
-        })
+        .is_some_and(|min| min > 0 && convs.len() >= min)
 }
 
 #[cfg(not(test))]
 fn should_inject_watch_ingest_test_oom(_convs: &[NormalizedConversation]) -> bool {
-    false
-}
-
-#[cfg(test)]
-fn should_inject_watch_lexical_test_oom(
-    convs: &[NormalizedConversation],
-    force_defer_lexical_updates: bool,
-) -> bool {
-    !force_defer_lexical_updates
-        && dotenvy::var("CASS_TEST_WATCH_LEXICAL_OOM_MIN_CONVS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .is_some_and(|min| {
-                min > 0
-                    && convs.len() >= min
-                    && test_oom_target_matches(convs, "CASS_TEST_WATCH_LEXICAL_OOM_TARGET")
-            })
-}
-
-#[cfg(not(test))]
-fn should_inject_watch_lexical_test_oom(
-    _convs: &[NormalizedConversation],
-    _force_defer_lexical_updates: bool,
-) -> bool {
     false
 }
 
@@ -20826,69 +20305,6 @@ fn watch_ingest_chunk_size() -> usize {
         Some(value) => value,
         None => WATCH_INGEST_DEFAULT_CHUNK_SIZE,
     }
-}
-
-fn watch_preemptive_lexical_defer_db_bytes() -> Option<u64> {
-    match env_u64("CASS_WATCH_PREEMPTIVE_LEXICAL_DEFER_DB_BYTES") {
-        Some(0) => None,
-        Some(value) => Some(value),
-        None => Some(WATCH_PREEMPTIVE_LEXICAL_DEFER_DB_BYTES_DEFAULT),
-    }
-}
-
-fn should_preemptively_defer_watch_lexical_updates(db_path: &Path) -> bool {
-    let Some(threshold_bytes) = watch_preemptive_lexical_defer_db_bytes() else {
-        return false;
-    };
-    fs::metadata(db_path)
-        .map(|metadata| metadata.len() >= threshold_bytes)
-        .unwrap_or(false)
-}
-
-pub(crate) fn deferred_lexical_refresh_needed(data_dir: &Path) -> bool {
-    let marker_path = data_dir.join(DEFERRED_LEXICAL_REFRESH_MARKER);
-    match fs::read_to_string(&marker_path) {
-        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
-            .ok()
-            .and_then(|json| {
-                json.get("state")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-            .map(|state| state == "pending")
-            .unwrap_or(true),
-        Err(_) => marker_path.exists(),
-    }
-}
-
-fn mark_deferred_lexical_refresh_needed(data_dir: &Path, conversations: usize) -> Result<()> {
-    let payload = serde_json::json!({
-        "state": "pending",
-        "reason": "watch_lexical_updates_deferred",
-        "updated_at_ms": FrankenStorage::now_millis(),
-        "conversations": conversations,
-    });
-    fs::write(
-        data_dir.join(DEFERRED_LEXICAL_REFRESH_MARKER),
-        serde_json::to_vec_pretty(&payload)?,
-    )?;
-    Ok(())
-}
-
-fn mark_deferred_lexical_refresh_resolved(data_dir: &Path) -> Result<()> {
-    if !data_dir.join(DEFERRED_LEXICAL_REFRESH_MARKER).exists() {
-        return Ok(());
-    }
-    let payload = serde_json::json!({
-        "state": "resolved",
-        "reason": "authoritative_lexical_refresh_completed",
-        "updated_at_ms": FrankenStorage::now_millis(),
-    });
-    fs::write(
-        data_dir.join(DEFERRED_LEXICAL_REFRESH_MARKER),
-        serde_json::to_vec_pretty(&payload)?,
-    )?;
-    Ok(())
 }
 
 fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Result<()>>(
@@ -21180,31 +20596,14 @@ fn reindex_paths_with_semantic_delta(
             .watch_once_paths
             .as_ref()
             .is_some_and(|paths| !paths.is_empty());
-        let preemptively_defer_lexical_updates =
-            should_preemptively_defer_watch_lexical_updates(&opts.db_path);
-        let (lexical_strategy, lexical_strategy_reason) = if preemptively_defer_lexical_updates {
-            (
-                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
-                if explicit_watch_once {
-                    "watch_once_targeted_reindex_defers_inline_lexical_updates_for_large_db"
-                } else {
-                    "watch_reindex_defers_inline_lexical_updates_for_large_db"
-                },
-            )
-        } else if explicit_watch_once {
-            (
-                LexicalPopulationStrategy::IncrementalInline,
-                "watch_once_targeted_reindex_applies_inline_lexical_updates_for_changed_paths",
-            )
+        let lexical_strategy_reason = if explicit_watch_once {
+            "watch_once_targeted_reindex_applies_inline_lexical_updates_for_changed_paths"
         } else {
-            (
-                LexicalPopulationStrategy::IncrementalInline,
-                "watch_reindex_applies_inline_lexical_updates_for_changed_paths",
-            )
+            "watch_reindex_applies_inline_lexical_updates_for_changed_paths"
         };
         record_lexical_population_strategy_if_unset(
             opts.progress.as_ref(),
-            lexical_strategy,
+            LexicalPopulationStrategy::IncrementalInline,
             lexical_strategy_reason,
         );
         if explicit_watch_once && !force_full && semantic_delta.is_none() {
@@ -21353,7 +20752,6 @@ fn reindex_paths_with_semantic_delta(
         let mut inserted_messages = 0usize;
         let mut processed_conversations = 0usize;
         let mut quarantined_conversations = 0usize;
-        let mut lexical_deferred_conversations = 0usize;
         {
             let storage = storage
                 .lock()
@@ -21367,7 +20765,6 @@ fn reindex_paths_with_semantic_delta(
                 watch_ingest_chunk_size()
             };
             let capture_semantic_delta = semantic_delta.is_some();
-            let mut deferred_lexical_seen = false;
             for chunk in convs.chunks(ingest_chunk_size) {
                 if t_index_guard.is_none() {
                     tracing::info!(
@@ -21388,7 +20785,6 @@ fn reindex_paths_with_semantic_delta(
                         &opts.progress,
                         !opts.watch,
                         capture_semantic_delta,
-                        preemptively_defer_lexical_updates,
                     )?
                 };
                 inserted_messages =
@@ -21397,10 +20793,6 @@ fn reindex_paths_with_semantic_delta(
                     processed_conversations.saturating_add(chunk_outcome.processed_conversations);
                 quarantined_conversations = quarantined_conversations
                     .saturating_add(chunk_outcome.quarantined_conversations);
-                lexical_deferred_conversations = lexical_deferred_conversations
-                    .saturating_add(chunk_outcome.lexical_deferred_conversations);
-                deferred_lexical_seen =
-                    deferred_lexical_seen || chunk_outcome.lexical_deferred_conversations > 0;
                 if let Some(delta) = semantic_delta.as_deref_mut() {
                     delta.extend_from_batch(
                         chunk_outcome.batch_outcome.semantic_delta_inputs,
@@ -21425,20 +20817,19 @@ fn reindex_paths_with_semantic_delta(
                         .commit()?;
                 }
 
-                // Deferred lexical updates intentionally leave readiness stale until the
-                // authoritative catch-up refresh rebuilds derived lexical assets.
-                persist::with_ephemeral_writer(
-                    &storage,
-                    false,
-                    "updating watch last_indexed_at",
-                    |writer| {
-                        if deferred_lexical_seen {
-                            writer.set_last_indexed_at(0)
-                        } else {
-                            writer.set_last_indexed_at(FrankenStorage::now_millis())
-                        }
-                    },
-                )?;
+                // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode.
+                if lexical_update_deferred {
+                    tracing::warn!(
+                        "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
+                    );
+                } else {
+                    persist::with_ephemeral_writer(
+                        &storage,
+                        false,
+                        "updating watch last_indexed_at",
+                        |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
+                    )?;
+                }
 
                 if !explicit_watch_once
                     && !preserve_this_watch_watermark
@@ -21461,9 +20852,6 @@ fn reindex_paths_with_semantic_delta(
                 }
             }
         }
-        if lexical_deferred_conversations > 0 {
-            mark_deferred_lexical_refresh_needed(&opts.data_dir, lexical_deferred_conversations)?;
-        }
         let index_ms = index_start.elapsed().as_millis() as u64;
 
         if let Some(p) = &opts.progress
@@ -21477,12 +20865,6 @@ fn reindex_paths_with_semantic_delta(
             stats.index_ms = stats.index_ms.saturating_add(index_ms);
             stats.total_conversations = stats.total_conversations.saturating_add(conv_count);
             stats.total_messages = stats.total_messages.saturating_add(inserted_messages);
-            stats.lexical_deferred_conversations = stats
-                .lexical_deferred_conversations
-                .saturating_add(lexical_deferred_conversations);
-            stats.quarantined_conversations = stats
-                .quarantined_conversations
-                .saturating_add(quarantined_conversations);
             stats.connectors.push(ConnectorStats {
                 name: connector_name.clone(),
                 conversations: conv_count,
@@ -21504,13 +20886,6 @@ fn reindex_paths_with_semantic_delta(
                 ?kind,
                 quarantined_conversations,
                 "watch ingest skipped poison conversations after OOM bisection"
-            );
-        }
-        if lexical_deferred_conversations > 0 {
-            tracing::warn!(
-                ?kind,
-                lexical_deferred_conversations,
-                "watch ingest persisted conversations with lexical updates deferred after OOM"
             );
         }
 
@@ -23064,39 +22439,12 @@ pub mod persist {
     }
 
     #[cfg(test)]
-    fn should_inject_incremental_lexical_update_oom(packet: &ConversationPacket) -> bool {
-        if dotenvy::var("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM").is_err() {
-            return false;
-        }
-        let Ok(target) = dotenvy::var("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM_TARGET") else {
-            return true;
-        };
-        let target = target.trim();
-        if target.is_empty() {
-            return true;
-        }
-        packet
-            .payload
-            .identity
-            .external_id
-            .as_deref()
-            .is_some_and(|external_id| external_id.contains(target))
-            || packet.payload.identity.source_path.contains(target)
-            || packet
-                .payload
-                .identity
-                .title
-                .as_deref()
-                .is_some_and(|title| title.contains(target))
-            || packet
-                .payload
-                .messages
-                .iter()
-                .any(|message| message.content.contains(target))
+    fn should_inject_incremental_lexical_update_oom() -> bool {
+        dotenvy::var("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM").is_ok()
     }
 
     #[cfg(not(test))]
-    fn should_inject_incremental_lexical_update_oom(_packet: &ConversationPacket) -> bool {
+    fn should_inject_incremental_lexical_update_oom() -> bool {
         false
     }
 
@@ -23913,20 +23261,19 @@ pub mod persist {
                         let positional =
                             positional_indices_for_inserted(&packet, &outcome.inserted_indices);
                         if !positional.is_empty() {
-                            let add_result =
-                                if should_inject_incremental_lexical_update_oom(&packet) {
-                                    Err(anyhow::anyhow!("out of memory"))
-                                } else {
-                                    t_index
-                                        .as_deref_mut()
-                                        .expect("incremental inline updates require Tantivy writer")
-                                        .add_messages_from_packet(
-                                            &packet,
-                                            Some(&positional),
-                                            Some(outcome.conversation_id),
-                                            |_| Ok(()),
-                                        )
-                                };
+                            let add_result = if should_inject_incremental_lexical_update_oom() {
+                                Err(anyhow::anyhow!("out of memory"))
+                            } else {
+                                t_index
+                                    .as_deref_mut()
+                                    .expect("incremental inline updates require Tantivy writer")
+                                    .add_messages_from_packet(
+                                        &packet,
+                                        Some(&positional),
+                                        Some(outcome.conversation_id),
+                                        |_| Ok(()),
+                                    )
+                            };
                             if let Err(error) = add_result {
                                 if should_defer_incremental_lexical_update_after_error(&error) {
                                     batch_outcome.record_deferred_lexical_update(&error);
@@ -24225,7 +23572,6 @@ pub mod persist {
             defer_checkpoints,
             false,
             None,
-            false,
         )
     }
 
@@ -24237,26 +23583,6 @@ pub mod persist {
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
     ) -> Result<PersistBatchOutcome> {
-        persist_conversations_batched_with_raw_mirror_links_inner(
-            storage,
-            t_index,
-            data_dir,
-            convs,
-            lexical_strategy,
-            defer_checkpoints,
-            false,
-        )
-    }
-
-    pub(super) fn persist_conversations_batched_with_raw_mirror_links_inner(
-        storage: &FrankenStorage,
-        t_index: Option<&mut TantivyIndex>,
-        data_dir: &Path,
-        convs: &[NormalizedConversation],
-        lexical_strategy: LexicalPopulationStrategy,
-        defer_checkpoints: bool,
-        force_defer_lexical_updates: bool,
-    ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
             t_index,
@@ -24265,18 +23591,16 @@ pub mod persist {
             defer_checkpoints,
             false,
             Some(data_dir),
-            force_defer_lexical_updates,
         )
     }
 
-    pub(super) fn persist_conversations_batched_with_semantic_delta_and_raw_mirror_links_inner(
+    pub(super) fn persist_conversations_batched_with_semantic_delta_and_raw_mirror_links(
         storage: &FrankenStorage,
         t_index: Option<&mut TantivyIndex>,
         data_dir: &Path,
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
-        force_defer_lexical_updates: bool,
     ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
@@ -24286,11 +23610,9 @@ pub mod persist {
             defer_checkpoints,
             true,
             Some(data_dir),
-            force_defer_lexical_updates,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn persist_conversations_batched_inner(
         storage: &FrankenStorage,
         mut t_index: Option<&mut TantivyIndex>,
@@ -24299,13 +23621,11 @@ pub mod persist {
         defer_checkpoints: bool,
         capture_semantic_delta: bool,
         raw_mirror_data_dir: Option<&Path>,
-        force_defer_lexical_updates: bool,
     ) -> Result<PersistBatchOutcome> {
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
         }
-        if !force_defer_lexical_updates
-            && lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
+        if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
             && t_index.is_none()
         {
             anyhow::bail!(
@@ -24313,15 +23633,8 @@ pub mod persist {
                 lexical_strategy.as_str()
             );
         }
-        if super::should_inject_watch_ingest_test_oom(convs) {
-            anyhow::bail!("out of memory");
-        }
-        if super::should_inject_watch_lexical_test_oom(convs, force_defer_lexical_updates) {
-            anyhow::bail!("out of memory");
-        }
 
-        let begin_concurrent_enabled =
-            begin_concurrent_writes_enabled() && !force_defer_lexical_updates;
+        let begin_concurrent_enabled = begin_concurrent_writes_enabled();
         let duplicate_keys_present =
             begin_concurrent_enabled && duplicate_conversation_keys_present(convs);
 
@@ -24428,19 +23741,13 @@ pub mod persist {
                 for start in (0..refs.len()).step_by(chunk_size) {
                     let end = (start + chunk_size).min(refs.len());
                     let chunk_refs = &refs[start..end];
-                    if force_defer_lexical_updates {
-                        outcomes.extend(
-                            writer.insert_conversations_batched_deferred_lexical(chunk_refs)?,
-                        );
-                    } else {
-                        outcomes.extend(writer.insert_conversations_batched(chunk_refs)?);
-                    }
+                    outcomes.extend(writer.insert_conversations_batched(chunk_refs)?);
                 }
 
                 Ok(outcomes)
             },
         )?;
-        let defer_lexical_updates = force_defer_lexical_updates || defer_lexical_updates_enabled();
+        let defer_lexical_updates = defer_lexical_updates_enabled();
         let mut batch_outcome = PersistBatchOutcome::default();
         record_persisted_raw_mirror_db_links(raw_mirror_data_dir, convs, &outcomes);
         if !defer_lexical_updates {
@@ -24475,22 +23782,19 @@ pub mod persist {
                             let positional =
                                 positional_indices_for_inserted(&packet, &outcome.inserted_indices);
                             if !positional.is_empty() {
-                                let add_result =
-                                    if should_inject_incremental_lexical_update_oom(&packet) {
-                                        Err(anyhow::anyhow!("out of memory"))
-                                    } else {
-                                        t_index
-                                            .as_deref_mut()
-                                            .expect(
-                                                "incremental inline updates require Tantivy writer",
-                                            )
-                                            .add_messages_from_packet(
-                                                &packet,
-                                                Some(&positional),
-                                                Some(outcome.conversation_id),
-                                                |_| Ok(()),
-                                            )
-                                    };
+                                let add_result = if should_inject_incremental_lexical_update_oom() {
+                                    Err(anyhow::anyhow!("out of memory"))
+                                } else {
+                                    t_index
+                                        .as_deref_mut()
+                                        .expect("incremental inline updates require Tantivy writer")
+                                        .add_messages_from_packet(
+                                            &packet,
+                                            Some(&positional),
+                                            Some(outcome.conversation_id),
+                                            |_| Ok(()),
+                                        )
+                                };
                                 if let Err(error) = add_result {
                                     if should_defer_incremental_lexical_update_after_error(&error) {
                                         batch_outcome.record_deferred_lexical_update(&error);
@@ -24677,62 +23981,6 @@ pub mod persist {
         fn defer_lexical_updates_flag_parsing() {
             let _guard = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
             assert!(defer_lexical_updates_enabled());
-        }
-
-        #[test]
-        #[serial]
-        fn force_deferred_lexical_persist_skips_post_write_tantivy_update() {
-            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
-            let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("force-deferred-lexical.db");
-            let storage = create_franken_db(&db_path);
-            let convs = vec![NormalizedConversation {
-                agent_slug: "codex".into(),
-                external_id: Some("force-deferred-1".into()),
-                title: Some("Force deferred lexical".into()),
-                workspace: Some(std::path::PathBuf::from("/tmp/force-deferred")),
-                source_path: std::path::PathBuf::from("/tmp/force-deferred/session.jsonl"),
-                started_at: Some(1_779_031_082_000),
-                ended_at: Some(1_779_031_083_000),
-                metadata: serde_json::json!({}),
-                messages: vec![NormalizedMessage {
-                    idx: 0,
-                    role: "user".into(),
-                    author: Some("tester".into()),
-                    created_at: Some(1_779_031_082_100),
-                    content: "force deferred lexical should not touch tantivy".into(),
-                    extra: serde_json::json!({}),
-                    snippets: Vec::new(),
-                    invocations: Vec::new(),
-                }],
-            }];
-
-            let outcome = persist_conversations_batched_inner(
-                &storage,
-                None,
-                &convs,
-                LexicalPopulationStrategy::IncrementalInline,
-                false,
-                false,
-                None,
-                true,
-            )
-            .expect("forced lexical deferral should persist without a Tantivy writer");
-
-            assert_eq!(outcome.inserted_conversations, 1);
-            assert_eq!(outcome.inserted_messages, 1);
-            let conversation_count: i64 = storage
-                .raw()
-                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
-                    row.get_typed(0)
-                })
-                .unwrap();
-            let message_count: i64 = storage
-                .raw()
-                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
-                .unwrap();
-            assert_eq!(conversation_count, 1);
-            assert_eq!(message_count, 1);
         }
 
         #[test]
@@ -25397,7 +24645,6 @@ pub mod persist {
                 targeted_watch_once_only: false,
                 salvage_messages_imported: 0,
                 canonical_messages: 0,
-                completed_checkpoint_indexed_docs: None,
                 tantivy_requires_rebuild: true,
                 observed_tantivy_docs: None,
                 published_index_validated_for_current_data: false,
@@ -25458,7 +24705,6 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
-                        completed_checkpoint_indexed_docs: None,
                         tantivy_requires_rebuild: true,
                         observed_tantivy_docs: None,
                         published_index_validated_for_current_data: false,
@@ -25483,7 +24729,6 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
-                        completed_checkpoint_indexed_docs: None,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(3),
                         published_index_validated_for_current_data: false,
@@ -25551,122 +24796,12 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
-                        completed_checkpoint_indexed_docs: Some(3),
-                        tantivy_requires_rebuild: false,
-                        observed_tantivy_docs: Some(3),
-                    },
-                ),
-                None
-            );
-        }
-
-        #[test]
-        fn incremental_canonical_lexical_repair_plan_still_repairs_when_checkpoint_docs_differ() {
-            assert_eq!(
-                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
-                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
-                        full_refresh: false,
-                        force_rebuild: false,
-                        resume_lexical_rebuild: false,
-                        targeted_watch_once_only: false,
-                        salvage_messages_imported: 0,
-                        canonical_messages: 42,
-                        completed_checkpoint_indexed_docs: Some(4),
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(42),
                         published_index_validated_for_current_data: false,
                     },
                 ),
                 None
-            );
-            assert_eq!(
-                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
-                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
-                        full_refresh: false,
-                        force_rebuild: false,
-                        resume_lexical_rebuild: false,
-                        targeted_watch_once_only: false,
-                        salvage_messages_imported: 0,
-                        canonical_messages: 42,
-                        completed_checkpoint_indexed_docs: Some(4),
-                        tantivy_requires_rebuild: false,
-                        observed_tantivy_docs: Some(3),
-                    },
-                ),
-                Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
-                    canonical_messages: 42,
-                    observed_tantivy_docs: Some(3),
-                    reason: "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan",
-                })
-            );
-        }
-
-        #[test]
-        fn deferred_lexical_refresh_finalization_skips_scan_only_for_matching_completed_checkpoint()
-        {
-            let checkpoint = crate::indexer::MatchingLexicalRebuildStateStatus {
-                has_pending_resume: false,
-                has_completed_checkpoint: true,
-                completed_indexed_docs: Some(3),
-                completed_exact_totals: Some((2, 3)),
-                completed_storage_fingerprint: Some("content-v1:2:2:5".to_string()),
-            };
-            let base = crate::indexer::DeferredLexicalRefreshFinalizationContext {
-                full_refresh: false,
-                force_rebuild: false,
-                watch_enabled: false,
-                has_watch_once_paths: false,
-                semantic: false,
-                build_hnsw: false,
-                deferred_refresh_needed: true,
-                historical_salvage_conversations_imported: 0,
-                salvage_messages_imported: 0,
-                tantivy_requires_rebuild: false,
-                incremental_canonical_repair_planned: false,
-                initial_checkpoint_status: &checkpoint,
-                observed_tantivy_docs: Some(3),
-            };
-
-            assert!(crate::indexer::should_finalize_deferred_lexical_refresh_without_scan(base));
-            assert!(
-                !crate::indexer::should_finalize_deferred_lexical_refresh_without_scan(
-                    crate::indexer::DeferredLexicalRefreshFinalizationContext {
-                        observed_tantivy_docs: Some(2),
-                        ..base
-                    }
-                )
-            );
-            assert!(
-                !crate::indexer::should_finalize_deferred_lexical_refresh_without_scan(
-                    crate::indexer::DeferredLexicalRefreshFinalizationContext {
-                        historical_salvage_conversations_imported: 1,
-                        ..base
-                    }
-                )
-            );
-            assert!(
-                !crate::indexer::should_finalize_deferred_lexical_refresh_without_scan(
-                    crate::indexer::DeferredLexicalRefreshFinalizationContext {
-                        salvage_messages_imported: 1,
-                        ..base
-                    }
-                )
-            );
-            assert!(
-                !crate::indexer::should_finalize_deferred_lexical_refresh_without_scan(
-                    crate::indexer::DeferredLexicalRefreshFinalizationContext {
-                        tantivy_requires_rebuild: true,
-                        ..base
-                    }
-                )
-            );
-            assert!(
-                !crate::indexer::should_finalize_deferred_lexical_refresh_without_scan(
-                    crate::indexer::DeferredLexicalRefreshFinalizationContext {
-                        incremental_canonical_repair_planned: true,
-                        ..base
-                    }
-                )
             );
         }
 
@@ -34953,7 +34088,6 @@ mod tests {
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 2,
-                lexical_deferred_conversations: 0,
             }
         );
         assert_eq!(conversation_count, 1);
@@ -35516,7 +34650,6 @@ mod tests {
             CanonicalMutationCounts {
                 inserted_conversations: expected_conversations as usize,
                 inserted_messages: expected_messages as usize,
-                lexical_deferred_conversations: 0,
             }
         );
         assert_eq!(
@@ -36214,7 +35347,6 @@ mod tests {
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 2,
-                lexical_deferred_conversations: 0,
             }
         );
         assert_eq!(conversation_count, 1);
@@ -41809,7 +40941,6 @@ mod tests {
         let prev = dotenvy::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
         let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "2");
-        let _oom_target_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_TARGET", "thread-oom-");
         let _chunk_guard = set_env("CASS_WATCH_INGEST_CHUNK_SIZE", "4");
         // Disable the mtime fallback for this test — we just wrote the source
         // files, so they would all trip the active-source filter and never be
@@ -41989,12 +41120,7 @@ mod tests {
         std::fs::create_dir_all(&xdg).unwrap();
         let prev = dotenvy::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
-        let _lexical_oom_guard = set_env("CASS_TEST_WATCH_LEXICAL_OOM_MIN_CONVS", "1");
-        let _lexical_oom_target_guard = set_env(
-            "CASS_TEST_WATCH_LEXICAL_OOM_TARGET",
-            "thread-watch-once-lexical-oom",
-        );
-        let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+        let _lexical_oom_guard = set_env("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM", "1");
 
         let data_dir = xdg.join("amp");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -42042,7 +41168,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(indexed, 1);
-        let (conversation_rows, message_rows, last_indexed_at): (i64, i64, Option<i64>) = {
+        let (conversation_rows, message_rows): (i64, i64) = {
             let storage = storage.lock().unwrap();
             let conversations = storage
                 .raw()
@@ -42060,132 +41186,26 @@ mod tests {
                     |row| row.get_typed(0),
                 )
                 .unwrap();
-            (
-                conversations,
-                messages,
-                storage.get_last_indexed_at().unwrap(),
-            )
+            (conversations, messages)
         };
         assert_eq!(conversation_rows, 1);
         assert_eq!(message_rows, 1);
-        assert_eq!(
-            last_indexed_at,
-            Some(0),
-            "deferred lexical updates must leave readiness stale until an authoritative lexical refresh runs"
-        );
         assert!(
             !data_dir
                 .join("quarantine/watch_ingest_poison.jsonl")
                 .exists(),
             "lexical update OOM must not quarantine a source conversation that persisted to SQLite"
         );
-        assert!(deferred_lexical_refresh_needed(&data_dir));
+        assert!(
+            t_index.lock().unwrap().is_none(),
+            "dirty Tantivy writer should be dropped after deferred lexical update"
+        );
 
         if let Some(prev) = prev {
             unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
         } else {
             unsafe { std::env::remove_var("XDG_DATA_HOME") };
         }
-    }
-
-    #[test]
-    #[serial]
-    fn watch_once_large_db_preemptively_defers_lexical_before_oom() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("watch_once_preemptive_lexical_defer");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let amp_dir = data_dir.join("amp");
-        std::fs::create_dir_all(&amp_dir).unwrap();
-        let session_path = amp_dir.join("thread-preemptive-lexical-defer.json");
-        std::fs::write(
-            &session_path,
-            r#"{"id":"thread-preemptive-lexical-defer","messages":[{"role":"user","text":"preemptive lexical defer proof","createdAt":1779031504767}]}"#,
-        )
-        .unwrap();
-        let _oom_guard = set_env("CASS_TEST_WATCH_LEXICAL_OOM_MIN_CONVS", "1");
-        let _oom_target_guard = set_env(
-            "CASS_TEST_WATCH_LEXICAL_OOM_TARGET",
-            "thread-preemptive-lexical-defer",
-        );
-        let _threshold_guard = set_env("CASS_WATCH_PREEMPTIVE_LEXICAL_DEFER_DB_BYTES", "1");
-        let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
-
-        let progress = Arc::new(super::IndexingProgress::default());
-        let opts = super::IndexOptions {
-            full: false,
-            watch: false,
-            force_rebuild: false,
-            db_path: data_dir.join("agent_search.db"),
-            data_dir: data_dir.clone(),
-            semantic: false,
-            build_hnsw: false,
-            embedder: "fastembed".to_string(),
-            progress: Some(progress.clone()),
-            watch_once_paths: Some(vec![session_path.clone()]),
-            watch_interval_secs: 30,
-        };
-
-        let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
-        let state = std::sync::Mutex::new(std::collections::HashMap::new());
-        let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
-        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
-
-        let indexed = reindex_paths(
-            &opts,
-            vec![session_path],
-            &roots,
-            &state,
-            &storage,
-            &t_index,
-            &index_path,
-            false,
-        )
-        .unwrap();
-
-        assert_eq!(indexed, 1);
-        assert_eq!(progress.current.load(Ordering::Relaxed), 1);
-        let storage_guard = storage.lock().unwrap();
-        let conversation_rows: i64 = storage_guard
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM conversations",
-                &[] as &[ParamValue],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        let message_rows: i64 = storage_guard
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM messages",
-                &[] as &[ParamValue],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(conversation_rows, 1);
-        assert_eq!(message_rows, 1);
-        assert!(
-            !data_dir
-                .join("quarantine/watch_ingest_poison.jsonl")
-                .exists(),
-            "large DB preemptive lexical deferral should avoid poisoning before an inline lexical OOM"
-        );
-        let stats = progress.stats.lock().unwrap();
-        assert_eq!(
-            stats.lexical_strategy_reason.as_deref(),
-            Some("watch_once_targeted_reindex_defers_inline_lexical_updates_for_large_db")
-        );
-        assert_eq!(stats.lexical_deferred_conversations, 1);
-        assert_eq!(stats.quarantined_conversations, 0);
-        assert_eq!(stats.total_messages, 1);
-        assert!(deferred_lexical_refresh_needed(&data_dir));
-        assert_eq!(
-            storage_guard.get_last_indexed_at().unwrap(),
-            Some(0),
-            "preemptive lexical deferral must not report the lexical index as freshly updated"
-        );
     }
 
     #[test]
@@ -45420,7 +44440,6 @@ mod tests {
         let changed = CanonicalMutationCounts {
             inserted_conversations: 0,
             inserted_messages: 1,
-            lexical_deferred_conversations: 0,
         };
 
         assert!(should_skip_noop_final_lexical_checkpoint_refresh(
@@ -45501,76 +44520,6 @@ mod tests {
             exact_counts,
             no_mutations,
         ));
-    }
-
-    #[test]
-    fn exact_completed_checkpoint_skip_does_not_survive_followup_scan() {
-        let exact_counts = Some((10, 99));
-
-        assert!(
-            should_skip_exact_completed_final_lexical_checkpoint_refresh(true, false, exact_counts,)
-        );
-        assert!(
-            !should_skip_exact_completed_final_lexical_checkpoint_refresh(true, true, exact_counts,),
-            "a scan after the authoritative rebuild may commit/GC the live index sidecars, so finalization must refresh the checkpoint"
-        );
-        assert!(
-            !should_skip_exact_completed_final_lexical_checkpoint_refresh(
-                false,
-                false,
-                exact_counts,
-            )
-        );
-        assert!(!should_skip_exact_completed_final_lexical_checkpoint_refresh(true, false, None,));
-    }
-
-    #[test]
-    fn final_checkpoint_refresh_recomputes_counts_after_canonical_mutations() {
-        let exact_counts = Some((10, 99));
-
-        assert_eq!(
-            exact_total_counts_for_final_lexical_checkpoint(
-                exact_counts,
-                None,
-                false,
-                CanonicalMutationCounts::default(),
-            ),
-            exact_counts
-        );
-        assert_eq!(
-            exact_total_counts_for_final_lexical_checkpoint(
-                exact_counts,
-                None,
-                true,
-                CanonicalMutationCounts::default(),
-            ),
-            None,
-            "follow-up scan stats are not authoritative canonical totals for checkpoint refresh"
-        );
-        assert_eq!(
-            exact_total_counts_for_final_lexical_checkpoint(
-                exact_counts,
-                Some((10703, 1055570)),
-                true,
-                CanonicalMutationCounts::default(),
-            ),
-            Some((10703, 1055570)),
-            "authoritative rebuild totals remain valid across a follow-up scan when the scan makes no canonical mutations"
-        );
-        assert_eq!(
-            exact_total_counts_for_final_lexical_checkpoint(
-                exact_counts,
-                Some((10703, 1055570)),
-                false,
-                CanonicalMutationCounts {
-                    inserted_conversations: 1,
-                    inserted_messages: 0,
-                    lexical_deferred_conversations: 0,
-                },
-            ),
-            None,
-            "progress exact counts captured before the follow-up scan are stale after new canonical rows are inserted"
-        );
     }
 
     #[test]
@@ -45671,7 +44620,6 @@ mod tests {
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 0,
-                lexical_deferred_conversations: 0,
             },
             None,
         ));
@@ -45777,7 +44725,6 @@ mod tests {
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 0,
-                lexical_deferred_conversations: 0,
             },
             Some(42),
         ));

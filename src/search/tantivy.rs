@@ -912,35 +912,6 @@ pub fn searchable_index_modified_time(index_path: &Path) -> Option<SystemTime> {
         .ok()
 }
 
-fn searchable_index_freshness_marker_path(index_path: &Path) -> PathBuf {
-    let meta_path = index_path.join("meta.json");
-    if meta_path.exists() {
-        meta_path
-    } else {
-        federated_search_manifest_path(index_path)
-    }
-}
-
-pub fn refresh_searchable_index_modified_time(index_path: &Path) -> Result<()> {
-    let marker_path = searchable_index_freshness_marker_path(index_path);
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .open(&marker_path)
-        .with_context(|| {
-            format!(
-                "opening searchable lexical freshness marker {}",
-                marker_path.display()
-            )
-        })?;
-    file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()))
-        .with_context(|| {
-            format!(
-                "refreshing searchable lexical freshness marker {}",
-                marker_path.display()
-            )
-        })
-}
-
 pub fn searchable_index_fingerprint(index_path: &Path) -> Result<Option<String>> {
     let meta_path = index_path.join("meta.json");
     match fs::read(&meta_path) {
@@ -1974,30 +1945,6 @@ mod tests {
     fn schema_hash_matches_current_hash() {
         assert!(schema_hash_matches(SCHEMA_HASH));
         assert!(!schema_hash_matches("invalid"));
-    }
-
-    #[test]
-    fn refresh_searchable_index_modified_time_touches_federated_manifest() {
-        let dir = TempDir::new().expect("temp dir");
-        let manifest_path = federated_search_manifest_path(dir.path());
-        fs::write(&manifest_path, br#"{"schema_version":1,"shards":[]}"#).expect("write manifest");
-        let old_time = SystemTime::now()
-            .checked_sub(std::time::Duration::from_secs(120))
-            .expect("old time");
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&manifest_path)
-            .expect("open manifest")
-            .set_times(std::fs::FileTimes::new().set_modified(old_time))
-            .expect("set old manifest mtime");
-
-        refresh_searchable_index_modified_time(dir.path()).expect("refresh mtime");
-
-        let refreshed = searchable_index_modified_time(dir.path()).expect("modified time");
-        assert!(
-            refreshed > old_time,
-            "refresh should update the fast-status freshness marker"
-        );
     }
 
     #[test]

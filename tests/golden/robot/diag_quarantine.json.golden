@@ -1,8 +1,8 @@
 {
   "version": "[VERSION]",
   "platform": {
-    "os": "[HOST_OS]",
-    "arch": "[HOST_ARCH]"
+    "os": "linux",
+    "arch": "x86_64"
   },
   "paths": {
     "data_dir": "[TEST_HOME]/cass-data",

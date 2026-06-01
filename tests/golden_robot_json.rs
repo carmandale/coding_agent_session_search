@@ -47,8 +47,6 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .current_dir(test_home)
         // Pin data dir so the test never touches the user's real cache.
-        .env("CASS_DATA_DIR", &test_data_dir)
-        .env("XDG_CONFIG_HOME", &test_config_dir)
         .env("XDG_DATA_HOME", test_home)
         .env("XDG_CONFIG_HOME", xdg_config_home)
         .env("HOME", test_home)
@@ -655,12 +653,6 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     out = top_level_version_re
         .replace_all(&out, r#"  "version": "[VERSION]""#)
         .to_string();
-    for (key, replacement) in [("os", "[HOST_OS]"), ("arch", "[HOST_ARCH]")] {
-        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*"[^"]*""#)).unwrap();
-        out = re
-            .replace_all(&out, format!(r#""{key}": "{replacement}""#).as_str())
-            .to_string();
-    }
 
     // 2. ISO-8601 timestamps (match with optional fractional seconds / tz).
     let ts_re =
@@ -806,50 +798,11 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         "max_inflight_bytes",
         "pipeline_max_message_bytes_in_flight",
     ] {
-        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*("?\d+"?|null)"#)).unwrap();
+        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*("?\d+"?)"#)).unwrap();
         out = re
             .replace_all(&out, format!(r#""{key}": "[LIVE_BYTES]""#).as_str())
             .to_string();
     }
-
-    // Host topology is intentionally sampled from the running machine. Linux
-    // CI and macOS developer machines legitimately report different sources
-    // and explanatory strings; the contract is that the fields exist.
-    let topology_source_re =
-        regex::Regex::new(r#""source"\s*:\s*"(linux_sysfs|fallback)""#).unwrap();
-    out = topology_source_re
-        .replace_all(&out, r#""source": "[HOST_TOPOLOGY_SOURCE]""#)
-        .to_string();
-    let topology_policy_re = regex::Regex::new(
-        r#""policy"\s*:\s*"(max\(default, locality\*2_on_large_hosts, smt_width, logical/12\) capped at \d+|current conservative default)""#,
-    )
-    .unwrap();
-    out = topology_policy_re
-        .replace_all(&out, r#""policy": "[HOST_TOPOLOGY_POLICY]""#)
-        .to_string();
-    let topology_reason_re =
-        regex::Regex::new(r#""reason"\s*:\s*"(reserve [^"]+|topology could not be derived[^"]*)""#)
-            .unwrap();
-    out = topology_reason_re
-        .replace_all(&out, r#""reason": "[HOST_TOPOLOGY_REASON]""#)
-        .to_string();
-    let topology_decision_reason_re = regex::Regex::new(
-        r#""decision_reason"\s*:\s*"(planned from [^"]+|using conservative defaults: [^"]+)""#,
-    )
-    .unwrap();
-    out = topology_decision_reason_re
-        .replace_all(&out, r#""decision_reason": "[HOST_TOPOLOGY_DECISION]""#)
-        .to_string();
-    let topology_fallback_re =
-        regex::Regex::new(r#""fallback_active"\s*:\s*(true|false)"#).unwrap();
-    out = topology_fallback_re
-        .replace_all(&out, r#""fallback_active": "[HOST_TOPOLOGY_FALLBACK]""#)
-        .to_string();
-    let topology_proof_notes_re =
-        regex::Regex::new(r#"(?s)"proof_notes"\s*:\s*\[\s*"[^"]*"(?:,\s*"[^"]*")*\s*\]"#).unwrap();
-    out = topology_proof_notes_re
-        .replace_all(&out, r#""proof_notes": ["[HOST_TOPOLOGY_PROOF]"]"#)
-        .to_string();
 
     let age_seconds_re = regex::Regex::new(r#""age_seconds"\s*:\s*(\d+|null)"#).unwrap();
     out = age_seconds_re
@@ -870,39 +823,6 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     }
 
     out
-}
-
-fn normalize_host_sampled_shape_values(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map.iter_mut() {
-                if child.is_null()
-                    && matches!(
-                        key.as_str(),
-                        "controller_loadavg_high_watermark_1m"
-                            | "controller_loadavg_low_watermark_1m"
-                    )
-                {
-                    *child = json!(0.0);
-                } else if child.is_null()
-                    && matches!(
-                        key.as_str(),
-                        "memory_total_bytes" | "memory_available_bytes"
-                    )
-                {
-                    *child = json!(0);
-                } else {
-                    normalize_host_sampled_shape_values(child);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for child in items {
-                normalize_host_sampled_shape_values(child);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Compare `actual` against the golden at `tests/golden/<name>`. Writes /
@@ -1992,7 +1912,6 @@ fn status_shape_matches_golden() {
         &["status", "--json"],
         ExpectStatus::ExitOk,
     );
-    normalize_host_sampled_shape_values(&mut status);
     // Keep the warnings array item schema pinned even when this fixture has no
     // warning instances.
     if let Some(warnings) = status

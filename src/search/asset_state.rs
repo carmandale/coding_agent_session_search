@@ -662,7 +662,7 @@ pub(crate) fn inspect_search_assets(
         db_available,
         compute_lexical_fingerprint,
     })?;
-    let current_db_fingerprint = semantic_readiness_db_fingerprint(&lexical);
+    let current_db_fingerprint = lexical.fingerprint.current_db_fingerprint.as_deref();
     let semantic = if inspect_semantic {
         inspect_semantic_assets(
             data_dir,
@@ -676,28 +676,6 @@ pub(crate) fn inspect_search_assets(
     };
 
     Ok(SearchAssetSnapshot { lexical, semantic })
-}
-
-fn semantic_readiness_db_fingerprint(lexical: &LexicalAssetState) -> Option<&str> {
-    lexical
-        .fingerprint
-        .current_db_fingerprint
-        .as_deref()
-        .or_else(|| trusted_completed_lexical_checkpoint_fingerprint(lexical))
-}
-
-fn trusted_completed_lexical_checkpoint_fingerprint(lexical: &LexicalAssetState) -> Option<&str> {
-    if lexical.fresh
-        && lexical.checkpoint.present
-        && lexical.checkpoint.completed == Some(true)
-        && lexical.checkpoint.db_matches == Some(true)
-        && lexical.checkpoint.schema_matches == Some(true)
-        && lexical.checkpoint.page_size_compatible == Some(true)
-    {
-        lexical.fingerprint.checkpoint_fingerprint.as_deref()
-    } else {
-        None
-    }
 }
 
 fn semantic_state_not_inspected(
@@ -3083,60 +3061,6 @@ mod tests {
         assert_eq!(snapshot.semantic.status, "hash_fallback");
         assert_eq!(snapshot.semantic.availability, "hash_fallback");
         assert!(snapshot.semantic.can_search);
-    }
-
-    #[test]
-    fn semantic_readiness_uses_completed_lexical_checkpoint_when_db_fingerprint_is_skipped() {
-        let lexical = LexicalAssetState {
-            status: "ready",
-            exists: true,
-            fresh: true,
-            stale: false,
-            rebuilding: false,
-            watch_active: false,
-            last_indexed_at_ms: Some(1_733_000_000_000),
-            age_seconds: Some(1),
-            stale_threshold_seconds: 60,
-            activity_at_ms: None,
-            pending_sessions: 0,
-            processed_conversations: None,
-            total_conversations: None,
-            indexed_docs: None,
-            status_reason: None,
-            fingerprint: LexicalFingerprintState {
-                current_db_fingerprint: None,
-                checkpoint_fingerprint: Some("content-v1:10:99:1000".to_string()),
-                matches_current_db_fingerprint: None,
-            },
-            checkpoint: LexicalCheckpointState {
-                present: true,
-                completed: Some(true),
-                db_matches: Some(true),
-                schema_matches: Some(true),
-                page_size_matches: Some(true),
-                page_size_compatible: Some(true),
-            },
-        };
-
-        assert_eq!(
-            semantic_readiness_db_fingerprint(&lexical),
-            Some("content-v1:10:99:1000")
-        );
-
-        let mut with_current = lexical.clone();
-        with_current.fingerprint.current_db_fingerprint = Some("current-db".to_string());
-        assert_eq!(
-            semantic_readiness_db_fingerprint(&with_current),
-            Some("current-db")
-        );
-
-        let mut stale = lexical.clone();
-        stale.fresh = false;
-        assert_eq!(semantic_readiness_db_fingerprint(&stale), None);
-
-        let mut incomplete = lexical;
-        incomplete.checkpoint.completed = Some(false);
-        assert_eq!(semantic_readiness_db_fingerprint(&incomplete), None);
     }
 
     #[test]
