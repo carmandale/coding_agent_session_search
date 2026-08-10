@@ -15131,7 +15131,9 @@ fn connector_coverage_state_json(floors: Option<&BTreeMap<String, i64>>) -> serd
 
 /// Pull the coverage floors back out of a `state` envelope produced by
 /// `state_meta_json_*`. `None` means the surface never checked.
-fn connector_coverage_floors_from_state(state: &serde_json::Value) -> Option<BTreeMap<String, i64>> {
+fn connector_coverage_floors_from_state(
+    state: &serde_json::Value,
+) -> Option<BTreeMap<String, i64>> {
     let coverage = state.get("connector_coverage")?;
     if !coverage
         .get("checked")
@@ -15175,8 +15177,10 @@ fn connector_coverage_warning(floors: &BTreeMap<String, i64>) -> Option<String> 
     let named = floors
         .iter()
         .map(|(connector, floor_ts)| {
-            let when = chrono::DateTime::from_timestamp_millis(*floor_ts)
-                .map_or_else(|| "the beginning of the archive".to_string(), |d| d.format("%Y-%m-%d %H:%M UTC").to_string());
+            let when = chrono::DateTime::from_timestamp_millis(*floor_ts).map_or_else(
+                || "the beginning of the archive".to_string(),
+                |d| d.format("%Y-%m-%d %H:%M UTC").to_string(),
+            );
             format!("{connector} (unproven from {when})")
         })
         .collect::<Vec<_>>()
@@ -64805,7 +64809,10 @@ fn run_status(
     let connector_coverage_incomplete = connector_scan_floors
         .as_ref()
         .is_some_and(|floors| !floors.is_empty());
-    if let Some(warning) = connector_scan_floors.as_ref().and_then(connector_coverage_warning) {
+    if let Some(warning) = connector_scan_floors
+        .as_ref()
+        .and_then(connector_coverage_warning)
+    {
         warnings.push(warning);
     }
 
@@ -64836,9 +64843,10 @@ fn run_status(
         "healthy"
     } else if not_initialized {
         "not_initialized"
-    } else if db_exists && !db_available {
-        "degraded"
-    } else if connector_coverage_incomplete {
+    } else if (db_exists && !db_available) || connector_coverage_incomplete {
+        // An unreadable database and an aborted connector scan are different
+        // faults with the same operator meaning: the archive is usable but is
+        // not telling the whole truth, so neither may read as healthy.
         "degraded"
     } else {
         "unhealthy"
@@ -65448,8 +65456,9 @@ fn run_health(
             "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; lexical search remains usable for non-quarantined sessions"
         ));
     }
-    if let Some(warning) =
-        connector_scan_floors.as_ref().and_then(connector_coverage_warning)
+    if let Some(warning) = connector_scan_floors
+        .as_ref()
+        .and_then(connector_coverage_warning)
     {
         warnings.push(warning);
     }
@@ -65552,9 +65561,10 @@ fn run_health(
         "healthy"
     } else if not_initialized {
         "not_initialized"
-    } else if db_degraded {
-        "degraded"
-    } else if connector_coverage_incomplete {
+    } else if db_degraded || connector_coverage_incomplete {
+        // Same reasoning as the status ladder above: a readable-but-incomplete
+        // archive is degraded, whether the cause is the database or a
+        // connector scan that aborted without reading its sessions.
         "degraded"
     } else {
         "unhealthy"

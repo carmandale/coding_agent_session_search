@@ -10667,10 +10667,7 @@ impl ConnectorScanCoverage {
     /// The `since_ts` this connector scans from, which is the run-wide value
     /// lowered to its coverage floor when one is recorded.
     fn since_ts_for(&self, connector: &str) -> Option<i64> {
-        self.since_ts_by_connector
-            .get(connector)
-            .copied()
-            .flatten()
+        self.since_ts_by_connector.get(connector).copied().flatten()
     }
 
     /// The floor to record when this connector's scan fails: the point it was
@@ -11077,7 +11074,6 @@ fn streaming_combine_max_bytes() -> usize {
 /// Processes batches as they arrive, providing early feedback and reducing
 /// peak memory usage compared to batch collection.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn run_streaming_consumer(
     rx: Receiver<IndexMessage>,
     num_producers: usize,
@@ -11360,10 +11356,7 @@ fn run_streaming_consumer(
                 // read everything from its `since_ts` forward, and that
                 // `since_ts` was already lowered to its floor by
                 // `ConnectorScanCoverage::new`. Its coverage hole is closed.
-                if is_discovered
-                    && stats.error.is_none()
-                    && coverage.has_floor(connector_name)
-                {
+                if is_discovered && stats.error.is_none() && coverage.has_floor(connector_name) {
                     clear_connector_scan_floor(
                         storage,
                         defer_streaming_checkpoints,
@@ -11602,7 +11595,10 @@ fn run_streaming_index_with_connector_factories(
                 since_ts: coverage.since_ts_for(name),
                 ..producer_config.clone()
             };
-            (name, spawn_connector_producer(name, factory, tx.clone(), config))
+            (
+                name,
+                spawn_connector_producer(name, factory, tx.clone(), config),
+            )
         })
         .collect();
 
@@ -11890,12 +11886,7 @@ fn run_batch_index_with_connector_factories(
     // durable coverage floor, and a clean one clears it.
     for (name, _, discovered, scan_failed) in &pending_batches {
         if *scan_failed {
-            record_connector_scan_floor(
-                storage,
-                false,
-                name,
-                coverage.failure_floor_for(name),
-            );
+            record_connector_scan_floor(storage, false, name, coverage.failure_floor_for(name));
         } else if *discovered && coverage.has_floor(name) {
             clear_connector_scan_floor(storage, false, name, coverage.since_ts_for(name));
         }

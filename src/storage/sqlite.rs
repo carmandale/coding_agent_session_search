@@ -7026,7 +7026,10 @@ impl FrankenStorage {
     pub fn record_connector_scan_floor(&self, connector: &str, floor_ts: i64) -> Result<()> {
         let mut floors = self.get_connector_scan_floors()?;
         let floor_ts = floor_ts.max(0);
-        if floors.get(connector).is_some_and(|existing| *existing <= floor_ts) {
+        if floors
+            .get(connector)
+            .is_some_and(|existing| *existing <= floor_ts)
+        {
             return Ok(());
         }
         floors.insert(connector.to_string(), floor_ts);
