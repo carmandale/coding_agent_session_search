@@ -16,7 +16,7 @@ use frankensqlite::{
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -41,6 +41,51 @@ use tracing::info;
 
 const DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const DOCTOR_MUTATION_LOCK_MAX_METADATA_READ: u64 = 64 * 1024;
+
+/// `meta` key holding the durable per-connector coverage floors, as a JSON
+/// object of `{"<connector>": <epoch_millis>}`.
+///
+/// `last_scan_ts` is a single value shared by every connector, and the scan
+/// loop advances it on a timer *while the scan is still running* — before any
+/// connector's failure is known. So when one connector aborts mid-scan, there
+/// is no watermark left to hold: the advance has already been committed, and
+/// rolling it back would drag every healthy connector into a full rescan.
+///
+/// A floor answers the question the watermark cannot: for this one connector,
+/// what point are we actually proven to have read past? It is written at the
+/// moment of the error from the `since_ts` that run was using, it survives
+/// restarts, and it is only cleared by a later scan of the same connector that
+/// started at or below it. While a floor exists the connector's coverage is
+/// incomplete, and `cass health` / `cass stats` say so.
+pub const CONNECTOR_SCAN_FLOORS_META_KEY: &str = "connector_scan_floors";
+
+/// Parse the stored coverage-floor JSON. A malformed or non-numeric value is
+/// treated as no floor rather than as an error: this is a coverage report, and
+/// failing the whole read would hide the connectors that *are* reporting.
+pub fn parse_connector_scan_floors(raw: &str) -> BTreeMap<String, i64> {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return BTreeMap::new();
+    };
+    map.into_iter()
+        .filter_map(|(connector, value)| Some((connector, value.as_i64()?.max(0))))
+        .collect()
+}
+
+/// The `since_ts` a connector must scan from, given the run-wide watermark and
+/// that connector's coverage floor.
+///
+/// `None` means "read everything". A floor at or below zero means the failed
+/// run had no watermark at all (it was a full scan), so nothing about that
+/// connector is proven and it must be read in full.
+#[must_use]
+pub fn connector_scan_since_ts(run_since_ts: Option<i64>, floor: Option<i64>) -> Option<i64> {
+    match (run_since_ts, floor) {
+        (None, _) => None,
+        (Some(_), Some(floor)) if floor <= 0 => None,
+        (Some(run), Some(floor)) => Some(run.min(floor)),
+        (Some(run), None) => Some(run),
+    }
+}
 
 // -------------------------------------------------------------------------
 // Lazy FrankenSQLite Connection (bd-1ueu)
@@ -6937,6 +6982,66 @@ impl FrankenStorage {
             fparams![ts.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Read the durable per-connector coverage floors.
+    ///
+    /// See [`CONNECTOR_SCAN_FLOORS_META_KEY`] for what a floor means and why
+    /// it exists alongside the global `last_scan_ts` watermark.
+    pub fn get_connector_scan_floors(&self) -> Result<BTreeMap<String, i64>> {
+        let result: Result<String, _> = self.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![CONNECTOR_SCAN_FLOORS_META_KEY],
+            |row| row.get_typed(0),
+        );
+        match result.optional() {
+            Ok(Some(raw)) => Ok(parse_connector_scan_floors(&raw)),
+            Ok(None) => Ok(BTreeMap::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn write_connector_scan_floors(&self, floors: &BTreeMap<String, i64>) -> Result<()> {
+        if floors.is_empty() {
+            self.conn.execute_compat(
+                "DELETE FROM meta WHERE key = ?1",
+                fparams![CONNECTOR_SCAN_FLOORS_META_KEY],
+            )?;
+            return Ok(());
+        }
+        let encoded = serde_json::to_string(floors)
+            .with_context(|| "serializing connector scan coverage floors")?;
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![CONNECTOR_SCAN_FLOORS_META_KEY, encoded.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Record that `connector` is only proven covered up to `floor_ts`.
+    ///
+    /// Lowering only: a connector that fails twice keeps the *earliest*
+    /// unproven point, so a second failure at a later watermark cannot
+    /// quietly shrink the hole the first one opened.
+    pub fn record_connector_scan_floor(&self, connector: &str, floor_ts: i64) -> Result<()> {
+        let mut floors = self.get_connector_scan_floors()?;
+        let floor_ts = floor_ts.max(0);
+        if floors.get(connector).is_some_and(|existing| *existing <= floor_ts) {
+            return Ok(());
+        }
+        floors.insert(connector.to_string(), floor_ts);
+        self.write_connector_scan_floors(&floors)
+    }
+
+    /// Clear `connector`'s coverage floor after a scan that actually read
+    /// from at or below it. Returns true when a floor was removed.
+    pub fn clear_connector_scan_floor(&self, connector: &str) -> Result<bool> {
+        let mut floors = self.get_connector_scan_floors()?;
+        if floors.remove(connector).is_none() {
+            return Ok(false);
+        }
+        self.write_connector_scan_floors(&floors)?;
+        Ok(true)
     }
 
     /// Get the timestamp of the last successful index completion.
@@ -23429,6 +23534,72 @@ mod tests {
 
         let actual_ts = storage.get_last_scan_ts().unwrap();
         assert_eq!(actual_ts, Some(expected_ts));
+    }
+
+    // =========================================================================
+    // Per-connector scan coverage floors
+    // (bead coding_agent_session_search-codex-coverage-gap-2bh4a)
+    // =========================================================================
+
+    #[test]
+    fn connector_scan_floors_round_trip_and_clear() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("floors.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        assert!(storage.get_connector_scan_floors().unwrap().is_empty());
+
+        storage.record_connector_scan_floor("codex", 0).unwrap();
+        let floors = storage.get_connector_scan_floors().unwrap();
+        assert_eq!(floors.get("codex"), Some(&0));
+
+        // A later, higher failure point must not shrink the recorded hole.
+        storage
+            .record_connector_scan_floor("codex", 1_700_000_000_000)
+            .unwrap();
+        assert_eq!(
+            storage.get_connector_scan_floors().unwrap().get("codex"),
+            Some(&0),
+            "the earliest unproven point wins; a second failure cannot narrow the first"
+        );
+
+        storage
+            .record_connector_scan_floor("pi_agent", 1_700_000_000_000)
+            .unwrap();
+        assert_eq!(storage.get_connector_scan_floors().unwrap().len(), 2);
+
+        assert!(storage.clear_connector_scan_floor("codex").unwrap());
+        assert!(!storage.clear_connector_scan_floor("codex").unwrap());
+        let floors = storage.get_connector_scan_floors().unwrap();
+        assert_eq!(floors.len(), 1);
+        assert_eq!(floors.get("pi_agent"), Some(&1_700_000_000_000));
+
+        assert!(storage.clear_connector_scan_floor("pi_agent").unwrap());
+        assert!(storage.get_connector_scan_floors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn connector_scan_since_ts_lowers_to_the_floor() {
+        // No floor: the run-wide watermark stands.
+        assert_eq!(connector_scan_since_ts(Some(500), None), Some(500));
+        // A floor below the watermark pulls the window back open.
+        assert_eq!(connector_scan_since_ts(Some(500), Some(100)), Some(100));
+        // A floor above it never narrows the window.
+        assert_eq!(connector_scan_since_ts(Some(500), Some(900)), Some(500));
+        // A zero floor means nothing is proven: read everything.
+        assert_eq!(connector_scan_since_ts(Some(500), Some(0)), None);
+        // An already-full scan stays full.
+        assert_eq!(connector_scan_since_ts(None, Some(100)), None);
+    }
+
+    #[test]
+    fn parse_connector_scan_floors_tolerates_junk() {
+        assert!(parse_connector_scan_floors("not json").is_empty());
+        assert!(parse_connector_scan_floors("[]").is_empty());
+        let floors = parse_connector_scan_floors(r#"{"codex": 12, "bad": "x", "neg": -5}"#);
+        assert_eq!(floors.get("codex"), Some(&12));
+        assert_eq!(floors.get("neg"), Some(&0));
+        assert!(!floors.contains_key("bad"));
     }
 
     // =========================================================================
