@@ -52,6 +52,7 @@ tests/fixtures/search_demo_data/index/v*/
 !tests/fixtures/search_demo_data/index/v1/**
 tests/fixtures/search_demo_data/index/.lexical-publish-backups/
 tests/fixtures/search_demo_data/index-run.lock
+tests/fixtures/search_demo_data/index-run.lock.meta
 tests/fixtures/search_demo_data/doctor/
 tests/fixtures/search_demo_data/tmp_home/
 

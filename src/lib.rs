@@ -15051,6 +15051,146 @@ const STATUS_COUNT_SCAN_MAX_DB_BYTES: u64 = 256 * 1024 * 1024;
 const CLI_DB_QUERY_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_DIAG_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Read the durable per-connector scan coverage floors from an open read
+/// connection.
+///
+/// A floor means a scan for that connector aborted and the archive is not
+/// proven to hold everything modified at or after that timestamp. This is the
+/// only signal that separates "the index is complete" from "the index looks
+/// complete because a failed scan let the watermark advance past what it never
+/// read" — bead `coding_agent_session_search-codex-coverage-gap-2bh4a`.
+fn read_connector_scan_floors(conn: &frankensqlite::Connection) -> BTreeMap<String, i64> {
+    use frankensqlite::compat::{ParamValue, RowExt};
+
+    franken_query_row_map_retry(
+        conn,
+        "SELECT value FROM meta WHERE key = ?1",
+        &[ParamValue::from(
+            crate::storage::sqlite::CONNECTOR_SCAN_FLOORS_META_KEY,
+        )],
+        |r| r.get_typed::<String>(0),
+    )
+    .map(|raw| crate::storage::sqlite::parse_connector_scan_floors(&raw))
+    .unwrap_or_default()
+}
+
+/// How long `cass health` will wait to open the database purely to answer the
+/// coverage question. Health is a fast surface, so it prefers reporting
+/// `checked: false` over blocking on a contended archive.
+const HEALTH_COVERAGE_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Read the coverage floors through a short bounded open, for surfaces whose
+/// state probe elided the database open entirely (`cass health`).
+fn read_connector_scan_floors_bounded(
+    db_path: &Path,
+    timeout: Duration,
+) -> Option<BTreeMap<String, i64>> {
+    let conn =
+        open_franken_cli_read_db(db_path.to_path_buf(), "connector-coverage", timeout).ok()?;
+    let floors = read_connector_scan_floors(&conn);
+    let _ = close_franken_cli_read_db(conn, db_path, "connector-coverage");
+    Some(floors)
+}
+
+/// Render the coverage floors as the `connector_coverage` block shared by
+/// `cass stats --json` and `cass status` / `cass health`.
+fn connector_coverage_json(floors: &BTreeMap<String, i64>) -> serde_json::Value {
+    serde_json::json!({
+        "checked": true,
+        "complete": floors.is_empty(),
+        "incomplete_connectors": floors.keys().cloned().collect::<Vec<_>>(),
+        "floors": floors
+            .iter()
+            .map(|(connector, floor_ts)| serde_json::json!({
+                "connector": connector,
+                "floor_ts": floor_ts,
+                "floor_iso": chrono::DateTime::from_timestamp_millis(*floor_ts)
+                    .map(|d| d.to_rfc3339()),
+                "recommended_action": connector_coverage_recommended_action(connector),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Same block, but honest about a probe that never opened the database.
+///
+/// `checked: false` is not the same claim as `complete: true`, and collapsing
+/// the two is the whole shape of this bug: an unchecked surface that reads as
+/// a clean one.
+fn connector_coverage_state_json(floors: Option<&BTreeMap<String, i64>>) -> serde_json::Value {
+    match floors {
+        Some(floors) => connector_coverage_json(floors),
+        None => serde_json::json!({
+            "checked": false,
+            "complete": serde_json::Value::Null,
+            "incomplete_connectors": Vec::<String>::new(),
+            "floors": Vec::<serde_json::Value>::new(),
+        }),
+    }
+}
+
+/// Pull the coverage floors back out of a `state` envelope produced by
+/// `state_meta_json_*`. `None` means the surface never checked.
+fn connector_coverage_floors_from_state(
+    state: &serde_json::Value,
+) -> Option<BTreeMap<String, i64>> {
+    let coverage = state.get("connector_coverage")?;
+    if !coverage
+        .get("checked")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    Some(
+        coverage
+            .get("floors")
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        Some((
+                            entry.get("connector")?.as_str()?.to_string(),
+                            entry.get("floor_ts")?.as_i64()?,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
+}
+
+fn connector_coverage_recommended_action(connector: &str) -> String {
+    format!(
+        "The {connector} scan aborted, so its coverage is incomplete. \
+         Re-read a bounded set of paths with \
+         'cass index --watch-once <path>[,<path>...]' (targeted paths ignore the \
+         mtime watermark), or 'cass index --full' to re-read everything."
+    )
+}
+
+fn connector_coverage_warning(floors: &BTreeMap<String, i64>) -> Option<String> {
+    if floors.is_empty() {
+        return None;
+    }
+    let named = floors
+        .iter()
+        .map(|(connector, floor_ts)| {
+            let when = chrono::DateTime::from_timestamp_millis(*floor_ts).map_or_else(
+                || "the beginning of the archive".to_string(),
+                |d| d.format("%Y-%m-%d %H:%M UTC").to_string(),
+            );
+            format!("{connector} (unproven from {when})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "scan coverage is incomplete for {named}; a connector scan aborted and \
+         those sessions are not searchable until they are re-read"
+    ))
+}
+
 #[derive(Debug, Default)]
 struct StateDbSnapshot {
     conversation_count: i64,
@@ -15066,6 +15206,10 @@ struct StateDbSnapshot {
     /// regular-file metadata alone in that case; callers needing the actual
     /// open-success signal use `cass diag` / `cass doctor`.
     open_skipped: bool,
+    /// Per-connector scan coverage floors, or `None` when this probe never
+    /// opened the database and so did not check. `Some(empty)` means checked
+    /// and complete; the two are not interchangeable.
+    connector_scan_floors: Option<BTreeMap<String, i64>>,
 }
 
 fn probe_state_db(
@@ -15121,6 +15265,7 @@ fn probe_state_db(
     )
     .ok()
     .and_then(|s| s.parse::<i64>().ok());
+    snapshot.connector_scan_floors = Some(read_connector_scan_floors(&conn));
     if include_counts {
         snapshot.conversation_count = franken_query_row_map_retry(
             &conn,
@@ -15715,6 +15860,7 @@ fn state_meta_json_inner(
     let db_open_retryable = db_snapshot.open_retryable;
     let counts_skipped = db_snapshot.counts_skipped;
     let open_skipped = db_snapshot.open_skipped;
+    let connector_scan_floors = db_snapshot.connector_scan_floors;
 
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
     let lexical_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
@@ -16051,6 +16197,7 @@ fn state_meta_json_inner(
             "counts_skipped": counts_skipped,
             "open_skipped": open_skipped
         },
+        "connector_coverage": connector_coverage_state_json(connector_scan_floors.as_ref()),
         "pending": {
             "sessions": lexical.pending_sessions,
             "watch_active": lexical.watch_active,
@@ -23579,6 +23726,10 @@ fn run_stats(
         })
         .unwrap_or((None, None));
     let raw_mirror_summary = crate::raw_mirror::storage_summary(&data_dir);
+    // A count is only a coverage figure if every connector finished its scan.
+    // When one aborted, these totals are what the index holds, not what the
+    // archive should hold — say so rather than letting the number stand alone.
+    let connector_scan_floors = read_connector_scan_floors(&conn);
 
     // Get per-source breakdown if requested (P3.7)
     let source_rows: Vec<(String, i64, i64)> = if by_source {
@@ -23623,6 +23774,7 @@ fn run_stats(
                 "newest": newest.and_then(|ts| chrono::DateTime::from_timestamp_millis(ts).map(|d| d.to_rfc3339())),
             },
             "raw_mirror": &raw_mirror_summary,
+            "connector_coverage": connector_coverage_json(&connector_scan_floors),
             "db_path": db_path.display().to_string(),
         });
 
@@ -23675,6 +23827,28 @@ fn run_stats(
     println!("Totals:");
     println!("  Conversations: {conversation_count}");
     println!("  Messages: {message_count}");
+    println!();
+    if connector_scan_floors.is_empty() {
+        println!("Scan Coverage: complete (no connector scan has aborted)");
+    } else {
+        println!("Scan Coverage: INCOMPLETE — these totals undercount the archive");
+        for (connector, floor_ts) in &connector_scan_floors {
+            let when = chrono::DateTime::from_timestamp_millis(*floor_ts).map_or_else(
+                || "the beginning of the archive".to_string(),
+                |d| d.format("%Y-%m-%d %H:%M UTC").to_string(),
+            );
+            println!("  {connector}: scan aborted; unproven from {when}");
+        }
+        println!(
+            "  {}",
+            connector_coverage_recommended_action(
+                connector_scan_floors
+                    .keys()
+                    .next()
+                    .map_or("that connector", String::as_str)
+            )
+        );
+    }
     println!();
     println!("Raw Mirror:");
     if raw_mirror_summary.initialized {
@@ -64631,6 +64805,17 @@ fn run_status(
         ));
     }
 
+    let connector_scan_floors = connector_coverage_floors_from_state(&state);
+    let connector_coverage_incomplete = connector_scan_floors
+        .as_ref()
+        .is_some_and(|floors| !floors.is_empty());
+    if let Some(warning) = connector_scan_floors
+        .as_ref()
+        .and_then(connector_coverage_warning)
+    {
+        warnings.push(warning);
+    }
+
     let db_available = db_opened || (db_exists && db_open_retryable);
     let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
     let not_initialized =
@@ -64641,7 +64826,8 @@ fn run_status(
         && index_fresh
         && !rebuild_active
         && !index_empty_with_messages
-        && !ingest_quarantine_critical;
+        && !ingest_quarantine_critical
+        && !connector_coverage_incomplete;
     // Stalled rebuilds are reported as a distinct status so operators
     // can tell a wedged indexer apart from a slow-but-progressing one
     // (issue #258). `stalled` implies `rebuild_active=true`, but it
@@ -64657,7 +64843,10 @@ fn run_status(
         "healthy"
     } else if not_initialized {
         "not_initialized"
-    } else if db_exists && !db_available {
+    } else if (db_exists && !db_available) || connector_coverage_incomplete {
+        // An unreadable database and an aborted connector scan are different
+        // faults with the same operator meaning: the archive is usable but is
+        // not telling the whole truth, so neither may read as healthy.
         "degraded"
     } else {
         "unhealthy"
@@ -64678,6 +64867,11 @@ fn run_status(
         Some("Run 'cass index --full' to create the database".to_string())
     } else if !db_available {
         Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database".to_string())
+    } else if connector_coverage_incomplete {
+        connector_scan_floors
+            .as_ref()
+            .and_then(|floors| floors.keys().next())
+            .map(|connector| connector_coverage_recommended_action(connector))
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
     } else if index_empty_with_messages {
@@ -64810,6 +65004,7 @@ fn run_status(
             "rebuild_progress": rebuild_progress_summary_json(&state),
             "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
             "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
+            "connector_coverage": connector_coverage_state_json(connector_scan_floors.as_ref()),
             "policy_registry": policy_registry,
             "topology_budget": topology_budget,
             "doctor_summary": doctor_summary,
@@ -65238,6 +65433,19 @@ fn run_health(
         .and_then(|q| q.get("recommended_action"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    // Health's fast path elides the database open, so the state envelope
+    // reports coverage as unchecked. Take one short bounded read to answer it:
+    // a readiness surface that cannot tell a complete index from one whose
+    // scan aborted is the failure this bead exists for.
+    let connector_scan_floors = connector_coverage_floors_from_state(&state).or_else(|| {
+        db_exists
+            .then(|| read_connector_scan_floors_bounded(&db_path, HEALTH_COVERAGE_OPEN_TIMEOUT))
+            .flatten()
+    });
+    let connector_coverage_incomplete = connector_scan_floors
+        .as_ref()
+        .is_some_and(|floors| !floors.is_empty());
+
     let mut warnings = Vec::<String>::new();
     if ingest_quarantine_critical {
         warnings.push(format!(
@@ -65247,6 +65455,12 @@ fn run_health(
         warnings.push(format!(
             "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; lexical search remains usable for non-quarantined sessions"
         ));
+    }
+    if let Some(warning) = connector_scan_floors
+        .as_ref()
+        .and_then(connector_coverage_warning)
+    {
+        warnings.push(warning);
     }
 
     let db_degraded = db_exists && !db_opened;
@@ -65259,7 +65473,8 @@ fn run_health(
         && index_fresh
         && !rebuild_active
         && !index_empty_with_messages
-        && !ingest_quarantine_critical;
+        && !ingest_quarantine_critical
+        && !connector_coverage_incomplete;
     let explanation = if not_initialized {
         Some(cass_not_initialized_explanation(&data_dir))
     } else {
@@ -65278,6 +65493,11 @@ fn run_health(
         Some(cass_not_initialized_recommended_action())
     } else if db_degraded {
         Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database.".to_string())
+    } else if connector_coverage_incomplete {
+        connector_scan_floors
+            .as_ref()
+            .and_then(|floors| floors.keys().next())
+            .map(|connector| connector_coverage_recommended_action(connector))
     } else if ingest_quarantine_critical || (healthy && quarantined_conversations > 0) {
         ingest_quarantine_recommended_action
     } else if !healthy {
@@ -65322,6 +65542,13 @@ fn run_health(
     if ingest_quarantine_critical {
         errors.push("ingest quarantine circuit breaker active".to_string());
     }
+    if connector_coverage_incomplete {
+        errors.push(
+            "connector scan coverage incomplete — a connector scan aborted and its \
+             sessions were never read"
+                .to_string(),
+        );
+    }
 
     // Determine status string for structured output.
     let status = if rebuild_stalled {
@@ -65334,7 +65561,10 @@ fn run_health(
         "healthy"
     } else if not_initialized {
         "not_initialized"
-    } else if db_degraded {
+    } else if db_degraded || connector_coverage_incomplete {
+        // Same reasoning as the status ladder above: a readable-but-incomplete
+        // archive is degraded, whether the cause is the database or a
+        // connector scan that aborted without reading its sessions.
         "degraded"
     } else {
         "unhealthy"
@@ -65418,6 +65648,7 @@ fn run_health(
             "recommended_commands": recommended_commands,
             "errors": errors,
             "latency_ms": latency_ms,
+            "connector_coverage": connector_coverage_state_json(connector_scan_floors.as_ref()),
             "rebuild_progress": rebuild_progress_summary_json(&state),
             "db": {
                 "exists": db_exists,
@@ -65484,6 +65715,20 @@ fn run_health(
             println!(
                 "Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database."
             );
+        }
+    } else if connector_coverage_incomplete {
+        println!("⚠ Degraded ({latency_ms}ms) - connector scan coverage is incomplete");
+        if let Some(floors) = &connector_scan_floors {
+            for (connector, floor_ts) in floors {
+                let when = chrono::DateTime::from_timestamp_millis(*floor_ts).map_or_else(
+                    || "the beginning of the archive".to_string(),
+                    |d| d.format("%Y-%m-%d %H:%M UTC").to_string(),
+                );
+                println!("  - {connector}: unproven from {when}");
+            }
+        }
+        if let Some(action) = &recommended_action {
+            println!("{action}");
         }
     } else {
         println!("✗ Unhealthy ({latency_ms}ms)");

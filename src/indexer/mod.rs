@@ -74,7 +74,7 @@ use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{
     DailyStatsRebuildResult, FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,
     LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, StatsAggregator, StatsDelta,
-    seed_canonical_from_best_historical_bundle,
+    connector_scan_since_ts, seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
     EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage,
@@ -10623,6 +10623,163 @@ struct StreamingProducerConfig {
     active_source_filter: Arc<ActiveSessionSourceFilter>,
 }
 
+/// Per-connector scan coverage for one index run.
+///
+/// The run-wide `since_ts` comes from the single global `last_scan_ts`
+/// watermark. When a connector aborts mid-scan the run keeps going and the
+/// watermark still advances — correctly, for every connector that finished.
+/// This type is what stops the failed one from being swept along with them:
+/// it lowers that connector's `since_ts` back to its recorded coverage floor
+/// on the next run, and records a new floor when a scan fails.
+///
+/// Bead `coding_agent_session_search-codex-coverage-gap-2bh4a`: on 2026-06-01
+/// the codex scan died partway through 2026/02/12, the run advanced the
+/// watermark past everything it never read, and every later incremental run
+/// filtered those 3,186 files out by mtime. Nothing in the archive recorded
+/// that the scan had failed.
+#[derive(Debug, Clone, Default)]
+struct ConnectorScanCoverage {
+    /// Floors read from the archive before this run started.
+    floors: BTreeMap<String, i64>,
+    /// The `since_ts` each connector is actually scanning from this run.
+    since_ts_by_connector: BTreeMap<&'static str, Option<i64>>,
+}
+
+impl ConnectorScanCoverage {
+    fn new(
+        run_since_ts: Option<i64>,
+        floors: BTreeMap<String, i64>,
+        connector_names: impl IntoIterator<Item = &'static str>,
+    ) -> Self {
+        let since_ts_by_connector = connector_names
+            .into_iter()
+            .map(|name| {
+                let since = connector_scan_since_ts(run_since_ts, floors.get(name).copied());
+                (name, since)
+            })
+            .collect();
+        Self {
+            floors,
+            since_ts_by_connector,
+        }
+    }
+
+    /// The `since_ts` this connector scans from, which is the run-wide value
+    /// lowered to its coverage floor when one is recorded.
+    fn since_ts_for(&self, connector: &str) -> Option<i64> {
+        self.since_ts_by_connector.get(connector).copied().flatten()
+    }
+
+    /// The floor to record when this connector's scan fails: the point it was
+    /// proven to have read past *before* this run, which is exactly the
+    /// `since_ts` it was scanning from. Zero means the failed run had no
+    /// watermark at all, so nothing about this connector is proven.
+    fn failure_floor_for(&self, connector: &str) -> i64 {
+        self.since_ts_for(connector).unwrap_or(0).max(0)
+    }
+
+    fn has_floor(&self, connector: &str) -> bool {
+        self.floors.contains_key(connector)
+    }
+}
+
+/// Read the coverage floors from the durable database rather than through the
+/// caller's long-lived handle.
+///
+/// The floors are written through short-lived ephemeral writers, and a
+/// long-lived read handle can hold an MVCC snapshot taken before that write —
+/// measured: a floor committed during a scan is invisible to the handle that
+/// started the scan while a fresh open sees it immediately. Since the whole
+/// point of a floor is that it survives the process that recorded it, reading
+/// it through a fresh connection is also the semantics we actually want. Same
+/// idiom as `fresh_franken_count_retry` on the CLI side.
+fn read_connector_scan_floors_fresh(db_path: &Path) -> BTreeMap<String, i64> {
+    if !db_path.exists() {
+        return BTreeMap::new();
+    }
+    let storage = match FrankenStorage::open_readonly(db_path) {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %error,
+                "could not open the archive to read connector scan coverage floors; \
+                 previously failed connectors will not be widened this run"
+            );
+            return BTreeMap::new();
+        }
+    };
+    let floors = storage.get_connector_scan_floors().unwrap_or_else(|error| {
+        tracing::warn!(
+            error = %error,
+            "could not read connector scan coverage floors"
+        );
+        BTreeMap::new()
+    });
+    let _ = storage.close();
+    floors
+}
+
+/// Record `connector`'s coverage floor durably, so a later restart still knows
+/// its scan never finished.
+fn record_connector_scan_floor(
+    storage: &FrankenStorage,
+    defer_checkpoints: bool,
+    connector: &str,
+    floor_ts: i64,
+) {
+    match persist::with_ephemeral_writer(
+        storage,
+        defer_checkpoints,
+        "recording connector scan coverage floor",
+        |writer| writer.record_connector_scan_floor(connector, floor_ts),
+    ) {
+        Ok(()) => tracing::warn!(
+            connector,
+            floor_ts,
+            "connector_scan_coverage_floor_recorded: this connector's scan did not \
+             finish, so its coverage is incomplete at and after this timestamp until \
+             a later scan reads from it again"
+        ),
+        Err(error) => tracing::error!(
+            connector,
+            floor_ts,
+            error = %error,
+            "connector_scan_coverage_floor_save_failed: the scan failure will not \
+             survive this process; the index may report complete coverage it does \
+             not have"
+        ),
+    }
+}
+
+/// Clear `connector`'s coverage floor after a scan that actually read from at
+/// or below it.
+fn clear_connector_scan_floor(
+    storage: &FrankenStorage,
+    defer_checkpoints: bool,
+    connector: &str,
+    scanned_since_ts: Option<i64>,
+) {
+    match persist::with_ephemeral_writer(
+        storage,
+        defer_checkpoints,
+        "clearing connector scan coverage floor",
+        |writer| writer.clear_connector_scan_floor(connector),
+    ) {
+        Ok(true) => tracing::info!(
+            connector,
+            scanned_since_ts = ?scanned_since_ts,
+            "connector_scan_coverage_floor_cleared"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            connector,
+            error = %error,
+            "connector_scan_coverage_floor_clear_failed"
+        ),
+    }
+}
+
 /// Spawn a producer thread that scans a connector and sends batches through the channel.
 ///
 /// Each connector runs in its own thread, scanning the built-in local roots plus
@@ -10927,6 +11084,7 @@ fn run_streaming_consumer(
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     scan_start_ts: Option<i64>,
+    coverage: &ConnectorScanCoverage,
 ) -> Result<(Vec<String>, NonWatchIngestOutcome)> {
     use std::collections::HashMap;
 
@@ -11162,7 +11320,17 @@ fn run_streaming_consumer(
                     error = %error,
                     "streaming_scan_error"
                 );
-                // Continue processing - scan errors are non-fatal
+                // The run continues — one dead connector must not abandon the
+                // others' work. What must NOT continue is the archive claiming
+                // this connector is covered. Record the floor now, durably and
+                // before any further ingest, so a process death from here on
+                // still leaves the incompleteness on record.
+                record_connector_scan_floor(
+                    storage,
+                    defer_streaming_checkpoints,
+                    connector_name,
+                    coverage.failure_floor_for(connector_name),
+                );
             }
             Ok(IndexMessage::Done {
                 connector_name,
@@ -11182,6 +11350,19 @@ fn run_streaming_consumer(
 
                 if is_discovered {
                     remember_discovered_connector(&mut discovered_names, connector_name);
+                }
+
+                // A connector that ran to completion with no scan error has
+                // read everything from its `since_ts` forward, and that
+                // `since_ts` was already lowered to its floor by
+                // `ConnectorScanCoverage::new`. Its coverage hole is closed.
+                if is_discovered && stats.error.is_none() && coverage.has_floor(connector_name) {
+                    clear_connector_scan_floor(
+                        storage,
+                        defer_streaming_checkpoints,
+                        connector_name,
+                        coverage.since_ts_for(connector_name),
+                    );
                 }
 
                 // If we haven't switched to indexing phase yet, this Done message represents
@@ -11382,6 +11563,19 @@ fn run_streaming_index_with_connector_factories(
 
     // Create bounded channel for backpressure
     let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
+    let coverage = ConnectorScanCoverage::new(
+        since_ts,
+        read_connector_scan_floors_fresh(&opts.db_path),
+        connector_factories.iter().map(|(name, _)| *name),
+    );
+    for (connector, floor) in &coverage.floors {
+        tracing::info!(
+            connector,
+            floor_ts = floor,
+            since_ts = ?coverage.since_ts_for(connector),
+            "widening connector scan window back to its recorded coverage floor"
+        );
+    }
     let producer_config = StreamingProducerConfig {
         flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
         data_dir: opts.data_dir.clone(),
@@ -11397,9 +11591,13 @@ fn run_streaming_index_with_connector_factories(
     let handles: Vec<(&'static str, JoinHandle<()>)> = connector_factories
         .into_iter()
         .map(|(name, factory)| {
+            let config = StreamingProducerConfig {
+                since_ts: coverage.since_ts_for(name),
+                ..producer_config.clone()
+            };
             (
                 name,
-                spawn_connector_producer(name, factory, tx.clone(), producer_config.clone()),
+                spawn_connector_producer(name, factory, tx.clone(), config),
             )
         })
         .collect();
@@ -11418,6 +11616,7 @@ fn run_streaming_index_with_connector_factories(
         &opts.progress,
         lexical_strategy,
         Some(scan_start_ts),
+        &coverage,
     );
 
     if consumer_result.is_err() {
@@ -11533,8 +11732,17 @@ fn run_batch_index_with_connector_factories(
         opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
     ));
 
-    // Return type includes whether agent was discovered (for post-parallel name collection)
-    let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>, bool)> =
+    let coverage = ConnectorScanCoverage::new(
+        since_ts,
+        read_connector_scan_floors_fresh(&opts.db_path),
+        connector_factories.iter().map(|(name, _)| *name),
+    );
+    let coverage_ref = &coverage;
+
+    // Return type includes whether agent was discovered (for post-parallel name
+    // collection) and whether any scan for this connector failed (so the
+    // coverage floor can be recorded after the parallel phase).
+    let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>, bool, bool)> =
         connector_factories
             .into_par_iter()
             .filter_map(|(name, factory)| {
@@ -11543,6 +11751,8 @@ fn run_batch_index_with_connector_factories(
                 let was_detected = detect.detected;
                 let mut convs = Vec::new();
                 let mut is_discovered = false;
+                let mut scan_failed = false;
+                let since_ts = coverage_ref.since_ts_for(name);
 
                 if detect.detected {
                     // Update discovered agents count immediately when detected
@@ -11587,8 +11797,11 @@ fn run_batch_index_with_connector_factories(
                             convs.extend(local_convs);
                         }
                         Err(e) => {
-                            // Note: agent was counted as discovered but scan failed
-                            // This is acceptable as detection succeeded (agent exists)
+                            // Detection succeeded, so the agent exists; the run
+                            // carries on. But this connector did not read what it
+                            // was asked to read, and the caller records a coverage
+                            // floor so the archive stops claiming otherwise.
+                            scan_failed = true;
                             tracing::warn!("scan failed for {}: {}", name, e);
                         }
                     }
@@ -11627,6 +11840,7 @@ fn run_batch_index_with_connector_factories(
                                 convs.extend(remote_convs);
                             }
                             Err(e) => {
+                                scan_failed = true;
                                 tracing::warn!(
                                     connector = name,
                                     root = %root.path.display(),
@@ -11650,7 +11864,7 @@ fn run_batch_index_with_connector_factories(
                     p.current.fetch_add(1, Ordering::Relaxed);
                 }
 
-                if convs.is_empty() && !is_discovered {
+                if convs.is_empty() && !is_discovered && !scan_failed {
                     return None;
                 }
 
@@ -11660,7 +11874,7 @@ fn run_batch_index_with_connector_factories(
                     discovered = is_discovered,
                     "batch_scan_complete"
                 );
-                Some((name, convs, is_discovered))
+                Some((name, convs, is_discovered, scan_failed))
             })
             .collect();
 
@@ -11668,24 +11882,34 @@ fn run_batch_index_with_connector_factories(
     // This eliminates O(connectors) mutex acquisitions during parallel execution
     let scan_ms = scan_start.elapsed().as_millis() as u64;
 
+    // Same contract as the streaming path: a failed connector scan records a
+    // durable coverage floor, and a clean one clears it.
+    for (name, _, discovered, scan_failed) in &pending_batches {
+        if *scan_failed {
+            record_connector_scan_floor(storage, false, name, coverage.failure_floor_for(name));
+        } else if *discovered && coverage.has_floor(name) {
+            clear_connector_scan_floor(storage, false, name, coverage.since_ts_for(name));
+        }
+    }
+
     let discovered_names: Vec<String> = pending_batches
         .iter()
-        .filter(|(_, _, discovered)| *discovered)
-        .map(|(name, _, _)| (*name).to_string())
+        .filter(|(_, _, discovered, _)| *discovered)
+        .map(|(name, _, _, _)| (*name).to_string())
         .collect();
 
     let total_conversations: usize = pending_batches
         .iter()
-        .map(|(_, convs, _)| convs.len())
+        .map(|(_, convs, _, _)| convs.len())
         .sum();
     let total_messages: usize = pending_batches
         .iter()
-        .map(|(_, convs, _)| convs.iter().map(|c| c.messages.len()).sum::<usize>())
+        .map(|(_, convs, _, _)| convs.iter().map(|c| c.messages.len()).sum::<usize>())
         .sum();
     let connector_stats: Vec<ConnectorStats> = pending_batches
         .iter()
-        .filter(|(_, convs, _)| !convs.is_empty())
-        .map(|(name, convs, _)| {
+        .filter(|(_, convs, _, _)| !convs.is_empty())
+        .map(|(name, convs, _, _)| {
             let msgs: usize = convs.iter().map(|c| c.messages.len()).sum();
             ConnectorStats {
                 name: (*name).to_string(),
@@ -11711,7 +11935,7 @@ fn run_batch_index_with_connector_factories(
     let mut last_scan_ts_save = std::time::Instant::now();
     let mut ingest_outcome = NonWatchIngestOutcome::default();
     let preserve_scan_watermark = scan_watermark_preservation_active();
-    for (name, convs, _discovered) in pending_batches {
+    for (name, convs, _discovered, _scan_failed) in pending_batches {
         let batch_outcome = ingest_non_watch_batch_with_oom_split(
             storage,
             t_index.as_deref_mut(),
@@ -33088,6 +33312,267 @@ mod tests {
         Box::new(DetectedRemoteFailureConnector)
     }
 
+    // ---------------------------------------------------------------------
+    // Coverage-floor fixture — bead
+    // coding_agent_session_search-codex-coverage-gap-2bh4a
+    //
+    // Reproduces the 2026-06-01 shape: a connector that filters candidate
+    // files by mtime against `ctx.since_ts` exactly the way the real ones do,
+    // and that dies partway through the walk on the first pass.
+    // ---------------------------------------------------------------------
+    static COVERAGE_FIXTURE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static COVERAGE_FIXTURE_ABORT_AFTER: Mutex<Option<usize>> = Mutex::new(None);
+
+    struct MtimeFilteredAbortingConnector;
+
+    impl MtimeFilteredAbortingConnector {
+        fn root() -> PathBuf {
+            COVERAGE_FIXTURE_ROOT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("coverage fixture root should be configured")
+        }
+    }
+
+    impl Connector for MtimeFilteredAbortingConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec!["coverage-fixture".to_string()],
+                root_paths: vec![Self::root()],
+            }
+        }
+
+        fn scan(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            let mut collected = Vec::new();
+            self.scan_with_callback(ctx, &mut |conversation| {
+                collected.push(conversation);
+                Ok(())
+            })?;
+            Ok(collected)
+        }
+
+        fn scan_with_callback(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+            on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            let abort_after = *COVERAGE_FIXTURE_ABORT_AFTER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            let mut files: Vec<PathBuf> = fs::read_dir(Self::root())?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                .collect();
+            files.sort();
+
+            let mut emitted = 0usize;
+            for file in files {
+                // The real mtime filter, from the same helper the shipped
+                // connectors use. This is what makes an advanced watermark a
+                // permanent hole rather than a temporary one.
+                if !crate::connectors::file_modified_since(&file, ctx.since_ts) {
+                    continue;
+                }
+                if abort_after.is_some_and(|limit| emitted >= limit) {
+                    return Err(anyhow::anyhow!(
+                        "codex scan aborted mid-stream at {}",
+                        file.display()
+                    ));
+                }
+                let external_id = file
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let mut conversation =
+                    norm_conv(Some(&external_id), vec![norm_msg(0, 1_700_000_000_000)]);
+                conversation.agent_slug = "codex".into();
+                conversation.source_path = file.clone();
+                on_conversation(conversation)?;
+                emitted += 1;
+            }
+            Ok(())
+        }
+    }
+
+    fn mtime_filtered_aborting_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(MtimeFilteredAbortingConnector)
+    }
+
+    fn write_coverage_fixture_rollout(root: &Path, name: &str, mtime: SystemTime) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, "{}\n").expect("fixture rollout should write");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("fixture rollout should reopen")
+            .set_modified(mtime)
+            .expect("fixture rollout mtime should be settable");
+        path
+    }
+
+    fn coverage_fixture_conversation_count(storage: &FrankenStorage) -> i64 {
+        storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                row.get_typed(0)
+            })
+            .expect("conversation count should query")
+    }
+
+    /// An aborted connector scan must not leave the archive claiming it holds
+    /// everything. Two passes, exactly the shape of the 2026-06-01 incident:
+    ///
+    /// 1. A full scan dies after reading 1 of 3 codex rollouts. The run keeps
+    ///    going, the partial output is kept, and the global watermark advances
+    ///    past every file the scan never opened.
+    /// 2. The next incremental run derives `since_ts` from that watermark.
+    ///
+    /// Before the fix, pass 2 filters the two unread rollouts out by mtime and
+    /// they are unreachable forever — the archive holds 1 conversation and
+    /// reports itself complete. After the fix, pass 1 records a durable
+    /// coverage floor for `codex`, pass 2 widens that connector's window back
+    /// to it, and all 3 land.
+    #[test]
+    #[serial]
+    fn aborted_connector_scan_does_not_leave_the_index_claiming_complete_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let sessions = tmp.path().join(".codex/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        // Every rollout is old, the way a real archive's history is: nothing
+        // here is rescued by being touched after the run.
+        let old = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+        for name in ["rollout-a.jsonl", "rollout-b.jsonl", "rollout-c.jsonl"] {
+            write_coverage_fixture_rollout(&sessions, name, old);
+        }
+        *COVERAGE_FIXTURE_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(sessions.clone());
+
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path: db_path.clone(),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+
+        // ---- Pass 1: full scan, connector dies after the first rollout ----
+        *COVERAGE_FIXTURE_ABORT_AFTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(1);
+        let first_scan_start_ts = FrankenStorage::now_millis();
+        let first_pass_logs = capture_logs(|| {
+            run_streaming_index_with_connector_factories(
+                &storage,
+                Some(&mut index),
+                &opts,
+                None,
+                LexicalPopulationStrategy::IncrementalInline,
+                Vec::new(),
+                vec![("codex", mtime_filtered_aborting_connector_factory)],
+                first_scan_start_ts,
+            )
+            .expect("a failed connector scan must not fail the whole run");
+        });
+        assert!(
+            first_pass_logs.contains("streaming_scan_error"),
+            "the fixture must actually abort mid-stream; logs were:\n{first_pass_logs}"
+        );
+
+        assert_eq!(
+            coverage_fixture_conversation_count(&storage),
+            1,
+            "the aborted scan should have kept the partial output it already emitted"
+        );
+
+        // The run treats itself as successful and advances the single global
+        // watermark past everything, including the two files it never read.
+        persist_final_index_run_metadata(
+            &storage,
+            &db_path,
+            true,
+            first_scan_start_ts,
+            FrankenStorage::now_millis(),
+        )
+        .expect("final metadata should persist");
+        assert_eq!(
+            storage.get_last_scan_ts().unwrap(),
+            Some(first_scan_start_ts),
+            "the watermark advance is the pre-existing behaviour this test is built on"
+        );
+
+        // Read the floors the way a later process would: the requirement is
+        // that the failure survives the run that recorded it, so a fresh open
+        // of the durable archive is the honest check.
+        let floors_after_failure = read_connector_scan_floors_fresh(&db_path);
+        assert!(
+            floors_after_failure.contains_key("codex"),
+            "an aborted codex scan must leave a durable coverage floor, not just a warn log; \
+             floors were {floors_after_failure:?}\nlogs:\n{first_pass_logs}"
+        );
+
+        // ---- Pass 2: healthy connector, ordinary incremental run ----
+        *COVERAGE_FIXTURE_ABORT_AFTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        let second_since_ts = non_watch_scan_since_ts(
+            false,
+            false,
+            false,
+            storage.get_last_scan_ts().unwrap_or(None),
+        );
+        assert!(
+            second_since_ts.is_some(),
+            "pass 2 must be an ordinary incremental run, not a full rescan"
+        );
+        run_streaming_index_with_connector_factories(
+            &storage,
+            Some(&mut index),
+            &opts,
+            second_since_ts,
+            LexicalPopulationStrategy::IncrementalInline,
+            Vec::new(),
+            vec![("codex", mtime_filtered_aborting_connector_factory)],
+            FrankenStorage::now_millis(),
+        )
+        .expect("second pass should succeed");
+
+        assert_eq!(
+            coverage_fixture_conversation_count(&storage),
+            3,
+            "the two rollouts the aborted scan never read must still be reachable; \
+             an incremental run that filters them out by mtime makes the hole permanent"
+        );
+        assert!(
+            read_connector_scan_floors_fresh(&db_path).is_empty(),
+            "a clean scan that read from the floor should clear it"
+        );
+
+        *COVERAGE_FIXTURE_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     struct PanicConnector;
 
     impl Connector for PanicConnector {
@@ -34020,6 +34505,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             None,
+            &ConnectorScanCoverage::default(),
         )
         .unwrap();
 
@@ -34068,6 +34554,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Some(FrankenStorage::now_millis()),
+            &ConnectorScanCoverage::default(),
         )
         .expect("deferred streaming ingest should not require a Tantivy writer");
 
@@ -34135,6 +34622,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             Some(FrankenStorage::now_millis()),
+            &ConnectorScanCoverage::default(),
         )
         .expect("lexical OOM after SQLite ingest should defer repair, not fail the scan");
 
@@ -34191,6 +34679,7 @@ mod tests {
                 &Some(progress.clone()),
                 LexicalPopulationStrategy::IncrementalInline,
                 Some(FrankenStorage::now_millis()),
+                &ConnectorScanCoverage::default(),
             )
             .expect("single deferred ingest OOM should quarantine and continue");
 
@@ -34616,6 +35105,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Some(FrankenStorage::now_millis()),
+            &ConnectorScanCoverage::default(),
         )
         .expect("mixed startup ingest should not violate foreign keys");
 
@@ -34854,6 +35344,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             None,
+            &ConnectorScanCoverage::default(),
         )
         .unwrap();
 
@@ -34958,6 +35449,7 @@ mod tests {
                 &Some(progress),
                 LexicalPopulationStrategy::IncrementalInline,
                 None,
+                &ConnectorScanCoverage::default(),
             )
             .unwrap();
 
@@ -35036,6 +35528,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             None,
+            &ConnectorScanCoverage::default(),
         )
         .unwrap();
         assert_eq!(discovered, vec!["codex".to_string()]);
@@ -35082,6 +35575,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             None,
+            &ConnectorScanCoverage::default(),
         )
         .unwrap();
         assert_eq!(mutations.inserted_conversations, 3);
@@ -35219,6 +35713,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             None,
+            &ConnectorScanCoverage::default(),
         )
         .unwrap();
         handle.join().unwrap();
