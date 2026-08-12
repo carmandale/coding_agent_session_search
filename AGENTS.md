@@ -240,21 +240,21 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ### UBS Pre-Merge Gate
 
-Per `coding_agent_session_search-dpfvr`, every PR runs `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges.
+Per `coding_agent_session_search-dpfvr`, every PR and push runs `ubs --format=json --ci` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). UBS scans complete files, so the gate also scans the exact base versions and blocks only when critical or warning findings increase. Existing findings that are unchanged from the base do not block the change.
 
 **Local pre-flight before pushing:**
 
 ```bash
-ubs $(git diff --name-only origin/main...HEAD)
+ubs --format=json --ci $(git diff --name-only origin/main...HEAD)
 ```
 
 Or, scoped to staged files:
 
 ```bash
-ubs $(git diff --name-only --cached)
+ubs --format=json --ci $(git diff --name-only --cached)
 ```
 
-If a known-acceptable warning needs to ship despite the gate, suppress at the UBS config level (`tests/policies/no_mock_allowlist.json` or per-file inline pragma) — never bypass by removing the gate.
+Review the JSON counts against the base when deciding whether a finding is a regression. Do not substitute a warning-failing scan for this repository's CI gate; it would reject historical findings instead of applying the base-versus-current comparison.
 
 The pinned UBS version lives in `.github/workflows/ubs-version.txt`; the CI installer reads that file. Local installs should match.
 
@@ -937,15 +937,15 @@ bv --robot-insights | jq '.Cycles'                         # Circular deps (must
 
 ## UBS — Ultimate Bug Scanner
 
-**Golden Rule:** `ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
+**Golden Rule:** Run `ubs --format=json --ci <changed-files>` before every commit and compare critical/warning counts with the base revision. An unchanged finding is allowed; an increase must be fixed or justified before landing.
 
 ### Commands
 
 ```bash
-ubs file.rs file2.rs                    # Specific files (< 1s) — USE THIS
-ubs $(git diff --name-only --cached)    # Staged files — before commit
+ubs --format=json --ci file.rs file2.rs # Specific files (< 1s) — USE THIS
+ubs --format=json --ci $(git diff --name-only --cached) # Staged files — before commit
 ubs --only=rust,toml src/               # Language filter (3-5x faster)
-ubs --ci --fail-on-warning .            # CI mode — before PR
+ubs --format=json --ci .               # CI-compatible JSON scan
 ubs .                                   # Whole project (ignores target/, Cargo.lock)
 ```
 
@@ -966,7 +966,7 @@ Parse: `file:line:col` -> location | Suggested fix -> how to fix | Exit 0/1 -> p
 2. Navigate `file:line:col` -> view context
 3. Verify real issue (not false positive)
 4. Fix root cause (not symptom)
-5. Re-run `ubs <file>` -> exit 0
+5. Re-run `ubs --format=json --ci <file>` -> verify no new critical/warning findings
 6. Commit
 
 ### Bug Severity
