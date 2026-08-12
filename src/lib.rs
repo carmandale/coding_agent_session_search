@@ -181,10 +181,25 @@ where
 }
 
 /// Command-line interface.
+fn cli_long_version() -> &'static str {
+    static LONG_VERSION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    LONG_VERSION.get_or_init(|| {
+        Box::leak(
+            format!(
+                "{}\ngit commit: {}",
+                env!("CARGO_PKG_VERSION"),
+                option_env!("VERGEN_GIT_SHA").unwrap_or("unknown")
+            )
+            .into_boxed_str(),
+        ) as &'static str
+    })
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "cass",
     version,
+    long_version = cli_long_version(),
     about = "Unified TUI search over coding agent histories"
 )]
 pub struct Cli {

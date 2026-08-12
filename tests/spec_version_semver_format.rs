@@ -18,8 +18,9 @@
 //!      build metadata) — a regression to a non-conforming version
 //!      string (e.g. `"0.6"` or `"0.6.7.1"`) would silently break
 //!      every agent that uses semver-aware version comparisons.
-//!   2. `cass --version` emits a single line `cass <version>` where
-//!      `<version>` also parses as `semver::Version`.
+//!   2. The first line of `cass --version` is `cass <version>` where
+//!      `<version>` also parses as `semver::Version`; subsequent lines carry
+//!      build identity metadata.
 //!   3. The version in `cass --version` plain text equals the
 //!      `crate_version` value in `api-version --json`. Cross-surface
 //!      coherence — extends INV-cass-15's `crate_version ==
@@ -78,11 +79,12 @@ fn assert_success(label: &str, outcome: CmdOutcome) -> Result<CmdOutcome, Box<dy
     Ok(outcome)
 }
 
-/// Extract the version token from `cass --version` plain-text output
-/// (format: `cass <version>` on a single line).
+/// Extract the version token from the first line of `cass --version` output
+/// (format: `cass <version>`; later lines carry build metadata).
 fn parse_plain_version_token(stdout: &str) -> Result<String, Box<dyn Error>> {
     let trimmed = stdout.trim();
-    let token = trimmed
+    let version_line = trimmed.lines().next().unwrap_or_default();
+    let token = version_line
         .strip_prefix("cass ")
         .ok_or_else(|| {
             test_error(format!(

@@ -126,6 +126,32 @@ fn plain_version_output_contains_cargo_package_version() -> TestResult {
 }
 
 #[test]
+fn plain_version_output_contains_git_commit() -> TestResult {
+    let git_sha = option_env!("VERGEN_GIT_SHA")
+        .ok_or_else(|| test_error("VERGEN_GIT_SHA was not emitted for the test build"))?;
+    ensure(
+        git_sha.len() == 40 && git_sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        format!("VERGEN_GIT_SHA must be a full 40-hex revision; got {git_sha:?}"),
+    )?;
+
+    let outcome = assert_success("cass --version", run_cass(&["--version"])?)?;
+    let expected_line = format!("git commit: {git_sha}");
+    ensure(
+        outcome.stdout.lines().any(|line| {
+            matches!(
+                line.as_bytes().cmp(expected_line.as_bytes()),
+                Ordering::Equal
+            )
+        }),
+        format!(
+            "`cass --version` output must contain `{expected_line}`; stdout: {:?}",
+            outcome.stdout
+        ),
+    )?;
+    Ok(())
+}
+
+#[test]
 fn api_version_field_is_non_negative_integer() -> TestResult {
     let outcome = assert_success("api-version --json", run_cass(&["api-version", "--json"])?)?;
     let parsed: Value = serde_json::from_str(outcome.stdout.trim())?;

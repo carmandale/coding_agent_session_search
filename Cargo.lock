@@ -1041,6 +1041,7 @@ dependencies = [
  "url",
  "urlencoding",
  "vergen",
+ "vergen-gix",
  "wait-timeout",
  "walkdir",
  "which",

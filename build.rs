@@ -699,7 +699,7 @@ fn git_output(repo_root: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn emit_vergen_metadata() {
-    use vergen::{BuildBuilder, CargoBuilder, Emitter};
+    use vergen_gix::{BuildBuilder, CargoBuilder, Emitter, GixBuilder};
 
     let mut emitter = Emitter::default();
 
@@ -708,6 +708,9 @@ fn emit_vergen_metadata() {
     }
     if let Ok(cargo) = CargoBuilder::all_cargo() {
         let _ = emitter.add_instructions(&cargo);
+    }
+    if let Ok(git) = GixBuilder::default().sha(false).build() {
+        let _ = emitter.add_instructions(&git);
     }
 
     if let Err(err) = emitter.emit() {
