@@ -15063,6 +15063,20 @@ async fn import_chatgpt_export(
 /// Compute lightweight state snapshot (index/db freshness) for robot meta and state command reuse
 const STATE_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATUS_COUNT_SCAN_MAX_DB_BYTES: u64 = 256 * 1024 * 1024;
+/// Manifest-count ceiling above which `cass status` stops collecting archive
+/// coverage inline and takes the fast path it already ships.
+///
+/// The inline collector walks every raw-mirror manifest and BLAKE3-hashes every
+/// blob it references, so its cost tracks the mirror rather than the database.
+/// Measured 2026-08-14 on the live 125,607-manifest mirror: 0.83 ms per
+/// manifest warm, over a 300-manifest random sample that read each referenced
+/// blob in full; the whole walk did not return inside a 900 s bound. This cap
+/// holds the inline collector under a second on a mirror of that shape.
+///
+/// ceiling: this counts manifests, not blob bytes, so a mirror holding a few
+/// very large blobs stays under the cap and still pays to hash them. Bound the
+/// bytes as well if such a store ever appears.
+const STATUS_COVERAGE_MAX_RAW_MIRROR_MANIFESTS: usize = 512;
 const CLI_DB_QUERY_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_DIAG_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -33751,6 +33765,51 @@ fn doctor_raw_mirror_size_warning(total_blob_bytes: u64, threshold_bytes: u64) -
             "raw_mirror.size: verified raw-mirror blobs use {total_blob_bytes} bytes, at or above the warn threshold of {threshold_bytes} bytes; inspect `cass mirror prune --older-than 90d --json` and apply only after reviewing the plan"
         )
     })
+}
+
+/// Decide, in O(cap) rather than O(store), whether the raw mirror is too large
+/// for `cass status` to verify inline.
+///
+/// `collect_doctor_raw_mirror_report` below reads every manifest and hashes
+/// every blob with no limit and no deadline, so the surfaces that call it need
+/// a way to ask how much work that would be without doing the work. This counts
+/// manifest files with an early exit at the cap, the same shape as
+/// `doctor_remote_mirror_top_level_entry_count`. Manifests are flat by
+/// construction (`doctor_raw_mirror_manifest_relative_path` writes
+/// `manifests/<manifest-id>.json`), so a single `read_dir` sees all of them.
+///
+/// An absent mirror is not too large — there is nothing to walk. A mirror that
+/// exists but cannot be counted is treated as too large: the cost is then
+/// unknown, and declining the inline scan costs an honest "not checked" while
+/// accepting it risks a command that never returns.
+fn status_raw_mirror_scan_too_large(data_dir: &Path) -> bool {
+    let manifest_dir = doctor_raw_mirror_root(data_dir).join("manifests");
+    if !manifest_dir.exists() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(&manifest_dir) else {
+        return true;
+    };
+
+    let mut count = 0usize;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        if Path::new(&entry.file_name())
+            .extension()
+            .and_then(|ext| ext.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        count += 1;
+        if count > STATUS_COVERAGE_MAX_RAW_MIRROR_MANIFESTS {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn collect_doctor_raw_mirror_report(data_dir: &Path) -> DoctorRawMirrorReport {
@@ -64928,11 +64987,25 @@ fn run_status(
         let topology_budget =
             serde_json::to_value(crate::topology_budget::inspect_host_topology_budget())
                 .unwrap_or(serde_json::Value::Null);
-        // Commit fe3972dc deliberately dropped status_should_skip_db_open and
-        // its STATUS_COUNT_SCAN_MAX_DB_BYTES short-circuit; the policy is now
-        // "always probe via DB open" — see the commit message. This call site
-        // was missed in that cleanup; inlining the now-unconditional `true`.
-        let status_collects_coverage = db_exists;
+        // Coverage collection below walks the whole raw mirror and hashes every
+        // blob, so it is gated on the size of the mirror it actually walks.
+        //
+        // History, because the comment that stood here recorded it wrong and a
+        // reader would have believed it: fe3972dc retired one thing only, the
+        // index-mtime optimization that let the status probe skip opening the
+        // database. It said nothing about coverage collection. But
+        // status_should_skip_db_open served both policies through one boolean,
+        // so deleting it left this call site dangling, and the four-minute
+        // build repair b8e3e78b inlined `db_exists` for both. That silently
+        // removed the only bound on this walk: on a 125,607-manifest mirror
+        // `cass status --json` then ran 15 minutes at 4 GB resident and wrote
+        // zero bytes (bead nvq59).
+        //
+        // The gate is on manifest count rather than the old database-size
+        // proxy, because the walk's cost is a function of the mirror and the
+        // database size only correlates with it by accident — a pruned and
+        // reindexed archive is exactly the shape that breaks the proxy.
+        let status_collects_coverage = db_exists && !status_raw_mirror_scan_too_large(&data_dir);
         let (coverage_risk, coverage_source, coverage_checked) = if status_collects_coverage {
             (
                 collect_doctor_coverage_risk_summary(&data_dir, &db_path),

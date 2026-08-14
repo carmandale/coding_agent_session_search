@@ -4572,6 +4572,145 @@ fn doctor_json_reports_missing_upstream_source_as_coverage_risk_not_data_loss() 
     );
 }
 
+/// `cass status --json` must not verify a raw mirror it cannot afford to walk.
+///
+/// The inline coverage collector reads every manifest and BLAKE3-hashes every
+/// blob. On the operator's 125,607-manifest mirror that made `cass status
+/// --json` run fifteen minutes at 4 GB resident and emit nothing at all, which
+/// reads as a hang rather than a slow command (bead nvq59). The gate that
+/// prevented it was deleted as collateral damage by b8e3e78b, a four-minute
+/// build repair, and nothing in the suite noticed for two and a half months.
+///
+/// This is that detector. It builds a mirror one manifest past the cap and
+/// asserts status declines the inline scan and says so. Delete the gate and
+/// status verifies all 513 blobs and reports `checked` here, so the assertion
+/// below goes red instead of the defect shipping green.
+#[test]
+fn status_json_declines_inline_coverage_on_a_raw_mirror_past_the_scan_cap() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    // One past STATUS_COVERAGE_MAX_RAW_MIRROR_MANIFESTS (512). Every manifest
+    // here is a real, well-formed one with a real blob, so removing the gate
+    // gives the collector genuine work to do rather than parse errors.
+    let manifest_count = 513;
+    for index in 0..manifest_count {
+        let original_path = test_home
+            .join(".codex/sessions")
+            .join(format!("capped-fixture-{index}.jsonl"));
+        write_raw_mirror_fixture(
+            &data_dir,
+            "codex",
+            "local",
+            "file",
+            &original_path,
+            format!("{{\"scan_cap_fixture\":{index}}}\n").as_bytes(),
+        );
+    }
+
+    let mirror_manifests = fs::read_dir(data_dir.join("raw-mirror").join("v1").join("manifests"))
+        .expect("read fixture manifests")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .count();
+    assert_eq!(
+        mirror_manifests, manifest_count,
+        "fixture must actually exceed the scan cap or this test proves nothing"
+    );
+
+    let status_out = cass_cmd(test_home)
+        .args([
+            "status",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass status --json");
+    assert!(
+        status_out.status.success(),
+        "cass status --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&status_out.stdout),
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+    let status_payload: Value = serde_json::from_slice(&status_out.stdout).expect("status json");
+    assert_eq!(
+        status_payload["doctor_summary"]["coverage_source"]["source"].as_str(),
+        Some("status-fast-state"),
+        "status must take the fast path on a mirror past the scan cap: {status_payload:#}"
+    );
+    assert_eq!(
+        status_payload["doctor_summary"]["coverage_source"]["status"].as_str(),
+        Some("not_checked"),
+        "status must say coverage was not checked rather than imply it verified the mirror: {status_payload:#}"
+    );
+    assert_eq!(
+        status_payload["doctor_summary"]["archive_coverage_state"].as_str(),
+        Some("not_checked"),
+        "the skipped inline scan must surface as not_checked, not as healthy coverage: {status_payload:#}"
+    );
+    assert!(
+        status_payload["coverage_risk"]["recommended_action"]
+            .as_str()
+            .is_some_and(|text| text.contains("cass doctor")),
+        "declining the scan must route the operator to the surface that does verify: {status_payload:#}"
+    );
+}
+
+/// The other half of the gate: an archive small enough to verify still gets
+/// verified. Without this, "always take the fast path" would pass the test
+/// above, and status would silently stop reporting coverage for everyone.
+#[test]
+fn status_json_still_verifies_coverage_inline_on_a_raw_mirror_under_the_scan_cap() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    for index in 0..4 {
+        let original_path = test_home
+            .join(".codex/sessions")
+            .join(format!("under-cap-fixture-{index}.jsonl"));
+        write_raw_mirror_fixture(
+            &data_dir,
+            "codex",
+            "local",
+            "file",
+            &original_path,
+            format!("{{\"scan_cap_fixture\":{index}}}\n").as_bytes(),
+        );
+    }
+
+    let status_out = cass_cmd(test_home)
+        .args([
+            "status",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass status --json");
+    assert!(
+        status_out.status.success(),
+        "cass status --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&status_out.stdout),
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+    let status_payload: Value = serde_json::from_slice(&status_out.stdout).expect("status json");
+    assert_eq!(
+        status_payload["doctor_summary"]["coverage_source"]["source"].as_str(),
+        Some("status-inline-small-archive"),
+        "a mirror under the cap must still be verified inline: {status_payload:#}"
+    );
+    assert_eq!(
+        status_payload["doctor_summary"]["coverage_source"]["status"].as_str(),
+        Some("checked"),
+        "a mirror under the cap must report coverage as checked: {status_payload:#}"
+    );
+}
+
 #[test]
 fn doctor_fix_backfills_legacy_raw_mirror_metadata_without_touching_provider_files() {
     let temp = tempfile::tempdir().expect("tempdir");
