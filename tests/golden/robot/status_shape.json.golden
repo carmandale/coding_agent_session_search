@@ -707,10 +707,10 @@
               "type": "integer"
             },
             "memory_total_bytes": {
-              "type": "integer"
+              "type": "string"
             },
             "memory_available_bytes": {
-              "type": "integer"
+              "type": "string"
             }
           }
         },

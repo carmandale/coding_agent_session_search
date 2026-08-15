@@ -332,6 +332,30 @@ fn normalize_live_robot_values(value: &mut Value) {
             let redact_result_content = map.contains_key("source_path")
                 && map.contains_key("line_number")
                 && map.contains_key("agent");
+
+            // Host-derived blocks, folded to the Linux values the goldens were
+            // recorded from — bead
+            // `coding_agent_session_search-golden-robot-json-host-drift-tutfy`.
+            //
+            // These four keys are detected by their SIBLINGS, not by name, and
+            // that is load-bearing rather than fastidious: `source`, `policy`,
+            // `reason` and `decision_reason` all occur elsewhere in these same
+            // payloads with unrelated values. `decision_reason` alone appears on
+            // every entry of `policy_registry.controllers` ("pipeline settings
+            // active", "semantic unavailable; lexical fallback remains active"),
+            // so folding it by name would rewrite live controller state into a
+            // topology sentence and the goldens would still be green about it.
+            let is_host_topology =
+                map.contains_key("topology_class") && map.contains_key("logical_cpus");
+            let is_reserved_core_policy = map.contains_key("reserved_cores")
+                && map.contains_key("policy")
+                && map.contains_key("reason");
+            let is_topology_budget = map.contains_key("fallback_active")
+                && map.contains_key("proof_notes")
+                && map.contains_key("topology");
+            let is_platform =
+                map.len() == 2 && map.contains_key("os") && map.contains_key("arch");
+
             for (key, child) in map.iter_mut() {
                 if key == "response_schemas" || looks_like_json_schema_object(child) {
                     continue;
@@ -344,6 +368,79 @@ fn normalize_live_robot_values(value: &mut Value) {
                 if redact_result_content && key == "snippet" && child.is_string() {
                     *child = json!("[RESULT_SNIPPET]");
                     continue;
+                }
+
+                if is_platform {
+                    match key.as_str() {
+                        "os" => {
+                            *child = json!("linux");
+                            continue;
+                        }
+                        "arch" => {
+                            *child = json!("x86_64");
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if is_host_topology {
+                    match key.as_str() {
+                        "source" => {
+                            *child = json!("linux_sysfs");
+                            continue;
+                        }
+                        // A host with no /sys topology reports these as null,
+                        // where Linux reports real byte counts that the string
+                        // scrubber above has already folded to the placeholder.
+                        "memory_total_bytes" | "memory_available_bytes" => {
+                            *child = json!("[LIVE_BYTES]");
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if is_reserved_core_policy {
+                    match key.as_str() {
+                        "policy" => {
+                            *child = json!(
+                                "max(default, locality*2_on_large_hosts, smt_width, logical/12) capped at 16"
+                            );
+                            continue;
+                        }
+                        "reason" => {
+                            *child = json!(
+                                "reserve 16 of 128 logical CPUs for interactive work, IO, and NUMA/LLC service headroom"
+                            );
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if is_topology_budget {
+                    match key.as_str() {
+                        "fallback_active" => {
+                            *child = json!(false);
+                            continue;
+                        }
+                        "decision_reason" => {
+                            *child = json!(
+                                "planned from ManyCoreSingleSocket: 128 logical CPUs, 64 physical cores, 1 socket(s), 1 NUMA node(s), 8 LLC group(s)"
+                            );
+                            continue;
+                        }
+                        "proof_notes" => {
+                            *child = json!([
+                                "advisory only: live controllers keep current conservative settings until explicitly wired",
+                                "CPU budgets prefer physical cores and LLC/NUMA locality over SMT oversubscription",
+                                "RAM caps scale only when MemAvailable is large enough to preserve broad host headroom"
+                            ]);
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
 
                 match key.as_str() {
@@ -1921,6 +2018,18 @@ fn status_shape_matches_golden() {
     {
         warnings.push(Value::String("[SHAPE_STRING]".to_string()));
     }
+    // Derive the schema from the NORMALIZED payload, the way the payload golden
+    // is compared — bead
+    // `coding_agent_session_search-golden-robot-json-host-drift-tutfy`.
+    //
+    // Without this the schema is taken from raw host values, so a field's TYPE
+    // varies by host: `memory_total_bytes` is a byte count on a Linux host with
+    // /sys topology and `null` on one without, which is `"type": "number"`
+    // against `"type": "null"` and is unfixable by editing the golden — either
+    // host makes the other red. Normalizing first folds both to the same
+    // placeholder, so the derived type is host-independent by construction
+    // rather than by whoever regenerated last.
+    normalize_live_robot_values(&mut status);
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&status)).expect("pretty-print JSON");
     assert_golden("robot/status_shape.json.golden", &canonical);
