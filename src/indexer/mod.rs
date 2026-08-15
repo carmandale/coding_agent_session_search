@@ -20293,6 +20293,14 @@ pub struct ConversationIngestQuarantineSummary {
     pub circuit_breaker_limit: usize,
     pub circuit_breaker_active: bool,
     pub quarantine_files: Vec<String>,
+    /// Quarantine files that exist and could NOT be read, so their records are
+    /// absent from the counts above — the counts are a floor, not a total.
+    /// Bead `coding_agent_session_search-quarantine-unreadable-undercounts-a59ou`.
+    ///
+    /// Skipped when empty, so the ordinary case serializes exactly as before
+    /// and this is an exception report rather than a new required field.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unreadable_quarantine_files: Vec<String>,
     pub newest_last_attempt_at_ms: Option<i64>,
     pub recommended_action: Option<String>,
 }
@@ -20304,6 +20312,7 @@ pub fn conversation_ingest_quarantine_summary(
     let mut keys = BTreeSet::<(String, i64)>::new();
     let mut recent_keys = BTreeSet::<(String, i64)>::new();
     let mut quarantine_files = Vec::new();
+    let mut unreadable_quarantine_files = Vec::new();
     let mut newest_last_attempt_at_ms: Option<i64> = None;
     let recent_window_seconds = ingest_quarantine_circuit_window_seconds();
     let recent_cutoff_ms =
@@ -20335,8 +20344,24 @@ pub fn conversation_ingest_quarantine_summary(
             continue;
         }
         quarantine_files.push(path.display().to_string());
-        let Ok(contents) = fs::read_to_string(&path) else {
-            continue;
+        // Bead `coding_agent_session_search-quarantine-unreadable-undercounts-a59ou`.
+        // Skipping an existing-but-unreadable poison file used to be silent, so
+        // its records fell out of the counts and the summary reported "ok" —
+        // "no quarantined conversations" as the rendering of "we could not
+        // find out". The records cannot be recovered here, so the honest move
+        // is to say the counts are incomplete rather than to invent them.
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "quarantine poison file exists but could not be read; the quarantine \
+                     counts below are a floor rather than a total"
+                );
+                unreadable_quarantine_files.push(path.display().to_string());
+                continue;
+            }
         };
         for line in contents.lines() {
             let trimmed = line.trim();
@@ -20383,6 +20408,11 @@ pub fn conversation_ingest_quarantine_summary(
             "critical".to_string()
         } else if quarantined_conversations > 0 {
             "degraded".to_string()
+        } else if !unreadable_quarantine_files.is_empty() {
+            // Zero COUNTABLE records is not evidence of zero quarantined
+            // conversations when a quarantine file could not be read at all.
+            // Bead `coding_agent_session_search-quarantine-unreadable-undercounts-a59ou`.
+            "degraded".to_string()
         } else {
             "ok".to_string()
         },
@@ -20398,12 +20428,21 @@ pub fn conversation_ingest_quarantine_summary(
                 "Quarantine volume exceeded the recent circuit-breaker threshold; pause the watcher, inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` before resuming watch."
                     .to_string(),
             )
-        } else {
-            (quarantined_conversations > 0).then(|| {
+        } else if quarantined_conversations > 0 {
+            Some(
                 "Inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` or run a bounded full refresh."
-                    .to_string()
-            })
+                    .to_string(),
+            )
+        } else if !unreadable_quarantine_files.is_empty() {
+            Some(format!(
+                "{} quarantine file(s) exist but could not be read, so the quarantine counts above are a floor rather than a total; check their permissions and ownership, then re-run this command: {}",
+                unreadable_quarantine_files.len(),
+                unreadable_quarantine_files.join(", ")
+            ))
+        } else {
+            None
         },
+        unreadable_quarantine_files,
     }
 }
 
@@ -34895,6 +34934,62 @@ mod tests {
             assert_eq!(summary.quarantined_conversations, 1);
             assert_eq!(summary.status, "degraded");
         }
+    }
+
+    /// Bead `coding_agent_session_search-quarantine-unreadable-undercounts-a59ou`.
+    /// An existing-but-unreadable poison file was skipped silently, so its
+    /// records fell out of the counts and the summary reported `"ok"` — a
+    /// failed read rendered as good news, on the surface that drives the
+    /// health warning and the ingest circuit breaker.
+    ///
+    /// The unreadable file is a DIRECTORY at the poison file's path.
+    /// `read_to_string` fails with `EISDIR` for every user, so this does not
+    /// depend on file permissions and cannot pass vacuously when the suite runs
+    /// as root. `tests/cli_robot.rs` already uses the same trick for an
+    /// unopenable database path.
+    #[test]
+    fn unreadable_quarantine_file_degrades_instead_of_reading_clean() -> Result<()> {
+        let tmp = TempDir::new()?;
+
+        // Positive control: an ordinary empty quarantine directory still reads
+        // "ok", so the "degraded" below is the unreadable file being detected
+        // rather than a summary that can no longer say "ok" at all.
+        let clean_dir = tmp.path().join("clean");
+        std::fs::create_dir_all(clean_dir.join("quarantine"))?;
+        let clean = conversation_ingest_quarantine_summary(&clean_dir);
+        assert_eq!(clean.status, "ok", "control must read clean");
+        assert!(clean.unreadable_quarantine_files.is_empty());
+        assert_eq!(clean.quarantined_conversations, 0);
+
+        // Subject: the poison file path exists and cannot be read.
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(quarantine_dir.join(WATCH_INGEST_POISON_FILE))?;
+
+        let summary = conversation_ingest_quarantine_summary(&data_dir);
+
+        assert_eq!(
+            summary.quarantined_conversations, 0,
+            "the records are genuinely uncountable here — the fix reports that, it does not invent a number"
+        );
+        assert_eq!(
+            summary.status, "degraded",
+            "zero COUNTABLE records is not evidence of zero quarantined conversations"
+        );
+        assert_eq!(
+            summary.unreadable_quarantine_files.len(),
+            1,
+            "the unreadable path must be named so an operator can act on it"
+        );
+        assert!(
+            summary
+                .recommended_action
+                .as_deref()
+                .is_some_and(|action| action.contains("floor rather than a total")),
+            "the summary must say the counts are incomplete: {:?}",
+            summary.recommended_action
+        );
+        Ok(())
     }
 
     #[test]
