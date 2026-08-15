@@ -23,7 +23,7 @@ anyhow = "1.0.102"
 thiserror = "1.0.69"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi"] }
-asupersync = { version = "0.3.2", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "=0.3.4", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
@@ -42,7 +42,14 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-frankensqlite = { version = "0.1.5", package = "fsqlite", features = ["fts5"] }
+# `=` is load-bearing, not decoration (bead p3kgr). fsqlite-core 0.1.11 added the
+# ExistsValueSet set-based path that avoids the correlated_exists_fallback wedging
+# lexical rebuild prep. 0.1.14 is the newest release carrying it that still resolves
+# on rustc 1.94: from 0.1.15 on, fsqlite-types requires asupersync >=0.3.5 -> sysinfo
+# 0.39 -> rustc 1.95. A caret range here resolves to 0.1.19 and fails the build with
+# an unrelated-looking rustc error. This, fsqlite-types and asupersync move together,
+# and build.rs CONTRACTS pins all three.
+frankensqlite = { version = "=0.1.14", package = "fsqlite", features = ["fts5"] }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -178,7 +185,7 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { version = "0.1.5", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.1.14", package = "fsqlite-types" }
 
 [[bin]]
 name = "cass"

@@ -2933,12 +2933,14 @@ Update check state is stored in the data directory:
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `0.1.4` (crates.io; #93 + #94 fixes) |
+| `frankensqlite` / `fsqlite-types` | `0.1.14` (crates.io; #93 + #94 + the 0.1.11 `ExistsValueSet` fix) |
 | `franken-agent-detection` | `b62d8597` |
-| `asupersync` | `0.3.2` |
+| `asupersync` | `0.3.4` |
 | `frankensearch` | `2cad158f` |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
+
+The frankensqlite and `asupersync` pins are a matched pair with a hard ceiling: from `fsqlite` 0.1.15 on, `fsqlite-types` requires `asupersync >= 0.3.5`, which requires `sysinfo` 0.39, which requires rustc 1.95. Raising either past the versions above therefore needs a newer toolchain than the `nightly` channel currently resolves to on this machine (1.94).
 
 **Build-time validation**
 - `build.rs` validates the committed dependency source contract against the expected package name, package version, Cargo feature/default-features contract, and git source where applicable.

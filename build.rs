@@ -47,13 +47,16 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // crates.io-only pin: fsqlite 0.1.5 (carrying the upstream #95
-        // BtCursor forward-progress fix that closes cass#259) is now
-        // published. Empty `expected_git` signals
+        // crates.io-only pin: fsqlite 0.1.14. 0.1.5 carried the upstream #95
+        // BtCursor forward-progress fix that closed cass#259; 0.1.11 added the
+        // ExistsValueSet set-based path that avoids the correlated_exists_fallback
+        // wedging lexical rebuild prep (bead p3kgr). 0.1.14 is the ceiling on
+        // rustc 1.94 — from 0.1.15 on, fsqlite-types requires asupersync >=0.3.5
+        // -> sysinfo 0.39 -> rustc 1.95. Empty `expected_git` signals
         // `validate_manifest_dependency_spec` to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.1.5",
+        expected_version: "0.1.14",
         expected_features: &["fts5"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -68,10 +71,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // crates.io-only pin aligned with the frankensqlite facade at 0.1.5.
+        // crates.io-only pin aligned with the frankensqlite facade at 0.1.14.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.1.5",
+        expected_version: "0.1.14",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -112,11 +115,13 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         // crates.io-only pin after the 0.3.x migration unified every source
         // (direct dep, frankensqlite transitive, frankensearch transitive)
-        // onto a single published release. Empty `expected_git` signals
-        // `validate_manifest_dependency_spec` to skip git/rev checks.
+        // onto a single published release. 0.3.4 is the floor fsqlite-types
+        // 0.1.14 requires and the ceiling rustc 1.94 allows: asupersync >=0.3.5
+        // requires sysinfo 0.39, which requires rustc 1.95. Empty `expected_git`
+        // signals `validate_manifest_dependency_spec` to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.2",
+        expected_version: "0.3.4",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -418,12 +423,21 @@ fn validate_manifest_dependency_version(
     contract: &DependencyContract,
 ) {
     let actual_version = string_value(spec, "version", contract.dep_key);
-    if actual_version != contract.expected_version {
+    // `expected_version` is the bare version, because the sibling-manifest check
+    // compares it against a `[package] version` field. A requirement may spell the
+    // same pin as `=X` — strictly narrower than the caret default, and required
+    // wherever a newer sibling release would otherwise be resolved (see the
+    // frankensqlite pin). Accept both spellings of the same version; reject any other.
+    if actual_version.strip_prefix('=').unwrap_or(actual_version) != contract.expected_version {
         contract_error(
             contract,
             format!(
-                "dependency `{}` in [{}] must pin version = `{}`, found `{}`",
-                contract.dep_key, contract.dep_table, contract.expected_version, actual_version
+                "dependency `{}` in [{}] must pin version = `{}` (optionally as `={}`), found `{}`",
+                contract.dep_key,
+                contract.dep_table,
+                contract.expected_version,
+                contract.expected_version,
+                actual_version
             ),
         );
     }
