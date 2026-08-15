@@ -10693,29 +10693,72 @@ impl ConnectorScanCoverage {
 /// point of a floor is that it survives the process that recorded it, reading
 /// it through a fresh connection is also the semantics we actually want. Same
 /// idiom as `fresh_franken_count_retry` on the CLI side.
-fn read_connector_scan_floors_fresh(db_path: &Path) -> BTreeMap<String, i64> {
+///
+/// Tri-state, and this is the third and last copy of one read to adopt it —
+/// bead `coding_agent_session_search-1a7mk`:
+///
+/// - `Some(non-empty)` — a scan aborted; those connectors must be widened.
+/// - `Some(empty)` — the meta row is absent, so no scan has aborted.
+/// - `None` — the read itself failed, so this run cannot know.
+///
+/// `FrankenStorage::get_connector_scan_floors` (`storage/sqlite.rs`) already
+/// discriminates with `.optional()` and returns `Result`;
+/// `read_connector_scan_floors` in `lib.rs` already returns `Option`. This was
+/// the only one that collapsed a failed read into an empty map, which is the
+/// exact shape `1a7mk` was filed for.
+///
+/// **`None` does not close the hole, and nothing here claims it does.** The
+/// callers substitute an empty map and carry on, so a failed read still leaves
+/// the run unwidened and the connector's gap unrepaired. That is deliberate:
+/// widening on `None` would force a full re-read of the whole archive on any
+/// transient error, and failing the run would contradict
+/// `indexer/mod.rs`'s own stance that one dead connector must not abandon the
+/// others' work. What the tri-state buys is that the failure is now logged at
+/// `error!` naming its consequence, that the type refuses a future
+/// `.unwrap_or_default()` from silently reintroducing the collapse, and that
+/// the tests below can tell a cleared floor apart from a failed read.
+///
+/// Deliberately NOT bounded by a worker thread, unlike the `lib.rs` sibling.
+/// The expensive branch of `release_connection` — the whole-database root
+/// drain, which spins rather than sleeps — is gated on `open_connections == 0`,
+/// and both call sites here already hold a long-lived `FrankenStorage` on this
+/// same path, so the count never reaches zero. Adding a bound would orphan a
+/// worker holding `runtime_state` across that spin, and `register_connection`
+/// needs the same mutex — so the next ephemeral-writer acquisition would block
+/// forever, with no timeout and no log, far from the cause. That trade is
+/// acceptable in a short-lived CLI and not in a long-lived indexer.
+fn read_connector_scan_floors_fresh(db_path: &Path) -> Option<BTreeMap<String, i64>> {
     if !db_path.exists() {
-        return BTreeMap::new();
+        // Not a failure: an archive that does not exist yet genuinely has no
+        // aborted scan. Mirrors lib.rs's `Ok(None) => Some(BTreeMap::new())`.
+        return Some(BTreeMap::new());
     }
     let storage = match FrankenStorage::open_readonly(db_path) {
         Ok(storage) => storage,
         Err(error) => {
-            tracing::warn!(
+            tracing::error!(
                 db_path = %db_path.display(),
                 error = %error,
                 "could not open the archive to read connector scan coverage floors; \
-                 previously failed connectors will not be widened this run"
+                 previously failed connectors will not be widened this run and their \
+                 gaps stay open until a later run reads the floors successfully"
             );
-            return BTreeMap::new();
+            return None;
         }
     };
-    let floors = storage.get_connector_scan_floors().unwrap_or_else(|error| {
-        tracing::warn!(
-            error = %error,
-            "could not read connector scan coverage floors"
-        );
-        BTreeMap::new()
-    });
+    let floors = match storage.get_connector_scan_floors() {
+        Ok(floors) => Some(floors),
+        Err(error) => {
+            tracing::error!(
+                db_path = %db_path.display(),
+                error = %error,
+                "could not read connector scan coverage floors; previously failed \
+                 connectors will not be widened this run and their gaps stay open \
+                 until a later run reads the floors successfully"
+            );
+            None
+        }
+    };
     let _ = storage.close();
     floors
 }
@@ -11565,7 +11608,11 @@ fn run_streaming_index_with_connector_factories(
     let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
     let coverage = ConnectorScanCoverage::new(
         since_ts,
-        read_connector_scan_floors_fresh(&opts.db_path),
+        // `None` means the floors read failed, which it has already logged at
+        // `error!`. Substituting an empty map is the deliberate choice argued on
+        // that function: run unwidened rather than force a full re-read or
+        // abandon the other connectors' work.
+        read_connector_scan_floors_fresh(&opts.db_path).unwrap_or_default(),
         connector_factories.iter().map(|(name, _)| *name),
     );
     for (connector, floor) in &coverage.floors {
@@ -11734,7 +11781,9 @@ fn run_batch_index_with_connector_factories(
 
     let coverage = ConnectorScanCoverage::new(
         since_ts,
-        read_connector_scan_floors_fresh(&opts.db_path),
+        // See the streaming path above: `None` is already logged at `error!` and
+        // the empty map is the deliberate unwidened-run choice.
+        read_connector_scan_floors_fresh(&opts.db_path).unwrap_or_default(),
         connector_factories.iter().map(|(name, _)| *name),
     );
     let coverage_ref = &coverage;
@@ -33524,7 +33573,8 @@ mod tests {
         // Read the floors the way a later process would: the requirement is
         // that the failure survives the run that recorded it, so a fresh open
         // of the durable archive is the honest check.
-        let floors_after_failure = read_connector_scan_floors_fresh(&db_path);
+        let floors_after_failure = read_connector_scan_floors_fresh(&db_path)
+            .expect("the floors read must succeed against this fixture archive");
         assert!(
             floors_after_failure.contains_key("codex"),
             "an aborted codex scan must leave a durable coverage floor, not just a warn log; \
@@ -33563,14 +33613,140 @@ mod tests {
             "the two rollouts the aborted scan never read must still be reachable; \
              an incremental run that filters them out by mtime makes the hole permanent"
         );
-        assert!(
-            read_connector_scan_floors_fresh(&db_path).is_empty(),
-            "a clean scan that read from the floor should clear it"
+        assert_eq!(
+            read_connector_scan_floors_fresh(&db_path),
+            Some(BTreeMap::new()),
+            "a clean scan that read from the floor should clear it — and `Some` is \
+             load-bearing here. Before the tri-state change this read returned a bare \
+             map, so `.is_empty()` passed identically whether the floor had been \
+             cleared or the read had FAILED, and the assertion could not tell the \
+             success it was named after from the failure it was meant to exclude"
         );
 
         *COVERAGE_FIXTURE_ROOT
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// A floors read that FAILS is `None`, never an empty map.
+    ///
+    /// Bead `coding_agent_session_search-1a7mk`. The neighbouring test above uses
+    /// `read_connector_scan_floors_fresh` as an instrument against a healthy
+    /// fixture, so before this test neither of its failure arms was exercised by
+    /// anything in the tree — which is how the collapse survived the `lib.rs` fix.
+    ///
+    /// An empty map and a failed read are the two states that must never be
+    /// interchangeable: an empty map means "no scan has aborted" and is the
+    /// input that makes `connector_coverage_json` render `"complete": true` on
+    /// the sibling path. A file that exists but is not a database drives the
+    /// failure without needing a lock, a permission change, or a race.
+    #[test]
+    fn a_failed_floors_read_is_unknown_and_never_an_empty_map() {
+        let tmp = TempDir::new().unwrap();
+        let not_a_db = tmp.path().join("corrupt.db");
+        fs::write(&not_a_db, b"this is not a sqlite database, it is 44 bytes").unwrap();
+
+        assert_eq!(
+            read_connector_scan_floors_fresh(&not_a_db),
+            None,
+            "a failed read must report UNKNOWN. Returning Some(empty) here is the \
+             pre-fix collapse: it is indistinguishable from a healthy archive in \
+             which no scan has ever aborted, which is exactly the state the \
+             sibling reporting path renders as proven-complete coverage"
+        );
+    }
+
+    /// An archive that does not exist yet is `Some(empty)`, not `None`.
+    ///
+    /// The other half of the tri-state, and the arm most likely to be
+    /// "simplified" back into the failure arm by a later reader: a database that
+    /// has never been created genuinely has no aborted scan, so it is a known
+    /// answer rather than an unknown one. Mirrors `lib.rs`'s
+    /// `Ok(None) => Some(BTreeMap::new())`.
+    #[test]
+    fn an_absent_archive_has_no_aborted_scan_rather_than_unknown_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let never_created = tmp.path().join("does-not-exist.db");
+        assert!(!never_created.exists());
+
+        assert_eq!(
+            read_connector_scan_floors_fresh(&never_created),
+            Some(BTreeMap::new()),
+            "an archive that does not exist yet has provably had no aborted scan; \
+             reporting that as unknown would make every first run look degraded"
+        );
+    }
+
+    /// Every connector scans from *its own* floor, and a connector with no floor
+    /// keeps the run-wide watermark.
+    ///
+    /// Bead `coding_agent_session_search-gxw32`. The neighbouring test above
+    /// proves a floor is recorded and honoured, but it registers exactly one
+    /// connector (`vec![("codex", ...)]` at both of its call sites), so it cannot
+    /// tell "each connector uses its own floor" apart from "every connector uses
+    /// whatever single floor exists". A mutant replacing the per-connector lookup
+    /// with any aggregate over the whole map passed all 5,127 tests.
+    ///
+    /// The load-bearing assertion is `amp`: a connector whose scan never failed
+    /// must not be dragged back to somebody else's floor and made to re-read
+    /// history it already covered.
+    ///
+    /// Three floors — 100, 400 and the 1,000 watermark — are pairwise distinct,
+    /// so no assertion here can pass by coincidence. Two floored connectors and
+    /// one clean one is the minimum that separates "own floor" from every
+    /// plausible aggregate: under `.min()` every connector gets 100 and the
+    /// `claude`, `amp` and `failure_floor_for("amp")` assertions all die; under
+    /// `.max()` the `codex` assertion dies; under first-floor-wins the `claude`
+    /// and `amp` assertions die; under no lookup at all the `codex` and `claude`
+    /// assertions die. Three independent failures means the test cannot be
+    /// re-armed by adjusting one number.
+    #[test]
+    fn each_connector_scans_from_its_own_coverage_floor() {
+        let floors = BTreeMap::from([
+            ("codex".to_string(), 100_i64),
+            ("claude".to_string(), 400_i64),
+        ]);
+
+        let coverage = ConnectorScanCoverage::new(Some(1_000), floors, ["codex", "claude", "amp"]);
+
+        assert_eq!(
+            coverage.since_ts_for("codex"),
+            Some(100),
+            "a floored connector scans from its own floor, not the run watermark"
+        );
+        assert_eq!(
+            coverage.since_ts_for("claude"),
+            Some(400),
+            "each floored connector scans from ITS OWN floor; sharing one floor \
+             across connectors is the regression this test exists to catch"
+        );
+        assert_eq!(
+            coverage.since_ts_for("amp"),
+            Some(1_000),
+            "a connector with no floor keeps the run-wide watermark and is not \
+             dragged back by another connector's failure"
+        );
+
+        assert_eq!(
+            coverage.failure_floor_for("codex"),
+            100,
+            "the floor recorded when a scan fails is the point that connector was \
+             proven to have read past, which is its own since_ts"
+        );
+        assert_eq!(
+            coverage.failure_floor_for("amp"),
+            1_000,
+            "an unfloored connector that fails records the run watermark, not \
+             another connector's floor"
+        );
+
+        assert!(coverage.has_floor("codex"));
+        assert!(
+            !coverage.has_floor("amp"),
+            "has_floor must reflect this connector's own entry; it gates whether \
+             a clean scan clears a floor, so a false positive would clear a floor \
+             that was never recorded"
+        );
     }
 
     struct PanicConnector;
