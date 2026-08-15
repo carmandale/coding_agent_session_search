@@ -15301,7 +15301,22 @@ fn connector_coverage_warning(floors: &BTreeMap<String, i64>) -> Option<String> 
 struct StateDbSnapshot {
     conversation_count: i64,
     message_count: i64,
-    last_scan_ts: Option<i64>,
+    /// The `last_scan_ts` meta watermark, as a real tri-state — bead
+    /// `coding_agent_session_search-0gzok` part 1.
+    ///
+    /// `None` = this probe did not obtain the watermark: it never opened the
+    /// database, or the read itself errored, or the stored value was not
+    /// parseable as an epoch-millis integer. `Some(None)` = checked, and the
+    /// key is genuinely absent, which is what a fresh archive that has never
+    /// been scanned looks like. `Some(Some(ts))` = checked, and this is the
+    /// value.
+    ///
+    /// The two are not interchangeable, and collapsing them is what this bead
+    /// was filed against: the staleness override below is guarded on this
+    /// field, so a failed read used to make the override silently not fire and
+    /// the index render as NOT stale. Same convention as
+    /// `connector_scan_floors`.
+    last_scan_ts: Option<Option<i64>>,
     last_indexed_at: Option<i64>,
     opened: bool,
     open_error: Option<String>,
@@ -15499,14 +15514,30 @@ fn probe_state_db_blocking(
     )
     .ok()
     .and_then(|s| s.parse::<i64>().ok());
-    snapshot.last_scan_ts = franken_query_row_map_retry(
+    // Bead `coding_agent_session_search-0gzok` part 1. The plain
+    // `SELECT value FROM meta WHERE key = ...` cannot answer this honestly:
+    // `query_row_map` returns `Err` both when the read genuinely failed and
+    // when the key is simply absent, and `.ok()` then collapsed the two into
+    // the same `None` that a never-scanned archive produces. Wrapping the
+    // lookup in a scalar subquery makes the statement yield exactly one row
+    // always — NULL when the key is absent — so `Ok` now means "the read ran"
+    // and `Err` means "it did not", which is the distinction this field exists
+    // to carry.
+    snapshot.last_scan_ts = match franken_query_row_map_retry(
         &conn,
-        "SELECT value FROM meta WHERE key = 'last_scan_ts'",
+        "SELECT (SELECT value FROM meta WHERE key = 'last_scan_ts')",
         params![],
-        |r| r.get_typed::<String>(0),
-    )
-    .ok()
-    .and_then(|s| s.parse::<i64>().ok());
+        |r| r.get_typed::<Option<String>>(0),
+    ) {
+        // Checked, key absent — a fresh archive that has never been scanned.
+        Ok(None) => Some(None),
+        // Checked and present. An unparseable value is NOT `Some(None)`: we
+        // reached the row and still cannot say what the watermark is, so it
+        // reports as "did not obtain it" rather than as "never scanned".
+        Ok(Some(raw)) => raw.parse::<i64>().ok().map(Some),
+        // The read itself failed.
+        Err(_) => None,
+    };
     // Assigned straight through: the field is already the same tri-state, and
     // its own doc comment says `None` means "did not check". Wrapping the read
     // in `Some` asserted "checked" even when the read had failed.
@@ -16390,20 +16421,49 @@ fn state_meta_json_inner(
             },
         }
     });
-    if !assets.lexical.rebuilding
-        && last_scan_ts.is_some_and(|scan_ts| {
-            last_indexed_at
-                .map(|indexed_at| scan_ts > indexed_at.saturating_add(1_000))
-                .unwrap_or(true)
-        })
-    {
-        assets.lexical.status = "stale";
-        assets.lexical.fresh = false;
-        assets.lexical.stale = true;
-        assets.lexical.status_reason = Some(
-            "last_scan_ts is newer than last_indexed_at; a prior scan advanced without a completed projection into the searchable index"
-                .to_string(),
-        );
+    if !assets.lexical.rebuilding {
+        match last_scan_ts {
+            // Checked, present, and the scan watermark is ahead of the
+            // projection. Unchanged behaviour.
+            Some(Some(scan_ts))
+                if last_indexed_at
+                    .map(|indexed_at| scan_ts > indexed_at.saturating_add(1_000))
+                    .unwrap_or(true) =>
+            {
+                assets.lexical.status = "stale";
+                assets.lexical.fresh = false;
+                assets.lexical.stale = true;
+                assets.lexical.status_reason = Some(
+                    "last_scan_ts is newer than last_indexed_at; a prior scan advanced without a completed projection into the searchable index"
+                        .to_string(),
+                );
+            }
+            // Bead `coding_agent_session_search-0gzok` part 1. The database
+            // opened, and the watermark read still did not produce a value we
+            // can trust, so this staleness check never actually ran. Say that,
+            // rather than letting the absence of a verdict read as a pass.
+            //
+            // Deliberately does NOT flip `fresh`/`stale`: whether "could not
+            // check" should degrade the one-word verdict is the open product
+            // question on bead
+            // `coding_agent_session_search-health-healthy-on-unknown-coverage-xarzt`,
+            // and it is Dale's call, not this fix's. What is unambiguous is
+            // that the reason must not stay silent.
+            //
+            // Scoped to `db_opened && !open_skipped` on purpose. A probe that
+            // never opened the database (`opened: false` — missing file, open
+            // error, or the bounded probe expiring) already surfaces through
+            // `database.open_error`, and `cass health` skips the open by
+            // documented design on every single call, so degrading on those
+            // would fire constantly and say nothing new.
+            None if db_opened && !open_skipped => {
+                assets.lexical.status_reason = Some(
+                    "last_scan_ts could not be read from the state database, so the scan-ahead-of-projection staleness check did not run; index freshness on this surface is unverified rather than confirmed"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
     }
     let not_initialized = cass_not_initialized(
         db_exists,
@@ -66751,7 +66811,14 @@ mod cli_read_db_tests {
 
         assert!(snapshot.opened, "state probe should open the database");
         assert_eq!(snapshot.last_indexed_at, Some(1_733_000_000_000));
-        assert_eq!(snapshot.last_scan_ts, Some(1_732_999_999_000));
+        // Re-encoded, not re-armed, for bead
+        // `coding_agent_session_search-0gzok` part 1. This test's own setup
+        // writes the value via `set_last_scan_ts` above, so "checked, and
+        // present" is its documented intent; the tri-state spells that
+        // `Some(Some(_))`. The outer `Some` is the new claim being made here —
+        // that the read actually ran — and it is the half a failed read can no
+        // longer forge.
+        assert_eq!(snapshot.last_scan_ts, Some(Some(1_732_999_999_000)));
         assert!(snapshot.counts_skipped, "count scan should remain disabled");
         assert_eq!(snapshot.conversation_count, 0);
         assert_eq!(snapshot.message_count, 0);
@@ -66759,6 +66826,67 @@ mod cli_read_db_tests {
             snapshot.open_error.is_none(),
             "state probe should not report an error: {:?}",
             snapshot.open_error
+        );
+    }
+
+    /// Bead `coding_agent_session_search-0gzok` part 1.
+    ///
+    /// The staleness override in `state_meta_json_inner` is guarded on
+    /// `last_scan_ts`, so before the fix a failed read and a never-scanned
+    /// archive were the same `None`: an unreadable watermark made the
+    /// scan-ahead-of-projection check silently not fire, and the index rendered
+    /// as NOT stale with nothing saying the check had not run.
+    ///
+    /// This asserts the property that fix depends on — that all three states
+    /// are reachable AND that the two that used to collapse are now different
+    /// values. The final `assert_ne!` is the one that fails if anyone
+    /// re-collapses them, whatever the individual encodings become.
+    #[test]
+    fn probe_state_db_distinguishes_unread_watermark_from_never_scanned() {
+        // (1) Checked, and present.
+        let (_temp, db_path) = seed_cli_db();
+        let present = probe_state_db(&db_path, "status", Duration::from_secs(5), false);
+        assert!(present.opened, "the seeded probe should open the database");
+        assert_eq!(present.last_scan_ts, Some(Some(1_732_999_999_000)));
+
+        // (2) Checked, and the key is genuinely absent — a fresh archive that
+        // has never been scanned. Seeded by writing `last_indexed_at` and
+        // deliberately NOT writing `last_scan_ts`.
+        let never_scanned_temp = TempDir::new().expect("tempdir");
+        let never_scanned_path = never_scanned_temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&never_scanned_path).expect("open cass db");
+        storage
+            .set_last_indexed_at(1_733_000_000_000)
+            .expect("set last_indexed_at");
+        drop(storage);
+        let never_scanned =
+            probe_state_db(&never_scanned_path, "status", Duration::from_secs(5), false);
+        assert!(
+            never_scanned.opened,
+            "the never-scanned probe must still open the database"
+        );
+        assert_eq!(
+            never_scanned.last_scan_ts,
+            Some(None),
+            "an absent last_scan_ts key is checked-and-never-scanned, not could-not-read"
+        );
+
+        // (3) Not obtained at all. A 1ns budget cannot cover a thread spawn
+        // plus a file open, so the bounded wrapper's `recv_timeout` expires.
+        let unread = probe_state_db(&db_path, "status", Duration::from_nanos(1), false);
+        assert!(
+            !unread.opened,
+            "the 1ns probe must not report a completed open"
+        );
+        assert_eq!(
+            unread.last_scan_ts, None,
+            "a probe that never completed must not claim the watermark is absent"
+        );
+
+        // The whole point: the two states that used to be one must differ.
+        assert_ne!(
+            never_scanned.last_scan_ts, unread.last_scan_ts,
+            "never-scanned and could-not-read must not collapse to the same value"
         );
     }
 
