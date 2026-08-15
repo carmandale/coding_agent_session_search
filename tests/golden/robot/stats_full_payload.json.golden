@@ -37,5 +37,11 @@
     "oldest_source_mtime_ms": null,
     "newest_source_mtime_ms": null
   },
+  "connector_coverage": {
+    "checked": false,
+    "complete": null,
+    "incomplete_connectors": [],
+    "floors": []
+  },
   "db_path": "[TEST_HOME]/search_demo_data/agent_search.db"
 }

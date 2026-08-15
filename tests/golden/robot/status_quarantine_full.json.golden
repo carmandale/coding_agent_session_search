@@ -194,6 +194,12 @@
     "newest_last_attempt_at_ms": null,
     "recommended_action": null
   },
+  "connector_coverage": {
+    "checked": false,
+    "complete": null,
+    "incomplete_connectors": [],
+    "floors": []
+  },
   "policy_registry": {
     "schema_version": "1",
     "controllers": [

@@ -578,6 +578,29 @@
         }
       }
     },
+    "connector_coverage": {
+      "type": "object",
+      "properties": {
+        "checked": {
+          "type": "boolean"
+        },
+        "complete": {
+          "type": "null"
+        },
+        "incomplete_connectors": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "floors": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        }
+      }
+    },
     "policy_registry": {
       "type": "object",
       "properties": {

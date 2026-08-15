@@ -45,6 +45,12 @@
     "index not initialized yet"
   ],
   "latency_ms": "[LATENCY_MS]",
+  "connector_coverage": {
+    "checked": false,
+    "complete": null,
+    "incomplete_connectors": [],
+    "floors": []
+  },
   "rebuild_progress": {
     "active": false,
     "stalled": false,
@@ -390,6 +396,12 @@
       "open_retryable": false,
       "counts_skipped": false,
       "open_skipped": false
+    },
+    "connector_coverage": {
+      "checked": false,
+      "complete": null,
+      "incomplete_connectors": [],
+      "floors": []
     },
     "pending": {
       "sessions": 0,

@@ -72,6 +72,29 @@
     "latency_ms": {
       "type": "string"
     },
+    "connector_coverage": {
+      "type": "object",
+      "properties": {
+        "checked": {
+          "type": "boolean"
+        },
+        "complete": {
+          "type": "null"
+        },
+        "incomplete_connectors": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "floors": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        }
+      }
+    },
     "rebuild_progress": {
       "type": "object",
       "properties": {
@@ -972,6 +995,29 @@
             },
             "open_skipped": {
               "type": "boolean"
+            }
+          }
+        },
+        "connector_coverage": {
+          "type": "object",
+          "properties": {
+            "checked": {
+              "type": "boolean"
+            },
+            "complete": {
+              "type": "null"
+            },
+            "incomplete_connectors": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "floors": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
             }
           }
         },
