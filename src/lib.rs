@@ -15088,10 +15088,26 @@ const CLI_DIAG_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 /// only signal that separates "the index is complete" from "the index looks
 /// complete because a failed scan let the watermark advance past what it never
 /// read" — bead `coding_agent_session_search-codex-coverage-gap-2bh4a`.
-fn read_connector_scan_floors(conn: &frankensqlite::Connection) -> BTreeMap<String, i64> {
-    use frankensqlite::compat::{ParamValue, RowExt};
+/// Tri-state, and no two of the three are interchangeable:
+///
+/// - `Some(non-empty)` — a scan aborted; the archive is unproven from the floor.
+/// - `Some(empty)` — the meta row is absent, so no scan has aborted.
+/// - `None` — the read itself failed, so coverage is UNKNOWN.
+///
+/// Collapsing the last two is bead `coding_agent_session_search-1a7mk`. The old
+/// `.unwrap_or_default()` mapped a failed query to an empty map, and
+/// `connector_coverage_json` renders an empty map as `"complete": true` — so a
+/// database error was reported to operators and agents as proven-complete
+/// coverage. `connector_coverage_state_json` below already argues this exact
+/// case for the `checked` flag; the error path was quietly undoing it.
+///
+/// `FrankenStorage::get_connector_scan_floors` (`storage/sqlite.rs`) performs
+/// the same read and already draws this distinction with `.optional()`. This is
+/// the second implementation of one read, and it must agree with the first.
+fn read_connector_scan_floors(conn: &frankensqlite::Connection) -> Option<BTreeMap<String, i64>> {
+    use frankensqlite::compat::{OptionalExtension, ParamValue, RowExt};
 
-    franken_query_row_map_retry(
+    match franken_query_row_map_retry(
         conn,
         "SELECT value FROM meta WHERE key = ?1",
         &[ParamValue::from(
@@ -15099,8 +15115,18 @@ fn read_connector_scan_floors(conn: &frankensqlite::Connection) -> BTreeMap<Stri
         )],
         |r| r.get_typed::<String>(0),
     )
-    .map(|raw| crate::storage::sqlite::parse_connector_scan_floors(&raw))
-    .unwrap_or_default()
+    .optional()
+    {
+        Ok(Some(raw)) => Some(crate::storage::sqlite::parse_connector_scan_floors(&raw)),
+        Ok(None) => Some(BTreeMap::new()),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "could not read connector scan coverage floors; reporting coverage as unchecked"
+            );
+            None
+        }
+    }
 }
 
 /// How long `cass health` will wait to open the database purely to answer the
@@ -15108,17 +15134,59 @@ fn read_connector_scan_floors(conn: &frankensqlite::Connection) -> BTreeMap<Stri
 /// `checked: false` over blocking on a contended archive.
 const HEALTH_COVERAGE_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Read the coverage floors through a short bounded open, for surfaces whose
+/// Read the coverage floors under a hard wall-clock bound, for surfaces whose
 /// state probe elided the database open entirely (`cass health`).
+///
+/// The unit being bounded is "answer the coverage question", not "open the
+/// database" — bead `coding_agent_session_search-1a7mk`. The previous version
+/// passed `timeout` to `open_franken_cli_read_db` alone, where it becomes a
+/// `PRAGMA busy_timeout`: a bound on lock contention, not on work. The query
+/// carried its own separate `CLI_DB_QUERY_RETRY_TIMEOUT`, and
+/// `close_franken_cli_read_db` — which calls `close_in_place` and on a 7.7 GB
+/// archive is the expensive step — was bounded by nothing at all. So a declared
+/// 2s ceiling measured >150s on the live archive and `cass health`, `triage`,
+/// `stats` and `status --json` all stopped returning.
+///
+/// Running open + read + close on a worker and waiting once with
+/// `recv_timeout` is the same shape as
+/// `open_franken_cli_read_db_with_hard_timeout` above, applied one level up.
+/// `None` already flows to `"checked": false` through
+/// `connector_coverage_state_json`, which is what the doc comment on
+/// `HEALTH_COVERAGE_OPEN_TIMEOUT` promises: report unchecked rather than block.
+///
+/// ceiling: on expiry the worker is orphaned holding the connection until it
+/// finishes on its own. That is the ceiling the existing hard-timeout open
+/// already accepts, and it is sound for a short-lived CLI process; a long-lived
+/// embedder that calls this in a loop would need a real cancellation path.
 fn read_connector_scan_floors_bounded(
     db_path: &Path,
     timeout: Duration,
 ) -> Option<BTreeMap<String, i64>> {
-    let conn =
-        open_franken_cli_read_db(db_path.to_path_buf(), "connector-coverage", timeout).ok()?;
-    let floors = read_connector_scan_floors(&conn);
-    let _ = close_franken_cli_read_db(conn, db_path, "connector-coverage");
-    Some(floors)
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = db_path.to_path_buf();
+    let _worker = std::thread::spawn(move || {
+        let floors = open_franken_cli_read_db(path.clone(), "connector-coverage", timeout)
+            .ok()
+            .and_then(|conn| {
+                let floors = read_connector_scan_floors(&conn);
+                let _ = close_franken_cli_read_db(conn, &path, "connector-coverage");
+                floors
+            });
+        let _ = tx.send(floors);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(floors) => floors,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            warn!(
+                db_path = %db_path.display(),
+                timeout_ms = timeout.as_millis() as u64,
+                "connector coverage read exceeded its bound; reporting coverage as unchecked"
+            );
+            None
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+    }
 }
 
 /// Render the coverage floors as the `connector_coverage` block shared by
@@ -15294,7 +15362,10 @@ fn probe_state_db(
     )
     .ok()
     .and_then(|s| s.parse::<i64>().ok());
-    snapshot.connector_scan_floors = Some(read_connector_scan_floors(&conn));
+    // Assigned straight through: the field is already the same tri-state, and
+    // its own doc comment says `None` means "did not check". Wrapping the read
+    // in `Some` asserted "checked" even when the read had failed.
+    snapshot.connector_scan_floors = read_connector_scan_floors(&conn);
     if include_counts {
         snapshot.conversation_count = franken_query_row_map_retry(
             &conn,
@@ -15604,6 +15675,144 @@ fn index_orphan_fk_cleanup_cli_error(chain: &str) -> CliError {
                 .to_string(),
         ),
         retryable: true,
+    }
+}
+
+/// Coverage-read honesty — bead `coding_agent_session_search-1a7mk`.
+///
+/// The defect these pin is not "a wrong number"; it is a readiness surface
+/// reporting proven-complete coverage when it never managed to read the
+/// coverage. Every assertion below is written so that restoring
+/// `.unwrap_or_default()` on `read_connector_scan_floors` turns it red.
+#[cfg(test)]
+mod connector_coverage_honesty_tests {
+    use super::*;
+    use frankensqlite::compat::ParamValue;
+    use tempfile::TempDir;
+
+    fn conn_with_meta_table(temp: &TempDir, name: &str) -> frankensqlite::Connection {
+        let db_path = temp.path().join(name);
+        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("open temp db");
+        conn.execute_compat(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            &[] as &[ParamValue],
+        )
+        .expect("create meta");
+        conn
+    }
+
+    /// `meta` exists and holds no floors row: nothing has aborted, so this is
+    /// genuinely complete coverage and must read as `Some(empty)`.
+    #[test]
+    fn absent_floors_row_reads_as_checked_and_complete() {
+        let temp = TempDir::new().expect("temp dir");
+        let conn = conn_with_meta_table(&temp, "no-floors.db");
+
+        let floors = read_connector_scan_floors(&conn);
+
+        assert_eq!(
+            floors,
+            Some(BTreeMap::new()),
+            "an absent floors row means no scan aborted — that is checked-and-complete, not unknown"
+        );
+        let rendered = connector_coverage_state_json(floors.as_ref());
+        assert_eq!(rendered["checked"], serde_json::json!(true));
+        assert_eq!(rendered["complete"], serde_json::json!(true));
+    }
+
+    /// THE MUTANT KILLER. No `meta` table at all, so the query itself fails.
+    ///
+    /// Under the pre-fix `.unwrap_or_default()` this returned an empty map,
+    /// which `connector_coverage_json` renders as `"complete": true` — a
+    /// database error reported to agents as proven coverage. Restoring that
+    /// implementation makes both halves of this test fail.
+    #[test]
+    fn failed_coverage_read_is_unknown_and_never_complete() {
+        let temp = TempDir::new().expect("temp dir");
+        let db_path = temp.path().join("no-meta-table.db");
+        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("open temp db");
+
+        // Positive control: the probe can produce a non-None answer on a
+        // database that does have the table, so a `None` below is the failure
+        // being detected rather than a probe that cannot succeed at all.
+        let control_temp = TempDir::new().expect("temp dir");
+        let control = conn_with_meta_table(&control_temp, "control.db");
+        assert!(
+            read_connector_scan_floors(&control).is_some(),
+            "control must succeed, otherwise a None from the subject proves nothing"
+        );
+
+        let floors = read_connector_scan_floors(&conn);
+
+        assert_eq!(
+            floors, None,
+            "a failed coverage read must be UNKNOWN, never an empty floor map"
+        );
+        let rendered = connector_coverage_state_json(floors.as_ref());
+        assert_eq!(
+            rendered["checked"],
+            serde_json::json!(false),
+            "a surface that could not read coverage must say so"
+        );
+        assert_ne!(
+            rendered["complete"],
+            serde_json::json!(true),
+            "a failed read must never render as complete coverage"
+        );
+    }
+
+    /// A real floor round-trips and renders as incomplete.
+    #[test]
+    fn recorded_floor_reads_as_checked_and_incomplete() {
+        let temp = TempDir::new().expect("temp dir");
+        let conn = conn_with_meta_table(&temp, "with-floor.db");
+        conn.execute_compat(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+            &[
+                ParamValue::from(crate::storage::sqlite::CONNECTOR_SCAN_FLOORS_META_KEY),
+                ParamValue::from(r#"{"codex":1700000000000}"#),
+            ],
+        )
+        .expect("insert floor");
+
+        let floors = read_connector_scan_floors(&conn).expect("read must succeed");
+
+        assert_eq!(floors.get("codex"), Some(&1_700_000_000_000));
+        let rendered = connector_coverage_state_json(Some(&floors));
+        assert_eq!(rendered["checked"], serde_json::json!(true));
+        assert_eq!(rendered["complete"], serde_json::json!(false));
+    }
+
+    /// The bound must cover the whole read, not just the open.
+    ///
+    /// This cannot prove the fix against a slow archive from a unit test, but
+    /// it does pin the contract that expiry yields UNKNOWN rather than a
+    /// default-empty map: a zero timeout cannot complete an open, and the
+    /// answer must still be `None` rather than something that renders complete.
+    #[test]
+    fn expired_bound_reports_unknown_rather_than_complete() {
+        let temp = TempDir::new().expect("temp dir");
+        let db_path = temp.path().join("bounded.db");
+        {
+            let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned())
+                .expect("open temp db");
+            conn.execute_compat(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                &[] as &[ParamValue],
+            )
+            .expect("create meta");
+        }
+
+        let floors = read_connector_scan_floors_bounded(&db_path, Duration::from_nanos(1));
+
+        let rendered = connector_coverage_state_json(floors.as_ref());
+        assert_ne!(
+            rendered["complete"],
+            serde_json::json!(true),
+            "a read that may not have finished must never render as complete coverage"
+        );
     }
 }
 
@@ -23803,7 +24012,7 @@ fn run_stats(
                 "newest": newest.and_then(|ts| chrono::DateTime::from_timestamp_millis(ts).map(|d| d.to_rfc3339())),
             },
             "raw_mirror": &raw_mirror_summary,
-            "connector_coverage": connector_coverage_json(&connector_scan_floors),
+            "connector_coverage": connector_coverage_state_json(connector_scan_floors.as_ref()),
             "db_path": db_path.display().to_string(),
         });
 
@@ -23857,11 +24066,13 @@ fn run_stats(
     println!("  Conversations: {conversation_count}");
     println!("  Messages: {message_count}");
     println!();
-    if connector_scan_floors.is_empty() {
+    if let Some(floors) = &connector_scan_floors
+        && floors.is_empty()
+    {
         println!("Scan Coverage: complete (no connector scan has aborted)");
-    } else {
+    } else if let Some(floors) = &connector_scan_floors {
         println!("Scan Coverage: INCOMPLETE — these totals undercount the archive");
-        for (connector, floor_ts) in &connector_scan_floors {
+        for (connector, floor_ts) in floors {
             let when = chrono::DateTime::from_timestamp_millis(*floor_ts).map_or_else(
                 || "the beginning of the archive".to_string(),
                 |d| d.format("%Y-%m-%d %H:%M UTC").to_string(),
@@ -23871,12 +24082,14 @@ fn run_stats(
         println!(
             "  {}",
             connector_coverage_recommended_action(
-                connector_scan_floors
-                    .keys()
-                    .next()
-                    .map_or("that connector", String::as_str)
+                floors.keys().next().map_or("that connector", String::as_str)
             )
         );
+    } else {
+        // The read failed. Saying nothing here would be the same defect one
+        // layer up: an absent warning reads as a clean bill of health.
+        println!("Scan Coverage: UNKNOWN — the coverage read did not complete");
+        println!("  These totals may undercount the archive. Run 'cass doctor' to check the database.");
     }
     println!();
     println!("Raw Mirror:");
