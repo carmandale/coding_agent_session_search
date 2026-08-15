@@ -29946,6 +29946,19 @@ struct DoctorCoverageSummary {
     schema_version: u32,
     confidence_tier: String,
     archive_conversation_count: usize,
+    /// True when `archive_conversation_count` above is NOT a measurement: the
+    /// source-inventory database query failed, so the count fell back to its
+    /// `Default` of 0. Bead
+    /// `coding_agent_session_search-doctor-promote-gate-fails-open-sgvg3`.
+    ///
+    /// The field exists because `usize` has no representation for "unknown",
+    /// which is the root cause the bead names. The candidate side of the
+    /// promotion gate is already `Option<usize>` and already blocks on `None`;
+    /// this is the baseline side finally able to say the same thing.
+    ///
+    /// Serialized only when true, so every existing golden is byte-unchanged.
+    #[serde(skip_serializing_if = "doctor_flag_unset")]
+    archive_conversation_count_unknown: bool,
     archived_message_count: usize,
     provider_count: usize,
     source_identity_count: usize,
@@ -30116,9 +30129,24 @@ struct DoctorSourceAuthorityCandidate {
     evidence: Vec<String>,
 }
 
+/// `skip_serializing_if` predicate for the doctor "this number is not a
+/// measurement" flags. They default false and are omitted when false, so the
+/// flags are additive to every existing serialized shape and only appear on the
+/// failure they describe.
+fn doctor_flag_unset(flag: &bool) -> bool {
+    !*flag
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 struct DoctorSourceAuthorityCoverageDelta {
     archive_conversation_count: usize,
+    /// Same meaning as `DoctorCoverageSummary::archive_conversation_count_unknown`
+    /// — the archive count below is a fallback 0, not a measurement. Carried
+    /// here too because `raw_mirror_links_minus_archive` is computed against
+    /// that count and feeds the candidate-build trigger, so the trigger needs
+    /// to know the subtraction was against a number nobody measured.
+    #[serde(skip_serializing_if = "doctor_flag_unset")]
+    archive_conversation_count_unknown: bool,
     visible_local_source_conversation_count: usize,
     missing_current_source_count: usize,
     remote_source_count: usize,
@@ -36573,6 +36601,12 @@ fn build_doctor_coverage_summary(
         schema_version: 1,
         confidence_tier,
         archive_conversation_count: source_inventory.total_indexed_conversations,
+        // Bead `-sgvg3`. On the inventory's error path the row loop never runs
+        // and `total_indexed_conversations` keeps its `Default` 0, which is
+        // indistinguishable from a genuinely empty archive. `db_query_error` is
+        // the signal that already exists for exactly this, and
+        // `run_doctor_impl` already reads it the same way elsewhere.
+        archive_conversation_count_unknown: source_inventory.db_query_error.is_some(),
         archived_message_count,
         provider_count: source_inventory.provider_counts.len(),
         source_identity_count: source_inventory.sources.len(),
@@ -36642,7 +36676,13 @@ fn build_doctor_coverage_comparison_gate(
     let mut evidence = vec![
         format!(
             "archive-conversation-count={}",
-            coverage_summary.archive_conversation_count
+            if coverage_summary.archive_conversation_count_unknown {
+                // Bead `-sgvg3`: do not print a fabricated 0 as a measurement.
+                // Matches how the candidate counts below already render.
+                "unknown".to_string()
+            } else {
+                coverage_summary.archive_conversation_count.to_string()
+            }
         ),
         format!(
             "archived-message-count={}",
@@ -36668,6 +36708,20 @@ fn build_doctor_coverage_comparison_gate(
         format!("selected-authority-decision={selected_authority_decision}"),
     ];
 
+    // Bead `coding_agent_session_search-doctor-promote-gate-fails-open-sgvg3`.
+    // The baseline side of this comparison had no way to say "unknown", so a
+    // failed archive read became a silent 0 and every candidate then compared
+    // favourably against it — the gate reported pass at precisely the moment it
+    // was supposed to be protecting something. The candidate side has always
+    // blocked on `None` (the two arms below). This is that same policy applied
+    // to the baseline, which is the asymmetry the bead was filed against:
+    // "same function, same paragraph, opposite policy."
+    if coverage_summary.archive_conversation_count_unknown {
+        blocking_reasons.push(
+            "archive conversation coverage is unknown and cannot be used as a promotion baseline"
+                .to_string(),
+        );
+    }
     match conversation_delta {
         Some(delta) if delta < 0 => blocking_reasons.push(format!(
             "candidate would drop {} archived conversation(s)",
@@ -37226,6 +37280,7 @@ fn doctor_source_authority_coverage_delta(
         .sum::<usize>();
     DoctorSourceAuthorityCoverageDelta {
         archive_conversation_count: source_inventory.total_indexed_conversations,
+        archive_conversation_count_unknown: source_inventory.db_query_error.is_some(),
         visible_local_source_conversation_count,
         missing_current_source_count: source_inventory.missing_current_source_count,
         remote_source_count: source_inventory.remote_source_count,
@@ -38487,10 +38542,18 @@ fn doctor_candidate_build_should_run(
         coverage_risk.status.as_str(),
         "ok" | "not_initialized" | "unchecked_fast_health"
     );
-    let raw_mirror_expands_archive = source_authority
+    // Bead `coding_agent_session_search-doctor-promote-gate-fails-open-sgvg3`.
+    // `raw_mirror_links_minus_archive` is `raw_mirror_db_link_count` minus the
+    // archive conversation count, so when that count is a fabricated 0 the
+    // difference is positive for any verified mirror link at all — and this
+    // trigger then stages a reconstruct candidate, a real write under
+    // `<data_dir>/doctor/candidates`, while the archive is perfectly fine. A
+    // subtraction against a number nobody measured is not evidence that the
+    // mirror expands anything.
+    let raw_mirror_expands_archive = !source_authority
         .coverage_delta
-        .raw_mirror_links_minus_archive
-        > 0;
+        .archive_conversation_count_unknown
+        && source_authority.coverage_delta.raw_mirror_links_minus_archive > 0;
     candidate_authority_available
         && (!db_ok || needs_rebuild || archive_risk || raw_mirror_expands_archive)
 }
@@ -61703,6 +61766,120 @@ paths = ["~/.claude/projects"]
         assert!(
             !rendered.contains("/tmp/"),
             "coverage gate details should be count and evidence based, not exact local paths"
+        );
+    }
+
+    /// Bead `coding_agent_session_search-doctor-promote-gate-fails-open-sgvg3`.
+    ///
+    /// The gate's fail-closed CANDIDATE branch had no regression guard at all:
+    /// both existing gate tests pass `Some(..)` for every count, so the two
+    /// `None => blocking_reasons.push(...)` arms were never executed by the
+    /// suite. That branch is the positive control the bead's whole argument
+    /// rests on — "an unknown candidate count blocks" — so it needs to be
+    /// pinned rather than assumed.
+    #[test]
+    fn doctor_coverage_comparison_gate_blocks_unknown_candidate_counts() {
+        let coverage_summary = DoctorCoverageSummary {
+            confidence_tier: "archive_db_coverage".to_string(),
+            archive_conversation_count: 4,
+            archived_message_count: 12,
+            ..DoctorCoverageSummary::default()
+        };
+
+        let gate = build_doctor_coverage_comparison_gate(
+            &coverage_summary,
+            &doctor_test_source_authority_report(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            !gate.promote_allowed,
+            "an unknown candidate count must never promote: {gate:#?}"
+        );
+        assert_eq!(gate.conversation_delta, None);
+        assert_eq!(gate.message_delta, None);
+        assert!(
+            gate.blocking_reasons.iter().any(|reason| {
+                reason.contains("candidate conversation coverage is unknown")
+            }),
+            "unknown candidate conversation coverage must block by name: {gate:#?}"
+        );
+        assert!(
+            gate.blocking_reasons
+                .iter()
+                .any(|reason| reason.contains("candidate message coverage is unknown")),
+            "unknown candidate message coverage must block by name: {gate:#?}"
+        );
+    }
+
+    /// Bead `coding_agent_session_search-doctor-promote-gate-fails-open-sgvg3`,
+    /// the defect itself.
+    ///
+    /// When the source-inventory query fails, `archive_conversation_count`
+    /// falls back to `Default` 0. Every candidate then compares favourably
+    /// against that fabricated baseline, so the gate reported `promote_allowed`
+    /// at exactly the moment it was supposed to be proving the candidate does
+    /// not shrink coverage. The baseline must now refuse the same way the
+    /// candidate side already does.
+    #[test]
+    fn doctor_coverage_comparison_gate_blocks_when_the_archive_baseline_is_unknown() {
+        let unknown_baseline = DoctorCoverageSummary {
+            confidence_tier: "archive_db_coverage".to_string(),
+            // What the failure path actually produces: the fallback 0, now
+            // carrying the flag that says it is not a measurement.
+            archive_conversation_count: 0,
+            archive_conversation_count_unknown: true,
+            archived_message_count: 0,
+            ..DoctorCoverageSummary::default()
+        };
+
+        let gate = build_doctor_coverage_comparison_gate(
+            &unknown_baseline,
+            &doctor_test_source_authority_report(),
+            Some(2),
+            Some(8),
+            Some(8),
+            None,
+        );
+
+        assert!(
+            !gate.promote_allowed,
+            "an unmeasured archive baseline must not authorise promotion: {gate:#?}"
+        );
+        assert!(
+            gate.blocking_reasons
+                .iter()
+                .any(|reason| reason.contains("archive conversation coverage is unknown")),
+            "the unknown baseline must block by name: {gate:#?}"
+        );
+        assert!(
+            gate.evidence
+                .iter()
+                .any(|line| line == "archive-conversation-count=unknown"),
+            "evidence must not print the fabricated 0 as a measurement: {gate:#?}"
+        );
+
+        // Control: the SAME candidate counts against a baseline that really was
+        // measured as 0 still promote. Without this, the assertions above would
+        // also pass if the gate simply blocked everything.
+        let measured_empty_baseline = DoctorCoverageSummary {
+            archive_conversation_count_unknown: false,
+            ..unknown_baseline.clone()
+        };
+        let measured_gate = build_doctor_coverage_comparison_gate(
+            &measured_empty_baseline,
+            &doctor_test_source_authority_report(),
+            Some(2),
+            Some(8),
+            Some(8),
+            None,
+        );
+        assert!(
+            measured_gate.promote_allowed,
+            "a genuinely empty archive is still a promotable baseline: {measured_gate:#?}"
         );
     }
 
