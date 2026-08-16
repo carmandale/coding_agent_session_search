@@ -13667,6 +13667,12 @@ pub fn run_index(
             );
         }
         let index_path_for_watch = index_path.clone();
+        // The watch callback ingests on its own path (`reindex_paths`), which is
+        // not the scan path `run_streaming_index` / `run_batch_index` take. Both
+        // are enrolled in stall detection by the same lock mode, so both have to
+        // post forward progress; only the scan path was given the plumbing to do
+        // it (bead 8llb5). Carry the same atomic into the callback.
+        let progress_bump_for_watch = Arc::clone(&progress_bump);
 
         // CASS #163 item 3: When autocommit_retain cannot be disabled, the
         // long-lived read handle accumulates MVCC snapshots. Periodically
@@ -13745,6 +13751,7 @@ pub fn run_index(
                         &t_index,
                         &index_path_for_watch,
                         true,
+                        Some(&progress_bump_for_watch),
                     );
                     finalize_watch_reindex_result(
                         indexed,
@@ -13764,6 +13771,7 @@ pub fn run_index(
                             &index_path_for_watch,
                             false,
                             semantic_enabled.then_some(&mut semantic_delta),
+                            Some(&progress_bump_for_watch),
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
@@ -13803,6 +13811,7 @@ pub fn run_index(
                             &index_path_for_watch,
                             false,
                             semantic_enabled.then_some(&mut semantic_delta),
+                            Some(&progress_bump_for_watch),
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
@@ -20907,9 +20916,22 @@ fn reindex_paths(
     t_index: &Mutex<Option<TantivyIndex>>,
     index_path: &Path,
     force_full: bool,
+    // Forward-progress heartbeat for the index run lock. `None` in tests, which
+    // drive this directly without a lock. See the bump at the chunk-commit
+    // boundary below for why this path has to post progress at all.
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<usize> {
     reindex_paths_with_semantic_delta(
-        opts, paths, roots, state, storage, t_index, index_path, force_full, None,
+        opts,
+        paths,
+        roots,
+        state,
+        storage,
+        t_index,
+        index_path,
+        force_full,
+        None,
+        progress_bump,
     )
 }
 
@@ -20924,6 +20946,7 @@ fn reindex_paths_with_semantic_delta(
     index_path: &Path,
     force_full: bool,
     semantic_delta: Option<&mut WatchSemanticDelta>,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<usize> {
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
@@ -21186,6 +21209,28 @@ fn reindex_paths_with_semantic_delta(
                         .expect("watch Tantivy writer must still be open before commit")
                         .commit()?;
                 }
+
+                // Forward progress, posted from INSIDE the ingest loop.
+                //
+                // Reaching here means a non-empty chunk was ingested and
+                // committed, which is the same durable boundary the streaming
+                // consumer bumps on. Bead 8llb5 fixed that consumer and the
+                // batch path, but `cass index --watch-once <paths>` reaches
+                // neither: it runs through `watch_sources` into this function,
+                // which had no bump at all. So `last_progress_at_ms` stayed
+                // pinned to lock-acquisition time and `cass status` called the
+                // run "stalled" ~2 minutes in, handing the operator a gdb
+                // incantation and a recommendation to restart a healthy
+                // indexer. Measured on the post-8llb5 binary before this
+                // change: 1,500 conversations committed, run rc=0, 67 of 89
+                // samples "stalled", `last_progress_at_ms` never moved once.
+                //
+                // Placed after the commit rather than after the scan so it
+                // means progress in both directions: an empty scan `continue`s
+                // above and never reaches here, so a wedged run is still
+                // detectable — which is the whole reason not to exempt
+                // WatchOnce from stall detection instead.
+                bump_index_run_lock_progress_if_present(progress_bump);
 
                 // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode.
                 if lexical_update_deferred {
@@ -41259,6 +41304,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
 
@@ -41270,6 +41316,133 @@ mod tests {
             .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
             .unwrap();
         assert_eq!(message_count, 2);
+    }
+
+    /// Bead 8llb5, second half: `--watch-once <paths>` never reached the bump.
+    ///
+    /// The first fix taught `run_streaming_consumer` and the batch path to post
+    /// forward progress from inside the scan, and
+    /// `streaming_consumer_posts_forward_progress_per_ingested_batch` pins it.
+    /// But `cass index --watch-once <paths>` runs through neither: it enters
+    /// `watch_sources`, whose callback ingests via `reindex_paths`. That
+    /// function had no bump at all, so the bead's own reproduction case was
+    /// untouched by its own fix — and the suite stayed green because the test
+    /// exercised the path the CLI does not take.
+    ///
+    /// Measured on the post-fix binary before this change, 1,500 rollouts
+    /// through the real CLI: run exited rc=0, 1,500 conversations committed,
+    /// and 67 of 89 status samples read `stalled` while `last_progress_at_ms`
+    /// held exactly one distinct value — byte-identical to `started_at_ms`. The
+    /// pre-fix control had the same signature, which is what proves the fix
+    /// never reached this path rather than merely underperforming on it.
+    ///
+    /// Two arms, same discipline as the streaming sibling:
+    ///
+    ///   ingested chunk -> the atomic MUST advance. Deleting the
+    ///                     `bump_index_run_lock_progress_if_present` call in
+    ///                     the ingest loop turns this red.
+    ///
+    ///   nothing to ingest -> the atomic MUST NOT advance. A stub with no
+    ///                     message records is skipped before the ingest phase,
+    ///                     so it must not claim progress. This is what refuses
+    ///                     the tempting alternative of exempting `WatchOnce`
+    ///                     from stall detection, which would silence the false
+    ///                     alarm by destroying real stall detection on the one
+    ///                     path known to wedge.
+    #[test]
+    #[serial]
+    fn watch_once_reindex_posts_forward_progress_per_ingested_chunk() {
+        // Far below any real millisecond timestamp, so "advanced" cannot be
+        // confused with "was already a plausible clock value".
+        const SENTINEL: i64 = 1;
+
+        let run = |with_messages: bool| -> (usize, i64) {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().join("cass-data");
+            std::fs::create_dir_all(&data_dir).unwrap();
+            let session = tmp
+                .path()
+                .join(".codex")
+                .join("sessions")
+                .join("2026")
+                .join("05")
+                .join("08")
+                .join("rollout-watch-once-progress.jsonl");
+            std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+
+            // Both arms write a well-formed rollout header. Only the ingesting
+            // arm adds message records, so the difference between the arms is
+            // exactly "did anything get ingested", not "was the file valid".
+            let mut body = String::from(
+                r#"{"timestamp":"2026-05-08T23:09:00.000Z","type":"session_meta","payload":{"id":"watch-once-progress","cwd":"/data/projects/ntm"}}
+"#,
+            );
+            if with_messages {
+                body.push_str(
+                    r#"{"timestamp":"2026-05-08T23:09:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"8llb5 watch once progress"}]}}
+{"timestamp":"2026-05-08T23:09:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"acknowledged"}]}}
+"#,
+                );
+            }
+            std::fs::write(&session, body).unwrap();
+
+            let opts = super::IndexOptions {
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                watch_once_paths: Some(vec![session.clone()]),
+                db_path: data_dir.join("db.sqlite"),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                build_hnsw: false,
+                embedder: "fastembed".to_string(),
+                progress: None,
+                watch_interval_secs: 30,
+            };
+            let storage = Mutex::new(FrankenStorage::open(&opts.db_path).unwrap());
+            let index_path = index_dir(&opts.data_dir).unwrap();
+            let state = Mutex::new(HashMap::new());
+            let t_index = Mutex::new(None);
+
+            let progress_bump = Arc::new(AtomicI64::new(SENTINEL));
+            let indexed = reindex_paths(
+                &opts,
+                vec![session],
+                &[],
+                &state,
+                &storage,
+                &t_index,
+                &index_path,
+                false,
+                Some(&progress_bump),
+            )
+            .expect("watch-once reindex should run cleanly");
+
+            (indexed, progress_bump.load(Ordering::Relaxed))
+        };
+
+        // Positive arm. `reindex_paths` takes no closing bump of its own, so a
+        // value observed here can only have been written from inside the ingest
+        // loop — which is the property under test.
+        let (indexed, with_ingest) = run(true);
+        assert_eq!(indexed, 1, "the ingesting arm must actually ingest");
+        assert!(
+            with_ingest > 1_600_000_000_000,
+            "ingesting a chunk must post forward progress from inside \
+             reindex_paths, so a long `cass index --watch-once <paths>` run is \
+             not reported as wedged (bead 8llb5); atomic was {with_ingest}, \
+             still at or near the {SENTINEL} sentinel"
+        );
+
+        // Negative arm. Nothing was ingested, so nothing may claim progress.
+        let (skipped, without_ingest) = run(false);
+        assert_eq!(skipped, 0, "the stub arm must ingest nothing");
+        assert_eq!(
+            without_ingest, SENTINEL,
+            "a watch-once pass that ingested nothing must NOT post forward \
+             progress — bumping unconditionally would silence the false alarm \
+             by making the stall signal meaningless on this path"
+        );
     }
 
     #[test]
@@ -41849,6 +42022,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
 
@@ -41937,6 +42111,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
 
@@ -42028,6 +42203,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
 
@@ -42096,6 +42272,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
 
@@ -42191,6 +42368,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
 
@@ -42281,6 +42459,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
 
@@ -42410,6 +42589,7 @@ mod tests {
             &index_path,
             false,
             Some(&mut first_delta),
+            None,
         )
         .unwrap();
         assert_eq!(indexed, 1);
@@ -42451,6 +42631,7 @@ mod tests {
             &index_path,
             false,
             Some(&mut second_delta),
+            None,
         )
         .unwrap();
         assert_eq!(indexed, 1);
@@ -42530,6 +42711,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
         assert!(
@@ -42594,6 +42776,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -42689,6 +42872,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
 
@@ -42765,6 +42949,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
 
@@ -42839,6 +43024,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(first, 1);
@@ -42897,6 +43083,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -42966,6 +43153,7 @@ mod tests {
             &t_index,
             &index_path,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(indexed, 1);
