@@ -1871,9 +1871,14 @@ pub enum AgentsAction {
     Exclude {
         /// Agent slug to exclude (e.g. openclaw, claude_code, codex)
         agent: String,
-        /// Persist the exclusion but leave already indexed archive data untouched
+        /// Also delete the archive data already indexed for this agent.
+        ///
+        /// Opt-in, matching `cass sources remove --purge`. Excluding an agent
+        /// says "stop indexing this"; it must not also mean "destroy what was
+        /// already indexed", because a conversation whose source file has since
+        /// rotated away cannot be re-indexed from anywhere.
         #[arg(long, default_value_t = false)]
-        keep_indexed_data: bool,
+        purge_indexed_data: bool,
     },
     /// Re-include an agent/connector in future indexing runs
     Include {
@@ -91483,8 +91488,8 @@ fn run_agents_command(action: AgentsAction, cli: &Cli) -> CliResult<()> {
         }
         AgentsAction::Exclude {
             agent,
-            keep_indexed_data,
-        } => run_agents_exclude(&agent, keep_indexed_data, cli),
+            purge_indexed_data,
+        } => run_agents_exclude(&agent, purge_indexed_data, cli),
         AgentsAction::Include { agent } => run_agents_include(&agent),
     }
 }
@@ -91639,7 +91644,7 @@ fn run_agents_list(output_format: Option<RobotFormat>) -> CliResult<()> {
     Ok(())
 }
 
-fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliResult<()> {
+fn run_agents_exclude(agent: &str, purge_indexed_data: bool, cli: &Cli) -> CliResult<()> {
     use crate::sources::config::SourcesConfig;
 
     let mut config = SourcesConfig::load().map_err(|e| CliError {
@@ -91668,10 +91673,16 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
         retryable: false,
     })?;
 
-    let purge = if keep_indexed_data {
-        crate::storage::sqlite::AgentArchivePurgeResult::default()
-    } else {
+    // Opt-in, not opt-out. Excluding an agent means "stop indexing this"; it
+    // must not silently also mean "destroy what was already indexed". A
+    // conversation whose source file has since rotated away cannot be
+    // re-indexed from anywhere, and this path deletes every row for the agent
+    // with no source_path predicate (storage/sqlite.rs, purge_agent_archive_data).
+    // `cass sources remove --purge` already works this way (bead qtn0e).
+    let purge = if purge_indexed_data {
         purge_excluded_agent_archive_data(agent, cli)?
+    } else {
+        crate::storage::sqlite::AgentArchivePurgeResult::default()
     };
 
     if changed {
@@ -91686,8 +91697,9 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
             agent.trim().to_ascii_lowercase()
         );
     }
-    if keep_indexed_data {
+    if !purge_indexed_data {
         println!("Existing indexed archive data was left untouched.");
+        println!("Delete it too with: cass sources agents exclude <agent> --purge-indexed-data");
     } else if purge.conversations_deleted > 0 {
         println!(
             "Purged {} conversations and {} messages already archived for that agent.",
@@ -92487,6 +92499,59 @@ mod subcommand_robot_output_tests {
             assert!(!refresh, "refresh should stay opt-in");
         });
     }
+
+    /// `cass sources agents exclude <agent>` must not delete the archive.
+    ///
+    /// Bead qtn0e. Deleting the already-indexed archive used to be the DEFAULT
+    /// here, behind an opt-OUT `--keep-indexed-data`, with no confirmation, no
+    /// dry run and no backup — and the deleter takes every row for the agent
+    /// with no source_path predicate, so it removes conversations whose source
+    /// file has since rotated away and which cannot be re-indexed from
+    /// anywhere. The sibling command `cass sources remove --purge` was already
+    /// opt-in. This pins the operator-facing contract: the bare command
+    /// excludes and nothing more.
+    #[test]
+    fn agents_exclude_does_not_purge_the_archive_unless_asked() {
+        run_on_large_stack(|| {
+            let cli = Cli::try_parse_from(["cass", "sources", "agents", "exclude", "codex"])
+                .expect("parse bare agents exclude");
+            let Some(Commands::Sources(SourcesCommand::Agents(AgentsAction::Exclude {
+                agent,
+                purge_indexed_data,
+            }))) = cli.command
+            else {
+                panic!("expected sources agents exclude");
+            };
+            assert_eq!(agent, "codex");
+            assert!(
+                !purge_indexed_data,
+                "excluding an agent must not also destroy its archive; \
+                 deletion has to be asked for explicitly"
+            );
+
+            let cli = Cli::try_parse_from([
+                "cass",
+                "sources",
+                "agents",
+                "exclude",
+                "codex",
+                "--purge-indexed-data",
+            ])
+            .expect("parse agents exclude with the purge opt-in");
+            let Some(Commands::Sources(SourcesCommand::Agents(AgentsAction::Exclude {
+                purge_indexed_data,
+                ..
+            }))) = cli.command
+            else {
+                panic!("expected sources agents exclude");
+            };
+            assert!(
+                purge_indexed_data,
+                "the opt-in flag must still reach the purge branch"
+            );
+        });
+    }
+
 }
 
 // Tests for `--include-attachments` removed: the flag was accepted
