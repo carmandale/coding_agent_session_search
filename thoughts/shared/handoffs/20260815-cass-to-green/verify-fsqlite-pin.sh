@@ -11,6 +11,36 @@
 #
 # WHAT HAS NEVER RUN is the test suite at that pin. That is the whole job here.
 #
+# IT HAS NOW RUN, AND THE ANSWER IS RED (2026-08-16, generation 8, bead p3kgr).
+# Do not re-run this expecting green — the next move is a different revision,
+# not another run at this one. The suite fails at =0.1.14 on two independent
+# axes, each reproduced isolated with only the pin varying:
+#
+#   fsqlite FTS5   4 tests fail. Two are semantic — an already-healthy FTS table
+#                  is reported as needing a rebuild, and a one-row incremental
+#                  catch-up degrades to a full rebuild. Two are hard open
+#                  failures: "database disk image is malformed: FTS5 table
+#                  `fts_messages` is missing required content shadow table
+#                  `fts_messages_content`" on a database 0.1.5 opens fine, which
+#                  puts the FTS repair path out of reach for exactly the
+#                  databases that need it.
+#
+#   asupersync     16 tests hang, not fail: 4 search::model_download::* and 12
+#                  update_check::integration_*. Threads pin at 100% in
+#                  run_future_with_budget -> yield_now under block_on, a
+#                  busy-spin rather than blocked I/O. The fixture server is
+#                  local, so no network is involved. The suite cannot terminate.
+#
+# The live archive is NOT exposed by the FTS half: checked read-only with a
+# positive control first, it carries `messages` and no `fts_messages` at all, so
+# there is no FTS5 virtual table for 0.1.14 to refuse.
+#
+# This is a trade rather than a regression against a clean baseline: 0.1.5 has
+# its own FTS5 shadow-table defect in the opposite direction ("not implemented:
+# reloading populated WITHOUT ROWID table fts_messages_idx into MemDatabase").
+# Refusing 0.1.14 is safe today only because the incremental path is already
+# unwedged in production by CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1.
+#
 # Why it needs disk, and why it is gated: the bump moves fsqlite, fsqlite-types
 # and asupersync together, so cargo rebuilds the dependency graph rather than
 # just this crate. Measured 2026-08-16, only 3 of 4,810 dep files in
@@ -68,19 +98,55 @@ export CARGO_TARGET_DIR="$TARGET"
 if [ -d "$WORK" ]; then
   echo "  reusing existing clone at $WORK"
   cd "$WORK" || exit 1
-  git fetch origin "$REF" 2>&1 | tail -1
+  # A SHA is not a fetchable refspec, so this fails for the normal case and that
+  # is fine — the --local clone already has every object. Output is kept rather
+  # than piped into `tail`, because tailing a FAILING command shows the summary
+  # and eats the diagnosis.
+  git fetch origin "$REF" 2>&1 | sed 's/^/    fetch: /' || true
 else
-  git clone --local --no-checkout "$REPO" "$WORK" 2>&1 | tail -1 || exit 1
+  if ! git clone --local --no-checkout "$REPO" "$WORK" 2>&1 | sed 's/^/    clone: /'; then
+    echo "REFUSING: clone of $REPO into $WORK failed" >&2
+    exit 1
+  fi
   cd "$WORK" || exit 1
 fi
-git checkout --detach "$REF" 2>&1 | tail -1 || exit 1
+
+# Resolve to a commit BEFORE detaching, and never hand `checkout` a bare name.
+#
+# In this clone the work branch exists only as a remote-tracking ref, so git
+# DWIMs `checkout <name>` into `checkout -b <name> --track origin/<name>`, which
+# collides with the flag we passed:
+#     fatal: '--detach' cannot be used with '-b/-B/--orphan'
+# A raw SHA cannot DWIM, so it takes the plain detach path. This bug shipped
+# undetected because the disk gate above always refused before reaching it —
+# generation 7 hit it the first time the gate ever cleared, and worked around it
+# by passing a SHA from the caller. This is the fix.
+if ! REF_SHA=$(git rev-parse --verify --quiet "${REF}^{commit}"); then
+  if ! REF_SHA=$(git rev-parse --verify --quiet "origin/${REF}^{commit}"); then
+    echo "REFUSING: cannot resolve '$REF' to a commit in $WORK." >&2
+    echo "          Tried '$REF' and 'origin/$REF'. Pass a SHA or a ref this clone has." >&2
+    exit 1
+  fi
+  echo "  resolved   : $REF -> origin/$REF"
+fi
+if ! git checkout --detach "$REF_SHA" 2>&1 | sed 's/^/    checkout: /'; then
+  echo "REFUSING: checkout of $REF_SHA failed" >&2
+  exit 1
+fi
 
 echo "  HEAD       : $(git rev-parse --short HEAD)"
+# Read the RESOLVED version from Cargo.lock, not the requirement from
+# Cargo.toml. `version = "0.1.5"` is a caret requirement and `"=0.1.14"` is an
+# exact one, so a pattern over the requirement string answers a different
+# question than "what will actually be linked".
 pin=$(rg -N 'frankensqlite = ' Cargo.toml | head -1)
-echo "  pin        : $pin"
-case "$pin" in
-  *'=0.1.14'*) ;;
-  *) echo "REFUSING: $REF does not pin fsqlite =0.1.14 — wrong ref?" >&2; exit 1 ;;
+locked=$(rg -A2 '^name = "fsqlite"$' Cargo.lock | rg -N -o '^version = "[^"]+"' | head -1)
+echo "  requirement: $pin"
+echo "  locked     : fsqlite $locked"
+case "$locked" in
+  *'"0.1.14"'*) ;;
+  '') echo "REFUSING: could not read fsqlite's version from Cargo.lock — unknown, not safe" >&2; exit 1 ;;
+  *) echo "REFUSING: $REF locks fsqlite $locked, not 0.1.14 — wrong ref?" >&2; exit 1 ;;
 esac
 
 echo
