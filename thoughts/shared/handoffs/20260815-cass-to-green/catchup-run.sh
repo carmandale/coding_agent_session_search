@@ -72,6 +72,23 @@ for b in "$WORK"/batch-*; do
     "$HOME/Library/Application Support/com.coding-agent-search.coding-agent-search/agent_search.db" \
     "SELECT count(*) FROM conversations;" 2>/dev/null)
   echo "=== $(basename "$b") END rc=$rc conversations=$n $(date -u +%FT%TZ) ===" >> "$LOG"
+
+  # Exit 14 is cass refusing to START because the archive's disk headroom is too
+  # low. It is a precondition, not a property of this batch, so every remaining
+  # batch will fail the same way — and instantly, which is the trap: on
+  # 2026-08-15 batches an..bn burned 27 invocations in two seconds and the loop
+  # then wrote "catchup done" over a run that had indexed nothing since batch am.
+  # A resumable stop must be distinguishable from a completed one.
+  if [ "$rc" -eq 14 ]; then
+    {
+      echo "=== catchup STOPPED: disk headroom (exit 14) at $(basename "$b") $(date -u +%FT%TZ) ==="
+      echo "    free now: $(df -g / | tail -1 | awk '{print $4}') GiB"
+      echo "    Nothing is corrupted — cass refused to start rather than risk a partial commit,"
+      echo "    and the error is marked retryable. Free space, then re-run this script;"
+      echo "    completed batches re-run as no-ops."
+    } >> "$LOG"
+    exit 14
+  fi
 done
 
 echo "=== catchup done $(date -u +%FT%TZ) ===" >> "$LOG"
