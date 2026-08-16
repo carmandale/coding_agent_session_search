@@ -161,6 +161,73 @@ Consequence for step 2: the acceptance test is expected to exit 1 on at least
 these two, because they are quiescent from 2025 and genuinely unindexed. That is
 the test doing its job, not a defect in the bound.
 
+## What the acceptance test actually found: 74 holes, two real causes, and an unreachable criterion
+
+Run at 14:49Z with 27 of 28 batches complete (`batch-bb`, 8 files, still in
+flight), against the quiescence bound:
+
+```
+claude_code   on_disk= 7962  indexed=11544  unindexed= 295   ->  15 stale, 280 arrived during the run
+codex         on_disk=10351  indexed=10281  unindexed=  70   ->  59 stale,  11 arrived during the run
+FAIL: 74 file(s) were quiescent before 2026-08-16T09:14:00Z and are still unindexed.
+```
+
+All 74 were in the 09:15Z manifest, so every one was offered to the indexer.
+62 of them sit in `batch-aa` — the batch of the 250 *smallest* files — which is
+the first hint that most of this is not a coverage failure at all.
+
+Classifying each by the record types it actually contains:
+
+| n | class | verdict |
+|---:|---|---|
+| 20 | codex, header record only | correct skip — nothing to index |
+| 19 | codex, `session_meta` + `task_started` and nothing else | correct skip — session opened, no turn ever happened |
+| 15 | claude_code, no `user` or `assistant` records | correct skip |
+| **18** | **codex, legacy un-wrapped shape** | **real hole** |
+| **2** | **codex, modern shape, 435 MB and 182 MB** | **real hole** |
+
+So **54 of the 74 are files that can never acquire a conversation row**, and 20
+are genuine.
+
+### The criterion cannot pass as written, for the reason its own docstring gives
+
+`catchup-manifest.py` already argues this case against `journal.jsonl`: "an
+acceptance test that can never pass tells you nothing." It then excludes exactly
+one basename. The same unreachability arrives through a second door — a file with
+a conversation-shaped name and no conversation inside it — and 54 files come
+through it. Tightening the exclusion to a *content* predicate rather than a
+basename would make the test sharper, not weaker: it would fail on exactly the 20
+real holes and pass otherwise.
+
+Deliberately not done in this session. The predicate that decides "does this file
+hold a conversation" is the connector's own judgment, and reimplementing it
+outside the product is how a test guard grows into a second parser
+(`right-sized-mechanism.md`). Recorded as a finding for a decision rather than
+patched around.
+
+### Class 1 — 18 legacy un-wrapped codex rollouts, real conversations
+
+Dated 2025-08 through 2025-09, up to 1,296 lines and 1.1 MB, carrying
+`function_call`, `function_call_output` and `message` records. Their records are
+flat — `{"type":"message","role":…,"content":[…]}` — with no `payload` wrapper,
+while `augment_modern_codex_messages` (`src/connectors/codex.rs:152`) requires
+`raw.get("payload")` and returns `None` without it.
+
+This is the same shape as the two flat-layout `.jsonl` files found earlier, which
+means that finding was not a flat-layout quirk at all: it is a **format-era**
+quirk that also affects nested files. 0.007 GiB of content, but real sessions.
+
+### Class 2 — 2 modern codex rollouts that are simply enormous
+
+`435,218,432` and `182,593,718` bytes, both well-formed modern shape with
+thousands of `response_item` and `event_msg` records. 0.575 GiB between them.
+Nothing about their content explains the miss; size is the only thing that
+distinguishes them from the 10,281 codex files that did index.
+
+Both classes need an executed probe against the live connector before being
+filed as parser defects — the classification above is a reading of the bytes on
+disk, not of what cass did with them.
+
 ## `8llb5` root cause, established from source
 
 The forward-progress atomic that `status` reads is bumped in exactly three
@@ -194,6 +261,81 @@ detection for the one path that is known to wedge.
 A comment at `mod.rs:12087` already claims the bump "is currently used at the
 per-conversation completion ingest loop." Three call sites say otherwise. That
 line is aspirational and should be corrected in the same change.
+
+### Reproduced live, and the lock file settles the mechanism
+
+Against the deployed binary `49fbba6e3789c252` at 14:38Z, with the catch-up
+completing batches `rc=0` throughout, `cass status --json` returned in seconds
+and said:
+
+```
+status                        "stalled"
+healthy                       false
+rebuild.last_progress_age_ms  611254        <- 10.2 minutes
+recommended_action            "Index rebuild is wedged; … capture a stack trace
+                               with sudo gdb … for issue #258"
+```
+
+So the headline is not merely a wrong word. The operator is told the indexer is
+**wedged** and handed a `gdb` incantation, while the run is healthy and one
+batch from finishing. That is worse than the bead recorded, which measured the
+`status` string but not the top-level `recommended_action`.
+
+Two reads of `index-run.lock` about a second apart make the mechanism
+unambiguous:
+
+```
+                        sample 1          sample 2        delta
+started_at_ms           1786890461996     1786890461996       0
+updated_at_ms           1786891101832     1786891102847   +1015 ms
+last_progress_at_ms     1786890461996     1786890461996       0
+mode                    watch_once        watch_once
+```
+
+`last_progress_at_ms` is byte-identical to `started_at_ms`: it has not moved
+once since the lock was acquired, while the heartbeat thread ticks
+`updated_at_ms` every second. The stall age is therefore just wall-clock since
+lock acquisition, and it crosses the 120 s threshold roughly two minutes into
+every twelve-minute batch. This is an executed falsifier, not an inference — the
+prediction from source was that the value never advances, and it does not.
+
+Also visible in the same capture, and worth separating from the above:
+`connector_coverage` reads `{"checked": false, "complete": null}` — the coverage
+read reports UNKNOWN rather than fabricating `complete: true`, which is
+generation 5's fix working on the live binary. `healthy: false` here is caused by
+`stalled`, not by the unknown coverage, so this capture does not exercise bead
+`xarzt` either way.
+
+### The shape of the fix, from the existing plumbing
+
+The bump is already threaded thoroughly — but only through the *lexical rebuild*
+path. `rebuild_tantivy_from_db_with_progress_bump` and its deferred-startup
+sibling take an `Arc<AtomicI64>` and bump per page and per shard flush, and
+`bump_index_run_lock_progress_if_present` (`mod.rs:2999`) already exists for
+passing it optionally.
+
+The *scan* path takes none. `run_streaming_index` (`mod.rs:11491`) and
+`run_batch_index` (`mod.rs:11724`) have no progress parameter at all, and
+`--watch-once` runs entirely inside them. So the change is to give the scan the
+plumbing the rebuild already has:
+
+1. add `progress_bump: Option<&Arc<AtomicI64>>` to `run_streaming_index`,
+   `run_batch_index`, and their `_with_connector_factories` variants;
+2. call `bump_index_run_lock_progress_if_present` at the per-conversation ingest
+   completion point inside the scan loop — a single relaxed store, with the
+   heartbeat already owning the I/O;
+3. pass `Some(&progress_bump)` at the two call sites, `mod.rs:13104` and
+   `mod.rs:13127`;
+4. correct the stale comment at `mod.rs:12087`, which claims this already
+   happens.
+
+Not a suppression, and it earns something beyond silencing the false alarm: a
+`--watch-once` run that genuinely wedges becomes detectable for the first time,
+because the signal it is judged by finally means something.
+
+The regression has to be a mutant, not just an assertion — the existing suite has
+2,900+ lines of tests in `asset_state.rs` alone and every one of them passed
+against this defect. Removing the new bump must turn a named case red.
 
 ## Disk plan for step 4, worked out before it bites
 
