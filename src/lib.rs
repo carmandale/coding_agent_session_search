@@ -15117,7 +15117,16 @@ fn read_connector_scan_floors(conn: &frankensqlite::Connection) -> Option<BTreeM
     )
     .optional()
     {
-        Ok(Some(raw)) => Some(crate::storage::sqlite::parse_connector_scan_floors(&raw)),
+        Ok(Some(raw)) => {
+            let parsed = crate::storage::sqlite::parse_connector_scan_floors(&raw);
+            if parsed.is_none() {
+                warn!(
+                    "connector scan coverage floors are stored but unparseable; \
+                     reporting coverage as unchecked rather than complete"
+                );
+            }
+            parsed
+        }
         Ok(None) => Some(BTreeMap::new()),
         Err(err) => {
             warn!(
@@ -15292,7 +15301,22 @@ fn connector_coverage_warning(floors: &BTreeMap<String, i64>) -> Option<String> 
 struct StateDbSnapshot {
     conversation_count: i64,
     message_count: i64,
-    last_scan_ts: Option<i64>,
+    /// The `last_scan_ts` meta watermark, as a real tri-state — bead
+    /// `coding_agent_session_search-0gzok` part 1.
+    ///
+    /// `None` = this probe did not obtain the watermark: it never opened the
+    /// database, or the read itself errored, or the stored value was not
+    /// parseable as an epoch-millis integer. `Some(None)` = checked, and the
+    /// key is genuinely absent, which is what a fresh archive that has never
+    /// been scanned looks like. `Some(Some(ts))` = checked, and this is the
+    /// value.
+    ///
+    /// The two are not interchangeable, and collapsing them is what this bead
+    /// was filed against: the staleness override below is guarded on this
+    /// field, so a failed read used to make the override silently not fire and
+    /// the index render as NOT stale. Same convention as
+    /// `connector_scan_floors`.
+    last_scan_ts: Option<Option<i64>>,
     last_indexed_at: Option<i64>,
     opened: bool,
     open_error: Option<String>,
@@ -15309,7 +15333,143 @@ struct StateDbSnapshot {
     connector_scan_floors: Option<BTreeMap<String, i64>>,
 }
 
+/// Bound the whole state-database probe, not merely its open — bead
+/// `coding_agent_session_search-nao4q`.
+///
+/// `timeout` used to reach only `open_franken_cli_read_db`, where it becomes a
+/// `PRAGMA busy_timeout`: a bound on lock contention, not on work. Everything
+/// after the open ran unbounded on the caller's thread — the FTS integrity
+/// validation, three meta reads, two `SELECT COUNT(*)` scans, their
+/// `fresh_franken_count_retry` fallbacks, and `close_in_place`. On a 16.7 GB
+/// archive the conversation count alone is a full b-tree descent, so
+/// `cass triage --json` — which `README.md` calls "the safest first command for
+/// agents" — never returned, and the 30s ceiling declared at its call site did
+/// not hold. Measured 2026-08-15: `triage --json` timed out at 75.84s on both
+/// the pre- and post-`1a7mk` binaries, so this is a second unbounded read
+/// rather than a regression from that fix.
+///
+/// Same shape as `read_connector_scan_floors_bounded` above, applied to the
+/// whole probe: run open + read + close on a worker and wait once with
+/// `recv_timeout`. On expiry report the probe as failed-and-retryable with the
+/// counts elided rather than invented — `state_db_count_json` already renders
+/// JSON null when `counts_skipped`, and a `None` floors map already means "did
+/// not check". The one thing this must never do is return
+/// `StateDbSnapshot::default()`, whose zero counts alongside
+/// `counts_skipped: false` are the lie the comment at
+/// `state_meta_json_for_status` already names.
+///
+/// ceiling: on expiry the worker is orphaned holding the connection until it
+/// finishes on its own. That is the ceiling the bounded open and the bounded
+/// floors read already accept, and it is sound for a short-lived CLI process; a
+/// long-lived embedder calling this in a loop would need a real cancellation
+/// path.
 fn probe_state_db(
+    db_path: &Path,
+    reason: &str,
+    timeout: Duration,
+    include_counts: bool,
+) -> StateDbSnapshot {
+    if !db_path.exists() {
+        return StateDbSnapshot::default();
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_path = db_path.to_path_buf();
+    let worker_reason = reason.to_string();
+    let _worker = std::thread::spawn(move || {
+        let snapshot =
+            probe_state_db_blocking(&worker_path, &worker_reason, timeout, include_counts);
+        let _ = tx.send(snapshot);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let detail = match err {
+                std::sync::mpsc::RecvTimeoutError::Timeout => format!(
+                    "state database probe exceeded its {}ms bound",
+                    timeout.as_millis()
+                ),
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    "state database probe worker disconnected".to_string()
+                }
+            };
+            warn!(
+                db_path = %db_path.display(),
+                reason,
+                timeout_ms = timeout.as_millis() as u64,
+                include_counts,
+                "{detail}; reporting the probe as failed with counts elided"
+            );
+            // `open_retryable: false` is doing real work here, and it is the
+            // difference between this fix helping and this fix lying.
+            //
+            // `run_status` and `run_triage` compute
+            // `db_available = db_opened || (db_exists && db_open_retryable)`,
+            // and `healthy` is a conjunction over `db_available` that never
+            // asks whether the probe actually completed. Reporting an expired
+            // probe as retryable therefore makes `db_available` true and lets a
+            // 16.7 GB archive that could not be read at all print
+            // `"status": "healthy"` — which would be a worse failure than the
+            // hang this bound removes, because a hang is at least visible.
+            // False routes it to the `degraded` arm instead, whose own comment
+            // already states the policy this case needs: "the archive is usable
+            // but is not telling the whole truth, so neither may read as
+            // healthy."
+            //
+            // It is also honest on the measured cause. The expiry here is a
+            // full b-tree descent over 1.4M messages, and re-running the same
+            // bound against the same archive expires again — retrying is not
+            // the remedy, a smaller query or a bigger bound is. It IS
+            // conservative for the other cause, transient lock contention,
+            // where a retry would have worked; degraded-when-unknown is the
+            // right direction to be wrong in.
+            StateDbSnapshot {
+                counts_skipped: true,
+                open_error: Some(format!("{detail} for {}", db_path.display())),
+                open_retryable: false,
+                ..StateDbSnapshot::default()
+            }
+        }
+    }
+}
+
+/// `SELECT COUNT(*)` for the state probe, with the pre-existing
+/// fresh-connection retry, returning `None` when the count could not be
+/// obtained at all.
+///
+/// The retry itself is unchanged: a count on a busy archive can come back zero
+/// spuriously, so a zero is re-asked on a fresh connection. What is new is that
+/// `Some(0)` — a genuinely empty table — is distinguishable from a failed read.
+/// The previous `.unwrap_or(0)` collapsed the two, so a query error reached
+/// operators and agents as a definite zero while `counts_skipped` stayed
+/// `false`. Bead `coding_agent_session_search-0gzok`; the comment at
+/// `state_meta_json_for_status` had already named that pairing a lie, but it
+/// guarded only the skip-open branch.
+fn state_db_count_or_unknown(
+    conn: &frankensqlite::Connection,
+    db_path: &Path,
+    reason: &str,
+    timeout: Duration,
+    sql: &str,
+) -> Option<i64> {
+    use frankensqlite::compat::RowExt;
+    use frankensqlite::params;
+
+    let first = franken_query_row_map_retry(conn, sql, params![], |r| r.get_typed::<i64>(0)).ok();
+    match first {
+        Some(count) if count > 0 => Some(count),
+        // Zero, or unreadable. Both took the fresh-connection retry before and
+        // still do; fall back to the first reading only when it succeeded, so a
+        // genuine zero survives a failed retry and a failed read stays unknown.
+        _ => fresh_franken_count_retry(db_path, reason, timeout, sql, params![]).or(first),
+    }
+}
+
+/// The blocking body of [`probe_state_db`]. Call it only from that wrapper's
+/// worker thread: on a large archive it is unbounded by construction, which is
+/// exactly why the wrapper exists.
+fn probe_state_db_blocking(
     db_path: &Path,
     reason: &str,
     timeout: Duration,
@@ -15354,50 +15514,55 @@ fn probe_state_db(
     )
     .ok()
     .and_then(|s| s.parse::<i64>().ok());
-    snapshot.last_scan_ts = franken_query_row_map_retry(
+    // Bead `coding_agent_session_search-0gzok` part 1. The plain
+    // `SELECT value FROM meta WHERE key = ...` cannot answer this honestly:
+    // `query_row_map` returns `Err` both when the read genuinely failed and
+    // when the key is simply absent, and `.ok()` then collapsed the two into
+    // the same `None` that a never-scanned archive produces. Wrapping the
+    // lookup in a scalar subquery makes the statement yield exactly one row
+    // always — NULL when the key is absent — so `Ok` now means "the read ran"
+    // and `Err` means "it did not", which is the distinction this field exists
+    // to carry.
+    snapshot.last_scan_ts = match franken_query_row_map_retry(
         &conn,
-        "SELECT value FROM meta WHERE key = 'last_scan_ts'",
+        "SELECT (SELECT value FROM meta WHERE key = 'last_scan_ts')",
         params![],
-        |r| r.get_typed::<String>(0),
-    )
-    .ok()
-    .and_then(|s| s.parse::<i64>().ok());
+        |r| r.get_typed::<Option<String>>(0),
+    ) {
+        // Checked, key absent — a fresh archive that has never been scanned.
+        Ok(None) => Some(None),
+        // Checked and present. An unparseable value is NOT `Some(None)`: we
+        // reached the row and still cannot say what the watermark is, so it
+        // reports as "did not obtain it" rather than as "never scanned".
+        Ok(Some(raw)) => raw.parse::<i64>().ok().map(Some),
+        // The read itself failed.
+        Err(_) => None,
+    };
     // Assigned straight through: the field is already the same tri-state, and
     // its own doc comment says `None` means "did not check". Wrapping the read
     // in `Some` asserted "checked" even when the read had failed.
     snapshot.connector_scan_floors = read_connector_scan_floors(&conn);
     if include_counts {
-        snapshot.conversation_count = franken_query_row_map_retry(
+        let conversations = state_db_count_or_unknown(
             &conn,
+            db_path,
+            reason,
+            timeout,
             "SELECT COUNT(*) FROM conversations",
-            params![],
-            |r| r.get_typed(0),
-        )
-        .unwrap_or(0);
-        snapshot.message_count =
-            franken_query_row_map_retry(&conn, "SELECT COUNT(*) FROM messages", params![], |r| {
-                r.get_typed(0)
-            })
-            .unwrap_or(0);
-        if snapshot.conversation_count == 0 {
-            snapshot.conversation_count = fresh_franken_count_retry(
-                db_path,
-                reason,
-                timeout,
-                "SELECT COUNT(*) FROM conversations",
-                params![],
-            )
-            .unwrap_or(0);
-        }
-        if snapshot.message_count == 0 {
-            snapshot.message_count = fresh_franken_count_retry(
-                db_path,
-                reason,
-                timeout,
-                "SELECT COUNT(*) FROM messages",
-                params![],
-            )
-            .unwrap_or(0);
+        );
+        let messages =
+            state_db_count_or_unknown(&conn, db_path, reason, timeout, "SELECT COUNT(*) FROM messages");
+        match (conversations, messages) {
+            (Some(conversations), Some(messages)) => {
+                snapshot.conversation_count = conversations;
+                snapshot.message_count = messages;
+            }
+            // Bead `coding_agent_session_search-0gzok`: a failed `COUNT(*)` is
+            // not zero. The snapshot carries one `counts_skipped` flag for the
+            // pair, so a half-reading is reported as no reading — which
+            // `state_db_count_json` renders as JSON null — rather than as one
+            // real number standing beside an invented one.
+            _ => snapshot.counts_skipped = true,
         }
     }
 
@@ -15783,6 +15948,59 @@ mod connector_coverage_honesty_tests {
         let rendered = connector_coverage_state_json(Some(&floors));
         assert_eq!(rendered["checked"], serde_json::json!(true));
         assert_eq!(rendered["complete"], serde_json::json!(false));
+    }
+
+    /// Bead `coding_agent_session_search-0gzok`, the count half. A `COUNT(*)`
+    /// that FAILS must read as unknown; only a table that is genuinely empty
+    /// may read as zero. `.unwrap_or(0)` made those the same value, and
+    /// `counts_skipped` stayed `false` beside it, so `cass` reported a database
+    /// error to operators and agents as a definite figure.
+    ///
+    /// Restoring `.unwrap_or(0)` makes the subject assertion fail while the
+    /// control keeps passing — which is the whole point of the pairing.
+    #[test]
+    fn failed_count_read_is_unknown_and_never_a_definite_zero() {
+        let temp = TempDir::new().expect("temp dir");
+
+        // Positive control: the helper CAN answer on a database that has the
+        // table, so a `None` from the subject is the failure being detected
+        // rather than a helper that is incapable of returning anything.
+        let control_path = temp.path().join("has-table.db");
+        let control = frankensqlite::Connection::open(control_path.to_string_lossy().into_owned())
+            .expect("open control db");
+        control
+            .execute_compat(
+                "CREATE TABLE conversations (id INTEGER PRIMARY KEY)",
+                &[] as &[ParamValue],
+            )
+            .expect("create conversations");
+        assert_eq!(
+            state_db_count_or_unknown(
+                &control,
+                &control_path,
+                "test",
+                Duration::from_secs(5),
+                "SELECT COUNT(*) FROM conversations",
+            ),
+            Some(0),
+            "an EMPTY table is a real reading of zero, and the control must produce it"
+        );
+
+        // Subject: no `conversations` table at all, so the query itself fails.
+        let subject_path = temp.path().join("no-table.db");
+        let subject = frankensqlite::Connection::open(subject_path.to_string_lossy().into_owned())
+            .expect("open subject db");
+        assert_eq!(
+            state_db_count_or_unknown(
+                &subject,
+                &subject_path,
+                "test",
+                Duration::from_secs(5),
+                "SELECT COUNT(*) FROM conversations",
+            ),
+            None,
+            "a failed count must be UNKNOWN, never a definite zero"
+        );
     }
 
     /// The bound must cover the whole read, not just the open.
@@ -16203,20 +16421,49 @@ fn state_meta_json_inner(
             },
         }
     });
-    if !assets.lexical.rebuilding
-        && last_scan_ts.is_some_and(|scan_ts| {
-            last_indexed_at
-                .map(|indexed_at| scan_ts > indexed_at.saturating_add(1_000))
-                .unwrap_or(true)
-        })
-    {
-        assets.lexical.status = "stale";
-        assets.lexical.fresh = false;
-        assets.lexical.stale = true;
-        assets.lexical.status_reason = Some(
-            "last_scan_ts is newer than last_indexed_at; a prior scan advanced without a completed projection into the searchable index"
-                .to_string(),
-        );
+    if !assets.lexical.rebuilding {
+        match last_scan_ts {
+            // Checked, present, and the scan watermark is ahead of the
+            // projection. Unchanged behaviour.
+            Some(Some(scan_ts))
+                if last_indexed_at
+                    .map(|indexed_at| scan_ts > indexed_at.saturating_add(1_000))
+                    .unwrap_or(true) =>
+            {
+                assets.lexical.status = "stale";
+                assets.lexical.fresh = false;
+                assets.lexical.stale = true;
+                assets.lexical.status_reason = Some(
+                    "last_scan_ts is newer than last_indexed_at; a prior scan advanced without a completed projection into the searchable index"
+                        .to_string(),
+                );
+            }
+            // Bead `coding_agent_session_search-0gzok` part 1. The database
+            // opened, and the watermark read still did not produce a value we
+            // can trust, so this staleness check never actually ran. Say that,
+            // rather than letting the absence of a verdict read as a pass.
+            //
+            // Deliberately does NOT flip `fresh`/`stale`: whether "could not
+            // check" should degrade the one-word verdict is the open product
+            // question on bead
+            // `coding_agent_session_search-health-healthy-on-unknown-coverage-xarzt`,
+            // and it is Dale's call, not this fix's. What is unambiguous is
+            // that the reason must not stay silent.
+            //
+            // Scoped to `db_opened && !open_skipped` on purpose. A probe that
+            // never opened the database (`opened: false` — missing file, open
+            // error, or the bounded probe expiring) already surfaces through
+            // `database.open_error`, and `cass health` skips the open by
+            // documented design on every single call, so degrading on those
+            // would fire constantly and say nothing new.
+            None if db_opened && !open_skipped => {
+                assets.lexical.status_reason = Some(
+                    "last_scan_ts could not be read from the state database, so the scan-ahead-of-projection staleness check did not run; index freshness on this surface is unverified rather than confirmed"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
     }
     let not_initialized = cass_not_initialized(
         db_exists,
@@ -29699,6 +29946,19 @@ struct DoctorCoverageSummary {
     schema_version: u32,
     confidence_tier: String,
     archive_conversation_count: usize,
+    /// True when `archive_conversation_count` above is NOT a measurement: the
+    /// source-inventory database query failed, so the count fell back to its
+    /// `Default` of 0. Bead
+    /// `coding_agent_session_search-doctor-promote-gate-fails-open-sgvg3`.
+    ///
+    /// The field exists because `usize` has no representation for "unknown",
+    /// which is the root cause the bead names. The candidate side of the
+    /// promotion gate is already `Option<usize>` and already blocks on `None`;
+    /// this is the baseline side finally able to say the same thing.
+    ///
+    /// Serialized only when true, so every existing golden is byte-unchanged.
+    #[serde(skip_serializing_if = "doctor_flag_unset")]
+    archive_conversation_count_unknown: bool,
     archived_message_count: usize,
     provider_count: usize,
     source_identity_count: usize,
@@ -29869,9 +30129,24 @@ struct DoctorSourceAuthorityCandidate {
     evidence: Vec<String>,
 }
 
+/// `skip_serializing_if` predicate for the doctor "this number is not a
+/// measurement" flags. They default false and are omitted when false, so the
+/// flags are additive to every existing serialized shape and only appear on the
+/// failure they describe.
+fn doctor_flag_unset(flag: &bool) -> bool {
+    !*flag
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 struct DoctorSourceAuthorityCoverageDelta {
     archive_conversation_count: usize,
+    /// Same meaning as `DoctorCoverageSummary::archive_conversation_count_unknown`
+    /// — the archive count below is a fallback 0, not a measurement. Carried
+    /// here too because `raw_mirror_links_minus_archive` is computed against
+    /// that count and feeds the candidate-build trigger, so the trigger needs
+    /// to know the subtraction was against a number nobody measured.
+    #[serde(skip_serializing_if = "doctor_flag_unset")]
+    archive_conversation_count_unknown: bool,
     visible_local_source_conversation_count: usize,
     missing_current_source_count: usize,
     remote_source_count: usize,
@@ -36326,6 +36601,12 @@ fn build_doctor_coverage_summary(
         schema_version: 1,
         confidence_tier,
         archive_conversation_count: source_inventory.total_indexed_conversations,
+        // Bead `-sgvg3`. On the inventory's error path the row loop never runs
+        // and `total_indexed_conversations` keeps its `Default` 0, which is
+        // indistinguishable from a genuinely empty archive. `db_query_error` is
+        // the signal that already exists for exactly this, and
+        // `run_doctor_impl` already reads it the same way elsewhere.
+        archive_conversation_count_unknown: source_inventory.db_query_error.is_some(),
         archived_message_count,
         provider_count: source_inventory.provider_counts.len(),
         source_identity_count: source_inventory.sources.len(),
@@ -36395,7 +36676,13 @@ fn build_doctor_coverage_comparison_gate(
     let mut evidence = vec![
         format!(
             "archive-conversation-count={}",
-            coverage_summary.archive_conversation_count
+            if coverage_summary.archive_conversation_count_unknown {
+                // Bead `-sgvg3`: do not print a fabricated 0 as a measurement.
+                // Matches how the candidate counts below already render.
+                "unknown".to_string()
+            } else {
+                coverage_summary.archive_conversation_count.to_string()
+            }
         ),
         format!(
             "archived-message-count={}",
@@ -36421,6 +36708,20 @@ fn build_doctor_coverage_comparison_gate(
         format!("selected-authority-decision={selected_authority_decision}"),
     ];
 
+    // Bead `coding_agent_session_search-doctor-promote-gate-fails-open-sgvg3`.
+    // The baseline side of this comparison had no way to say "unknown", so a
+    // failed archive read became a silent 0 and every candidate then compared
+    // favourably against it — the gate reported pass at precisely the moment it
+    // was supposed to be protecting something. The candidate side has always
+    // blocked on `None` (the two arms below). This is that same policy applied
+    // to the baseline, which is the asymmetry the bead was filed against:
+    // "same function, same paragraph, opposite policy."
+    if coverage_summary.archive_conversation_count_unknown {
+        blocking_reasons.push(
+            "archive conversation coverage is unknown and cannot be used as a promotion baseline"
+                .to_string(),
+        );
+    }
     match conversation_delta {
         Some(delta) if delta < 0 => blocking_reasons.push(format!(
             "candidate would drop {} archived conversation(s)",
@@ -36979,6 +37280,7 @@ fn doctor_source_authority_coverage_delta(
         .sum::<usize>();
     DoctorSourceAuthorityCoverageDelta {
         archive_conversation_count: source_inventory.total_indexed_conversations,
+        archive_conversation_count_unknown: source_inventory.db_query_error.is_some(),
         visible_local_source_conversation_count,
         missing_current_source_count: source_inventory.missing_current_source_count,
         remote_source_count: source_inventory.remote_source_count,
@@ -38240,10 +38542,18 @@ fn doctor_candidate_build_should_run(
         coverage_risk.status.as_str(),
         "ok" | "not_initialized" | "unchecked_fast_health"
     );
-    let raw_mirror_expands_archive = source_authority
+    // Bead `coding_agent_session_search-doctor-promote-gate-fails-open-sgvg3`.
+    // `raw_mirror_links_minus_archive` is `raw_mirror_db_link_count` minus the
+    // archive conversation count, so when that count is a fabricated 0 the
+    // difference is positive for any verified mirror link at all — and this
+    // trigger then stages a reconstruct candidate, a real write under
+    // `<data_dir>/doctor/candidates`, while the archive is perfectly fine. A
+    // subtraction against a number nobody measured is not evidence that the
+    // mirror expands anything.
+    let raw_mirror_expands_archive = !source_authority
         .coverage_delta
-        .raw_mirror_links_minus_archive
-        > 0;
+        .archive_conversation_count_unknown
+        && source_authority.coverage_delta.raw_mirror_links_minus_archive > 0;
     candidate_authority_available
         && (!db_ok || needs_rebuild || archive_risk || raw_mirror_expands_archive)
 }
@@ -61459,6 +61769,120 @@ paths = ["~/.claude/projects"]
         );
     }
 
+    /// Bead `coding_agent_session_search-doctor-promote-gate-fails-open-sgvg3`.
+    ///
+    /// The gate's fail-closed CANDIDATE branch had no regression guard at all:
+    /// both existing gate tests pass `Some(..)` for every count, so the two
+    /// `None => blocking_reasons.push(...)` arms were never executed by the
+    /// suite. That branch is the positive control the bead's whole argument
+    /// rests on — "an unknown candidate count blocks" — so it needs to be
+    /// pinned rather than assumed.
+    #[test]
+    fn doctor_coverage_comparison_gate_blocks_unknown_candidate_counts() {
+        let coverage_summary = DoctorCoverageSummary {
+            confidence_tier: "archive_db_coverage".to_string(),
+            archive_conversation_count: 4,
+            archived_message_count: 12,
+            ..DoctorCoverageSummary::default()
+        };
+
+        let gate = build_doctor_coverage_comparison_gate(
+            &coverage_summary,
+            &doctor_test_source_authority_report(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            !gate.promote_allowed,
+            "an unknown candidate count must never promote: {gate:#?}"
+        );
+        assert_eq!(gate.conversation_delta, None);
+        assert_eq!(gate.message_delta, None);
+        assert!(
+            gate.blocking_reasons.iter().any(|reason| {
+                reason.contains("candidate conversation coverage is unknown")
+            }),
+            "unknown candidate conversation coverage must block by name: {gate:#?}"
+        );
+        assert!(
+            gate.blocking_reasons
+                .iter()
+                .any(|reason| reason.contains("candidate message coverage is unknown")),
+            "unknown candidate message coverage must block by name: {gate:#?}"
+        );
+    }
+
+    /// Bead `coding_agent_session_search-doctor-promote-gate-fails-open-sgvg3`,
+    /// the defect itself.
+    ///
+    /// When the source-inventory query fails, `archive_conversation_count`
+    /// falls back to `Default` 0. Every candidate then compares favourably
+    /// against that fabricated baseline, so the gate reported `promote_allowed`
+    /// at exactly the moment it was supposed to be proving the candidate does
+    /// not shrink coverage. The baseline must now refuse the same way the
+    /// candidate side already does.
+    #[test]
+    fn doctor_coverage_comparison_gate_blocks_when_the_archive_baseline_is_unknown() {
+        let unknown_baseline = DoctorCoverageSummary {
+            confidence_tier: "archive_db_coverage".to_string(),
+            // What the failure path actually produces: the fallback 0, now
+            // carrying the flag that says it is not a measurement.
+            archive_conversation_count: 0,
+            archive_conversation_count_unknown: true,
+            archived_message_count: 0,
+            ..DoctorCoverageSummary::default()
+        };
+
+        let gate = build_doctor_coverage_comparison_gate(
+            &unknown_baseline,
+            &doctor_test_source_authority_report(),
+            Some(2),
+            Some(8),
+            Some(8),
+            None,
+        );
+
+        assert!(
+            !gate.promote_allowed,
+            "an unmeasured archive baseline must not authorise promotion: {gate:#?}"
+        );
+        assert!(
+            gate.blocking_reasons
+                .iter()
+                .any(|reason| reason.contains("archive conversation coverage is unknown")),
+            "the unknown baseline must block by name: {gate:#?}"
+        );
+        assert!(
+            gate.evidence
+                .iter()
+                .any(|line| line == "archive-conversation-count=unknown"),
+            "evidence must not print the fabricated 0 as a measurement: {gate:#?}"
+        );
+
+        // Control: the SAME candidate counts against a baseline that really was
+        // measured as 0 still promote. Without this, the assertions above would
+        // also pass if the gate simply blocked everything.
+        let measured_empty_baseline = DoctorCoverageSummary {
+            archive_conversation_count_unknown: false,
+            ..unknown_baseline.clone()
+        };
+        let measured_gate = build_doctor_coverage_comparison_gate(
+            &measured_empty_baseline,
+            &doctor_test_source_authority_report(),
+            Some(2),
+            Some(8),
+            Some(8),
+            None,
+        );
+        assert!(
+            measured_gate.promote_allowed,
+            "a genuinely empty archive is still a promotable baseline: {measured_gate:#?}"
+        );
+    }
+
     #[test]
     fn doctor_coverage_comparison_gate_warns_on_derived_only_mismatches() {
         let coverage_summary = DoctorCoverageSummary {
@@ -65081,6 +65505,18 @@ fn run_status(
         .and_then(|q| q.get("recommended_action"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    // Bead `coding_agent_session_search-quarantine-unreadable-undercounts-a59ou`:
+    // a quarantine file that exists and cannot be read leaves its records out
+    // of the counts above, so `quarantined_conversations == 0` means "none
+    // found" rather than "none exist". The key is absent in the ordinary case,
+    // so this reads false for every archive whose quarantine files are fine.
+    let unreadable_quarantine_files = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("unreadable_quarantine_files"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let quarantine_counts_incomplete = unreadable_quarantine_files > 0;
     let mut warnings = Vec::<String>::new();
     if ingest_quarantine_critical {
         warnings.push(format!(
@@ -65089,6 +65525,11 @@ fn run_status(
     } else if quarantined_conversations > 0 {
         warnings.push(format!(
             "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; search remains usable for the rest of the archive"
+        ));
+    }
+    if quarantine_counts_incomplete {
+        warnings.push(format!(
+            "{unreadable_quarantine_files} quarantine file(s) exist but could not be read, so the quarantine counts are a floor rather than a total and coverage cannot be confirmed clean"
         ));
     }
 
@@ -65114,7 +65555,12 @@ fn run_status(
         && !rebuild_active
         && !index_empty_with_messages
         && !ingest_quarantine_critical
-        && !connector_coverage_incomplete;
+        && !connector_coverage_incomplete
+        // An unreadable quarantine file belongs in the same bucket as an
+        // aborted connector scan by the `degraded` arm's own stated rule: the
+        // archive is usable but is not telling the whole truth. Bead
+        // `coding_agent_session_search-quarantine-unreadable-undercounts-a59ou`.
+        && !quarantine_counts_incomplete;
     // Stalled rebuilds are reported as a distinct status so operators
     // can tell a wedged indexer apart from a slow-but-progressing one
     // (issue #258). `stalled` implies `rebuild_active=true`, but it
@@ -65130,10 +65576,16 @@ fn run_status(
         "healthy"
     } else if not_initialized {
         "not_initialized"
-    } else if (db_exists && !db_available) || connector_coverage_incomplete {
-        // An unreadable database and an aborted connector scan are different
-        // faults with the same operator meaning: the archive is usable but is
-        // not telling the whole truth, so neither may read as healthy.
+    } else if (db_exists && !db_available)
+        || connector_coverage_incomplete
+        || quarantine_counts_incomplete
+    {
+        // An unreadable database, an aborted connector scan, and a quarantine
+        // file that could not be read are three different faults with the same
+        // operator meaning: the archive is usable but is not telling the whole
+        // truth, so none of them may read as healthy. Without this arm the new
+        // conjunct above would fall through to "unhealthy", which overstates a
+        // reading we simply could not take.
         "degraded"
     } else {
         "unhealthy"
@@ -66525,11 +66977,25 @@ mod cli_read_db_tests {
     #[test]
     fn probe_state_db_reads_meta_without_count_scan() {
         let (_temp, db_path) = seed_cli_db();
-        let snapshot = probe_state_db(&db_path, "status", Duration::from_millis(250), false);
+        // 5s, not the 250ms this used to pass. The parameter changed meaning
+        // with bead `coding_agent_session_search-nao4q`: it was a
+        // `PRAGMA busy_timeout` reaching only the open, and it is now a hard
+        // wall-clock bound over spawn + open + FTS validation + three meta
+        // reads + `close_in_place`. 250ms was a fine lock-contention allowance
+        // and is a flaky wall-clock budget on a loaded machine. 5s is
+        // `STATE_DB_OPEN_TIMEOUT`, which is what production passes here.
+        let snapshot = probe_state_db(&db_path, "status", Duration::from_secs(5), false);
 
         assert!(snapshot.opened, "state probe should open the database");
         assert_eq!(snapshot.last_indexed_at, Some(1_733_000_000_000));
-        assert_eq!(snapshot.last_scan_ts, Some(1_732_999_999_000));
+        // Re-encoded, not re-armed, for bead
+        // `coding_agent_session_search-0gzok` part 1. This test's own setup
+        // writes the value via `set_last_scan_ts` above, so "checked, and
+        // present" is its documented intent; the tri-state spells that
+        // `Some(Some(_))`. The outer `Some` is the new claim being made here —
+        // that the read actually ran — and it is the half a failed read can no
+        // longer forge.
+        assert_eq!(snapshot.last_scan_ts, Some(Some(1_732_999_999_000)));
         assert!(snapshot.counts_skipped, "count scan should remain disabled");
         assert_eq!(snapshot.conversation_count, 0);
         assert_eq!(snapshot.message_count, 0);
@@ -66537,6 +67003,113 @@ mod cli_read_db_tests {
             snapshot.open_error.is_none(),
             "state probe should not report an error: {:?}",
             snapshot.open_error
+        );
+    }
+
+    /// Bead `coding_agent_session_search-0gzok` part 1.
+    ///
+    /// The staleness override in `state_meta_json_inner` is guarded on
+    /// `last_scan_ts`, so before the fix a failed read and a never-scanned
+    /// archive were the same `None`: an unreadable watermark made the
+    /// scan-ahead-of-projection check silently not fire, and the index rendered
+    /// as NOT stale with nothing saying the check had not run.
+    ///
+    /// This asserts the property that fix depends on — that all three states
+    /// are reachable AND that the two that used to collapse are now different
+    /// values. The final `assert_ne!` is the one that fails if anyone
+    /// re-collapses them, whatever the individual encodings become.
+    #[test]
+    fn probe_state_db_distinguishes_unread_watermark_from_never_scanned() {
+        // (1) Checked, and present.
+        let (_temp, db_path) = seed_cli_db();
+        let present = probe_state_db(&db_path, "status", Duration::from_secs(5), false);
+        assert!(present.opened, "the seeded probe should open the database");
+        assert_eq!(present.last_scan_ts, Some(Some(1_732_999_999_000)));
+
+        // (2) Checked, and the key is genuinely absent — a fresh archive that
+        // has never been scanned. Seeded by writing `last_indexed_at` and
+        // deliberately NOT writing `last_scan_ts`.
+        let never_scanned_temp = TempDir::new().expect("tempdir");
+        let never_scanned_path = never_scanned_temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&never_scanned_path).expect("open cass db");
+        storage
+            .set_last_indexed_at(1_733_000_000_000)
+            .expect("set last_indexed_at");
+        drop(storage);
+        let never_scanned =
+            probe_state_db(&never_scanned_path, "status", Duration::from_secs(5), false);
+        assert!(
+            never_scanned.opened,
+            "the never-scanned probe must still open the database"
+        );
+        assert_eq!(
+            never_scanned.last_scan_ts,
+            Some(None),
+            "an absent last_scan_ts key is checked-and-never-scanned, not could-not-read"
+        );
+
+        // (3) Not obtained at all. A 1ns budget cannot cover a thread spawn
+        // plus a file open, so the bounded wrapper's `recv_timeout` expires.
+        let unread = probe_state_db(&db_path, "status", Duration::from_nanos(1), false);
+        assert!(
+            !unread.opened,
+            "the 1ns probe must not report a completed open"
+        );
+        assert_eq!(
+            unread.last_scan_ts, None,
+            "a probe that never completed must not claim the watermark is absent"
+        );
+
+        // The whole point: the two states that used to be one must differ.
+        assert_ne!(
+            never_scanned.last_scan_ts, unread.last_scan_ts,
+            "never-scanned and could-not-read must not collapse to the same value"
+        );
+    }
+
+    /// Bead `coding_agent_session_search-nao4q`. Asserts the bound is REAL, not
+    /// that it is tight: a 1ns budget cannot be met by a thread spawn plus a
+    /// file open, so the wrapper's `recv_timeout` always expires here.
+    ///
+    /// Before the fix `probe_state_db` had no wall-clock bound at all — the
+    /// `timeout` argument reached only `open_franken_cli_read_db`, where it
+    /// becomes a `PRAGMA busy_timeout` — so `cass triage --json` never returned
+    /// on a 16.7 GB archive. Reverting the wrapper makes this case run the
+    /// whole probe inline against the seeded database and come back with
+    /// `counts_skipped == false` and no `open_error`, which is what the first
+    /// two assertions below catch.
+    #[test]
+    fn probe_state_db_that_exceeds_its_bound_elides_counts_instead_of_inventing_zeros() {
+        let (_temp, db_path) = seed_cli_db();
+        let snapshot = probe_state_db(&db_path, "status", Duration::from_nanos(1), true);
+
+        assert!(
+            snapshot.counts_skipped,
+            "an expired probe must elide the counts; reporting counts_skipped=false \
+             alongside a zero count is the lie state_meta_json_for_status already names"
+        );
+        let open_error = snapshot
+            .open_error
+            .expect("an expired probe must say why it produced no reading");
+        assert!(
+            open_error.contains("exceeded its"),
+            "the error must name the bound rather than a database failure: {open_error}"
+        );
+        assert!(
+            !snapshot.open_retryable,
+            "an expired probe must NOT read as retryable-and-therefore-available: \
+             run_status computes db_available = db_opened || (db_exists && db_open_retryable), \
+             and `healthy` is a conjunction over db_available that never asks whether the \
+             probe completed. True here prints \"status\": \"healthy\" for an archive that \
+             could not be read at all"
+        );
+        assert!(
+            !snapshot.opened,
+            "an expired probe never established that the database opened"
+        );
+        assert!(
+            snapshot.connector_scan_floors.is_none(),
+            "coverage must read as unchecked on expiry, never as checked-and-complete"
         );
     }
 

@@ -59,16 +59,33 @@ const DOCTOR_MUTATION_LOCK_MAX_METADATA_READ: u64 = 64 * 1024;
 /// incomplete, and `cass health` / `cass stats` say so.
 pub const CONNECTOR_SCAN_FLOORS_META_KEY: &str = "connector_scan_floors";
 
-/// Parse the stored coverage-floor JSON. A malformed or non-numeric value is
-/// treated as no floor rather than as an error: this is a coverage report, and
-/// failing the whole read would hide the connectors that *are* reporting.
-pub fn parse_connector_scan_floors(raw: &str) -> BTreeMap<String, i64> {
+/// Parse the stored coverage-floor JSON, or `None` when the stored blob is not
+/// a JSON object at all.
+///
+/// Two tolerances live here and only one of them survives — bead
+/// `coding_agent_session_search-parse-floors-unparseable-reads-compl-ddkwa`.
+///
+/// The per-entry `filter_map` below stays exactly as it was, and its original
+/// argument still holds: one connector with a malformed or non-numeric value
+/// must not hide the connectors that *are* reporting.
+///
+/// The whole-blob case is different and used to share that tolerance by
+/// returning an empty map. There, nothing is reporting and there are no other
+/// connectors to protect — and an empty map is not neutral, because
+/// `connector_coverage_json` renders it as `"complete": true`. So a corrupt
+/// floors record read as PROVEN-complete coverage, which is the same
+/// `Some(empty)`-versus-`None` collapse `8dcd245b` fixed one layer up, still
+/// present one layer down. The honest answer for an unparseable blob is
+/// unknown.
+pub fn parse_connector_scan_floors(raw: &str) -> Option<BTreeMap<String, i64>> {
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return BTreeMap::new();
+        return None;
     };
-    map.into_iter()
-        .filter_map(|(connector, value)| Some((connector, value.as_i64()?.max(0))))
-        .collect()
+    Some(
+        map.into_iter()
+            .filter_map(|(connector, value)| Some((connector, value.as_i64()?.max(0))))
+            .collect(),
+    )
 }
 
 /// The `since_ts` a connector must scan from, given the run-wide watermark and
@@ -6995,7 +7012,20 @@ impl FrankenStorage {
             |row| row.get_typed(0),
         );
         match result.optional() {
-            Ok(Some(raw)) => Ok(parse_connector_scan_floors(&raw)),
+            // An unparseable blob is a failed read, not an empty one. The
+            // callers already treat `Err` correctly —
+            // `read_connector_scan_floors_fresh` logs at `error!` and reports
+            // the floors as unknown rather than widening — and the two floor
+            // mutators propagate it with `?` instead of rebuilding the record
+            // from an empty map, which would silently discard every other
+            // connector's floor. Bead
+            // `coding_agent_session_search-parse-floors-unparseable-reads-compl-ddkwa`.
+            Ok(Some(raw)) => parse_connector_scan_floors(&raw).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "connector scan coverage floors are stored but unparseable \
+                     (meta key '{CONNECTOR_SCAN_FLOORS_META_KEY}' is not a JSON object)"
+                )
+            }),
             Ok(None) => Ok(BTreeMap::new()),
             Err(e) => Err(e.into()),
         }
@@ -23595,14 +23625,46 @@ mod tests {
         assert_eq!(connector_scan_since_ts(None, Some(100)), None);
     }
 
+    /// Re-adjudicated for bead
+    /// `coding_agent_session_search-parse-floors-unparseable-reads-compl-ddkwa`,
+    /// which is the intent evidence for the change: the two tolerances that
+    /// used to share one answer now have opposite ones, so the case that
+    /// asserted `is_empty()` for whole-blob junk is asserting `None`.
+    ///
+    /// The per-entry half is byte-unchanged in what it requires, and that is
+    /// deliberate — one bad connector value must still not sink the connectors
+    /// that are reporting.
     #[test]
-    fn parse_connector_scan_floors_tolerates_junk() {
-        assert!(parse_connector_scan_floors("not json").is_empty());
-        assert!(parse_connector_scan_floors("[]").is_empty());
-        let floors = parse_connector_scan_floors(r#"{"codex": 12, "bad": "x", "neg": -5}"#);
+    fn parse_connector_scan_floors_tolerates_bad_entries_but_not_a_bad_blob() {
+        // Whole-blob junk: nothing is reporting, there are no other connectors
+        // to protect, and an empty map would render as `"complete": true`.
+        assert_eq!(
+            parse_connector_scan_floors("not json"),
+            None,
+            "unparseable JSON is unknown coverage, never proven-complete coverage"
+        );
+        assert_eq!(
+            parse_connector_scan_floors("[]"),
+            None,
+            "a JSON array is not a floors object; it is unknown, not empty"
+        );
+
+        // Positive control: a well-formed object still parses, so the `None`s
+        // above are the failure being detected rather than a parser that can
+        // no longer succeed.
+        let floors = parse_connector_scan_floors(r#"{"codex": 12, "bad": "x", "neg": -5}"#)
+            .expect("a well-formed floors object must still parse");
         assert_eq!(floors.get("codex"), Some(&12));
         assert_eq!(floors.get("neg"), Some(&0));
         assert!(!floors.contains_key("bad"));
+
+        // An object with no entries is genuinely empty coverage — checked and
+        // complete — and must stay distinguishable from the `None`s above.
+        assert_eq!(
+            parse_connector_scan_floors("{}"),
+            Some(BTreeMap::new()),
+            "an empty object means no scan aborted: that is checked-and-complete, not unknown"
+        );
     }
 
     // =========================================================================
