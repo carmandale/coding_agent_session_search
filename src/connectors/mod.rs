@@ -37,7 +37,6 @@ pub use franken_agent_detection::{
     file_modified_since,
     flatten_content,
     franken_detection_for_connector,
-    get_connector_factories,
     normalize_model,
     parse_timestamp,
     reindex_messages,
@@ -218,3 +217,124 @@ pub mod opencode;
 pub mod pi_agent;
 pub mod qwen;
 pub mod vibe;
+
+/// franken's connector factory table, with the codex entry replaced by this
+/// crate's wrapper.
+///
+/// Every connector module here except `codex` is a bare `pub use` of franken's
+/// implementation. `codex::CodexConnector` is the one that adds behavior: it
+/// recovers rollouts written in the pre-envelope record shape, which franken's
+/// `.jsonl` arm drops before `on_conversation` is ever called (bead 1pzs3).
+///
+/// Without this substitution that recovery was reachable only through
+/// `ConnectorKind::create_connector`, which serves `--watch-once`. Everything
+/// that builds the archive — `run_streaming_index` and `run_batch_index`, i.e.
+/// `cass index` and `cass index --full` — goes through this table instead, so
+/// it constructed franken's connector and indexed none of those rollouts while
+/// exiting 0. Measured on the deployed binary before this change: the same 17
+/// real rollouts gave 0 conversations through `cass index` and 17 (2,859
+/// messages) through `cass index --watch-once`.
+pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> {
+    let mut factories = franken_agent_detection::get_connector_factories();
+    for (name, factory) in &mut factories {
+        if *name == "codex" {
+            *factory = || Box::new(codex::CodexConnector::new()) as Box<dyn Connector + Send>;
+        }
+    }
+    factories
+}
+
+#[cfg(test)]
+mod connector_factory_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A rollout in the pre-envelope record shape: the Responses-API item sits
+    /// at the top level instead of inside a `payload` envelope, so franken's
+    /// `.jsonl` arm drops the whole file.
+    const PRE_ENVELOPE_ROLLOUT: &str = r#"{"id":"c27a914d","timestamp":"2025-08-20T13:20:47.060Z","instructions":null,"git":{"branch":"main"}}
+{"type":"message","id":null,"role":"user","content":[{"type":"input_text","text":"index the pre-envelope rollouts"}]}
+{"type":"message","id":null,"role":"assistant","content":[{"type":"output_text","text":"listed the directory"}]}
+"#;
+
+    fn codex_home_with_pre_envelope(dir: &TempDir) -> PathBuf {
+        let home = dir.path().join("home").join(".codex");
+        let day = home.join("sessions").join("2025").join("08").join("20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("rollout-pre-envelope.jsonl"), PRE_ENVELOPE_ROLLOUT).unwrap();
+        home
+    }
+
+    fn scan_count(connector: &(dyn Connector + Send), ctx: &ScanContext) -> usize {
+        let mut count = 0usize;
+        connector
+            .scan_with_callback(ctx, &mut |_conversation| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        count
+    }
+
+    fn codex_factory_from(
+        factories: &[(&'static str, fn() -> Box<dyn Connector + Send>)],
+    ) -> fn() -> Box<dyn Connector + Send> {
+        factories
+            .iter()
+            .find(|(name, _)| *name == "codex")
+            .map(|(_, factory)| *factory)
+            .expect("the factory table must carry a connector under the slug `codex`")
+    }
+
+    /// The property, not the mechanism: a codex connector built the way the
+    /// archive-building scan builds one must recover a pre-envelope rollout.
+    ///
+    /// This is what `cass index` and `cass index --full` actually do, and it is
+    /// the assertion that was missing when 89db6723 landed — the recovery was
+    /// tested by driving our wrapper directly, which is the path the full scan
+    /// does not take.
+    #[test]
+    fn codex_connector_from_the_factory_table_recovers_pre_envelope_rollouts() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home_with_pre_envelope(&dir);
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass"),
+            vec![ScanRoot::local(home)],
+            None,
+        );
+
+        let factories = get_connector_factories();
+        let connector = codex_factory_from(&factories)();
+
+        assert_eq!(
+            scan_count(connector.as_ref(), &ctx),
+            1,
+            "the connector the full scan builds must recover this rollout; \
+             getting 0 here is bead 1pzs3 reaching the archive again"
+        );
+    }
+
+    /// Why the substitution above has to exist. If this ever goes red, franken
+    /// has learned the pre-envelope shape upstream and the wrapper should be
+    /// re-adjudicated rather than kept out of habit.
+    #[test]
+    fn frankens_own_codex_factory_still_drops_pre_envelope_rollouts() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home_with_pre_envelope(&dir);
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass"),
+            vec![ScanRoot::local(home)],
+            None,
+        );
+
+        let upstream = franken_agent_detection::get_connector_factories();
+        let connector = codex_factory_from(&upstream)();
+
+        assert_eq!(
+            scan_count(connector.as_ref(), &ctx),
+            0,
+            "franken's connector is expected to drop this shape; if it no longer \
+             does, this crate's CodexConnector substitution may be redundant"
+        );
+    }
+}
