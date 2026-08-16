@@ -11128,6 +11128,10 @@ fn run_streaming_consumer(
     lexical_strategy: LexicalPopulationStrategy,
     scan_start_ts: Option<i64>,
     coverage: &ConnectorScanCoverage,
+    // Forward-progress heartbeat for the index run lock. `None` in tests, which
+    // drive this consumer directly without a lock. See the bump at the ingest
+    // boundary below for why the scan has to post progress at all.
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<(Vec<String>, NonWatchIngestOutcome)> {
     use std::collections::HashMap;
 
@@ -11296,6 +11300,25 @@ fn run_streaming_consumer(
                 );
                 flow_limiter.release(combined_byte_reservation);
                 ingest_outcome = ingest_outcome.accumulate(batch_outcome?);
+
+                // Forward progress, posted from INSIDE the scan.
+                //
+                // Without this the only bumps on a scan path fire after
+                // `run_streaming_index` returns, i.e. once the scan is already
+                // over. `--watch-once` takes lock mode `WatchOnce`, which
+                // `SearchMaintenanceMode::rebuild_active()` enrols in stall
+                // detection, and its threshold is 120s against a scan that runs
+                // ~12 minutes. So `last_progress_at_ms` stayed pinned at
+                // lock-acquisition time and `cass status` called a healthy run
+                // "stalled" about two minutes in, with a top-level
+                // recommended_action telling the operator the rebuild was
+                // wedged and handing them a gdb incantation (bead 8llb5).
+                //
+                // Suppressing the check for `WatchOnce` would have been the
+                // bandaid: it also destroys real stall detection on the one
+                // path known to actually wedge. Posting progress is what makes
+                // the signal mean something in both directions.
+                bump_index_run_lock_progress_if_present(progress_bump);
 
                 // For tracing parity with the per-message path, use the
                 // first batch's connector_name + the combined totals.
@@ -11488,6 +11511,7 @@ fn run_streaming_consumer(
 /// This spawns producer threads for each connector that send batches through
 /// a bounded channel. The consumer receives and ingests batches as they arrive,
 /// providing backpressure when indexing falls behind scanning.
+#[allow(clippy::too_many_arguments)]
 fn run_streaming_index(
     storage: &FrankenStorage,
     t_index: Option<&mut TantivyIndex>,
@@ -11496,6 +11520,7 @@ fn run_streaming_index(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     scan_start_ts: i64,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     run_streaming_index_with_connector_factories(
         storage,
@@ -11506,6 +11531,7 @@ fn run_streaming_index(
         additional_scan_roots,
         configured_connector_factories(),
         scan_start_ts,
+        progress_bump,
     )
 }
 
@@ -11562,6 +11588,7 @@ fn run_streaming_index_with_connector_factories(
     additional_scan_roots: Vec<ScanRoot>,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
     scan_start_ts: i64,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     if connector_factories.is_empty() {
         tracing::warn!("no enabled connectors are configured for indexing; skipping scan");
@@ -11664,6 +11691,7 @@ fn run_streaming_index_with_connector_factories(
         lexical_strategy,
         Some(scan_start_ts),
         &coverage,
+        progress_bump,
     );
 
     if consumer_result.is_err() {
@@ -11721,6 +11749,7 @@ fn run_streaming_index_with_connector_factories(
 /// This uses rayon's par_iter to scan all connectors in parallel, collecting
 /// all conversations into memory before ingesting. This is the fallback when
 /// streaming is disabled via CASS_STREAMING_INDEX=0.
+#[allow(clippy::too_many_arguments)]
 fn run_batch_index(
     storage: &FrankenStorage,
     t_index: Option<&mut TantivyIndex>,
@@ -11729,6 +11758,7 @@ fn run_batch_index(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     scan_start_ts: i64,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     run_batch_index_with_connector_factories(
         storage,
@@ -11739,6 +11769,7 @@ fn run_batch_index(
         additional_scan_roots,
         configured_connector_factories(),
         scan_start_ts,
+        progress_bump,
     )
 }
 
@@ -11752,6 +11783,7 @@ fn run_batch_index_with_connector_factories(
     additional_scan_roots: Vec<ScanRoot>,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
     scan_start_ts: i64,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     let scan_start = std::time::Instant::now();
 
@@ -11995,6 +12027,11 @@ fn run_batch_index_with_connector_factories(
             !opts.watch,
         )?;
         ingest_outcome = ingest_outcome.accumulate(batch_outcome);
+        // Forward progress from inside the scan — same reason as the streaming
+        // consumer above (bead 8llb5). `--watch-once` runs entirely inside this
+        // function when CASS_STREAMING_INDEX=0, so without this the batch path
+        // has the identical false-"wedged" defect.
+        bump_index_run_lock_progress_if_present(progress_bump);
         // Periodically persist scan_start_ts so that if the process is killed,
         // the next run does a delta scan instead of a full rescan (infinite-OOM-loop fix).
         if !preserve_scan_watermark && last_scan_ts_save.elapsed() >= Duration::from_secs(10) {
@@ -12084,9 +12121,22 @@ pub fn run_index(
     // without holding a `&mut IndexRunLockGuard`. The clone is cheap
     // (single Arc bump) and lives only inside this function.
     let progress_bump = Arc::clone(&index_run_lock.last_progress_at_ms_atomic);
-    // The atomic-store bump runs once per "interesting" batch boundary
-    // — currently used at the per-conversation completion ingest loop
-    // and the lexical commit boundary; see `bump_index_run_lock_progress_atomic`.
+    // The atomic-store bump runs once per "interesting" batch boundary:
+    //   * the scan's per-batch ingest completion, in `run_streaming_consumer`
+    //     and `run_batch_index_with_connector_factories`,
+    //   * the lexical rebuild's page/shard-flush boundaries, via
+    //     `maybe_persist_staged_lexical_rebuild_progress`,
+    //   * preflight phase completion, and scan completion, below.
+    // See `bump_index_run_lock_progress_atomic`.
+    //
+    // Until bead 8llb5 this comment described the first of those and the code
+    // did not do it: the scan functions took no progress parameter at all, so
+    // on a `--watch-once` run nothing posted progress between lock acquisition
+    // and scan completion. `last_progress_at_ms` therefore stayed byte-identical
+    // to `started_at_ms` for the whole run, and stall detection — which
+    // `WatchOnce` IS enrolled in, at a 120s threshold against a ~12 minute scan
+    // — reported a healthy run as wedged. An aspirational comment is worse than
+    // no comment, because it stops the next reader looking.
 
     if can_skip_absent_explicit_watch_once_index_run(&opts) {
         let path_count = opts
@@ -13109,13 +13159,20 @@ pub fn run_index(
                         lexical_strategy,
                         additional_scan_roots.clone(),
                         scan_start_ts,
+                        Some(&progress_bump),
                     )?;
                     // F4 (cass tech debt): a completed scan is a real
                     // forward-progress boundary; bump the atomic so the
                     // heartbeat folds the timestamp into the lock file
-                    // on its next tick and a long single-mode scan does
-                    // not false-positive as `status: "stalled"`
-                    // (cass#258 follow-up).
+                    // on its next tick.
+                    //
+                    // This bump is now the CLOSING one. It used to be the only
+                    // one on this path, which is why a long single-mode scan
+                    // false-positived as `status: "stalled"` for its whole
+                    // duration — it can only prevent that once the scan is over
+                    // and can no longer be called stalled anyway. The scan now
+                    // posts progress per ingested batch from inside
+                    // `run_streaming_consumer` (bead 8llb5).
                     bump_index_run_lock_progress_atomic(&progress_bump);
                     scan_canonical_mutations =
                         scan_canonical_mutations.accumulate(scan_outcome.canonical_mutations);
@@ -13132,6 +13189,7 @@ pub fn run_index(
                         lexical_strategy,
                         additional_scan_roots.clone(),
                         scan_start_ts,
+                        Some(&progress_bump),
                     )?;
                     bump_index_run_lock_progress_atomic(&progress_bump);
                     scan_canonical_mutations =
@@ -27401,6 +27459,7 @@ mod tests {
             Vec::new(),
             vec![("codex", failing_explicit_file_root_connector_factory)],
             FrankenStorage::now_millis(),
+            None,
         )
         .expect("failed scan should not abort batch indexing");
         *FAILING_EXPLICIT_FILE_ROOT
@@ -33579,6 +33638,7 @@ mod tests {
                 Vec::new(),
                 vec![("codex", mtime_filtered_aborting_connector_factory)],
                 first_scan_start_ts,
+                None,
             )
             .expect("a failed connector scan must not fail the whole run");
         });
@@ -33643,6 +33703,7 @@ mod tests {
             Vec::new(),
             vec![("codex", mtime_filtered_aborting_connector_factory)],
             FrankenStorage::now_millis(),
+            None,
         )
         .expect("second pass should succeed");
 
@@ -34721,6 +34782,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             None,
             &ConnectorScanCoverage::default(),
+            None,
         )
         .unwrap();
 
@@ -34730,6 +34792,99 @@ mod tests {
         assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
         assert_eq!(stats.total_conversations, 0);
         assert_eq!(stats.total_messages, 0);
+    }
+
+    /// Bead 8llb5: the scan must post forward progress from INSIDE itself.
+    ///
+    /// `--watch-once` takes lock mode `WatchOnce`, which
+    /// `SearchMaintenanceMode::rebuild_active()` enrols in stall detection at a
+    /// 120s threshold. Every progress bump on a scan path used to fire only
+    /// after `run_streaming_index` returned, so across a ~12 minute scan
+    /// `last_progress_at_ms` stayed byte-identical to `started_at_ms` and
+    /// `cass status` reported a healthy run as `stalled`, with a top-level
+    /// recommended_action telling the operator the rebuild was wedged and
+    /// handing them a gdb incantation.
+    ///
+    /// Two arms, and the second is why this is not a vacuous guard:
+    ///
+    ///   ingested batches  -> the atomic MUST advance. Deleting the
+    ///                        `bump_index_run_lock_progress_if_present` call in
+    ///                        the consumer's ingest arm turns this red. That
+    ///                        mutant is what makes the assertion load-bearing —
+    ///                        the whole 5,137-test suite passed against the
+    ///                        defect this fixes.
+    ///
+    ///   no batches        -> the atomic MUST NOT advance. This refuses the
+    ///                        other tempting "fix": bumping unconditionally on
+    ///                        entry, or exempting `WatchOnce` from stall
+    ///                        detection. Either would silence the false alarm
+    ///                        while destroying real stall detection on the one
+    ///                        path known to actually wedge. Progress has to mean
+    ///                        progress.
+    #[test]
+    fn streaming_consumer_posts_forward_progress_per_ingested_batch() {
+        // A sentinel far below any real millisecond timestamp, so "advanced"
+        // cannot be confused with "was already a plausible clock value".
+        const SENTINEL: i64 = 1;
+
+        let run = |send_batches: bool| -> i64 {
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path().join("data");
+            std::fs::create_dir_all(&data_dir).unwrap();
+            let storage = FrankenStorage::open(&data_dir.join("db.sqlite")).unwrap();
+            ensure_fts_schema(&storage);
+
+            let progress = Arc::new(IndexingProgress::default());
+            let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+            let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+
+            if send_batches {
+                let convs: Vec<_> = (0..2)
+                    .map(|i| large_startup_conv("amp", "amp-progress", i, 2, 64, 1_700_000_000_000))
+                    .collect();
+                send_conversation_batches(&tx, "amp", convs, true);
+            }
+            send_done(&tx, "amp", true);
+            drop(tx);
+
+            let progress_bump = Arc::new(AtomicI64::new(SENTINEL));
+            run_streaming_consumer(
+                rx,
+                1,
+                &storage,
+                &data_dir,
+                None,
+                flow_limiter,
+                &Some(progress.clone()),
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                Some(FrankenStorage::now_millis()),
+                &ConnectorScanCoverage::default(),
+                Some(&progress_bump),
+            )
+            .expect("consumer should ingest cleanly");
+
+            progress_bump.load(Ordering::Relaxed)
+        };
+
+        // Positive arm. The consumer returns before the caller's closing bump,
+        // so a value observed here can only have been written from inside the
+        // scan — which is the whole property under test.
+        let with_batches = run(true);
+        assert!(
+            with_batches > 1_600_000_000_000,
+            "ingesting a batch must post forward progress from inside the scan, \
+             so a long --watch-once run is not reported as wedged (bead 8llb5); \
+             atomic was {with_batches}, still at or near the {SENTINEL} sentinel"
+        );
+
+        // Negative arm. No ingest happened, so nothing may claim progress.
+        let without_batches = run(false);
+        assert_eq!(
+            without_batches, SENTINEL,
+            "a scan that ingested nothing must NOT post forward progress — \
+             bumping on entry would silence the false alarm by making the \
+             stall signal meaningless on the one path known to wedge"
+        );
     }
 
     #[test]
@@ -34770,6 +34925,7 @@ mod tests {
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Some(FrankenStorage::now_millis()),
             &ConnectorScanCoverage::default(),
+            None,
         )
         .expect("deferred streaming ingest should not require a Tantivy writer");
 
@@ -34838,6 +34994,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             Some(FrankenStorage::now_millis()),
             &ConnectorScanCoverage::default(),
+            None,
         )
         .expect("lexical OOM after SQLite ingest should defer repair, not fail the scan");
 
@@ -34895,6 +35052,7 @@ mod tests {
                 LexicalPopulationStrategy::IncrementalInline,
                 Some(FrankenStorage::now_millis()),
                 &ConnectorScanCoverage::default(),
+                None,
             )
             .expect("single deferred ingest OOM should quarantine and continue");
 
@@ -35377,6 +35535,7 @@ mod tests {
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Some(FrankenStorage::now_millis()),
             &ConnectorScanCoverage::default(),
+            None,
         )
         .expect("mixed startup ingest should not violate foreign keys");
 
@@ -35616,6 +35775,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             None,
             &ConnectorScanCoverage::default(),
+            None,
         )
         .unwrap();
 
@@ -35721,6 +35881,7 @@ mod tests {
                 LexicalPopulationStrategy::IncrementalInline,
                 None,
                 &ConnectorScanCoverage::default(),
+                None,
             )
             .unwrap();
 
@@ -35800,6 +35961,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             None,
             &ConnectorScanCoverage::default(),
+            None,
         )
         .unwrap();
         assert_eq!(discovered, vec!["codex".to_string()]);
@@ -35847,6 +36009,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             None,
             &ConnectorScanCoverage::default(),
+            None,
         )
         .unwrap();
         assert_eq!(mutations.inserted_conversations, 3);
@@ -35985,6 +36148,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             None,
             &ConnectorScanCoverage::default(),
+            None,
         )
         .unwrap();
         handle.join().unwrap();
@@ -36038,6 +36202,7 @@ mod tests {
             Vec::new(),
             vec![("claude", panic_connector_factory)],
             FrankenStorage::now_millis(),
+            None,
         )
         .expect_err("producer panic should abort streaming indexing");
         let message = error.to_string();
@@ -36093,6 +36258,7 @@ mod tests {
             Vec::new(),
             vec![("codex", deferred_batch_connector_factory)],
             FrankenStorage::now_millis(),
+            None,
         )
         .expect("deferred batch ingest should not require a Tantivy writer");
 
