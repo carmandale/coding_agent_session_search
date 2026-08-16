@@ -15267,6 +15267,60 @@ fn connector_coverage_floors_from_state(
     )
 }
 
+/// What the connector-coverage question actually answered, kept as four
+/// distinct answers all the way to the verdict.
+///
+/// Bead `coding_agent_session_search-health-healthy-on-unknown-coverage-xarzt`.
+/// `read_connector_scan_floors` is a documented tri-state and both readiness
+/// surfaces reduced it with `.is_some_and(|f| !f.is_empty())`, which is `false`
+/// for `None` — the same answer it gives for proven-clean. So a coverage read
+/// that FAILED satisfied the `healthy` conjunction exactly as a clean one did,
+/// while the JSON beside it correctly said `checked: false, complete: null`.
+///
+/// The collapse is the recurring shape in this codebase's honesty family
+/// (1a7mk, a59ou, 0gzok, b6xc3), so the reduction now happens in exactly one
+/// place instead of being open-coded at each site. `resolve` is the only reader
+/// of the `Option`; a third surface cannot quietly re-collapse it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectorCoverageVerdict {
+    /// No database exists, so there is no coverage question to answer. The
+    /// readiness ladders reach `not_initialized` or `unhealthy` on their own
+    /// merits, and coverage must not speak for a database that is not there —
+    /// without this case a missing database would be *downgraded* from
+    /// `unhealthy` to `degraded` by the coverage arm.
+    NotApplicable,
+    /// The read succeeded and no scan aborted.
+    Complete,
+    /// The read succeeded and at least one scan aborted.
+    Incomplete,
+    /// The read itself failed, so `Complete` and `Incomplete` are
+    /// indistinguishable from here. Not good news.
+    Unknown,
+}
+
+impl ConnectorCoverageVerdict {
+    fn resolve(db_exists: bool, floors: Option<&BTreeMap<String, i64>>) -> Self {
+        match floors {
+            Some(floors) if !floors.is_empty() => Self::Incomplete,
+            Some(_) => Self::Complete,
+            None if db_exists => Self::Unknown,
+            None => Self::NotApplicable,
+        }
+    }
+
+    /// Only a positive reading may satisfy `healthy`. An absent reading is not
+    /// a passing one.
+    fn permits_healthy(self) -> bool {
+        matches!(self, Self::NotApplicable | Self::Complete)
+    }
+
+    /// Both negative readings carry the same operator meaning: the archive is
+    /// usable but is not telling the whole truth.
+    fn forces_degraded(self) -> bool {
+        matches!(self, Self::Incomplete | Self::Unknown)
+    }
+}
+
 fn connector_coverage_recommended_action(connector: &str) -> String {
     format!(
         "The {connector} scan aborted, so its coverage is incomplete. \
@@ -15925,6 +15979,75 @@ mod connector_coverage_honesty_tests {
             rendered["complete"],
             serde_json::json!(true),
             "a failed read must never render as complete coverage"
+        );
+    }
+
+    /// Bead
+    /// `coding_agent_session_search-health-healthy-on-unknown-coverage-xarzt`.
+    ///
+    /// The reader and the renderer above were already honest — the tri-state
+    /// survives `read_connector_scan_floors` and `checked: false` reaches the
+    /// JSON. What was NOT honest is the verdict beside them: both readiness
+    /// ladders reduced the tri-state with `.is_some_and(|f| !f.is_empty())`,
+    /// which returns `false` for `None`, i.e. the same answer it gives for
+    /// proven-clean. A failed coverage read therefore satisfied `healthy`.
+    ///
+    /// This pins the reduction itself, which is now the single place either
+    /// ladder reads the `Option`.
+    #[test]
+    fn unknown_coverage_never_permits_healthy_and_forces_degraded() {
+        use ConnectorCoverageVerdict as V;
+
+        let clean = BTreeMap::new();
+        let aborted: BTreeMap<String, i64> = [("codex".to_string(), 1_700_000_000_000)]
+            .into_iter()
+            .collect();
+
+        // The four inputs, so the reduction is total rather than sampled.
+        assert_eq!(V::resolve(true, Some(&clean)), V::Complete);
+        assert_eq!(V::resolve(true, Some(&aborted)), V::Incomplete);
+        assert_eq!(
+            V::resolve(true, None),
+            V::Unknown,
+            "a database exists and its coverage could not be read — that is unknown, not clean"
+        );
+        assert_eq!(
+            V::resolve(false, None),
+            V::NotApplicable,
+            "with no database there is no coverage question; the ladder's own \
+             not_initialized / unhealthy arms must answer instead"
+        );
+
+        // THE DEFECT. Before the fix this was the only line that mattered and
+        // it read the other way: unknown permitted healthy.
+        assert!(
+            !V::Unknown.permits_healthy(),
+            "a coverage read that FAILED must never satisfy the healthy conjunction — \
+             that is the whole of bead xarzt"
+        );
+        assert!(V::Unknown.forces_degraded());
+
+        // Unchanged behaviour, asserted so the fix cannot have bought the above
+        // by breaking the cases that already worked.
+        assert!(V::Complete.permits_healthy());
+        assert!(!V::Complete.forces_degraded());
+        assert!(!V::Incomplete.permits_healthy());
+        assert!(V::Incomplete.forces_degraded());
+
+        // THE REGRESSION GUARD ON THE FIX ITSELF. A machine with no database
+        // must not be dragged into `degraded` by the coverage arm: `degraded`
+        // means "usable but not telling the whole truth", and a missing
+        // canonical database is `unhealthy` (or `not_initialized` on a fresh
+        // install). Dropping the `db_exists` guard turns this red.
+        assert!(
+            !V::NotApplicable.forces_degraded(),
+            "no database is not a coverage fault; treating it as one DOWNGRADES a \
+             missing canonical database from unhealthy to degraded"
+        );
+        assert!(
+            V::NotApplicable.permits_healthy(),
+            "coverage must not be the reason a databaseless machine fails healthy — \
+             the ladder already requires db_exists for that"
         );
     }
 
@@ -36429,8 +36552,16 @@ fn collect_doctor_raw_mirror_backfill_report(
     report
 }
 
+#[allow(clippy::too_many_arguments)]
 fn doctor_coverage_confidence_tier(
     archive_conversation_count: usize,
+    // Bead `coding_agent_session_search-b6xc3`. When the source-inventory query
+    // failed, `archive_conversation_count` kept its `Default` 0 and the
+    // `== 0` arm below reported `no_archive_rows` — a positive claim that the
+    // archive is empty, made out of a query that never answered. `unchecked`
+    // already exists as a tier and `coverage_known` already keys on it, so this
+    // is wiring rather than new representation.
+    archive_conversation_count_unknown: bool,
     db_projection_only_count: usize,
     db_without_raw_mirror_count: usize,
     missing_current_source_count: usize,
@@ -36438,6 +36569,11 @@ fn doctor_coverage_confidence_tier(
     mirror_without_db_link_count: usize,
     current_source_newer_than_archive_count: usize,
 ) -> String {
+    // Ordered ahead of the count-derived arms because every one of them reads
+    // `archive_conversation_count`, which is not a measurement here. The
+    // structural arms above it stay first: they are derived from the backfill
+    // receipts rather than the failed query, so they remain true regardless,
+    // and a sole-copy risk must not be masked by an unreadable count.
     if db_projection_only_count > 0 && missing_current_source_count > 0 {
         "sole_copy_db_projection".to_string()
     } else if missing_current_source_count > 0 && raw_mirror_db_link_count > 0 {
@@ -36446,6 +36582,9 @@ fn doctor_coverage_confidence_tier(
         "archive_db_without_raw_mirror".to_string()
     } else if mirror_without_db_link_count > 0 {
         "raw_mirror_unlinked".to_string()
+    } else if archive_conversation_count_unknown {
+        // "we could not count" — never "we counted, and it was zero".
+        "unchecked".to_string()
     } else if archive_conversation_count == 0 {
         "no_archive_rows".to_string()
     } else if current_source_newer_than_archive_count > 0 {
@@ -36574,6 +36713,7 @@ fn build_doctor_coverage_summary(
         .max();
     let confidence_tier = doctor_coverage_confidence_tier(
         source_inventory.total_indexed_conversations,
+        source_inventory.db_query_error.is_some(),
         backfill.db_projection_only_count,
         db_without_raw_mirror_count,
         backfill.source_missing_count,
@@ -37344,13 +37484,29 @@ fn build_doctor_source_authority_report(
     let mut rejected_authorities = Vec::new();
 
     if archive_available {
-        selected_authorities.push(doctor_source_authority_candidate(
-            DoctorSourceAuthorityKind::CanonicalArchiveDb,
-            DoctorSourceAuthorityDecision::ReadOnly,
+        // Bead `coding_agent_session_search-b6xc3`, surfaces 1 and 2. The
+        // inventory's error path leaves `total_indexed_conversations` at its
+        // `Default` 0, so both the prose and the evidence line below used to
+        // state a failed query as a measured fact — "contains 0 indexed
+        // conversation(s) and is authoritative". `db_query_error` is the same
+        // signal the promotion gate's evidence line already renders as
+        // `unknown`; these two are the ones sgvg3 left behind because they
+        // gate nothing. Reading as measured fact is the harm either way.
+        let archive_count_unknown = source_inventory.db_query_error.is_some();
+        let reason = if archive_count_unknown {
+            "archive database opened but its conversation count could not be read, so it is \
+             authoritative for derived rebuild decisions without a proven row count"
+                .to_string()
+        } else {
             format!(
                 "archive database currently contains {} indexed conversation(s) and is authoritative for derived rebuild decisions",
                 source_inventory.total_indexed_conversations
-            ),
+            )
+        };
+        selected_authorities.push(doctor_source_authority_candidate(
+            DoctorSourceAuthorityKind::CanonicalArchiveDb,
+            DoctorSourceAuthorityDecision::ReadOnly,
+            reason,
             0,
             None,
             DoctorArtifactChecksumStatus::NotRecorded,
@@ -37358,7 +37514,11 @@ fn build_doctor_source_authority_report(
                 "archive-db-opened".to_string(),
                 format!(
                     "archive-conversation-count={}",
-                    source_inventory.total_indexed_conversations
+                    if archive_count_unknown {
+                        "unknown".to_string()
+                    } else {
+                        source_inventory.total_indexed_conversations.to_string()
+                    }
                 ),
             ],
         ));
@@ -61658,21 +61818,47 @@ paths = ["~/.claude/projects"]
         assert_eq!(risk.current_source_newer_than_archive_count, 1);
 
         assert_eq!(
-            doctor_coverage_confidence_tier(1, 0, 0, 1, 1, 0, 0),
+            doctor_coverage_confidence_tier(1, false, 0, 0, 1, 1, 0, 0),
             "sole_copy_verified_raw_mirror"
         );
         assert_eq!(
-            doctor_coverage_confidence_tier(1, 1, 1, 1, 0, 0, 0),
+            doctor_coverage_confidence_tier(1, false, 1, 1, 1, 0, 0, 0),
             "sole_copy_db_projection"
         );
         assert_eq!(
-            doctor_coverage_confidence_tier(1, 0, 0, 0, 1, 0, 1),
+            doctor_coverage_confidence_tier(1, false, 0, 0, 0, 1, 0, 1),
             "current_source_newer_than_archive"
         );
         assert_eq!(
-            doctor_coverage_confidence_tier(0, 0, 0, 0, 0, 1, 0),
+            doctor_coverage_confidence_tier(0, false, 0, 0, 0, 0, 1, 0),
             "raw_mirror_unlinked"
         );
+
+        // Bead `coding_agent_session_search-b6xc3`, surface 3. A zero count
+        // that came from a FAILED query must not be reported as the measured
+        // fact "no_archive_rows". These two calls differ only in the unknown
+        // flag, so the pairing is what makes the assertion load-bearing:
+        // deleting the new `unchecked` arm collapses them and turns this red.
+        assert_eq!(
+            doctor_coverage_confidence_tier(0, false, 0, 0, 0, 0, 0, 0),
+            "no_archive_rows",
+            "a genuinely empty archive still reports no_archive_rows"
+        );
+        assert_eq!(
+            doctor_coverage_confidence_tier(0, true, 0, 0, 0, 0, 0, 0),
+            "unchecked",
+            "a fabricated 0 from a failed source-inventory query must read as unchecked, \
+             never as the positive claim that the archive holds no rows"
+        );
+        // The structural arms are derived from backfill receipts rather than
+        // the failed query, so they stay true and must still outrank unknown —
+        // an unreadable count must not mask a sole-copy risk.
+        assert_eq!(
+            doctor_coverage_confidence_tier(0, true, 1, 1, 1, 0, 0, 0),
+            "sole_copy_db_projection",
+            "an unreadable count must not mask a sole-copy risk that does not depend on it"
+        );
+
         let mirror_only_risk = doctor_coverage_risk_summary(
             &DoctorCoverageSummary {
                 confidence_tier: "raw_mirror_unlinked".to_string(),
@@ -65534,14 +65720,23 @@ fn run_status(
     }
 
     let connector_scan_floors = connector_coverage_floors_from_state(&state);
-    let connector_coverage_incomplete = connector_scan_floors
-        .as_ref()
-        .is_some_and(|floors| !floors.is_empty());
+    // One reducer for the tri-state, shared with `cass health` (bead xarzt).
+    let coverage_verdict =
+        ConnectorCoverageVerdict::resolve(db_exists, connector_scan_floors.as_ref());
+    let connector_coverage_incomplete = coverage_verdict == ConnectorCoverageVerdict::Incomplete;
+    let connector_coverage_unknown = coverage_verdict == ConnectorCoverageVerdict::Unknown;
     if let Some(warning) = connector_scan_floors
         .as_ref()
         .and_then(connector_coverage_warning)
     {
         warnings.push(warning);
+    }
+    if connector_coverage_unknown {
+        warnings.push(
+            "connector scan coverage could not be read, so completeness is unknown rather \
+             than proven; the archive may be missing sessions an aborted scan never read"
+                .to_string(),
+        );
     }
 
     let db_available = db_opened || (db_exists && db_open_retryable);
@@ -65555,7 +65750,10 @@ fn run_status(
         && !rebuild_active
         && !index_empty_with_messages
         && !ingest_quarantine_critical
-        && !connector_coverage_incomplete
+        // Incomplete AND unknown both fail this: a coverage read that failed is
+        // not a coverage read that passed (xarzt). Total over the enum, so a
+        // future variant has to be classified rather than silently permitted.
+        && coverage_verdict.permits_healthy()
         // An unreadable quarantine file belongs in the same bucket as an
         // aborted connector scan by the `degraded` arm's own stated rule: the
         // archive is usable but is not telling the whole truth. Bead
@@ -65577,15 +65775,17 @@ fn run_status(
     } else if not_initialized {
         "not_initialized"
     } else if (db_exists && !db_available)
-        || connector_coverage_incomplete
+        || coverage_verdict.forces_degraded()
         || quarantine_counts_incomplete
     {
-        // An unreadable database, an aborted connector scan, and a quarantine
-        // file that could not be read are three different faults with the same
-        // operator meaning: the archive is usable but is not telling the whole
-        // truth, so none of them may read as healthy. Without this arm the new
-        // conjunct above would fall through to "unhealthy", which overstates a
-        // reading we simply could not take.
+        // An unreadable database, an aborted connector scan, a coverage read
+        // that failed outright, and a quarantine file that could not be read
+        // are four different faults with the same operator meaning: the archive
+        // is usable but is not telling the whole truth, so none of them may
+        // read as healthy. Without this arm the new conjuncts above would fall
+        // through to "unhealthy", which overstates a reading we simply could
+        // not take. `not_initialized` is tested before this arm, so a fresh
+        // machine keeps reading `not_initialized` rather than `degraded`.
         "degraded"
     } else {
         "unhealthy"
@@ -66195,9 +66395,13 @@ fn run_health(
             .then(|| read_connector_scan_floors_bounded(&db_path, HEALTH_COVERAGE_OPEN_TIMEOUT))
             .flatten()
     });
-    let connector_coverage_incomplete = connector_scan_floors
-        .as_ref()
-        .is_some_and(|floors| !floors.is_empty());
+    // Same reducer as the status ladder (bead xarzt). Here a `None` has already
+    // survived the bounded fallback read above, so it means the short read did
+    // not answer either.
+    let coverage_verdict =
+        ConnectorCoverageVerdict::resolve(db_exists, connector_scan_floors.as_ref());
+    let connector_coverage_incomplete = coverage_verdict == ConnectorCoverageVerdict::Incomplete;
+    let connector_coverage_unknown = coverage_verdict == ConnectorCoverageVerdict::Unknown;
 
     let mut warnings = Vec::<String>::new();
     if ingest_quarantine_critical {
@@ -66215,6 +66419,13 @@ fn run_health(
     {
         warnings.push(warning);
     }
+    if connector_coverage_unknown {
+        warnings.push(
+            "connector scan coverage could not be read, so completeness is unknown rather \
+             than proven; the archive may be missing sessions an aborted scan never read"
+                .to_string(),
+        );
+    }
 
     let db_degraded = db_exists && !db_opened;
     let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
@@ -66227,7 +66438,8 @@ fn run_health(
         && !rebuild_active
         && !index_empty_with_messages
         && !ingest_quarantine_critical
-        && !connector_coverage_incomplete;
+        // Incomplete AND unknown both fail this (xarzt); see the status ladder.
+        && coverage_verdict.permits_healthy();
     let explanation = if not_initialized {
         Some(cass_not_initialized_explanation(&data_dir))
     } else {
@@ -66302,6 +66514,14 @@ fn run_health(
                 .to_string(),
         );
     }
+    if connector_coverage_unknown {
+        errors.push(
+            "connector scan coverage unknown — the coverage read failed, so a complete \
+             archive and one with sessions an aborted scan never read are \
+             indistinguishable from here"
+                .to_string(),
+        );
+    }
 
     // Determine status string for structured output.
     let status = if rebuild_stalled {
@@ -66314,10 +66534,12 @@ fn run_health(
         "healthy"
     } else if not_initialized {
         "not_initialized"
-    } else if db_degraded || connector_coverage_incomplete {
+    } else if db_degraded || coverage_verdict.forces_degraded() {
         // Same reasoning as the status ladder above: a readable-but-incomplete
-        // archive is degraded, whether the cause is the database or a
-        // connector scan that aborted without reading its sessions.
+        // archive is degraded, whether the cause is the database, a connector
+        // scan that aborted without reading its sessions, or a coverage read
+        // that failed and so cannot tell those two apart. `not_initialized` is
+        // tested before this arm, so a fresh machine is unaffected.
         "degraded"
     } else {
         "unhealthy"
