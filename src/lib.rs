@@ -15082,6 +15082,30 @@ const STATUS_COUNT_SCAN_MAX_DB_BYTES: u64 = 256 * 1024 * 1024;
 /// very large blobs stays under the cap and still pays to hash them. Bound the
 /// bytes as well if such a store ever appears.
 const STATUS_COVERAGE_MAX_RAW_MIRROR_MANIFESTS: usize = 512;
+/// Archive-size ceiling above which `cass status` stops collecting archive
+/// coverage inline, for the same reason as the manifest cap above and on the
+/// other dimension.
+///
+/// The cap above bounds the raw-mirror walk. It does not bound the other half
+/// of the same collector: `collect_doctor_raw_mirror_backfill_report` reads
+/// every conversation row in the archive and builds one receipt per row. One
+/// boolean gated both costs while only the mirror was ever measured, so a data
+/// dir with a small (or absent) mirror pointing at a huge database passed the
+/// gate and ran the census anyway. Measured 2026-08-17 on the 23 GB /
+/// 27,441-conversation probe archive: `cass status --json` produced zero bytes
+/// and did not return inside 240 s, with not one `CASS_PREP_PROFILE` line
+/// printed (bead zumve).
+///
+/// 256 MiB is not a new number: `STATUS_COUNT_SCAN_MAX_DB_BYTES` above already
+/// refuses a plain `COUNT(*)` past that size. This census is strictly more
+/// expensive than that count, so it cannot deserve a looser bound.
+///
+/// ceiling: database bytes are a proxy for conversation count and for the live
+/// source bytes the receipts stat, exactly as the cap above proxies blob bytes
+/// by manifest count. A small database whose rows point at enormous session
+/// files stays under this cap.
+const STATUS_COVERAGE_MAX_ARCHIVE_DB_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
+const CASS_STATUS_COVERAGE_MAX_ARCHIVE_DB_BYTES: &str = "CASS_STATUS_COVERAGE_MAX_ARCHIVE_DB_BYTES";
 const CLI_DB_QUERY_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_DIAG_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -15609,8 +15633,13 @@ fn probe_state_db_blocking(
             timeout,
             "SELECT COUNT(*) FROM conversations",
         );
-        let messages =
-            state_db_count_or_unknown(&conn, db_path, reason, timeout, "SELECT COUNT(*) FROM messages");
+        let messages = state_db_count_or_unknown(
+            &conn,
+            db_path,
+            reason,
+            timeout,
+            "SELECT COUNT(*) FROM messages",
+        );
         match (conversations, messages) {
             (Some(conversations), Some(messages)) => {
                 snapshot.conversation_count = conversations;
@@ -24457,14 +24486,19 @@ fn run_stats(
         println!(
             "  {}",
             connector_coverage_recommended_action(
-                floors.keys().next().map_or("that connector", String::as_str)
+                floors
+                    .keys()
+                    .next()
+                    .map_or("that connector", String::as_str)
             )
         );
     } else {
         // The read failed. Saying nothing here would be the same defect one
         // layer up: an absent warning reads as a clean bill of health.
         println!("Scan Coverage: UNKNOWN — the coverage read did not complete");
-        println!("  These totals may undercount the archive. Run 'cass doctor' to check the database.");
+        println!(
+            "  These totals may undercount the archive. Run 'cass doctor' to check the database."
+        );
     }
     println!();
     println!("Raw Mirror:");
@@ -29773,6 +29807,12 @@ struct DoctorRawMirrorBackfillCandidate {
     origin_kind: Option<String>,
     started_at_ms: Option<i64>,
     message_count: usize,
+    /// False when neither the archive's tail cache nor a point probe could
+    /// supply this row's message count, so `message_count` is 0 by default
+    /// rather than by observation. The report turns a non-zero tally of these
+    /// into an explicit warning instead of letting the census under-report
+    /// silently.
+    message_count_known: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -34428,6 +34468,36 @@ fn status_raw_mirror_scan_too_large(data_dir: &Path) -> bool {
     false
 }
 
+fn status_coverage_max_archive_db_bytes() -> u64 {
+    dotenvy::var(CASS_STATUS_COVERAGE_MAX_ARCHIVE_DB_BYTES)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(STATUS_COVERAGE_MAX_ARCHIVE_DB_BYTES_DEFAULT)
+}
+
+/// Decide, from one `stat`, whether the archive is too large for `cass status`
+/// to run the coverage census inline.
+///
+/// The twin of `status_raw_mirror_scan_too_large` above, on the dimension that
+/// function does not measure. `collect_doctor_raw_mirror_backfill_report` reads
+/// every conversation row and builds a receipt per row with no limit and no
+/// deadline, so a surface that must return quickly needs a way to ask how much
+/// work that would be without doing it.
+///
+/// A database that does not exist is not too large — there is nothing to read;
+/// the caller already gates on `db_exists` and this keeps the two answers
+/// consistent. A database that exists but cannot be stat'd is treated as too
+/// large, the same failure direction as the mirror gate: the cost is then
+/// unknown, and declining the inline census costs an honest "not checked" while
+/// accepting it risks a command that never returns.
+fn status_archive_scan_too_large(db_path: &Path) -> bool {
+    match std::fs::metadata(db_path) {
+        Ok(metadata) => metadata.len() > status_coverage_max_archive_db_bytes(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
 fn collect_doctor_raw_mirror_report(data_dir: &Path) -> DoctorRawMirrorReport {
     collect_doctor_raw_mirror_report_with_threshold(
         data_dir,
@@ -35883,7 +35953,36 @@ fn query_doctor_raw_mirror_backfill_candidates(
     } else {
         "NULL"
     };
-    let message_count_expr = if can_count_messages {
+    // Order matters and the correlated COUNT is last on purpose.
+    //
+    // `conversations.last_message_idx` is the archive's own cache of this row's
+    // highest message index, maintained by the insert and append paths, and
+    // this codebase already treats `last_message_idx + 1` as the per-conversation
+    // message count (`lexical_rebuild_message_count_from_tail_idx`,
+    // src/storage/sqlite.rs). Reading it costs nothing: the statement is already
+    // selecting from `conversations`.
+    //
+    // The correlated `COUNT(*)` below is exact but scans the whole `messages`
+    // table once per conversation on the pinned engine — the sampled stack shows
+    // `BtCursor::advance_next_impl`, so the `UNIQUE(conversation_id, idx)`
+    // autoindex is not elected — and that is what made this census never return
+    // on a 23 GB / 2.3 M-message archive (bead zumve). It stays as the fallback
+    // for pre-v15 schemas, which is the only shape that lacks the column.
+    //
+    // Do NOT "fix" this with one grouped `SELECT conversation_id, COUNT(*) FROM
+    // messages GROUP BY conversation_id`: that is the exact statement commit
+    // 26932422 removed from the lexical rebuild for taking over 10 hours on this
+    // pin against 77 ms in stock SQLite.
+    //
+    // ceiling: a conversation whose `last_message_idx` was never populated —
+    // rows written before the v15 column existed and never re-indexed — reports
+    // 0 here where the count would report the true number. This value is a
+    // census statistic and a manifest provenance field; nothing branches on it.
+    let message_count_expr = if conversation_columns.contains("last_message_idx") {
+        // NULL, not 0, when the cache holds no value for the row: an unknown
+        // count is resolved by a bounded point probe below, never defaulted.
+        "c.last_message_idx + 1"
+    } else if can_count_messages {
         "(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id)"
     } else if conversation_columns.contains("message_count") {
         "COALESCE(c.message_count, 0)"
@@ -35907,8 +36006,8 @@ fn query_doctor_raw_mirror_backfill_candidates(
          ORDER BY c.id"
     );
 
-    conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
-        let message_count: i64 = row.get_typed(7)?;
+    let mut candidates = conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
+        let message_count: Option<i64> = row.get_typed(7)?;
         Ok(DoctorRawMirrorBackfillCandidate {
             conversation_id: row.get_typed(0)?,
             provider: row.get_typed(1)?,
@@ -35917,9 +36016,66 @@ fn query_doctor_raw_mirror_backfill_candidates(
             origin_host: row.get_typed(4)?,
             origin_kind: row.get_typed(5)?,
             started_at_ms: row.get_typed(6)?,
-            message_count: message_count.max(0) as usize,
+            message_count: message_count.unwrap_or(0).max(0) as usize,
+            message_count_known: message_count.is_some(),
         })
-    })
+    })?;
+
+    resolve_doctor_backfill_unknown_message_counts(conn, &mut candidates, can_count_messages);
+    Ok(candidates)
+}
+
+/// Ceiling on how many per-conversation message counts the census will probe
+/// one row at a time when the archive's tail cache does not have them.
+///
+/// The same shape and the same figure as the lexical rebuild's
+/// `LEXICAL_REBUILD_FOOTPRINT_POINT_TAIL_FALLBACK_LIMIT`, and for the same
+/// reason: one point probe is a `COUNT(*)` the pinned engine answers by
+/// scanning `messages`, so a handful is fine and a whole archive is the hang
+/// this census was filed for. Above the cap the census reports what it knows
+/// and says how many rows it could not count, rather than running the scan or
+/// passing off a default as a measurement.
+const DOCTOR_BACKFILL_MESSAGE_COUNT_POINT_PROBE_LIMIT: usize = 64;
+
+/// Fill in message counts the archive's own tail cache could not supply.
+///
+/// Measured on the live 27,441-conversation archive by 26932422: zero rows are
+/// missing tail metadata, so on a current archive this does nothing at all. It
+/// exists for rows written before the v15 `conversations.last_message_idx`
+/// column and never re-indexed, which is the shape the doctor test fixtures
+/// build by inserting rows straight into SQL.
+fn resolve_doctor_backfill_unknown_message_counts(
+    conn: &frankensqlite::Connection,
+    candidates: &mut [DoctorRawMirrorBackfillCandidate],
+    can_count_messages: bool,
+) {
+    use frankensqlite::compat::ConnectionExt as _;
+
+    if !can_count_messages {
+        return;
+    }
+    let unknown = candidates
+        .iter()
+        .filter(|candidate| !candidate.message_count_known)
+        .count();
+    if unknown == 0 || unknown > DOCTOR_BACKFILL_MESSAGE_COUNT_POINT_PROBE_LIMIT {
+        return;
+    }
+
+    for candidate in candidates
+        .iter_mut()
+        .filter(|candidate| !candidate.message_count_known)
+    {
+        let counted: Result<i64, _> = conn.query_row_map(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+            frankensqlite::params![candidate.conversation_id],
+            |row| row.get_typed(0),
+        );
+        if let Ok(counted) = counted {
+            candidate.message_count = counted.max(0) as usize;
+            candidate.message_count_known = true;
+        }
+    }
 }
 
 fn doctor_raw_mirror_backfill_source_path_blake3(path: &str) -> String {
@@ -35962,8 +36118,19 @@ fn doctor_raw_mirror_backfill_record_id(candidate: &DoctorRawMirrorBackfillCandi
     )
 }
 
+/// Snapshot one candidate's live source file.
+///
+/// `hash_contents` decides whether the file's bytes are read. The hash has
+/// exactly one reader — `doctor_raw_mirror_backfill_live_source_changed`, which
+/// compares it against an existing raw-mirror blob hash — so it is worth
+/// computing only when this candidate actually has existing mirror evidence to
+/// compare against. Without that, the read is dead work: nothing ever looks at
+/// the result. It is not cheap dead work either, because it is a full-file read
+/// and a single-threaded BLAKE3 of every provider session file in the archive,
+/// on a path `cass doctor` and (under the cap) `cass status` both take.
 fn doctor_raw_mirror_backfill_source_stat(
     path: &Path,
+    hash_contents: bool,
 ) -> DoctorRawMirrorBackfillSourceStatSnapshot {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -35977,11 +36144,12 @@ fn doctor_raw_mirror_backfill_source_stat(
                 "other"
             }
             .to_string();
-            let content_blake3 = if metadata.is_file() && !metadata.file_type().is_symlink() {
-                doctor_file_blake3(path).ok()
-            } else {
-                None
-            };
+            let content_blake3 =
+                if hash_contents && metadata.is_file() && !metadata.file_type().is_symlink() {
+                    doctor_file_blake3(path).ok()
+                } else {
+                    None
+                };
             DoctorRawMirrorBackfillSourceStatSnapshot {
                 exists: true,
                 file_type,
@@ -36209,7 +36377,16 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
         origin_host.as_deref(),
         &source_path,
     );
-    let source_stat = doctor_raw_mirror_backfill_source_stat(path);
+    // Hash the live bytes only when this candidate has existing mirror evidence
+    // to compare them against. That is the exact reachability condition of the
+    // hash's only reader: the two `get` hits immediately below are the only
+    // callers of `doctor_raw_mirror_backfill_live_source_changed`. On a data dir
+    // with no raw mirror both maps are empty, so every candidate misses, and
+    // hashing there reads every provider session file in the archive to produce
+    // a value nothing ever looks at.
+    let has_existing_evidence = by_conversation_id.contains_key(&candidate.conversation_id)
+        || by_source_key.contains_key(&source_key);
+    let source_stat = doctor_raw_mirror_backfill_source_stat(path, has_existing_evidence);
     receipt.source_stat_snapshot = Some(source_stat.clone());
     receipt.source_missing = !source_stat.exists;
 
@@ -36449,6 +36626,18 @@ fn collect_doctor_raw_mirror_backfill_report(
             return report;
         }
     };
+
+    // Say so when the census could not account for some rows' messages, rather
+    // than letting the default 0 read as a measurement of an empty conversation.
+    let uncounted_message_conversations = candidates
+        .iter()
+        .filter(|candidate| !candidate.message_count_known)
+        .count();
+    if uncounted_message_conversations > 0 {
+        report.warnings.push(format!(
+            "{uncounted_message_conversations} archive rows have no cached message count and were not counted; archived_message_count understates them by that many conversations. Re-index to populate the cache."
+        ));
+    }
 
     let (by_conversation_id, by_source_key) = doctor_raw_mirror_existing_evidence_maps(raw_mirror);
     if apply {
@@ -38718,7 +38907,10 @@ fn doctor_candidate_build_should_run(
     let raw_mirror_expands_archive = !source_authority
         .coverage_delta
         .archive_conversation_count_unknown
-        && source_authority.coverage_delta.raw_mirror_links_minus_archive > 0;
+        && source_authority
+            .coverage_delta
+            .raw_mirror_links_minus_archive
+            > 0;
     candidate_authority_available
         && (!db_ok || needs_rebuild || archive_risk || raw_mirror_expands_archive)
 }
@@ -61993,9 +62185,9 @@ paths = ["~/.claude/projects"]
         assert_eq!(gate.conversation_delta, None);
         assert_eq!(gate.message_delta, None);
         assert!(
-            gate.blocking_reasons.iter().any(|reason| {
-                reason.contains("candidate conversation coverage is unknown")
-            }),
+            gate.blocking_reasons
+                .iter()
+                .any(|reason| { reason.contains("candidate conversation coverage is unknown") }),
             "unknown candidate conversation coverage must block by name: {gate:#?}"
         );
         assert!(
@@ -65875,7 +66067,16 @@ fn run_status(
         // proxy, because the walk's cost is a function of the mirror and the
         // database size only correlates with it by accident — a pruned and
         // reindexed archive is exactly the shape that breaks the proxy.
-        let status_collects_coverage = db_exists && !status_raw_mirror_scan_too_large(&data_dir);
+        //
+        // The archive gate beside it bounds the other half of the same
+        // collector. `status_raw_mirror_scan_too_large` measures the mirror;
+        // `collect_doctor_raw_mirror_backfill_report` reads every conversation
+        // row and builds a receipt each. One boolean gated both while only one
+        // was measured, so a data dir with an empty mirror and a 23 GB archive
+        // ran the census and `cass status --json` never returned (bead zumve).
+        let status_collects_coverage = db_exists
+            && !status_raw_mirror_scan_too_large(&data_dir)
+            && !status_archive_scan_too_large(&db_path);
         let (coverage_risk, coverage_source, coverage_checked) = if status_collects_coverage {
             (
                 collect_doctor_coverage_risk_summary(&data_dir, &db_path),
@@ -92551,7 +92752,6 @@ mod subcommand_robot_output_tests {
             );
         });
     }
-
 }
 
 // Tests for `--include-attachments` removed: the flag was accepted

@@ -4711,6 +4711,250 @@ fn status_json_still_verifies_coverage_inline_on_a_raw_mirror_under_the_scan_cap
     );
 }
 
+/// The mirror cap above bounds the coverage collector's walk over the raw
+/// mirror. It does not bound the other half of the same collector, which reads
+/// every conversation row in the archive and builds a receipt each — so a data
+/// dir with an empty mirror and a 23 GB archive passed the gate and
+/// `cass status --json` never returned (bead zumve).
+///
+/// The matched half of this pair is
+/// `status_json_still_verifies_coverage_inline_on_a_raw_mirror_under_the_scan_cap`
+/// above: its archive is far under the default cap, so it goes red if this gate
+/// ever fires when it should not. Between them, both directions are pinned.
+#[test]
+fn status_json_declines_inline_coverage_on_an_archive_past_the_db_scan_cap() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let db_path = data_dir.join("agent_search.db");
+    let db_bytes = fs::metadata(&db_path).expect("archive metadata").len();
+    assert!(
+        db_bytes > 1,
+        "fixture must actually exceed the archive scan cap or this test proves nothing (db is {db_bytes} bytes)"
+    );
+
+    let status_out = cass_cmd(test_home)
+        .env("CASS_STATUS_COVERAGE_MAX_ARCHIVE_DB_BYTES", "1")
+        .args([
+            "status",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass status --json");
+    assert!(
+        status_out.status.success(),
+        "cass status --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&status_out.stdout),
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+    let status_payload: Value = serde_json::from_slice(&status_out.stdout).expect("status json");
+    assert_eq!(
+        status_payload["doctor_summary"]["coverage_source"]["source"].as_str(),
+        Some("status-fast-state"),
+        "status must take the fast path on an archive past the db scan cap: {status_payload:#}"
+    );
+    assert_eq!(
+        status_payload["doctor_summary"]["coverage_source"]["status"].as_str(),
+        Some("not_checked"),
+        "status must say coverage was not checked rather than imply it verified the archive: {status_payload:#}"
+    );
+    assert_eq!(
+        status_payload["doctor_summary"]["archive_coverage_state"].as_str(),
+        Some("not_checked"),
+        "the skipped inline census must surface as not_checked, not as healthy coverage: {status_payload:#}"
+    );
+    assert!(
+        status_payload["coverage_risk"]["recommended_action"]
+            .as_str()
+            .is_some_and(|text| text.contains("cass doctor")),
+        "declining the census must route the operator to the surface that does verify: {status_payload:#}"
+    );
+}
+
+/// Pins WHICH source of truth the census reads for per-conversation message
+/// counts. The archive caches the row's highest message index in
+/// `conversations.last_message_idx`; reading it is free, while the correlated
+/// `COUNT(*)` it replaced scans the whole `messages` table once per
+/// conversation on the pinned engine.
+///
+/// The fixture deliberately makes the two disagree — a cached index of 4 over
+/// only 2 stored messages — so the assertion cannot pass by accident on a build
+/// that still counts rows. Stating the ceiling out loud: the tail cache is
+/// authoritative here, and a stale cache is reported as-is.
+#[test]
+fn doctor_json_reports_message_counts_from_the_conversation_tail_cache() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let session_dir = test_home.join(".codex/sessions/tail-cache");
+    fs::create_dir_all(&session_dir).expect("session dir");
+    let cached_source = session_dir.join("cached-session.jsonl");
+    let uncached_source = session_dir.join("uncached-session.jsonl");
+    fs::write(&cached_source, b"{\"tail\":\"cached\"}\n").expect("write cached source");
+    fs::write(&uncached_source, b"{\"tail\":\"uncached\"}\n").expect("write uncached source");
+
+    let db_path = data_dir.join("agent_search.db");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).expect("open db");
+    let agent_id = ensure_codex_agent(&conn);
+    let cached_source_str = cached_source.to_string_lossy().into_owned();
+    let uncached_source_str = uncached_source.to_string_lossy().into_owned();
+    conn.execute_compat(
+        "INSERT INTO conversations (id, agent_id, source_id, external_id, title, source_path, started_at, last_message_idx)
+         VALUES (301, ?1, 'local', 'tail-cached', 'tail cached', ?2, 1700000000000, 4)",
+        frankensqlite::params![agent_id, cached_source_str.as_str()],
+    )
+    .expect("insert cached conversation");
+    conn.execute_compat(
+        "INSERT INTO conversations (id, agent_id, source_id, external_id, title, source_path, started_at)
+         VALUES (302, ?1, 'local', 'tail-uncached', 'tail uncached', ?2, 1700000001000)",
+        frankensqlite::params![agent_id, uncached_source_str.as_str()],
+    )
+    .expect("insert uncached conversation");
+    for (conversation_id, idx) in [(301_i64, 0_i64), (301, 1), (302, 0)] {
+        conn.execute_compat(
+            "INSERT INTO messages (conversation_id, idx, role, content)
+             VALUES (?1, ?2, 'user', 'archived message')",
+            frankensqlite::params![conversation_id, idx],
+        )
+        .expect("insert message");
+    }
+    drop(conn);
+
+    let doctor_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --json");
+    assert!(
+        doctor_out.status.success(),
+        "cass doctor --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&doctor_out.stdout),
+        String::from_utf8_lossy(&doctor_out.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&doctor_out.stdout).expect("doctor json");
+    let receipts = payload["raw_mirror_backfill"]["receipts"]
+        .as_array()
+        .expect("backfill receipts");
+    let cached = receipts
+        .iter()
+        .find(|receipt| receipt["conversation_id"].as_i64() == Some(301))
+        .expect("receipt for the tail-cached conversation");
+    assert_eq!(
+        cached["message_count"].as_u64(),
+        Some(5),
+        "the cached tail index (4) must be read as a count of 5, not recounted as the 2 stored rows: {cached:#}"
+    );
+    let uncached = receipts
+        .iter()
+        .find(|receipt| receipt["conversation_id"].as_i64() == Some(302))
+        .expect("receipt for the uncached conversation");
+    assert_eq!(
+        uncached["message_count"].as_u64(),
+        Some(1),
+        "a row with no cached tail must fall back to a bounded point probe, not to a default of 0: {uncached:#}"
+    );
+    assert_eq!(
+        payload["coverage_summary"]["archived_message_count"].as_u64(),
+        Some(6),
+        "the archive-wide total must be the sum of what each row reported: {payload:#}"
+    );
+}
+
+/// The live-source BLAKE3 has exactly one reader — the comparison against an
+/// existing raw-mirror blob hash — so a candidate with no existing mirror
+/// evidence has nothing to compare against and the read is dead work. On this
+/// operator's archive that was a full read and single-threaded hash of every
+/// provider session file, on a command whose help says "quick health check".
+///
+/// The matched half of this pair already exists and must stay green: the
+/// `linked_existing_raw_manifest_live_source_changed` assertion in
+/// `doctor_fix_backfills_legacy_raw_mirror_metadata_without_touching_provider_files`
+/// is an evidence hit, so it still hashes and still sees the exact live hash.
+#[test]
+fn doctor_json_does_not_hash_live_sources_without_existing_mirror_evidence() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let session_dir = test_home.join(".codex/sessions/no-evidence");
+    fs::create_dir_all(&session_dir).expect("session dir");
+    let live_source = session_dir.join("unmirrored-session.jsonl");
+    fs::write(&live_source, b"{\"type\":\"message\",\"role\":\"user\"}\n")
+        .expect("write live source");
+
+    let db_path = data_dir.join("agent_search.db");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).expect("open db");
+    let agent_id = ensure_codex_agent(&conn);
+    let live_source_str = live_source.to_string_lossy().into_owned();
+    conn.execute_compat(
+        "INSERT INTO conversations (id, agent_id, source_id, external_id, title, source_path, started_at, last_message_idx)
+         VALUES (401, ?1, 'local', 'no-mirror-evidence', 'no mirror evidence', ?2, 1700000000000, 0)",
+        frankensqlite::params![agent_id, live_source_str.as_str()],
+    )
+    .expect("insert conversation");
+    conn.execute_compat(
+        "INSERT INTO messages (conversation_id, idx, role, content)
+         VALUES (401, 0, 'user', 'archived message')",
+        frankensqlite::params![],
+    )
+    .expect("insert message");
+    drop(conn);
+
+    let doctor_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --json");
+    assert!(
+        doctor_out.status.success(),
+        "cass doctor --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&doctor_out.stdout),
+        String::from_utf8_lossy(&doctor_out.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&doctor_out.stdout).expect("doctor json");
+    let receipt = payload["raw_mirror_backfill"]["receipts"]
+        .as_array()
+        .expect("backfill receipts")
+        .iter()
+        .find(|receipt| receipt["conversation_id"].as_i64() == Some(401))
+        .expect("receipt for the unmirrored conversation")
+        .clone();
+    assert_eq!(
+        receipt["action"].as_str(),
+        Some("would_capture_live_source"),
+        "the fixture must reach the branch that has no existing evidence, or this test proves nothing: {receipt:#}"
+    );
+    let snapshot = &receipt["source_stat_snapshot"];
+    assert_eq!(
+        snapshot["exists"].as_bool(),
+        Some(true),
+        "the stat must still happen — only the read is skipped: {receipt:#}"
+    );
+    assert!(
+        snapshot["size_bytes"].as_u64().is_some(),
+        "the stat must still report size — only the read is skipped: {receipt:#}"
+    );
+    assert!(
+        snapshot["content_blake3"].is_null(),
+        "with no mirror evidence to compare against, the live bytes must not be read and hashed: {receipt:#}"
+    );
+}
+
 #[test]
 fn doctor_fix_backfills_legacy_raw_mirror_metadata_without_touching_provider_files() {
     let temp = tempfile::tempdir().expect("tempdir");
