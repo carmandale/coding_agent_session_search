@@ -291,3 +291,116 @@ deterministic, which is enough to stop attributing it.
 The 8 are the pin's remaining work, not this change's: none is in a module this
 change touches. They are being triaged separately (workflow `wf_5db3409b-f14`)
 so the toolchain decision comes with its full cost attached.
+
+## The triage returned: the pin move is blocked by two real defects, both in cass
+
+`wf_5db3409b-f14` completed after 39 minutes — 10 agents, 0 errors, every lane
+returning. Five groups, each classified by one lane and then attacked by an
+independent verifier lane.
+
+| group | tests | classification | blocks pin |
+|---|---|---|---|
+| dependency-drift | 1 | expected artifact of the experiment | no |
+| encrypt-overflow | 1 | rustc/std `Display` change, 1.94 -> 1.99 | no |
+| fts-repair-mode | 2 | **split** — see below | **yes** |
+| fts-shadow-table | 2 | fixtures build a database real SQLite also rejects | no |
+| salvage-counts | 2 | new fsqlite sidecar family not in cass's allowlist | **yes** |
+
+### Blocker 1 — the FTS write gate stops discriminating (bead `-hd4u5`)
+
+Every in-transaction FTS write is gated on
+`SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages' AND rootpage > 0`
+(`src/storage/sqlite.rs:4126-4131`); all 14 write sites funnel through
+`flush_pending_fts_entries` (:15281-15296), which consults it at :15292.
+`rootpage > 0` was a proxy for "fsqlite has registered this vtable", and fsqlite
+0.1.19 made the CREATE side match real SQLite: literal rootpage `0` plus shadow
+tables. Measured in two probe crates pinned to the exact stacks, plus a third
+party:
+
+```
+fsqlite 0.1.5        [("fts_messages", 2)]                    gate rows = 1
+fsqlite 0.1.19       [("fts_messages", 0), + 4 shadow rows]   gate rows = 0
+stock sqlite3 3.54.0 on cass's own FTS5_REGISTER_SQL          gate rows = 0
+```
+
+Stock SQLite agrees with 0.1.19, so 0.1.5 was the non-conformant one. This is
+not a test artifact: `FrankenStorage::open` never arms
+`fts_messages_present_cache`, the five sites that do are all inside the repair
+path, and every production caller of `ensure_search_fallback_fts_consistency`
+runs on a fresh short-lived handle. On the long-lived indexing handle the gate is
+permanently false and nothing re-arms it — ordinary inserts would stop
+maintaining the fallback FTS index, silently.
+
+### Blocker 2 — a new sidecar family reopens the #236 class (bead `-xybl9`)
+
+fsqlite-vfs 0.1.17 added `namespace.rs`, which lays two persistent sidecars per
+opened database: `-fsqlite-ns-gate` (0 bytes) and `-fsqlite-ns-use` (40 bytes,
+header `FSQLNS01`). Both are created before the main file is opened, on the
+read-only path too, and are deliberately never unlinked. Vendored crates confirm
+the boundary — 0.1.6 and 0.1.14 have no `namespace.rs`; 0.1.17 and 0.1.19 do.
+
+cass's `has_db_sidecar_suffix` (:3008-3017) knows five suffixes and neither new
+one, and the parent-dir scan applies that filter *before* the
+`agent_search.corrupt.` / `.backup.` prefix test — so those sidecars become
+bundle roots. The 0-byte gate is culled by the `total_bytes > 0` filter at :2051,
+which is exactly why both failures are off by one rather than two. The chain
+`...-fsqlite-ns-use-fsqlite-ns-use` is reachable, which is the #236 shape
+(~789k orphan files / 195 GB). Worse than phantom enumeration:
+`cleanup_old_backups` (:1718-1755) selects on the same prefix, so orphan sidecars
+occupy retention slots and can evict real backups.
+
+**Checked against the machine, not just the source.** The pair is already on the
+production database — `agent_search.db-fsqlite-ns-gate` 0 B,
+`agent_search.db-fsqlite-ns-use` 40 B with the `FSQLNS01` header. Neither
+`~/.local/bin/cass` nor any cass binary under the dev tree carries the literal
+(positive controls on the same search: `agent_search` 47 hits, `fsqlite` 673;
+`strings` agrees), so a different fsqlite >= 0.1.17 consumer already reaches that
+file. That writer is not identified. **No damage today**: no prefix-matching
+sidecars, no chained names, no backups dir. The exposure arrives when cass itself
+starts writing these next to quarantine and backup files — with the pin.
+
+### What the verifiers changed
+
+Two of the five verdicts moved, which is the reason the panel was worth running.
+
+`fts-repair-mode` was **refuted and split**. Its two tests have different causes:
+the indexer test is the gate defect above (cass owes the adaptation), while
+`ensure_fts_consistency_via_rusqlite_catches_up_missing_rows` is a genuine fsqlite
+deviation — a contentless FTS5 table appended in-session reports `COUNT(*) = 1`
+under 0.1.19 where both 0.1.5 and stock sqlite3 3.54.0 report 2. One label would
+have travelled downstream as "adaptation owed by cass" and nobody would have
+filed the upstream bug. Filed as bead `-mgw1o`, unsent: filing upstream on
+frankensqlite is outside this session's authorization.
+
+`dependency-drift` kept its verdict but **half its evidence was fabricated**. The
+lane reported asupersync moved to 0.3.10 in the forward manifest and that the
+matching assertion failed for the same reason. Neither is true: that Cargo.toml
+still reads `0.3.2` byte-identically, 0.3.10 is only the lockfile resolution of a
+caret range, and the assertion never executed because `ensure(...)?` short-circuits
+at the earlier line. Its proposed fix — bump the literal to `0.3.10` — would turn a
+currently-green assertion red in both trees, and bumping the manifest instead would
+hit `build.rs:119/138` and hard-exit the build. **Correct fix: one literal**,
+`src/dependency_drift.rs:869` `"0.1.5"` -> `"0.1.19"`, in the same commit that moves
+`Cargo.toml:45/181` and `build.rs:56/74`. Leave line 882 alone.
+
+### My own error, recorded
+
+Three lane prompts told their agents to read
+`~/.cargo/registry/src/*/frankensqlite-0.1.x`. That directory does not exist — cass
+renames the crate through `package = "fsqlite"`, so the vendored trees are
+`fsqlite-0.1.x`, `fsqlite-ast-*`, `fsqlite-ext-fts5-*`, `fsqlite-vfs-*`. The three
+lanes that stalled longest were exactly the three carrying that path. They
+recovered by searching — the salvage lane's evidence cites real
+`fsqlite-vfs-0.1.19/src/namespace.rs` lines — so the error cost wall-clock, not
+results. The successor session relaunched a corrected copy before this one
+returned; that run is redundant with these findings rather than contradicting
+them.
+
+### Net, for the toolchain decision
+
+Moving to fsqlite 0.1.19 is not a compiler bump with a tail of test churn. It needs
+three code changes in cass — the FTS gate, the sidecar allowlist plus its sweep, and
+the catch-up recount — two test-only edits, one version literal, and it carries one
+upstream library bug that cass can defend against but not fix. None of that is a
+reason against the move; all of it is cost the decision should carry, which is why
+the triage ran.
