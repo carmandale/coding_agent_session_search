@@ -270,7 +270,24 @@ other 11 then failed identically at `src/indexer/mod.rs:24301` with
 `env mutation lock: PoisonError { .. }`. The primary is `database is busy` —
 SQLite write contention — and this run was concurrent with (a) this session's own
 full 0.3.2 suite and (b) another live session running
-`cass index --force-rebuild` against the production database. Environment-
-attributed, so it is being re-run alone rather than recorded as a finding. The
-8 that B3 already recorded are unchanged and are the pin's remaining work, not
-this change's: none of them is in a module this change touches.
+`cass index --force-rebuild` against the production database.
+
+**Re-run, and the attribution holds** (`fwd-lib-rerun.log`,
+`fwd-rerun-verdict.log`). With this session's own 0.3.2 suite finished:
+
+```
+test result: FAILED. 5143 passed; 8 failed; 3 ignored; finished in 143.09s
+--- any PoisonError cascade? ---
+  0 — no cascade
+```
+
+Eight failures, byte-identical in name to the eight experiment B3 recorded, and
+zero `PoisonError`. So the 12 extras were contention and are excluded on
+evidence rather than on assumption. The re-run was *not* fully quiet — the
+sibling session's `cass index --force-rebuild` (pid 38174) was still running and
+was left alone — so what this establishes is that the cascade is not
+deterministic, which is enough to stop attributing it.
+
+The 8 are the pin's remaining work, not this change's: none is in a module this
+change touches. They are being triaged separately (workflow `wf_5db3409b-f14`)
+so the toolchain decision comes with its full cost attached.
