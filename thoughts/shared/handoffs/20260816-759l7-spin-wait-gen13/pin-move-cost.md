@@ -45,8 +45,16 @@ a broken fixture.
 
 ## The eight, one row each
 
-*(verdict column filled in from the adversarial verifiers; see the detail
-sections for the reasoning behind each)*
+Every classification below was handed to an adversarial verifier told to refute
+it and to default to "refuted" if it could not independently confirm the
+load-bearing claim. **Five verdicts returned, and none refuted anything.** The
+group that could genuinely block got three verifiers with different lenses
+rather than one, because the failure mode there is data-loss shaped.
+
+One of those verifiers is worth singling out: the `fts-shadow-table` lane had
+flagged its rootpage mechanism as an "honest gap" — deduced from source rather
+than executed — and the verifier independently confirmed it with a fourth line
+of evidence the finder did not have.
 
 | # | failure | what it actually is | blocks the pin | effort |
 |---|---|---|---|---|

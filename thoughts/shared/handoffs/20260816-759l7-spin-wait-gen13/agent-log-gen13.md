@@ -195,6 +195,22 @@ measure: the napkin records the e2e suite spawning 8 concurrent
 and not finishing in 90 minutes. So "100% green" is true of the lib suite and
 unmeasured beyond it.
 
+## Verifier verdicts
+
+Five returned before this session wound down. **Every one came back
+`refuted=false`**, each naming the load-bearing claim it confirmed and how.
+
+| verifier | verdict | what it independently established |
+|---|---|---|
+| `dependency-drift` | holds | read `src/dependency_drift.rs:799-889`; `checked_in_manifest()` (`:815`) reads the real manifest via `CARGO_MANIFEST_DIR`, and `dependency_spec()` (`:826`) carries no version data feeding the failing assertions |
+| `encrypt-overflow` | holds | opened `src/pages/encrypt.rs:298-306` and `:1819-1826` verbatim; confirmed `encrypt.rs` byte-identical across the two trees (84,030 bytes both sides), ruling out a different conversion path |
+| `fts-shadow-table` (lens: reproduce) | holds | re-ran the decisive probes rather than trusting the reported ones; found no test-name reasoning, no unopened-library assertion, no dead instrument |
+| `fts-shadow-table` (second lens) | holds | **closed the finder's own stated gap** — independently confirmed the rootpage mechanism with a fourth leg of evidence the finder did not have |
+| `salvage-counts` | holds | confirmed from source that `bundles_considered` is openability-independent (`:9029-9031` over `:2032-2052`, whose only filters are `exists()` and `total_bytes > 0`), killing the mirror-image hypothesis outright |
+
+Still outstanding at wind-down: the third `fts-shadow-table` lens, and the
+`fts-repair-mode` triage lane with its verifier. Generation 14 owns both.
+
 ## Notes for whoever is next
 
 - The forward target dir is `/tmp/cass-759l7-forward-target`, a **sibling** of
