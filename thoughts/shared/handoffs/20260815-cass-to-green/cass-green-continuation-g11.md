@@ -44,49 +44,69 @@ Clearing scratch directories **you created yourself this session** is inside the
 
 ## The exact next action
 
-**Run the ibuuh.29.1 probe. It is one command, it is decisive either way, and
-the instrument it uses has never been run on this path.**
+**Fix ibuuh.29.1. The probe has run, the statement is named, and the fix is one
+deletion plus a test.** The full measurement chain is on the bead as two
+comments; the summary is below under *Open*.
+
+Delete the `raise_lexical_rebuild_footprints_to_exact_message_counts` call from
+the tail-metadata path in `list_conversation_footprints_for_lexical_rebuild`
+(`src/storage/sqlite.rs`, the `if !every_footprint_was_missing_tail` arm), and
+pin the deletion with a test over a corpus whose tails are deliberately stale, so
+the shard boundaries it produces are asserted rather than assumed.
+
+Why that is the fix, in one paragraph. That call runs
+`SELECT conversation_id, COUNT(*) FROM messages GROUP BY conversation_id` across
+the whole archive, and it is **96% of the step that wedges** — 12,897 ms of
+13,412 ms on 580k messages, and over 360,000 ms *without completing* on 2.3M. It
+only ever raises a footprint when the exact count **exceeds** the tail-derived
+estimate, and measured across both real corpora the estimate is never low: 0
+underestimates of 12,722 and 0 of 27,441. Its output then feeds only shard
+sizing, which `indexer/mod.rs:9160-9164` calls "sizing estimates, not validation
+contracts" in its own comment, and `mod.rs:9185` overwrites `shard.message_count`
+with `LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT` on the next line. So a whole-corpus
+exact aggregation runs to refine a heuristic that is then discarded, and it
+changes nothing. Over-estimates are the safe direction — they make shards
+*smaller* — and conversations with missing tails are already handled ahead of it
+by `fill_missing_lexical_rebuild_footprint_tails`.
+
+If deleting it feels too strong, the cheaper-to-verify variant is to run it only
+when at least one footprint is missing a tail, which is the case it was written
+for.
+
+Then re-run the probe below to prove the wedge is gone, and only then attempt
+`cass index --full --force-rebuild` on the live archive.
+
+The probe, read-only on production, about 20 seconds on the control:
 
 ```bash
-S=$(mktemp -d /tmp/cass-ibuuh-probe-XXXXXX)
 CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1 CASS_PREP_PROFILE=1 \
-  ~/.local/bin/cass index --force-rebuild \
-    --db "$HOME/Library/Application Support/com.coding-agent-search.coding-agent-search/agent_search.db" \
-    --data-dir "$S" 2>&1 | tee /tmp/ibuuh-probe.log
+  <binary> index --force-rebuild --db <db> --data-dir <fresh scratch dir>
 ```
 
-`--force-rebuild` **WITHOUT** `--full`. That takes the read-only canonical path,
-which I verified in source rather than assuming: `should_try_readonly_canonical_force_rebuild`
+`--force-rebuild` **WITHOUT** `--full` takes the read-only canonical path —
+verified in source, not assumed: `should_try_readonly_canonical_force_rebuild`
 (`src/indexer/mod.rs:2091-2101`) requires `force_rebuild && !full && !watch &&
-!semantic && !build_hnsw` and no watch-once paths, and
-`try_readonly_canonical_force_rebuild` then uses `FrankenStorage::open_readonly`
-(:2112) and `close_without_checkpoint` (:2126). It rebuilds into the scratch
-data dir, so it needs Tantivy index space only, not a 23 GB DB copy.
+!semantic && !build_hnsw`, then `open_readonly` (:2112) and
+`close_without_checkpoint` (:2129), returning `Ok(true)` so there is no
+fall-through to a write path. It builds Tantivy into the scratch data dir, so it
+needs index space only, not a 23 GB copy.
 
-Read the stderr `CASS_PREP_PROFILE step=` lines:
+**The sub-step timers that named this are committed** (`1aa8172a`), under the
+existing `CASS_PREP_PROFILE` var, so you do not need to rebuild them.
 
-- `open_readonly` → `prepare_db_state_deferred_fingerprint` → `load_checkpoint_state`
-  **and then silence** means the wedge IS the whole-corpus `GROUP BY` at
-  `src/storage/sqlite.rs:7501`, and ibuuh.29.1 owns it outright.
-- **Zero lines at all** means the wedge is upstream in another preflight step and
-  ibuuh.29.1 does not own it.
-
-Two things to know before you run it. `CASS_PREP_PROFILE` writes with `eprintln!`,
-not `tracing`, so no `EnvFilter` touches it — the recorded belief that `--json`
-suppressed it is **wrong**, and that correction matters because it is why nobody
-trusted the instrument. And there is real counter-evidence you must weigh:
+Two corrections to the record that cost this session real time. `CASS_PREP_PROFILE`
+writes with `eprintln!`, not `tracing`, so no `EnvFilter` touches it — the
+recorded belief that `--json` suppressed it is **wrong**, and it is why nobody
+trusted the instrument for weeks. And the counter-evidence at
 `thoughts/shared/handoffs/20260814-cass-repair-to-green/lanes/backfill-falsifier.md:112-116`
-records a full rebuild of this corpus at **12,438 ms** — 12 seconds for 12,722
-conversations and 579,776 messages. If that rebuild went through the same prep
-window, a whole-corpus GROUP BY cannot be costing 20+ minutes and the aggregate
-is not the wedge. The ledger is written at `indexer/mod.rs:18182` and `:19212`,
-both OUTSIDE `rebuild_tantivy_from_db_with_options`, so the 12s entry may come
-from a different entry point. The probe settles it; reading more source will not.
+— a 12,438 ms full rebuild — is **resolved, not outstanding**: it was measured on
+12,722 conversations / 579,776 messages, which is exactly the control corpus
+here, and this session's control run of that same path took 18 seconds end to
+end. The two agree. It was never evidence against the wedge; it was measured on a
+corpus four times smaller than today's.
 
-Disk is at ~50 GiB against the 150 GiB floor, so watch free space during the run.
-
-After that, **9fnbr's counting half**, which is the last open unit of the
-original goal and is described below.
+After that, **`g0eyv`** — the codex tool-message reindex — is the largest
+remaining unit of the original goal.
 
 ## What this session did
 
@@ -202,31 +222,40 @@ question in the finding's favor by finding the reconstruction path above.
   parse, which is the safe direction — it cannot silently be read as consent to
   delete. Its surviving mutant is disclosed in the commit message and filed as
   `n62wn`; do not treat that test as covering the branch.
+- **`1aa8172a`** — 9fnbr's counting half, plus the prep timers, pushed. Three
+  counters (`codex_pre_envelope_recovered`, `codex_rollouts_unrecoverable`,
+  `codex_recovery_discovery_failures`) now sit beside `quarantined_conversations`
+  in `snapshot_json`. The third is not decoration: when discovery fails the pass
+  returns `Ok(())` and the other two stay at zero, which is byte-identical to a
+  clean run, so without it a reader cannot tell "nothing was dropped" from "the
+  check never ran". The test asserts on `snapshot_json` rather than the counters,
+  because counting without surfacing would leave the operator where they started.
+  Mutants: drop the recovered increment → RED, drop the unrecoverable increment →
+  RED, **keep counting but delete the three JSON lines → RED** — that last is the
+  one a counter-only test would have survived, and it is exactly this bead's
+  defect. The same commit carries nine `CASS_PREP_PROFILE` sub-step timers inside
+  the lexical shard planner; they are kept rather than reverted because they are
+  what named ibuuh.29.1 and that bead is still open.
 
 **Suite, same clone and target dir throughout, so every delta is attributable:**
 
 ```
 5146  generation 10 baseline
-5148  + the two connector-factory tests      0 failed, 3 ignored, rc=0, 140.61s
-5149  + the qtn0e exclude test               (verify this number yourself)
+5148  + the two connector-factory tests
+5149  + the qtn0e exclude test
+5150  + the 9fnbr reporting test           0 failed, 3 ignored, rc=0, 125.19s
 ```
 
-## State of the tree — READ THIS FIRST
+## State of the tree
 
-This session wound down on a context threshold, not at a clean stopping point.
-**Before anything else, run `git status --short` and `git log --oneline -5`.**
+Everything this session owns is committed and pushed. Nothing is owed here.
 
-- If `src/lib.rs` is dirty and the last commit is `9531315d`, the qtn0e flip did
-  NOT get committed. The commit message is written and waiting at
-  `~/.claude-accounts/george/jobs/e6f96c37/tmp/commit-msg-qtn0e.txt` **but that
-  job directory dies with the job** — if it is gone, the message content is
-  reproduced in bead `qtn0e`'s comment and in this artifact. Verify the suite
-  green yourself, then `git commit -F <msg> -- src/lib.rs && git push origin main`.
-- If the last commit is the qtn0e one, it landed and there is nothing owed here.
-
-`/tmp/cass-gen8/src/lib.rs` and the shared checkout's `src/lib.rs` were
-byte-identical (md5 `bca9adfdfa10ee630c7119d3a2cefed2`) at the moment the patch
-was applied.
+Note that **this checkout is shared with roughly twenty concurrent sessions**, so
+`HEAD` moves under you: a sibling landed `5d1718a3` between my `git add` and my
+`git commit`. That is the normal case, not an event. Bound every commit by
+pathspec (`git commit -F <msg> -- <exact paths>`) and read
+`git diff HEAD~1 HEAD --stat` before pushing; a full-index commit here silently
+reverts whatever a sibling landed since your index entries were written.
 
 **A trap in the clone:** `/tmp/cass-gen8` is detached at `1c9c0cec` and carries
 276 uncommitted lines in `src/lib.rs` that are NOT yours — they are the
@@ -246,28 +275,46 @@ strip correctly; it fails with `tmp/cass-gen8/src/lib.rs: No such file or direct
 
 ## Open, with what is known
 
-- **`ibuuh.29.1` (P0)** — the probe above. Decisive either way.
-- **`9fnbr` (P1) — the counting half, the last unit of the original goal.**
-  `recover_rollouts_the_base_parser_dropped` (`src/connectors/codex.rs:99-138`)
-  counts **nothing** today; its only output is three `warn!`s — a discovery
-  failure (:108, which then `return Ok(())`, a swallowed failure), the SKIP
-  (:123, per unrecoverable file) and the RECOVERY (:129, per rescued file). The
-  two numbers the bead wants are how many times the `else` at :120-128 fires
-  versus how many times `on_conversation` at :134 does. Under `--json` the filter
-  is hard-coded to `error` (`src/lib.rs:5769-5774`, verified), so an operator sees
-  `quarantined_conversations: 0` and `last_error: null` over real drops.
-  Surface them beside `quarantined_conversations` on `IndexingStats`
-  (`src/indexer/mod.rs:818`, serialized at :1172; the accumulate/saturating_add
-  template is at :850-862 and :11491-11493).
-  The investigating lane recommends **option (b)** — module-level atomics in
-  `codex.rs` drained into `IndexingStats` at end of run, ~35 lines, no signature
-  changes — because `create_connector` boxes as `Box<dyn Connector + Send>` and
-  the factory is a bare `fn()` pointer, so there is no handle to hang an `Arc` on.
-  Global mutable state needs a ceiling comment and care about test parallelism.
-  **Now that `9531315d` landed, counters added there are reached by BOTH paths**,
-  which was not true before — that was the lane's main worry and it is resolved.
-  The test must pin that a `--json` run over a stub REPORTS the skip rather than
-  only logging it.
+- **`ibuuh.29.1` (P0) — diagnosed, not fixed. The fix is the exact next action
+  above.** Root cause, each step measured:
+
+  | | |
+  |---|---|
+  | symptom | `cass index --full --force-rebuild` never completes on the live archive |
+  | why 1 | the prep window never ends, and it is one step: `plan_lexical_shards` |
+  | why 2 | 96% of that step is `raise_lexical_rebuild_footprints_to_exact_message_counts` (`storage/sqlite.rs:7486`) |
+  | why 3 | it runs a whole-corpus `COUNT(*) … GROUP BY conversation_id` through **frankensqlite** (`fsqlite` 0.1.5, `Cargo.toml:45`), a Rust reimplementation of SQLite. C SQLite runs the identical statement against the identical file in 20 ms / 870 ms — so the gap is 645× on the control, ≥414× on production, and it widens with corpus size |
+  | why 4 | it exists to raise *sizing estimates* to exact counts, and the result is thrown away one line later (`mod.rs:9185`) |
+
+  Timings, same binary, fresh data dir per arm, live archive read-only:
+
+  ```
+  corpus                          plan_lexical_shards   of which the GROUP BY
+  12,722 conv /   580,374 msgs          13,412 ms          12,897 ms   (96%)
+  27,441 conv / 2,335,514 msgs      >360,000 ms, did not complete
+  ```
+
+  Everything else in the production prep window totals 1,021 ms. cass's **own**
+  stall detector fires inside the call at 120 s with `"event":"stall_detected"`,
+  `phase:"preparing"`, `current:0` — this bead reproducing live, with the
+  statement now named.
+
+  Note what falsified what. The recorded hypothesis named the right *line* and
+  the wrong *mechanism*, and my own first conclusion — "the cost is not the
+  query" — was also wrong, because every statement timed under a second in the
+  `sqlite3` CLI. The statement **is** the cost; what the CLI could not show is
+  that cass does not execute it through C SQLite.
+
+- **`p3kgr` (P0) — same root family, found independently the same day.** A
+  sibling session measured fsqlite turning `MAX(id)` into a full table scan:
+  `max(messages.id)` never returned in 45 minutes, fixed to 7 ms by bisecting the
+  signed rowid domain with 66 existence probes. Different statement, same
+  dependency, same shape. Their fix does **not** cover ibuuh — nothing bisects a
+  per-conversation `COUNT(*)` — so the two need separate fixes, but if fsqlite is
+  ever fixed rather than worked around, both are measurements of one defect.
+  That bead's note that "background jobs cannot push" to main is **false** and I
+  have corrected it there: this session is a background job and pushed three
+  times today. Do not treat p3kgr as operator-blocked.
 - **`g0eyv` (P1, new)** — the codex tool-message loss and the reindex owed.
   Three questions it has to answer first: does incremental `cass index` re-read
   already-indexed files or does `last_scan_ts` skip them (if it skips, the loss
@@ -299,8 +346,6 @@ strip correctly; it fails with `tmp/cass-gen8/src/lib.rs: No such file or direct
   `thoughts/shared/handoffs/20260815-cass-to-green/verify-fsqlite-pin.sh:64`), and
   `/tmp/cass-gen8` (the source clone). **This is the one thing that needs Dale's
   express approval** — it is destructive and the approval did not transfer.
-- **`p3kgr` (P0)** — the frankensqlite pin bump, refused on evidence by
-  generation 8 and still refused. Do not land `worktree-cass-gen5-honesty`.
 
 ## Environment facts that cost real time
 
