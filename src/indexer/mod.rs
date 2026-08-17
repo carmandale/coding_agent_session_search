@@ -7966,6 +7966,27 @@ fn lexical_rebuild_deferred_content_fingerprint(total_conversations: usize) -> S
     format!("content-pending-v1:{total_conversations}")
 }
 
+/// Highest `conversations.id`, written as a descending-order seek rather than
+/// `MAX(id)`.
+///
+/// `id` is `INTEGER PRIMARY KEY`, so both forms are one b-tree seek in stock
+/// SQLite and both return the same value. They are not equivalent on the pinned
+/// storage engine: inside the cass process `SELECT COALESCE(MAX(id), 0) FROM
+/// conversations` compiles to 82,337 opcodes over 27,441 rows — three per row,
+/// so a row-by-row scan — and measured 3,578 ms, while the same statement over
+/// `messages` (2,335,514 rows) has never been observed to return. Full evidence
+/// and the falsified alternatives are on bead
+/// `coding_agent_session_search-p3kgr`.
+const LEXICAL_FINGERPRINT_MAX_CONVERSATION_ID_SQL: &str =
+    "SELECT COALESCE((SELECT id FROM conversations ORDER BY id DESC LIMIT 1), 0)";
+
+/// Highest `messages.id`. See [`LEXICAL_FINGERPRINT_MAX_CONVERSATION_ID_SQL`] —
+/// this is the statement that made every `cass search` hang, because
+/// `search_lexical_self_heal_diagnosis` fingerprints the database on every
+/// query to decide whether the published lexical index is still valid.
+const LEXICAL_FINGERPRINT_MAX_MESSAGE_ID_SQL: &str =
+    "SELECT COALESCE((SELECT id FROM messages ORDER BY id DESC LIMIT 1), 0)";
+
 fn lexical_rebuild_content_fingerprint(
     storage: &FrankenStorage,
     total_conversations: usize,
@@ -7975,7 +7996,7 @@ fn lexical_rebuild_content_fingerprint(
     let max_conversation_id: i64 = storage
         .raw()
         .query_row_map(
-            "SELECT COALESCE(MAX(id), 0) FROM conversations",
+            LEXICAL_FINGERPRINT_MAX_CONVERSATION_ID_SQL,
             &[] as &[ParamValue],
             |row| row.get_typed(0),
         )
@@ -7990,7 +8011,7 @@ fn lexical_rebuild_content_fingerprint(
     let max_message_id: i64 = storage
         .raw()
         .query_row_map(
-            "SELECT COALESCE(MAX(id), 0) FROM messages",
+            LEXICAL_FINGERPRINT_MAX_MESSAGE_ID_SQL,
             &[] as &[ParamValue],
             |row| row.get_typed(0),
         )
