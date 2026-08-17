@@ -19,7 +19,6 @@ that owns it and delete what expired.
 
 | What went wrong | Correction | Marker |
 |---|---|---|
-| Reported `WATERMARK before=None after=None (must be unchanged)` from a probe reading `last_scan_ts` out of `cass stats --json` — a key that does not exist there. Both reads were None for the same reason, so the line proved nothing. | Read `meta` from the DB directly. Verified properly afterwards: pass 3 logs zero `updated last_scan_ts` lines and the DB still holds pass 2's value. | Expires: on next edit of this file — already fixed in the bead comment |
 | `cargo clippy \| tail` and `close-check \| tail` both report tail's exit code, not the tool's. Clippy "passed" with exit 0 while emitting 3 errors. | Capture the status directly (`out=$(cmd); rc=$?`) or read the verdict line, never the pipeline's `$?`. Already in the global rules; it still caught me twice today. | Expires: 2026-09-10 |
 
 ## Hypotheses
