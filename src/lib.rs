@@ -15106,6 +15106,48 @@ const STATUS_COVERAGE_MAX_RAW_MIRROR_MANIFESTS: usize = 512;
 /// files stays under this cap.
 const STATUS_COVERAGE_MAX_ARCHIVE_DB_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
 const CASS_STATUS_COVERAGE_MAX_ARCHIVE_DB_BYTES: &str = "CASS_STATUS_COVERAGE_MAX_ARCHIVE_DB_BYTES";
+
+/// The bound on `doctor_database_integrity_probe`, which is a different cost
+/// with a different driver from the census above and therefore gets its own
+/// knob rather than borrowing that one.
+///
+/// `PRAGMA quick_check` and `PRAGMA integrity_check` both walk every b-tree page
+/// in the database. That is not an inference: fsqlite-core 0.1.5 dispatches both
+/// spellings to the same function — `connection.rs:43348`, `if matches!(name,
+/// "quick_check" | "integrity_check") { pragma_integrity_check_rows(name ==
+/// "quick_check") }` — and the walk's own doc comment (`connection.rs:42434`)
+/// says `quick` skips the ownership map and orphan detection while "the walk
+/// still validates every page's structural integrity". So quick_check is not a
+/// cheaper alternative on this engine, and the FIRST call in the probe is the
+/// one that does not return.
+///
+/// Measured 2026-08-17 against the 23 GB / 5,691,767-page probe archive, on the
+/// binary carrying the zumve fix (bead lj72p):
+///
+/// | | result |
+/// |---|---|
+/// | `cass doctor --json` | no result in 200 s, zero bytes |
+/// | resident set across those 200 s | flat at 4,026,672 KiB — no per-page ownership map, i.e. this is `quick_check`, the first call |
+/// | stock sqlite3 3.54.0 `PRAGMA quick_check(1)` on the same file | **rc=0 in 50 s, "ok"** |
+///
+/// The archive is healthy; stock SQLite says so in 50 s. The cost is the pinned
+/// engine's pager, which rebuilds its whole S3-FIFO eviction model on every
+/// eviction (76% of a sampled 1,663-frame stack), so page-read cost grows with
+/// cache occupancy instead of staying constant. On a 3.98 GB archive that stock
+/// answers in 10 s, fsqlite had not finished at 150 s — so the degradation is
+/// well below the size that provoked the bug report, and the bound has to be
+/// conservative rather than generous.
+///
+/// 256 MiB is the same figure `STATUS_COUNT_SCAN_MAX_DB_BYTES` already applies
+/// to a plain `COUNT(*)`. A whole-database page walk cannot deserve a looser
+/// bound than a single-table count, so this is a ceiling taken from precedent
+/// rather than a new number.
+///
+/// ceiling: file bytes proxy page count, which is what the walk actually costs.
+/// The two track each other exactly for a given page size, so unlike the census
+/// cap above this proxy has no slack in it.
+const DOCTOR_INTEGRITY_MAX_ARCHIVE_DB_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
+const CASS_DOCTOR_INTEGRITY_MAX_ARCHIVE_DB_BYTES: &str = "CASS_DOCTOR_INTEGRITY_MAX_ARCHIVE_DB_BYTES";
 const CLI_DB_QUERY_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_DIAG_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -32146,6 +32188,7 @@ fn doctor_active_repair_report(operation_state: &DoctorOperationStateReport) -> 
 fn doctor_check_scope_report(
     command_surface: doctor::DoctorCommandSurface,
     execution_mode: doctor::DoctorExecutionMode,
+    integrity_walk_skipped: bool,
 ) -> serde_json::Value {
     let mut skipped_expensive_collectors = vec![
         serde_json::json!({
@@ -32169,6 +32212,20 @@ fn doctor_check_scope_report(
             "name": "cleanup_planning",
             "status": "not_checked",
             "next_action": "Use explicit repair/cleanup planning once read-only check output has been inspected."
+        }));
+    }
+    // Emitted only when the gate actually fired, so a reader can tell "doctor
+    // declined this run" from "doctor never does this". The three entries above are
+    // properties of the surface; this one is a property of the archive in front of
+    // it. This is the machine-readable half of the same fact the `database` check
+    // states in prose — an agent should not have to string-match a message.
+    if integrity_walk_skipped {
+        skipped_expensive_collectors.push(serde_json::json!({
+            "name": "archive_db_integrity_walk",
+            "status": "not_checked",
+            "next_action": format!(
+                "Archive is past the {CASS_DOCTOR_INTEGRITY_MAX_ARCHIVE_DB_BYTES} budget and the frankensqlite b-tree walk has no deadline. Raise that variable to force it, or verify out of band with `sqlite3 <db> 'PRAGMA integrity_check;'`."
+            )
         }));
     }
 
@@ -34491,11 +34548,43 @@ fn status_coverage_max_archive_db_bytes() -> u64 {
 /// unknown, and declining the inline census costs an honest "not checked" while
 /// accepting it risks a command that never returns.
 fn status_archive_scan_too_large(db_path: &Path) -> bool {
+    archive_db_exceeds_byte_budget(db_path, status_coverage_max_archive_db_bytes())
+}
+
+/// One `stat` against a caller-supplied budget, shared by every gate that has to
+/// decide whether an archive is too big for some inline whole-database work.
+///
+/// The failure directions are the load-bearing part and they live here so the
+/// two callers cannot drift apart on them. A database that does not exist is not
+/// too large — there is nothing to read, and each caller already gates on
+/// existence separately, so answering "false" keeps the two answers consistent.
+/// A database that exists but cannot be stat'd is treated as too large: the cost
+/// is then unknown, and declining costs an honest "not checked" while accepting
+/// risks a command that never returns.
+fn archive_db_exceeds_byte_budget(db_path: &Path, max_bytes: u64) -> bool {
     match std::fs::metadata(db_path) {
-        Ok(metadata) => metadata.len() > status_coverage_max_archive_db_bytes(),
+        Ok(metadata) => metadata.len() > max_bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => false,
         Err(_) => true,
     }
+}
+
+fn doctor_integrity_max_archive_db_bytes() -> u64 {
+    dotenvy::var(CASS_DOCTOR_INTEGRITY_MAX_ARCHIVE_DB_BYTES)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DOCTOR_INTEGRITY_MAX_ARCHIVE_DB_BYTES_DEFAULT)
+}
+
+/// Decide, from one `stat`, whether this archive is too large for doctor to walk
+/// every b-tree page inline.
+///
+/// Doctor's contract is "may be slow, and will name the slow span" — not "may
+/// never return". See `DOCTOR_INTEGRITY_MAX_ARCHIVE_DB_BYTES_DEFAULT` for the
+/// measurements behind the figure and for why `PRAGMA quick_check` is not a
+/// cheaper alternative on the pinned engine.
+fn doctor_integrity_scan_too_large(db_path: &Path) -> bool {
+    archive_db_exceeds_byte_budget(db_path, doctor_integrity_max_archive_db_bytes())
 }
 
 fn collect_doctor_raw_mirror_report(data_dir: &Path) -> DoctorRawMirrorReport {
@@ -69621,7 +69710,13 @@ pub(crate) fn run_doctor_impl(
     // 3. Check database exists and is readable
     // Fix #128: use the CLI read-only opener with a timeout to prevent hanging on degraded
     // databases without dirtying precious archive evidence during a read-only doctor check.
+    //
+    // That opener's `Duration` bounds the OPEN and nothing else — it hands the open to a
+    // worker thread and `recv_timeout`s on it. Every statement issued on the returned
+    // connection runs with no ceiling at all, which is why the integrity probe below needs
+    // its own gate rather than relying on the 30 s above (bead lj72p).
     let archive_db_probe_started = Instant::now();
+    let mut integrity_walk_skipped = false;
     if db_path.exists() {
         let db_open_result = open_franken_cli_read_db_with_hard_timeout(
             db_path.to_path_buf(),
@@ -69650,8 +69745,57 @@ pub(crate) fn run_doctor_impl(
                 if let (Some(conv_count), Some(msg_count)) = (conv_count, msg_count) {
                     db_conversations = Some(conv_count.max(0) as usize);
                     db_messages = Some(msg_count.max(0) as usize);
-                    match doctor_database_integrity_probe(&conn) {
-                        Ok(integrity) if integrity.is_ok() => {
+                    // The probe walks every b-tree page and has no deadline, so ask how
+                    // much work that is before doing it. `None` here means declined, not
+                    // failed, and it is deliberately NOT folded into the Err arm below:
+                    // Err sets `needs_rebuild`, and a size gate is not evidence that
+                    // anything is wrong with the archive.
+                    integrity_walk_skipped = doctor_integrity_scan_too_large(&db_path);
+                    let integrity_probe = if integrity_walk_skipped {
+                        None
+                    } else {
+                        Some(doctor_database_integrity_probe(&conn))
+                    };
+                    match integrity_probe {
+                        // Declined. `db_ok` stays true and `needs_rebuild` is left alone.
+                        //
+                        // `db_ok` does not mean "structurally verified" anywhere in this
+                        // function — every consumer reads it as "the canonical archive DB
+                        // is usable as an authority", which is exactly what the open and
+                        // the two counts above established. The name at the one call
+                        // boundary that spells it out is `archive_db_usable`
+                        // (`doctor_build_derived_semantic_asset_report`).
+                        //
+                        // Setting it false here would not be the cautious choice. On
+                        // `cass doctor --fix` against a healthy archive it alone fires
+                        // `doctor_candidate_build_should_run` (no `needs_rebuild` term
+                        // required), reaches `move_database_bundle` and renames the live
+                        // db/wal/shm to `agent_search.corrupt.<ts>`, selects a
+                        // reconstruct candidate for promotion over the live archive with
+                        // the reason string "archive DB is not readable", and forces a
+                        // full source reindex. All of that on the strength of one `stat`.
+                        None => {
+                            db_ok = true;
+                            add_check!(
+                                "database",
+                                "pass",
+                                format!(
+                                    "Database readable ({} conversations, {} messages); structural integrity NOT checked - the archive is {} bytes, past the {} byte walk budget, and the frankensqlite page walk has no deadline. Raise {} to force it, or verify out of band with `sqlite3 <db> 'PRAGMA integrity_check;'`.",
+                                    conv_count,
+                                    msg_count,
+                                    std::fs::metadata(&db_path)
+                                        .map(|metadata| metadata.len())
+                                        .map_or_else(
+                                            |_| "an unreadable number of".to_string(),
+                                            |len| len.to_string()
+                                        ),
+                                    doctor_integrity_max_archive_db_bytes(),
+                                    CASS_DOCTOR_INTEGRITY_MAX_ARCHIVE_DB_BYTES
+                                ),
+                                false
+                            );
+                        }
+                        Some(Ok(integrity)) if integrity.is_ok() => {
                             db_ok = true;
                             add_check!(
                                 "database",
@@ -69662,36 +69806,8 @@ pub(crate) fn run_doctor_impl(
                                 ),
                                 false
                             );
-
-                            // Check whether the FTS table is visible through
-                            // frankensqlite on this connection. Do not auto-register
-                            // it here: on migrated databases with legacy rootpage=0
-                            // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
-                            // can persist duplicate sqlite_master rows.
-                            match probe_doctor_fts_table(&conn) {
-                                DoctorFtsTableState::QueryableViaFrankensqlite => {
-                                    add_check!(
-                                        "fts_table",
-                                        "pass",
-                                        "FTS search table (fts_messages) is queryable via frankensqlite",
-                                        false
-                                    );
-                                }
-                                DoctorFtsTableState::Missing {
-                                    frankensqlite_error,
-                                } => {
-                                    add_check!(
-                                        "fts_table",
-                                        "pass",
-                                        format!(
-                                            "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
-                                        ),
-                                        false
-                                    );
-                                }
-                            }
                         }
-                        Ok(integrity) => {
+                        Some(Ok(integrity)) => {
                             let failed_pragma = integrity.failed_pragma_name();
                             add_check!(
                                 "database",
@@ -69706,7 +69822,7 @@ pub(crate) fn run_doctor_impl(
                             );
                             needs_rebuild = true;
                         }
-                        Err(err) => {
+                        Some(Err(err)) => {
                             add_check!(
                                 "database",
                                 "fail",
@@ -69714,6 +69830,40 @@ pub(crate) fn run_doctor_impl(
                                 true
                             );
                             needs_rebuild = true;
+                        }
+                    }
+
+                    // Hoisted out of the integrity-passed arm so the declined path keeps
+                    // this check too. `db_ok` is true in exactly the two arms that used to
+                    // reach it plus the declined one, so nothing existing changes. The
+                    // probe is `SELECT rowid FROM fts_messages LIMIT 1`, so it stays cheap
+                    // on an archive too big to walk.
+                    //
+                    // Do not auto-register the FTS table here: on migrated databases with
+                    // legacy rootpage=0 FTS schema entries, CREATE VIRTUAL TABLE IF NOT
+                    // EXISTS can persist duplicate sqlite_master rows.
+                    if db_ok {
+                        match probe_doctor_fts_table(&conn) {
+                            DoctorFtsTableState::QueryableViaFrankensqlite => {
+                                add_check!(
+                                    "fts_table",
+                                    "pass",
+                                    "FTS search table (fts_messages) is queryable via frankensqlite",
+                                    false
+                                );
+                            }
+                            DoctorFtsTableState::Missing {
+                                frankensqlite_error,
+                            } => {
+                                add_check!(
+                                    "fts_table",
+                                    "pass",
+                                    format!(
+                                        "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
+                                    ),
+                                    false
+                                );
+                            }
                         }
                     }
                 } else {
@@ -69750,7 +69900,13 @@ pub(crate) fn run_doctor_impl(
         "archive_db_open_and_integrity",
         archive_db_probe_started,
         DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
-        vec!["archive DB open, row counts, and integrity-style checks completed or were skipped by state".to_string()],
+        vec![if integrity_walk_skipped {
+            format!(
+                "archive DB opened and row counts read; the b-tree integrity walk was declined because the archive is past the {CASS_DOCTOR_INTEGRITY_MAX_ARCHIVE_DB_BYTES} budget"
+            )
+        } else {
+            "archive DB open, row counts, and integrity-style checks completed or were skipped by state".to_string()
+        }],
     );
 
     // 4. Check Tantivy index exists and is readable
@@ -71329,7 +71485,8 @@ pub(crate) fn run_doctor_impl(
         &check_reports,
     );
     let active_repair = doctor_active_repair_report(&operation_state);
-    let check_scope = doctor_check_scope_report(command_surface, execution_mode);
+    let check_scope =
+        doctor_check_scope_report(command_surface, execution_mode, integrity_walk_skipped);
     let operation_outcome = doctor_top_level_operation_outcome(
         &check_reports,
         fix,
