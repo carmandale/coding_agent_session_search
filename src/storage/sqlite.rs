@@ -7409,11 +7409,51 @@ impl FrankenStorage {
                 &missing_tail_positions,
             )?;
         }
-        if !every_footprint_was_missing_tail {
+        if !every_footprint_was_missing_tail
+            && self.lexical_rebuild_tail_estimates_understate_message_total(&footprints)?
+        {
             self.raise_lexical_rebuild_footprints_to_exact_message_counts(&mut footprints)?;
         }
 
         Ok(footprints)
+    }
+
+    /// Cheap staleness probe deciding whether the per-conversation exact-count
+    /// raise can change anything.
+    ///
+    /// `last_message_idx + 1` is an upper bound on a conversation's message
+    /// count whenever the tail cache is current, and the raise only ever moves
+    /// a footprint *upward*. So the raise is a no-op unless the cache is behind
+    /// the table, and one ungrouped `COUNT(*)` decides that for the whole
+    /// archive.
+    ///
+    /// This matters because the grouped form the raise needs is many orders of
+    /// magnitude more expensive on this storage engine. Measured 2026-08-17 on
+    /// the 2,335,514-row live archive: `GROUP BY conversation_id` is 77 ms under
+    /// stock SQLite (which plans it as a covering-index scan) and 8,927,989 ms
+    /// under fsqlite 0.1.19, while the ungrouped count below stays at 19 ms.
+    ///
+    /// ceiling: a global total, so per-conversation errors that compensate
+    /// (one conversation overstated, another understated) can leave an
+    /// individual footprint low. That affects shard sizing only — exact message
+    /// and byte accounting is performed later by the rebuild packet pipeline,
+    /// per `list_conversation_footprints_for_lexical_rebuild`'s contract.
+    fn lexical_rebuild_tail_estimates_understate_message_total(
+        &self,
+        footprints: &[LexicalRebuildConversationFootprintRow],
+    ) -> Result<bool> {
+        let estimated_total: u64 = footprints
+            .iter()
+            .map(|footprint| footprint.message_count as u64)
+            .sum();
+        let exact_total: i64 = self
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .with_context(|| "counting messages for lexical rebuild footprint staleness probe")?;
+        let exact_total = u64::try_from(exact_total.max(0)).unwrap_or(u64::MAX);
+        Ok(exact_total > estimated_total)
     }
 
     pub fn lexical_rebuild_has_tail_footprint_metadata(&self) -> Result<bool> {
@@ -20976,6 +21016,207 @@ mod tests {
                 message_bytes: 3 * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
             }],
             "stale-low tail caches must not under-plan lexical shards and trip doc>plan invariants"
+        );
+    }
+
+    /// Pins the decision the cheap staleness probe makes, independently of the
+    /// call site that consumes it.
+    #[test]
+    fn lexical_rebuild_tail_estimates_understate_message_total_reads_the_ungrouped_total() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation_id = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: Some(PathBuf::from("/tmp/workspace")),
+                    external_id: Some("footprint-understate-probe".to_string()),
+                    title: Some("footprint-understate-probe".to_string()),
+                    source_path: PathBuf::from("/tmp/footprint-understate-probe.jsonl"),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: Some(1_700_000_000_100),
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: (0..3)
+                        .map(|idx| Message {
+                            id: None,
+                            idx,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_700_000_000_010 + idx),
+                            content: format!("message {idx}"),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        })
+                        .collect(),
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .unwrap()
+            .conversation_id;
+
+        let estimate_of = |message_count: usize| {
+            vec![LexicalRebuildConversationFootprintRow {
+                conversation_id,
+                message_count,
+                message_bytes: message_count * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
+            }]
+        };
+
+        assert!(
+            !storage
+                .lexical_rebuild_tail_estimates_understate_message_total(&estimate_of(3))
+                .unwrap(),
+            "an estimate that already accounts for every message is current, so the exact-count raise cannot change it"
+        );
+        assert!(
+            !storage
+                .lexical_rebuild_tail_estimates_understate_message_total(&estimate_of(4))
+                .unwrap(),
+            "an over-stated estimate is not understated either — the raise only ever moves counts upward"
+        );
+        assert!(
+            storage
+                .lexical_rebuild_tail_estimates_understate_message_total(&estimate_of(2))
+                .unwrap(),
+            "an estimate below the message total means the tail cache is behind the table and the raise must run"
+        );
+    }
+
+    /// Goes red if the exact-count raise is ever run unconditionally again.
+    ///
+    /// That raise issues one `GROUP BY conversation_id` over every message,
+    /// which this storage engine cannot plan as a covering-index scan: measured
+    /// 2026-08-17 on the 2,335,514-row live archive it took 8,927,989 ms
+    /// against stock SQLite's 77 ms, and it is why no rebuild had ever
+    /// completed. It is skipped whenever one ungrouped `COUNT(*)` says the tail
+    /// estimates are not behind the table.
+    ///
+    /// The observable here is that global check's documented ceiling: one
+    /// conversation over-stated by exactly as much as another is under-stated
+    /// leaves the totals equal, so the raise is skipped and the under-stated
+    /// footprint keeps its estimate of 2. Remove or invert the guard and the
+    /// raise runs and lifts that footprint to 3, failing this test.
+    #[test]
+    fn list_conversation_footprints_for_lexical_rebuild_skips_exact_count_raise_when_tail_totals_agree()
+     {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let insert_three_message_conversation = |slug: &str| {
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "codex".into(),
+                        workspace: Some(PathBuf::from("/tmp/workspace")),
+                        external_id: Some(slug.to_string()),
+                        title: Some(slug.to_string()),
+                        source_path: PathBuf::from(format!("/tmp/{slug}.jsonl")),
+                        started_at: Some(1_700_000_000_000),
+                        ended_at: Some(1_700_000_000_100),
+                        approx_tokens: None,
+                        metadata_json: serde_json::Value::Null,
+                        messages: (0..3)
+                            .map(|idx| Message {
+                                id: None,
+                                idx,
+                                role: MessageRole::User,
+                                author: None,
+                                created_at: Some(1_700_000_000_010 + idx),
+                                content: format!("message {idx}"),
+                                extra_json: serde_json::Value::Null,
+                                snippets: Vec::new(),
+                            })
+                            .collect(),
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap()
+                .conversation_id
+        };
+
+        let overstated_id = insert_three_message_conversation("footprint-tail-overstated");
+        let understated_id = insert_three_message_conversation("footprint-tail-understated");
+        assert!(
+            overstated_id < understated_id,
+            "footprints come back in conversation-id order, so the assertion below depends on this"
+        );
+
+        // Tail idx 3 estimates 4 messages against 3 rows; tail idx 1 estimates
+        // 2 against the same 3. The archive-wide totals therefore agree exactly
+        // (4 + 2 == 3 + 3) while both conversations are individually wrong.
+        for (conversation_id, last_message_idx) in [(overstated_id, 3), (understated_id, 1)] {
+            storage
+                .conn
+                .execute_compat(
+                    "UPDATE conversations
+                     SET last_message_idx = ?2, last_message_created_at = 1700000000010
+                     WHERE id = ?1",
+                    fparams![conversation_id, last_message_idx],
+                )
+                .unwrap();
+            storage
+                .conn
+                .execute_compat(
+                    "UPDATE conversation_tail_state
+                     SET last_message_idx = ?2, last_message_created_at = 1700000000010
+                     WHERE conversation_id = ?1",
+                    fparams![conversation_id, last_message_idx],
+                )
+                .unwrap();
+        }
+
+        let footprints = storage
+            .list_conversation_footprints_for_lexical_rebuild()
+            .unwrap();
+
+        assert_eq!(
+            footprints,
+            vec![
+                LexicalRebuildConversationFootprintRow {
+                    conversation_id: overstated_id,
+                    message_count: 4,
+                    message_bytes: 4 * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
+                },
+                LexicalRebuildConversationFootprintRow {
+                    conversation_id: understated_id,
+                    message_count: 2,
+                    message_bytes: 2 * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
+                },
+            ],
+            "with the tail totals agreeing archive-wide, the per-conversation exact-count GROUP BY must not run"
         );
     }
 
