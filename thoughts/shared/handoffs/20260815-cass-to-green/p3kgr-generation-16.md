@@ -204,9 +204,23 @@ markers, never by timestamp**, that is a recorded incident in this repo:
 
 1. **Nothing is on `main`.** Both `26932422` (the rebuild guard inversion,
    2h28m → 57s) and this session's fix are on `worktree-cass-p3kgr-gen13`,
-   pushed. Background jobs cannot push `main`. Landing needs a session that can:
-   `git merge --ff-only worktree-cass-p3kgr-gen13`, then push `main` and
-   `main:master`. **`26932422` is worth landing on its own.**
+   pushed. Background jobs cannot push `main`, and this one is also forbidden to
+   merge, so landing needs a session that can do both.
+
+   **`--ff-only` will NOT work, and an earlier revision of this file said it
+   would.** `sync-gate` caught it: `origin/main` (`5d1718a3`) is not an ancestor
+   of this branch. Main carries exactly one commit the branch lacks —
+   `5d1718a3 beads(p3kgr): the query phase is 16m20s with no result` — and it
+   touches exactly one file, `.beads/issues.jsonl`. Merge-base is `10575de2`.
+
+   So the landing is an ordinary merge with one expected conflict, in a file that
+   must not be hand-resolved: `.beads/issues.jsonl` is a generated export. Take
+   either side to get past the conflict, then regenerate it from the database —
+   `br sync --import-only --rebuild` followed by `br sync --flush-only` — and
+   commit the regenerated export. Confirm both new beads survive
+   (`rg -c 'zumve|iekel' .beads/issues.jsonl`) before pushing.
+
+   **`26932422` is worth landing on its own** even if the rest waits.
 2. **A sibling job has burned 16+ hours on the pre-fix binary** — pid 38174,
    account `george`, `cass index --force-rebuild` via `~/.local/bin/cass`, which
    predates `26932422`. Do not kill another session's job. Installing the fixed
@@ -294,7 +308,8 @@ until it is merged. It only becomes repo-wide when it lands on `main`.
 
 - Branch `worktree-cass-p3kgr-gen13`, pushed. Tree clean but for `.agent-state/`
   (session-local, ignored).
-- `main` / `origin/main` at `5d1718a3`; the branch fast-forwards onto it cleanly.
+- `main` / `origin/main` at `5d1718a3`. The branch does **not** fast-forward onto
+  it — see item 1 above for the one-commit divergence and the landing recipe.
 - Open beads: `p3kgr` (P0), `759l7`, `9fnbr`, `qtn0e`, `hd4u5`, `xybl9`, and the
   three the 759l7 chain filed.
 - Both p3kgr sibling sessions confirmed read-only before this session wrote
