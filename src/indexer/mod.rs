@@ -35,7 +35,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
 use frankensearch::index::VectorIndex as FsVectorIndex;
 use frankensqlite::compat::{
-    ConnectionExt, ParamValue, RowExt, Transaction as FrankenTransaction,
+    ConnectionExt, OptionalExtension, ParamValue, RowExt, Transaction as FrankenTransaction,
     TransactionExt as FrankenTransactionExt,
 };
 use fs2::FileExt;
@@ -7966,26 +7966,138 @@ fn lexical_rebuild_deferred_content_fingerprint(total_conversations: usize) -> S
     format!("content-pending-v1:{total_conversations}")
 }
 
-/// Highest `conversations.id`, written as a descending-order seek rather than
-/// `MAX(id)`.
-///
-/// `id` is `INTEGER PRIMARY KEY`, so both forms are one b-tree seek in stock
-/// SQLite and both return the same value. They are not equivalent on the pinned
-/// storage engine: inside the cass process `SELECT COALESCE(MAX(id), 0) FROM
-/// conversations` compiles to 82,337 opcodes over 27,441 rows — three per row,
-/// so a row-by-row scan — and measured 3,578 ms, while the same statement over
-/// `messages` (2,335,514 rows) has never been observed to return. Full evidence
-/// and the falsified alternatives are on bead
-/// `coding_agent_session_search-p3kgr`.
-const LEXICAL_FINGERPRINT_MAX_CONVERSATION_ID_SQL: &str =
-    "SELECT COALESCE((SELECT id FROM conversations ORDER BY id DESC LIMIT 1), 0)";
+/// Does any row exist at all? One row off the front, no predicate.
+const LEXICAL_FINGERPRINT_CONVERSATIONS_ANY_ROW_SQL: &str = "SELECT 1 FROM conversations LIMIT 1";
+const LEXICAL_FINGERPRINT_MESSAGES_ANY_ROW_SQL: &str = "SELECT 1 FROM messages LIMIT 1";
 
-/// Highest `messages.id`. See [`LEXICAL_FINGERPRINT_MAX_CONVERSATION_ID_SQL`] —
-/// this is the statement that made every `cass search` hang, because
-/// `search_lexical_self_heal_diagnosis` fingerprints the database on every
-/// query to decide whether the published lexical index is still valid.
-const LEXICAL_FINGERPRINT_MAX_MESSAGE_ID_SQL: &str =
-    "SELECT COALESCE((SELECT id FROM messages ORDER BY id DESC LIMIT 1), 0)";
+/// Does any row exist strictly above `?1`? A rowid-range predicate, which is
+/// the only shape the pinned storage engine will seek — see
+/// [`lexical_fingerprint_max_id`].
+const LEXICAL_FINGERPRINT_CONVERSATIONS_ANY_ABOVE_SQL: &str =
+    "SELECT 1 FROM conversations WHERE id > ?1 LIMIT 1";
+const LEXICAL_FINGERPRINT_MESSAGES_ANY_ABOVE_SQL: &str =
+    "SELECT 1 FROM messages WHERE id > ?1 LIMIT 1";
+
+/// Highest `id` in a table whose `id` is `INTEGER PRIMARY KEY`, found by
+/// bisecting the rowid domain with existence probes.
+///
+/// **Why not `MAX(id)`.** On the pinned storage engine (frankensqlite 0.1.5)
+/// there is no seek path for `MAX(<rowid alias>)` and none for
+/// `ORDER BY id DESC LIMIT 1` either, so both are full row-by-row scans of the
+/// whole table. `fsqlite-vdbe-0.1.5/src/codegen.rs:1791-1796` forces
+/// `rowid_target = None` whenever `is_aggregate`, which also disables the
+/// `rowid_range` (:1806), `index_range` (:1815) and `index_eq` (:1840) paths;
+/// the `ORDER BY` form emits a sorter over a full scan (:5048-5150), and the
+/// `LIMIT` bounds the sorter rather than the scan. `Opcode::Last` — the real
+/// one-row seek — is emitted only at :2865, which requires a WHERE clause, and
+/// at :4570, which requires a real secondary index. `conversations.id` and
+/// `messages.id` are bare `INTEGER PRIMARY KEY` with no secondary index
+/// (`storage/sqlite.rs` declares no index with `id` as a leading column).
+///
+/// A WHERE clause on the rowid is therefore the one formulation that seeks, and
+/// bisecting over it recovers the exact same value the aggregate would return.
+/// Measured on the 23 GB production archive with a probe binary pinned to cass's
+/// exact engine — every `fsqlite-*` crate and `asupersync` forced to the
+/// versions in this repo's `Cargo.lock`, verified in the lockfile and again by
+/// version markers in the built binary:
+///
+/// | statement | conversations (27,441 rows) | messages (2,335,514 rows) |
+/// |---|---|---|
+/// | `COALESCE(MAX(id), 0)` | 1,075-3,578 ms | never returned in 45 minutes |
+/// | this bisection, cold | 65 ms | 7 ms |
+/// | this bisection, warm | 7 ms | 7 ms |
+///
+/// 66 probes per table either way — 64 bisection steps over the signed domain
+/// plus the two setup probes — and both returned the true maximum, cross-checked
+/// against independently measured row counts. The cost does not grow with the
+/// table: the 2.3-million-row table is the *faster* of the two, because the cost
+/// is 66 seeks rather than anything proportional to the rows.
+///
+/// The control that proves the speed is real: `COUNT(*) FROM messages` costs
+/// 818 ms on the same connection, so a full scan cannot be what answers "no row
+/// above 9e9" in 0 ms.
+///
+/// This is what made every `cass search` hang:
+/// `search_lexical_self_heal_diagnosis` fingerprints the canonical database on
+/// every query to decide whether the published lexical index is still valid,
+/// and the message aggregate never returned. Evidence and the falsified
+/// alternatives are on bead `coding_agent_session_search-p3kgr`.
+///
+/// ceiling: bisection exists only because this engine cannot seek an aggregate.
+/// If the `fsqlite` pin moves to a version where
+/// `SELECT COALESCE(MAX(id), 0) FROM messages` returns promptly on a
+/// million-row table, delete this and go back to the aggregate — it is the
+/// clearer statement of the same question. Measured on 0.1.19, both aggregates
+/// return in 0 ms.
+///
+/// Concurrency: this issues several statements where the aggregate issued one,
+/// so a concurrent writer can move the maximum mid-search. That widens an
+/// exposure the previous code already had (it read the count and both maxima in
+/// three separate statements), and it widens it in the safe direction: a torn
+/// read yields a fingerprint that does not match the checkpoint, which triggers
+/// a rebuild. It cannot report "unchanged" for a database that changed.
+fn lexical_fingerprint_max_id(
+    storage: &FrankenStorage,
+    any_row_sql: &str,
+    any_above_sql: &str,
+    what: &str,
+) -> Result<i64> {
+    // Discriminate "no rows" from "the read failed". Collapsing the two would
+    // report an empty table for an unreadable one, and an empty table
+    // fingerprints as 0 — a value a real database could legitimately hold.
+    let any_row: Option<i64> = storage
+        .raw()
+        .query_row_map(any_row_sql, &[] as &[ParamValue], |row| row.get_typed(0))
+        .optional()
+        .with_context(|| format!("probing {what} for any row while fingerprinting"))?;
+    if any_row.is_none() {
+        // Empty table. Matches the `COALESCE(MAX(id), 0)` this replaces.
+        return Ok(0);
+    }
+
+    let any_above = |floor: i64| -> Result<bool> {
+        let found: Option<i64> = storage
+            .raw()
+            .query_row_map(any_above_sql, &[ParamValue::from(floor)], |row| {
+                row.get_typed(0)
+            })
+            .optional()
+            .with_context(|| format!("probing {what} above id {floor} while fingerprinting"))?;
+        Ok(found.is_some())
+    };
+
+    // Bisect the whole signed rowid domain rather than galloping up from zero:
+    // SQLite rowids may be negative, and a table holding only negative ids would
+    // otherwise fingerprint as 0 while `MAX(id)` returned the true negative
+    // maximum — a silent disagreement with the statement being replaced.
+    //
+    // Invariant: some row is above `lo`, and no row is above `hi`. The answer is
+    // pinned between them, so the loop always terminates.
+    if !any_above(i64::MIN)? {
+        // Non-empty, yet nothing above the smallest representable id: every row
+        // sits at `i64::MIN`, so that is the maximum.
+        return Ok(i64::MIN);
+    }
+    let mut lo: i64 = i64::MIN;
+    let mut hi: i64 = i64::MAX;
+    while lo.saturating_add(1) < hi {
+        // Midpoint in i128 so `hi - lo` cannot overflow at the domain edges.
+        //
+        // `expect` rather than a fallback on purpose: the midpoint of two i64
+        // always fits in an i64, so this cannot fire — but a silent fallback
+        // value would sit outside `(lo, hi)` at the domain edges, stall the
+        // invariant, and spin this loop forever. That failure mode is the very
+        // hang this function exists to remove, so it has to be loud.
+        let mid = i64::try_from((i128::from(lo) + i128::from(hi)) / 2)
+            .expect("the i128 midpoint of two i64 values always fits in an i64");
+        if any_above(mid)? {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(hi)
+}
 
 fn lexical_rebuild_content_fingerprint(
     storage: &FrankenStorage,
@@ -7993,14 +8105,13 @@ fn lexical_rebuild_content_fingerprint(
 ) -> Result<String> {
     let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
     let conversations_started = Instant::now();
-    let max_conversation_id: i64 = storage
-        .raw()
-        .query_row_map(
-            LEXICAL_FINGERPRINT_MAX_CONVERSATION_ID_SQL,
-            &[] as &[ParamValue],
-            |row| row.get_typed(0),
-        )
-        .context("computing lexical rebuild conversation fingerprint")?;
+    let max_conversation_id = lexical_fingerprint_max_id(
+        storage,
+        LEXICAL_FINGERPRINT_CONVERSATIONS_ANY_ROW_SQL,
+        LEXICAL_FINGERPRINT_CONVERSATIONS_ANY_ABOVE_SQL,
+        "conversations",
+    )
+    .context("computing lexical rebuild conversation fingerprint")?;
     if prep_profile {
         eprintln!(
             "CASS_PREP_PROFILE step=fingerprint_conversations step_ms={}",
@@ -8008,14 +8119,13 @@ fn lexical_rebuild_content_fingerprint(
         );
     }
     let messages_started = Instant::now();
-    let max_message_id: i64 = storage
-        .raw()
-        .query_row_map(
-            LEXICAL_FINGERPRINT_MAX_MESSAGE_ID_SQL,
-            &[] as &[ParamValue],
-            |row| row.get_typed(0),
-        )
-        .context("computing lexical rebuild message fingerprint")?;
+    let max_message_id = lexical_fingerprint_max_id(
+        storage,
+        LEXICAL_FINGERPRINT_MESSAGES_ANY_ROW_SQL,
+        LEXICAL_FINGERPRINT_MESSAGES_ANY_ABOVE_SQL,
+        "messages",
+    )
+    .context("computing lexical rebuild message fingerprint")?;
     if prep_profile {
         eprintln!(
             "CASS_PREP_PROFILE step=fingerprint_messages step_ms={}",
@@ -8181,14 +8291,20 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
 }
 
 fn max_conversation_id_exact(storage: &FrankenStorage) -> Result<Option<i64>> {
-    let max_conversation_id: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COALESCE(MAX(id), 0) FROM conversations",
-            &[] as &[ParamValue],
-            |row| row.get_typed(0),
-        )
-        .context("computing lexical rebuild max conversation id")?;
+    // Same unseekable aggregate, same engine, same unbounded scan as the
+    // fingerprint — see [`lexical_fingerprint_max_id`], which carries the
+    // codegen citations and the measurements. This call site is on the rebuild
+    // and checkpoint paths rather than the search hot path, so it cost 1,075-
+    // 3,578 ms per call rather than hanging, and the earlier sweep missed it.
+    // Fixing the one statement and not the shape is how the same defect comes
+    // back.
+    let max_conversation_id = lexical_fingerprint_max_id(
+        storage,
+        LEXICAL_FINGERPRINT_CONVERSATIONS_ANY_ROW_SQL,
+        LEXICAL_FINGERPRINT_CONVERSATIONS_ANY_ABOVE_SQL,
+        "conversations",
+    )
+    .context("computing lexical rebuild max conversation id")?;
     Ok((max_conversation_id > 0).then_some(max_conversation_id))
 }
 
@@ -24480,6 +24596,129 @@ pub mod persist {
                 crate::indexer::lexical_rebuild_content_fingerprint(&storage, 2).unwrap();
 
             assert_eq!(fingerprint, "content-v1:2:9:11");
+        }
+
+        /// An archive with no rows yet must fingerprint as zero, exactly as the
+        /// `COALESCE(MAX(id), 0)` aggregate this replaced did.
+        ///
+        /// This is the case the bisection cannot reach: it takes the early
+        /// return, because a bisection over an empty table has no boundary to
+        /// find. Deleting that early return makes this test red.
+        #[test]
+        fn lexical_rebuild_content_fingerprint_is_zero_for_empty_tables() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("fingerprint-empty.db");
+            let storage = create_franken_db(&db_path);
+
+            let fingerprint =
+                crate::indexer::lexical_rebuild_content_fingerprint(&storage, 0).unwrap();
+
+            assert_eq!(fingerprint, "content-v1:0:0:0");
+        }
+
+        /// Rowids may be negative, and the maximum of a wholly-negative table is
+        /// negative — not zero.
+        ///
+        /// This test exists because the obvious way to write the replacement is
+        /// to gallop upward from zero, and that implementation returns 0 here
+        /// while `MAX(id)` returns -4. It is the control that proves the
+        /// bisection really covers the signed domain rather than the positive
+        /// half, and it is the one case where a wrong answer would be SILENT:
+        /// a fingerprint that stays 0 while the data changes underneath it
+        /// reports "unchanged" forever and serves a stale index.
+        #[test]
+        fn lexical_rebuild_content_fingerprint_finds_negative_max_ids() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("fingerprint-negative.db");
+            let storage = create_franken_db(&db_path);
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "codex".into(),
+                    name: "Codex".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let workspace_id = storage
+                .ensure_workspace(std::path::Path::new("/tmp/fingerprint-negative"), None)
+                .unwrap();
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO conversations(
+                         id, agent_id, workspace_id, source_id, title, source_path, metadata_json
+                     ) VALUES
+                         (-9, ?1, ?2, 'local', 'lower', '/tmp/fingerprint-negative/a.jsonl', '{}'),
+                         (-4, ?1, ?2, 'local', 'upper', '/tmp/fingerprint-negative/b.jsonl', '{}')",
+                    &[ParamValue::from(agent_id), ParamValue::from(workspace_id)],
+                )
+                .unwrap();
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(id, conversation_id, idx, role, content, extra_json)
+                     VALUES
+                         (-11, -9, 0, 'user', 'lower message', '{}'),
+                         (-7, -4, 0, 'assistant', 'upper message', '{}')",
+                    &[],
+                )
+                .unwrap();
+
+            let fingerprint =
+                crate::indexer::lexical_rebuild_content_fingerprint(&storage, 2).unwrap();
+
+            assert_eq!(fingerprint, "content-v1:2:-4:-7");
+        }
+
+        /// Ids far apart and far from zero, so the bisection runs its full depth
+        /// rather than terminating in a handful of steps near the origin.
+        ///
+        /// The message id is past `u32::MAX` and past `i32::MAX`, which is where
+        /// a midpoint computed in the wrong width would wrap.
+        #[test]
+        fn lexical_rebuild_content_fingerprint_finds_sparse_far_max_ids() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("fingerprint-sparse.db");
+            let storage = create_franken_db(&db_path);
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "codex".into(),
+                    name: "Codex".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let workspace_id = storage
+                .ensure_workspace(std::path::Path::new("/tmp/fingerprint-sparse"), None)
+                .unwrap();
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO conversations(
+                         id, agent_id, workspace_id, source_id, title, source_path, metadata_json
+                     ) VALUES
+                         (1, ?1, ?2, 'local', 'first', '/tmp/fingerprint-sparse/a.jsonl', '{}'),
+                         (4000000000, ?1, ?2, 'local', 'far', '/tmp/fingerprint-sparse/b.jsonl', '{}')",
+                    &[ParamValue::from(agent_id), ParamValue::from(workspace_id)],
+                )
+                .unwrap();
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(id, conversation_id, idx, role, content, extra_json)
+                     VALUES
+                         (2, 1, 0, 'user', 'first message', '{}'),
+                         (9000000000000, 4000000000, 0, 'assistant', 'far message', '{}')",
+                    &[],
+                )
+                .unwrap();
+
+            let fingerprint =
+                crate::indexer::lexical_rebuild_content_fingerprint(&storage, 2).unwrap();
+
+            assert_eq!(fingerprint, "content-v1:2:4000000000:9000000000000");
         }
 
         fn tantivy_doc_count(index: &mut crate::search::tantivy::TantivyIndex) -> u64 {
