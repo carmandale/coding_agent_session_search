@@ -404,3 +404,45 @@ the catch-up recount — two test-only edits, one version literal, and it carrie
 upstream library bug that cass can defend against but not fix. None of that is a
 reason against the move; all of it is cost the decision should carry, which is why
 the triage ran.
+
+## Correction: we wrote those sidecars, and that is the stronger finding
+
+The section above concluded that the ns sidecars on the production database proved
+"a different fsqlite >= 0.1.17 consumer already reaches that file", writer
+unidentified. **That was wrong.** The peer session working this same bead had the
+binary evidence and supplied it; I had reasoned a third party out of an absence.
+
+This investigation created them. A verifier lane opened the production database
+read-only under the forward pin, and the namespace bind runs before validation.
+Confirmed by literals rather than by argument:
+
+```
+/tmp/ftsprobe19/target/debug/ftsprobe   FSQLNS=1  fsqlite-ns-use=1   (control fsqlite=164163)
+/tmp/ftsprobe5/target/debug/ftsprobe    FSQLNS=0  fsqlite-ns-use=0   (control fsqlite=144586)
+~/.local/bin/cass                       FSQLNS=0  fsqlite-ns-use=0   (control fsqlite=673)
+```
+
+File times 00:26:19Z and 01:26:55Z both fall inside the triage windows.
+
+The error was mine and it was the alarming direction — an unnamed third-party tool
+touching his database is a thing you interrupt someone for. What produced it is a
+shape this repo already has a rule about: I read a negative off an instrument
+(no literal in the shipping binary) and let it carry a positive claim (therefore
+something else wrote them) that the instrument could not support. The measurement
+was right. The inference was invented.
+
+**The corrected reading is the strongest evidence for blocker 2, not a retreat from
+it.** Opening the production database read-only under 0.1.19, with nothing going
+wrong and no corruption anywhere, was by itself sufficient to create two files that
+cass's own discovery scan would then enumerate as bundle roots. The defect is
+demonstrated on the production path rather than inferred from fixtures.
+
+Bead `-xybl9` carries the corrected text plus a comment recording the change, so the
+false version does not survive anywhere a reader would find it.
+
+### Disclosure
+
+Lanes in this investigation opened the live production database. Read-only in
+intent, no damage observed, and the residue is exactly the two sidecar files — a
+directory listing of that data dir shows only `agent_search.db`, `-wal`, `-shm`, and
+the ns pair. Recording it here rather than leaving it to be discovered.
