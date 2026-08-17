@@ -108,9 +108,24 @@ reported to the operator before the verdict landed.
 **`dependency_drift`** parses cass's own checked-in `Cargo.toml` and asserts the
 version strings equal literals hardcoded in the test
 (`src/dependency_drift.rs:869` and `:882`, `"0.1.5"` and `"0.3.2"`). The
-experiment moved the manifest and left the literals alone, so the test did
-exactly its job. Fix: update the two literals in lockstep whenever the pin
-actually moves.
+experiment moved the manifest and left the first literal alone, so the test did
+exactly its job.
+
+**Fix: exactly ONE literal — `:869`, `"0.1.5"` → `"0.1.19"` — in the same commit
+that moves `Cargo.toml:45` and `build.rs`. Leave `:882` alone.** An earlier
+revision of this document said "update the two literals in lockstep," and that
+advice would have broken a passing test. Generation 12's verifier caught its own
+finder fabricating the premise, and I confirmed it independently: `Cargo.toml:26`
+reads `asupersync = { version = "0.3.2", … }` **byte-identically in both trees**.
+Only `frankensqlite` moved. The `0.3.10` you see is the *lockfile's* resolution
+of the caret range, not a manifest edit, so the `:882` assertion is green on both
+pins and bumping it to `"0.3.10"` would turn it red in both. The asupersync
+assertion also never executed on the forward run — the `ensure(...)?` at `:869`
+short-circuits first.
+
+Read the differential table above with that in mind: `asupersync 0.3.2 →
+0.3.10` there describes what is **linked into the binary** (which is why the
+`strings` markers differ), not a version anyone edited.
 
 **`pages::encrypt`** pins an error message whose second half belongs to std.
 `key_slot_id_for_len` (`src/pages/encrypt.rs:298-306`) interpolates
@@ -176,7 +191,38 @@ matches neither salvage prefix. The phantom only appears once a
 
 ---
 
-## 5 and 6 — the one that costs something real
+### The sidecars are already beside your live database — and we put them there
+
+Generation 12 measured `agent_search.db-fsqlite-ns-gate` (0 B) and
+`agent_search.db-fsqlite-ns-use` (40 B, header `FSQLNS01`) sitting next to the
+live 23.3 GB production database, found no such literal in any shipped cass
+binary, and inferred that "some other fsqlite ≥ 0.1.17 consumer already reaches
+that file." **The measurement reproduces exactly; the inference does not hold,
+and I checked before repeating it.**
+
+Both sidecars are dated **today**, inside the windows our own triage was reading
+that database: `-gate` at 00:26:19Z, `-use` at 01:26:55Z. Our forward-pin
+binaries embed the literal and the shipping-pin build does not —
+`/tmp/ftsprobe19/target/debug/ftsprobe` and the forward test binary both carry
+`fsqlite-ns-use` and `FSQLNS`, while `~/.local/bin/cass` carries neither (control:
+8 hits for `agent_search` in the same binary, so the scan works). The writer was
+our own investigation, not a third-party tool on the machine.
+
+Two things follow, and the second is the useful one:
+
+- **Disclosure.** Triage lanes opened the production database with the forward-pin
+  library. The intent was read-only and no damage is visible — the database is
+  23.3 GB and intact, the two sidecars total 40 bytes — but the opens were not
+  free of side effects, and that belongs in the record rather than in a footnote.
+- **This is the blocker demonstrated on the production path.** Nothing had to go
+  wrong for those files to appear; merely *opening* the database under 0.1.19
+  created them, exactly as the failing tests predict. Under the pin, cass's own
+  discovery scan would then see them as bundle roots. The exposure is no longer
+  hypothetical, and the two-string fix is what closes it.
+
+---
+
+## 5 and 6 — cheaper than first reported
 
 Under 0.1.19, opening a database whose `sqlite_master` holds a **duplicate
 legacy `fts_messages` row** fails outright:
@@ -365,7 +411,26 @@ and streams one row per indexable message, a superset of what the incremental
 path would have written. So this one can be fixed cass-side, or simply waited out
 upstream — it is the one item on the list that does not have to be your problem.
 
-## The two decisions that are yours
+## The decisions that are yours
+
+Three of these are calls only you can make, and the fourth is an external write
+no session here is authorized to perform.
+
+### 0. The `rootpage > 0` gate — the one I would put first
+
+`src/storage/sqlite.rs:4129` is unsound on **both** pins. It returns the right
+answer today only because fsqlite 0.1.5 wrote a non-stock rootpage; stock SQLite
+and 0.1.19 both write 0, and then the gate silently disables every db-resident
+FTS write on the ordinary insert path. Fixing it is a production behavior change
+rather than a test edit, which is why no session here has landed it alongside the
+safe-today fixes. Filed as `coding_agent_session_search-hd4u5`. My
+recommendation: fix it now, on the shipping pin, independently of the pin
+decision — it is latent today and load-bearing the moment the pin moves.
+
+The sidecar allow-list fix is filed as `coding_agent_session_search-xybl9`, and
+two pre-existing gaps generation 12 found while checking it are filed separately:
+a `-wal-fec` name that 0.1.5 already produces and cass's allow-list already
+misses, and backup retention evicting real backups on the same prefix.
 
 ### 1. Merging `1fc20dbb` to `main`
 
@@ -400,6 +465,19 @@ with very different blast radii:
   this repo at once**, which is why no session has done it unasked.
 
 Neither is a cass code problem, and both are yours to call.
+
+### 3. Filing the fsqlite regression upstream — written, not sent
+
+Row 8 is a real fsqlite 0.1.19 deviation from stock SQLite, independently
+reproduced by two sessions. The report is drafted and carried on bead
+`coding_agent_session_search-mgw1o`, and it is deliberately **UNSENT**: filing
+against frankensqlite is an external write, and no session in this chain holds
+that approval. It needs you, or your say-so.
+
+Worth noting why it nearly went unfiled at all. A single classification label
+for the pair would have travelled as "cass owes an adaptation," and the upstream
+half would have disappeared inside it. Two sessions split the pair the same way
+independently, which is the only reason the report exists.
 
 ---
 

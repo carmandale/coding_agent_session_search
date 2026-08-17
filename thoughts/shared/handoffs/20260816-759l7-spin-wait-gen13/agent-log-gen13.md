@@ -260,6 +260,45 @@ were too narrow:
   complete in that agent's transcript. Reading only the journal would have
   scored it as missing. Generation 14 recovered it.
 
+## Addendum 2, same hour — generation 12 was never dead, and my relaunch was redundant
+
+Generation 12 is alive. Its workflow `wf_5db3409b-f14` completed with 10 results
+and 0 errors; I verified that count in its journal directly rather than taking
+the claim. The three lanes I diagnosed as stalled on bad
+`frankensqlite-0.1.x` registry paths **recovered on their own by searching** —
+the salvage lane's evidence cites real `fsqlite-vfs-0.1.19/src/namespace.rs`
+lines. So my path diagnosis was correct and my conclusion from it was not: the
+defect cost wall-clock, not results, and `wf_628b78dd-655` re-bought answers that
+already existed. Three sessions ended up on one bead in one worktree.
+
+The redundancy was not free, but it was not worthless either: the two runs agree
+on every classification, and independent convergence is what makes the row-7/row-8
+split credible rather than a single lane's opinion.
+
+Two corrections from generation 12, both verified here before being carried:
+
+- **A finder fabricated its premise.** The `dependency_drift` lane claimed
+  asupersync moved to 0.3.10 in the forward manifest and that the matching
+  assertion failed for that reason. `Cargo.toml:26` reads `"0.3.2"`
+  byte-identically in **both** trees — I diffed them — and `0.3.10` is only the
+  lockfile's resolution of the caret range. Its proposed fix would have turned a
+  green assertion red on both pins. Corrected in `pin-move-cost.md`, which had
+  repeated the "update both literals" version.
+- **Generation 12's own sidecar inference was wrong, and I checked rather than
+  repeating it.** The `-fsqlite-ns-gate` / `-fsqlite-ns-use` pair really is beside
+  the live 23.3 GB database (`FSQLNS01`, 40 bytes) and no shipped cass binary
+  carries the literal — both true. But both files are dated today, at 00:26:19Z
+  and 01:26:55Z, inside our own triage windows, and our forward-pin binaries do
+  carry the literal (`/tmp/ftsprobe19/target/debug/ftsprobe` and the forward test
+  binary) while the shipping build does not. **We wrote them.** Reported as
+  "some unidentified consumer reaches your database," that finding would have
+  been alarming and false.
+
+That second one is the instrument lesson of this whole run, and it is the same
+one three times over: a true measurement with a plausible inference bolted on is
+the most expensive shape available, because the measurement's credibility carries
+the inference through unexamined.
+
 ## Notes for whoever is next
 
 - The forward target dir is `/tmp/cass-759l7-forward-target`, a **sibling** of
