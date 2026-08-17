@@ -211,6 +211,55 @@ Five returned before this session wound down. **Every one came back
 Still outstanding at wind-down: the third `fts-shadow-table` lens, and the
 `fts-repair-mode` triage lane with its verifier. Generation 14 owns both.
 
+## Addendum, 2026-08-17T01:42Z — the workflow completed after wind-down
+
+`wf_628b78dd-655` finished with all 10 agents returned and 0 errors, minutes
+after the paragraph above was written. Both outstanding items landed, so the
+handoff to generation 14 was superseded before it was acted on; gen-14 and I
+each independently proposed the same split, our messages crossed, and I kept
+ownership of the two gen-13 artifacts while gen-14 keeps `gen14/`.
+
+Final verdict tally: **seven verifiers, six confirmed, one refuted.**
+
+The refutation is the important one, and it lands on my own reporting. The
+`fts-shadow-table` reachability lens refuted the finder's cost analysis — class
+and blocks-pin survive, the reason inverts — and I had already relayed the
+superseded version to the operator. Three points, each executed rather than
+read: two production `writable_schema` paths exist and are not test-gated
+(`sqlite.rs:2180-2196`, `2479-2498`); the range cited to prove the probe dies on
+open contains its own `sqlite3` fallback at `2141-2142`, and the verifier ran
+both cass's probe SQL (`13 / 2 / 1`, rc=0) and its scrub (rc=0, clean) against a
+duplicate-row database it built; and the `shadowed_by_materialized` mask is
+built from the file's own rootpages with byte-identical code across versions, so
+two real damaged cass databases on this machine (10.5 GB and 11.3 GB under
+`~/Desktop/cass-backups-parked/`) still open under 0.1.19 because both carry a
+positive-rootpage twin and `fts_messages_content`. The failing shape is a
+fixture artifact cass cannot produce.
+
+The `fts-repair-mode` classification is the one nobody predicted: failure 7 is a
+production defect on the ordinary insert path, not a test artifact, via cass's
+own `rootpage > 0` gate at `sqlite.rs:4127-4131`. Failure 8 is the single
+genuine fsqlite 0.1.19 regression in the eight. Both were measured against both
+prebuilt rlibs with live positive controls and a stock-sqlite3 ground truth;
+details in `pin-move-cost.md`.
+
+Two corrections to evidence recorded above, both from generation 14 rather than
+from me, and both worth keeping because they show where this run's instruments
+were too narrow:
+
+- The salvage verifier reported `-wal-fec` as new in 0.1.19. It is not —
+  `fsqlite-wal-0.1.5/src/wal_fec.rs:2119` builds it with `format!`, and 0.1.5's
+  own tests pin `test.db-wal` → `test.db-wal-fec`. The verifier enumerated
+  quoted literals in the *vfs* crate only, so a name constructed in the *wal*
+  crate was invisible to it. That makes `-wal-fec` a pre-existing gap on the pin
+  we ship today, not a pin-move item. It never reached `pin-move-cost.md`, so
+  nothing operator-facing had to be retracted — but the near miss is the point:
+  an enumeration scoped to one crate cannot answer a question about a name.
+  Filed as `…-sidecar-suffixes-missing-wal-fec-jou-7dewl`.
+- One verifier's structured output never reached the journal, though it is
+  complete in that agent's transcript. Reading only the journal would have
+  scored it as missing. Generation 14 recovered it.
+
 ## Notes for whoever is next
 
 - The forward target dir is `/tmp/cass-759l7-forward-target`, a **sibling** of

@@ -10,18 +10,39 @@ Written by generation 13; evidence trail in `agent-log-gen13.md` beside this fil
 
 Moving cass forward from **fsqlite 0.1.5 / asupersync 0.3.2 / rustc 1.94** to
 **fsqlite 0.1.19 / asupersync 0.3.10 / rustc 1.99** breaks 8 tests. None of them
-is data corruption, and none is a case of the newer library returning wrong
-answers. Five are two-line fixes. The real cost is one small test
-re-adjudication that retires a documented recovery path, plus one upstream
-report worth filing whatever you decide.
+is data corruption, and none makes search return a wrong answer. Six of the eight
+are cass asserting something about the old library's private behavior that the
+new library legitimately corrected — in every one of those cases 0.1.19 now
+matches stock SQLite and 0.1.5 did not.
 
-The headline number is smaller than "8 failures" sounds:
+Two findings changed after this document was first written, and both are stated
+in full rather than folded in, because the superseded versions were reported to
+the operator first:
+
+- **One failure (row 7) is a production defect, not a test artifact.** cass
+  detects its FTS table with `rootpage > 0`, which is false on stock SQLite. Under
+  0.1.19 that gate goes false and **every db-resident FTS write on the ordinary
+  insert path silently stops** — ten call sites in `insert_conversation_tree`.
+  Bounded: Tantivy is authoritative and this is the fallback index, so search
+  results are unaffected. But it is real, it reaches the live database, and it
+  is the single most important line in this document.
+- **One failure (row 8) is a genuine fsqlite 0.1.19 regression** — the only one.
+  A transient row undercount after reopen; no data loss, `MATCH` always correct,
+  self-corrects on the next open. It costs a full rebuild where an incremental
+  catch-up would have done. Fixable cass-side or waitable upstream.
+
+Against that, the item previously flagged as the most expensive got **cheaper**:
+a verifier refuted the claim that rows 5 and 6 destroy a recovery path. They
+don't — two real damaged databases were measured and both still open fine under
+0.1.19. Those tests block because their fixtures stopped resembling real damage,
+which is a re-adjudication rather than a rescue.
 
 | what | how much |
 |---|---|
-| trivial edits (literal strings, one assertion, two allow-list entries) | **5 of 8 failures**, 3 files |
-| small test re-adjudication, and it needs a written decision | **2 of 8 failures**, 1 file |
-| *(the eighth is covered below once its lane lands)* | |
+| trivial edits (literal strings, one assertion, two allow-list entries) | **4 of 8 failures**, 3 files |
+| small test re-adjudication toward the real-world shape, needs a written decision | **2 of 8 failures**, 1 file |
+| production gate fix — stop asking `rootpage > 0` | **1 of 8**, and the one that matters |
+| upstream regression — fix locally or wait for fsqlite | **1 of 8**, optional |
 
 ## The controlled differential
 
@@ -47,14 +68,27 @@ a broken fixture.
 
 Every classification below was handed to an adversarial verifier told to refute
 it and to default to "refuted" if it could not independently confirm the
-load-bearing claim. **Five verdicts returned, and none refuted anything.** The
+load-bearing claim. **Seven verdicts returned. Six confirmed; one refuted.** The
 group that could genuinely block got three verifiers with different lenses
-rather than one, because the failure mode there is data-loss shaped.
+rather than one, because the failure mode there is data-loss shaped — and the
+third of those three is the one that fired.
 
-One of those verifiers is worth singling out: the `fts-shadow-table` lane had
+Two verifiers are worth singling out.
+
+The first confirmed more than it was asked to: the `fts-shadow-table` lane had
 flagged its rootpage mechanism as an "honest gap" — deduced from source rather
-than executed — and the verifier independently confirmed it with a fourth line
-of evidence the finder did not have.
+than executed — and the verifier closed it with a fourth line of evidence the
+finder did not have, then found a real specimen on disk
+(`~/Desktop/cass-backups-parked/agent_search.db.backup.3963…`, `fts_messages` at
+rootpage 74) proving cass-on-older-fsqlite really did materialize with a
+positive rootpage.
+
+The second **refuted the reachability story for rows 5 and 6** — on reasoning,
+not on label. The classification and "blocks the pin" both survive; the reason
+they block is now close to the opposite of what the finder argued, and the fix
+is cheaper and lower-risk as a result. That correction is written into the 5-and-6
+section below rather than quietly folded in, because the superseded version was
+reported to the operator before the verdict landed.
 
 | # | failure | what it actually is | blocks the pin | effort |
 |---|---|---|---|---|
@@ -62,10 +96,10 @@ of evidence the finder did not have.
 | 2 | `pages::encrypt::…key_slot_id_for_len_rejects_overflow` | rustc/std changed a message; nothing to do with fsqlite | no | trivial |
 | 3 | `storage::sqlite::…salvage_historical_databases_imports_backups_once_and_merges_overlap` | fsqlite's new namespace sidecar counted as a database bundle | yes, but two strings | trivial |
 | 4 | `storage::sqlite::…salvage_historical_databases_skips_unreadable_quarantined_bundles` | same cause as 3 | yes, same fix | trivial |
-| 5 | `storage::sqlite::…franken_storage_open_repairs_duplicate_fts_messages_schema_rows` | a repair path for historically-damaged databases is now unreachable | yes | small |
+| 5 | `storage::sqlite::…franken_storage_open_repairs_duplicate_fts_messages_schema_rows` | the fixture's damaged shape stops reproducing the real-world one it was written to protect | yes | small |
 | 6 | `storage::sqlite::…rebuild_fts_via_rusqlite_cleans_duplicate_legacy_schema_rows` | same cause as 5 | yes, same fix | small |
-| 7 | `indexer::…full_run_fallback_fts_repair_skips_rebuild_when_fts_is_already_healthy` | *(pending)* | | |
-| 8 | `storage::sqlite::…ensure_fts_consistency_via_rusqlite_catches_up_missing_rows` | *(pending)* | | |
+| 7 | `indexer::…full_run_fallback_fts_repair_skips_rebuild_when_fts_is_already_healthy` | **cass's own `rootpage > 0` gate goes false, silently disabling FTS writes on the ordinary insert path** | yes | small |
+| 8 | `storage::sqlite::…ensure_fts_consistency_via_rusqlite_catches_up_missing_rows` | a real fsqlite 0.1.19 regression — transient undercount, no data loss | yes | small, or wait for upstream |
 
 ---
 
@@ -171,12 +205,48 @@ byte-identical *contentless* duplicate produces the same error, proving the
 rejection is about the duplicate name rather than the missing shadow table. On
 this fixture 0.1.19 is the more correct of the two.
 
-**But the repair really does become unreachable.** `FrankenStorage::open` opens
-the fsqlite connection as its first act, before migrations and before
-`ensure_search_fallback_fts_consistency`. Every production repair route goes
-through that open, and `DatabaseCorrupt` is not retryable. So a case cass
-currently self-heals becomes a hard failure whose operator remedy is the one
-cass already writes down — back up and rebuild — for a 23 GB database.
+**A superseded claim, kept visible because it was reported before it was
+checked.** The finding lane argued — and I relayed to the operator — that the
+repair "becomes unreachable": `FrankenStorage::open` opens the connection as its
+first act, `DatabaseCorrupt` is not retryable, so a case cass self-heals today
+becomes a hard failure needing a 23 GB rebuild. **The third verifier refuted
+that, with executed evidence, on three points.**
+
+1. *The claim that every `writable_schema` site is test-gated is false.* Two
+   production paths shell out to the real `sqlite3` binary with
+   `PRAGMA writable_schema=ON`: `probe_historical_bundle_via_sqlite3_metadata`
+   (`sqlite.rs:2180-2196`) and `scrub_staged_derived_fts_metadata_via_sqlite3`
+   (`sqlite.rs:2479-2498`). Neither is `#[cfg(test)]`.
+2. *The cited range refutes itself.* `sqlite.rs:2141-2142` — inside the very
+   range quoted for "the probe also opens through fsqlite" — is
+   `let Ok(conn) = open_historical_bundle_readonly(root_path) else { return probe_historical_bundle_via_sqlite3_metadata(root_path).unwrap_or_default(); };`
+   That is the fallback for a bundle fsqlite cannot open, with a second at 2174.
+   The verifier executed cass's production probe SQL against a duplicate-row
+   database it built: `13 / 2 / 1` at rc=0 — the exact `Some(2)` the ranker keys
+   on. Healing is wired too: `ensure_seeded_canonical_fts_consistency`
+   (`sqlite.rs:2539-2570`) catches this error class and runs the scrub. The
+   verifier executed that scrub: rc=0, duplicate removed, integrity check clean.
+   So "probed" and "healed" are both false; only "opened via fsqlite" is true,
+   and that is a recognized, handled branch.
+3. *The decisive one — the fixture is not what the wild contains.* The
+   `shadowed_by_materialized` mask is built by filtering **the file's own**
+   `sqlite_master` rows on `root_page_num > 0`, and that code is byte-identical
+   between 0.1.5 and 0.1.19. Two genuinely damaged cass databases were measured
+   on this machine (`~/Desktop/cass-backups-parked/agent_search.db.pre-rebuild-bak`,
+   10.5 GB, and `backups/agent_search.db.1774667229.failed-baseline-seed.bak`,
+   11.3 GB): both have `COUNT(*) WHERE name='fts_messages'` = 2, both carry a
+   positive-rootpage materialized twin (2137238 / 2367531), and **both carry
+   `fts_messages_content`** (rootpage 23 and 17). So under 0.1.19 they are still
+   masked, still skipped, still openable. The failing fixture has neither
+   property — it needs both rows at rootpage 0 *and* a contentless canonical
+   table so `_content` never exists — and cass cannot produce that: its two
+   production `writable_schema` paths only DELETE rows, and stock SQLite refuses
+   a second `CREATE VIRTUAL TABLE` outright.
+
+**So rows 5 and 6 block for the opposite reason.** Not because a production
+recovery capability is destroyed, but because the fixtures no longer reproduce
+the real-world damage they exist to protect against. That makes the fix cheaper
+and the risk lower than the superseded version implied.
 
 **Can your database hit this?** Not as it stands. Measured read-only against the
 live 23 GB file: 71 objects in `sqlite_master`, schema version 20, **zero**
@@ -188,30 +258,112 @@ frankensqlite FTS consistency check finds it missing or malformed". The primary
 index is Tantivy, on disk with 211 entries. A schema-20 database with no FTS
 objects is exactly what the code predicts.
 
-What the pin costs is therefore **not your live database — it is the ability to
-recover a database that reached the damaged state in the past**, including any
-pre-V14 backup or salvage bundle still on disk. cass's own commit `e4796ba6`
-describes that state as arising from "interrupted migrations or concurrent
-schema operations", and the salvage ranker has a branch for it, so it is a state
-cass has met in the field and built machinery for.
+Nor does it cost you the historical databases. That was the superseded reading —
+"any pre-V14 backup or salvage bundle a user still holds" — and the two real
+specimens above are exactly those files. They do not take this path under
+0.1.19. cass's own commit `e4796ba6` attributes the duplicate state to
+"interrupted migrations or concurrent schema operations", and it is right that
+the state is production-reachable; what is *not* production-reachable is the
+fixture's particular variant of it.
 
-**Fix: re-adjudicate the two fixtures, and write down why.** Split each into a
-test that keeps the real repair signal on a state 0.1.19 can open, plus a new
-test pinning the new behavior. This is the one item that must not be a silent
-re-arm — the coverage being retired is a documented recovery path, and the
-record has to say so.
+**Fix: re-adjudicate the two fixtures toward the real specimen shape.** Rebuild
+each around what the wild actually contains — a materialized twin at positive
+rootpage with `_content` present — so the test again exercises the recovery path
+on a state that can occur, and add a case pinning the new behavior. Two notes on
+scope: this must not be a silent re-arm, because the shape being changed is a
+documented recovery path and the record has to say why; and the previously
+proposed "add a rusqlite pre-flight" option should be **dropped outright** —
+cass already ships that capability in production through the `sqlite3` binary at
+`sqlite.rs:2479-2498`, so it was never a new-dependency question.
 
 **Worth filing upstream regardless of the pin decision**, and it is narrow: do
 *not* report the duplicate case, where fsqlite is more correct than 0.1.5 was.
 Report the **orphan** case, where fsqlite genuinely diverges from stock — given
 a single rootpage-0 fts5 row whose shadow tables are absent, real SQLite opens
 the database and fails lazily only on first access to that table, while fsqlite
-fails eagerly during schema reload and makes the whole file unopenable. Asking
-for that validation to be deferred to first use would also restore cass's repair
-reachability for free, because the repair drops and recreates the table without
-ever querying it.
+fails eagerly during schema reload and makes the whole file unopenable. That
+divergence stands on its own merits and is worth reporting; note that the
+"and it would restore cass's repair reachability for free" argument attached to
+it in the superseded version does not survive, since the reachability was never
+lost.
 
 ---
+
+## 7 and 8 — the one I would not have guessed
+
+These two share a cause with 5 and 6 — the same `rootpage` correction — but they
+land somewhere far more consequential, and only one of them is a test problem.
+
+**7 is a production defect, not a test artifact.** cass decides whether an FTS
+table exists with this, at `src/storage/sqlite.rs:4127-4131`:
+
+```sql
+SELECT COUNT(*) FROM sqlite_master
+ WHERE name = 'fts_messages' AND rootpage > 0
+```
+
+Real SQLite writes `rootpage = 0` for a virtual table. fsqlite 0.1.5 wrote 2-3,
+so the gate returned 1; 0.1.19 writes 0 like SQLite, so **the gate returns 0 and
+cass concludes the FTS table is absent.** Every db-resident FTS write sits behind
+it — `flush_pending_fts_entries` at `sqlite.rs:15292`, reached from ten call
+sites inside the production `insert_conversation_tree` (9213, 9236, 9329, 9351,
+9494, 9521, 9665, 9691, 9837, 9860). Under 0.1.19 those writes silently no-op on
+every index run against the real database, and the fallback index only catches
+up on the next `cass index --full`.
+
+Measured, not read. A standalone probe was linked against both prebuilt rlibs
+(a version/compiler mismatch fails loudly at `E0514`, so a silent mislink is
+impossible):
+
+| | `fts_messages` rootpage | cass's gate | shadow tables |
+|---|---|---|---|
+| fsqlite 0.1.5 | 3 | `1` | none |
+| fsqlite 0.1.19 | 0 | `0` | all five |
+| stock sqlite3 3.54.0 | 0 | `0` | all five |
+
+The positive control ran in the same probe on the same databases: the identical
+gate query against the ordinary `messages` table returns `1` on both pins, so the
+zero is a real zero rather than a dead query. The gate's own stated rationale
+(`sqlite.rs:1155-1160`, "FrankenSQLite skips virtual-table entries") was also
+falsified directly — under 0.1.19 the rootpage-0 table accepted an INSERT,
+answered `COUNT(*)`, and answered `MATCH`, on both the creating connection and a
+fresh reopen. The discriminator is simply obsolete.
+
+**How bad is it?** Bounded, and worth stating precisely. Tantivy is the
+authoritative index; the SQLite FTS path is consulted only when Tantivy is
+unavailable (`src/search/query.rs:3596`). So the failure degrades a fallback, not
+primary search. The fix is to stop asking `rootpage > 0` and ask something that
+is true on stock SQLite.
+
+**8 is a genuine fsqlite 0.1.19 regression** — the only one in the eight, and I
+was wrong to tell the operator there were none before this landed. In
+`fsqlite-ext-fts5-0.1.19/src/lib.rs:7480`,
+`hydrate_contentless_index_from_segments` ends by setting `self.shadow_rows =
+None` without repopulating `self.documents`; `row_count()` at 7837 then falls
+through to `self.documents.len()`, which holds only the newly inserted row. On a
+contentless table with one persisted row, reopened, then given one catch-up
+insert:
+
+| | `COUNT(*)` | rowids |
+|---|---|---|
+| fsqlite 0.1.5 | 2 | 1, 2 |
+| fsqlite 0.1.19 | **1** | 2 |
+| stock sqlite3 3.54.0 | 2 | 1, 2 |
+
+An ordinary table carried through the identical sequence returned 2 on both pins,
+which is what proves the instrument. Here 0.1.5 agrees with upstream and 0.1.19
+does not.
+
+**It is not data loss, and I checked rather than assumed.** The undercount is
+transient: reopen once more and `COUNT(*)` is 2 with both rowids, and `MATCH`
+stayed correct even inside the bad window — so search never returns a wrong
+answer. What it costs is efficiency. cass reads that count as `repaired_rows`
+(`sqlite.rs:10176-10181`), sees it fall short, and takes the full-rebuild branch
+at `sqlite.rs:10213-10217` instead of the incremental one. The end states are
+equivalent by construction: `rebuild_fts_via_frankensqlite` recreates the table
+and streams one row per indexable message, a superset of what the incremental
+path would have written. So this one can be fixed cass-side, or simply waited out
+upstream — it is the one item on the list that does not have to be your problem.
 
 ## The two decisions that are yours
 
