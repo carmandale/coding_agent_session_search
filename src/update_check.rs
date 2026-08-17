@@ -10,7 +10,6 @@ use anyhow::{Context, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
@@ -836,27 +835,19 @@ fn build_update_info(
 }
 
 /// Fetch latest release using the native asupersync HTTP client.
+///
+/// The context comes from the ambient `Cx` the runtime installs for the
+/// duration of the poll, so no task needs to be spawned to obtain one.
+/// `Runtime::block_on` sets it (asupersync #41, `runtime/builder.rs`), which is
+/// what makes `Cx::current()` sufficient here on both 0.3.2 and 0.3.4.
+///
+/// An earlier revision spawned a task purely to be handed a `Cx` and then read
+/// its result back over a `std::sync::mpsc` receiver. That receiver has no async
+/// wakeup, so the wait had to be a `yield_now` spin — and on a `current_thread`
+/// runtime the root future of `block_on` is not in task accounting, so the
+/// spawned task never got polled from the root's yield and the spin never ended.
+/// 0.3.2 tolerated it; 0.3.4 does not. See bead 759l7.
 async fn fetch_latest_release() -> Result<GitHubRelease> {
-    if let Some(handle) = asupersync::runtime::Runtime::current_handle() {
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        handle
-            .try_spawn_with_cx(move |cx| async move {
-                let _ = tx.send(fetch_latest_release_with_cx(&cx).await);
-            })
-            .context("spawning update check task")?;
-
-        loop {
-            match rx.try_recv() {
-                Ok(result) => return result,
-                Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
-                Err(TryRecvError::Disconnected) => {
-                    anyhow::bail!("update check task exited before returning a result");
-                }
-            }
-        }
-    }
-
     let cx = asupersync::Cx::current().context("update check requires an active asupersync Cx")?;
     fetch_latest_release_with_cx(&cx).await
 }

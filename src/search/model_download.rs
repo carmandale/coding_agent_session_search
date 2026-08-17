@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use asupersync::bytes::Buf;
@@ -1003,30 +1002,20 @@ where
             DownloadError::NetworkError(format!("failed to build download runtime: {e}"))
         })?;
 
+    // `block_on` installs an ambient `Cx` backed by this runtime's drivers for
+    // the duration of the poll (asupersync #41), so the work runs inline on the
+    // root future and needs no spawned task to carry a context to it.
+    //
+    // Spawning and reading the result back over a `std::sync::mpsc` receiver is
+    // what bead 759l7 records: that receiver has no async wakeup, so the wait
+    // had to be a `yield_now` spin, and on a `current_thread` runtime the root
+    // future is outside task accounting, so the spawned task never got polled
+    // and the spin never ended.
     runtime.block_on(async move {
-        let handle = asupersync::runtime::Runtime::current_handle().ok_or_else(|| {
-            DownloadError::NetworkError("download runtime handle unavailable".into())
+        let cx = asupersync::Cx::current().ok_or_else(|| {
+            DownloadError::NetworkError("download runtime context unavailable".into())
         })?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        handle
-            .try_spawn_with_cx(move |cx| async move {
-                let _ = tx.send(f(cx).await);
-            })
-            .map_err(|e| {
-                DownloadError::NetworkError(format!("failed to spawn download task: {e}"))
-            })?;
-
-        loop {
-            match rx.try_recv() {
-                Ok(result) => return result,
-                Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
-                Err(TryRecvError::Disconnected) => {
-                    return Err(DownloadError::NetworkError(
-                        "download task exited before returning a result".into(),
-                    ));
-                }
-            }
-        }
+        f(cx).await
     })
 }
 

@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
@@ -827,25 +826,20 @@ where
         .build()
         .context("building Cloudflare API runtime")?;
 
+    // `block_on` installs an ambient `Cx` backed by this runtime's drivers for
+    // the duration of the poll (asupersync #41), so the work runs inline on the
+    // root future and needs no spawned task to carry a context to it.
+    //
+    // Spawning and reading the result back over a `std::sync::mpsc` receiver is
+    // what bead 759l7 records: that receiver has no async wakeup, so the wait
+    // had to be a `yield_now` spin, and on a `current_thread` runtime the root
+    // future is outside task accounting, so the spawned task never got polled
+    // and the spin never ended. This site had no test coverage, so it would have
+    // hung in production with nothing to catch it.
     runtime.block_on(async move {
-        let handle = asupersync::runtime::Runtime::current_handle()
-            .ok_or_else(|| anyhow::anyhow!("Cloudflare API runtime handle unavailable"))?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        handle
-            .try_spawn_with_cx(move |cx| async move {
-                let _ = tx.send(f(cx).await);
-            })
-            .map_err(|e| anyhow::anyhow!("spawning Cloudflare API task: {e}"))?;
-
-        loop {
-            match rx.try_recv() {
-                Ok(result) => return result,
-                Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
-                Err(TryRecvError::Disconnected) => {
-                    bail!("Cloudflare API task exited before returning a result");
-                }
-            }
-        }
+        let cx = asupersync::Cx::current()
+            .ok_or_else(|| anyhow::anyhow!("Cloudflare API runtime context unavailable"))?;
+        f(cx).await
     })
 }
 
