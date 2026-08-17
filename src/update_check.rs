@@ -843,10 +843,15 @@ fn build_update_info(
 ///
 /// An earlier revision spawned a task purely to be handed a `Cx` and then read
 /// its result back over a `std::sync::mpsc` receiver. That receiver has no async
-/// wakeup, so the wait had to be a `yield_now` spin — and on a `current_thread`
-/// runtime the root future of `block_on` is not in task accounting, so the
-/// spawned task never got polled from the root's yield and the spin never ended.
-/// 0.3.2 tolerated it; 0.3.4 does not. See bead 759l7.
+/// wakeup, which is what forced the wait to be a `yield_now` spin: under
+/// `block_on`'s driver a self-wake counts as a budget event, so the loop
+/// degrades into a burst of polls followed by escalating sleeps, forever.
+/// See bead 759l7.
+///
+/// That spin was wrong on every runtime version, not a regression. The driver
+/// (`block_on`, `run_future_with_budget`, `yield_now`) is byte-identical between
+/// 0.3.2 and 0.3.4, so it cannot be what changed — and removing the spin was
+/// measured NOT to fix the 0.3.4 test hang, which is a separate open defect.
 async fn fetch_latest_release() -> Result<GitHubRelease> {
     let cx = asupersync::Cx::current().context("update check requires an active asupersync Cx")?;
     fetch_latest_release_with_cx(&cx).await

@@ -1007,10 +1007,11 @@ where
     // root future and needs no spawned task to carry a context to it.
     //
     // Spawning and reading the result back over a `std::sync::mpsc` receiver is
-    // what bead 759l7 records: that receiver has no async wakeup, so the wait
-    // had to be a `yield_now` spin, and on a `current_thread` runtime the root
-    // future is outside task accounting, so the spawned task never got polled
-    // and the spin never ended.
+    // what bead 759l7 records: that receiver has no async wakeup, which is what
+    // forced the wait to be a `yield_now` spin. That was wrong on every runtime
+    // version rather than a regression — the driver is byte-identical between
+    // 0.3.2 and 0.3.4 — and removing it was measured NOT to fix the 0.3.4 test
+    // hang, which is a separate open defect below this repo.
     runtime.block_on(async move {
         let cx = asupersync::Cx::current().ok_or_else(|| {
             DownloadError::NetworkError("download runtime context unavailable".into())

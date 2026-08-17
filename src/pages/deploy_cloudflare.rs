@@ -831,11 +831,12 @@ where
     // root future and needs no spawned task to carry a context to it.
     //
     // Spawning and reading the result back over a `std::sync::mpsc` receiver is
-    // what bead 759l7 records: that receiver has no async wakeup, so the wait
-    // had to be a `yield_now` spin, and on a `current_thread` runtime the root
-    // future is outside task accounting, so the spawned task never got polled
-    // and the spin never ended. This site had no test coverage, so it would have
-    // hung in production with nothing to catch it.
+    // what bead 759l7 records: that receiver has no async wakeup, which is what
+    // forced the wait to be a `yield_now` spin. That was wrong on every runtime
+    // version rather than a regression — the driver is byte-identical between
+    // 0.3.2 and 0.3.4. This site had no test coverage at all, so it would have
+    // burned CPU in production with nothing to catch it; see the two tests at
+    // the bottom of this file.
     runtime.block_on(async move {
         let cx = asupersync::Cx::current()
             .ok_or_else(|| anyhow::anyhow!("Cloudflare API runtime context unavailable"))?;
@@ -2092,5 +2093,60 @@ mod tests {
             selected.iter().map(|f| f.hash.as_str()).collect();
         assert!(hashes.contains("hash-shared"));
         assert!(hashes.contains("hash-unique"));
+    }
+
+    // ---------------------------------------------------------------------
+    // `run_cloudflare_with_cx` — the sync-to-async bridge every Cloudflare API
+    // call goes through.
+    //
+    // Bead 759l7 named this site as carrying the spawn-and-spin shape with NO
+    // test coverage at all, which is why it was a code defect rather than a
+    // test problem: it would have hung in production and nothing here would
+    // have said so. These two tests are that missing coverage.
+    //
+    // They are deliberately network-free. What they pin is that the bridge
+    // runs the closure it was given, on a usable context, and hands back its
+    // result — a test that hangs rather than fails if the bridge ever
+    // deadlocks again, which is the observable the defect actually produces.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn run_cloudflare_with_cx_runs_the_closure_and_returns_its_value() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+
+        let value = run_cloudflare_with_cx(move |cx| async move {
+            // Touch the context so this fails if the bridge ever supplies one
+            // that is not usable, rather than only proving the closure ran.
+            let _ = cx.now();
+            flag.store(true, Ordering::SeqCst);
+            Ok(1234_u32)
+        })
+        .expect("bridge returned Err for an infallible closure");
+
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "the bridge returned without ever running the closure"
+        );
+        assert_eq!(
+            value, 1234,
+            "the bridge did not return the closure's own value"
+        );
+    }
+
+    #[test]
+    fn run_cloudflare_with_cx_propagates_the_closure_error() {
+        let err = run_cloudflare_with_cx(|_cx| async move {
+            Err::<u32, anyhow::Error>(anyhow::anyhow!("deliberate failure from the closure"))
+        })
+        .expect_err("an erroring closure must not report success");
+
+        assert!(
+            err.to_string().contains("deliberate failure from the closure"),
+            "the closure's own error was replaced rather than propagated: {err}"
+        );
     }
 }
