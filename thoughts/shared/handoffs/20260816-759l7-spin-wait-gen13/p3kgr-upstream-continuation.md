@@ -115,15 +115,35 @@ untouched) because the bead DB lives in the main checkout, which sits on `main`.
 their session, but both leave durable output. Read them first — do not re-run
 what already finished.**
 
-1. **A triage workflow, run ID `wf_5db3409b-f14`.** Five lanes classifying the 8
-   remaining forward-line failures (test defect / compatible behavior change /
-   toolchain artifact / real fsqlite regression / experiment artifact), each with
-   an adversarial verifier. Read its results out of
-   `<project subagents dir>/workflows/wf_5db3409b-f14/journal.jsonl` — one
-   `{"type":"result",...}` line per completed agent. If it did not finish, resume
-   with
-   `Workflow({scriptPath: "…/workflows/scripts/forward-line-failure-triage-wf_5db3409b-f14.js", resumeFromRunId: "wf_5db3409b-f14"})`;
-   completed lanes replay from cache.
+1. **A triage workflow, run ID `wf_5db3409b-f14`**, five lanes classifying the 8
+   remaining forward-line failures, each with an adversarial verifier. It died
+   with the parent session partway through, but **its journal survives on disk
+   and two lanes had already returned**:
+
+   | failure | classification | blocks pin | effort |
+   |---|---|---|---|
+   | `dependency_drift::…manifest_pin_reads_git_and_registry_dependency_specs` | expected artifact of the experiment | **no** | trivial |
+   | `pages::encrypt::tests::key_slot_id_for_len_rejects_overflow` | toolchain artifact (rustc/std, not fsqlite) | **no** | trivial |
+
+   Read the rest — including each lane's full reasoning, citations, and its
+   verifier's verdict — from:
+
+   ```
+   /Users/dalecarman/.claude-accounts/george/projects/-Users-dalecarman-dev-coding-agent-session-search--claude-worktrees-cass-759l7-spin-wait/090aa9b4-6d0a-4669-b9e3-d2f1bab51ca9/subagents/workflows/wf_5db3409b-f14/journal.jsonl
+   ```
+
+   one `{"type":"result",...}` line per completed agent. The script is beside it
+   under `…/090aa9b4-…/workflows/scripts/forward-line-failure-triage-wf_5db3409b-f14.js`
+   and is worth reading — it carries the full prompt for each lane.
+
+   **`resumeFromRunId` will NOT work for you — it is same-session only.** Re-run
+   the script as a NEW workflow with `Workflow({scriptPath: "<that path>"})`,
+   after trimming the two groups above out of its `GROUPS` array so you do not
+   pay for them twice. The three that remain, and they are the ones that matter:
+   `fts-repair-mode`, `fts-shadow-table`, `salvage-counts`. `fts-shadow-table` is
+   the one that could genuinely block — under 0.1.19 the open path REJECTS a
+   database 0.1.5 accepted and repaired, and the question is whether real user
+   data can reach that path or only synthetic fixtures.
 
 2. ~~A forward-line full-suite re-run~~ — **this one FINISHED; do not re-run
    it.** The first forward full run showed 20 failures against experiment B3's
