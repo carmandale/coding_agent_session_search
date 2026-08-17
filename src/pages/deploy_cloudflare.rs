@@ -826,21 +826,33 @@ where
         .build()
         .context("building Cloudflare API runtime")?;
 
-    // `block_on` installs an ambient `Cx` backed by this runtime's drivers for
-    // the duration of the poll (asupersync #41), so the work runs inline on the
-    // root future and needs no spawned task to carry a context to it.
+    // Same shape as `run_download_with_cx` in src/search/model_download.rs, and
+    // for the same measured reasons; see bead 759l7 and the comment there.
     //
-    // Spawning and reading the result back over a `std::sync::mpsc` receiver is
-    // what bead 759l7 records: that receiver has no async wakeup, which is what
-    // forced the wait to be a `yield_now` spin. That was wrong on every runtime
-    // version rather than a regression — the driver is byte-identical between
-    // 0.3.2 and 0.3.4. This site had no test coverage at all, so it would have
-    // burned CPU in production with nothing to catch it; see the two tests at
-    // the bottom of this file.
+    // The work runs on a spawned task and its result comes back through that
+    // task's `JoinHandle`. An earlier revision spawned the task and then polled
+    // a `std::sync::mpsc` receiver in a `yield_now` loop, because that receiver
+    // has no async wakeup — that spin is the defect 759l7 was filed for, and
+    // this site had NO test coverage at all, so it would have burned CPU in
+    // production with nothing to catch it. See the two tests at the bottom of
+    // this file.
+    //
+    // Do not "simplify" this to running `f` inline on the `block_on` root. That
+    // was tried and it hangs the equivalent download tests on asupersync 0.3.2,
+    // the shipping pin. Why is not root-caused; the spawn stays because it is
+    // the shape that is measured to work on both 0.3.2 and 0.3.10.
     runtime.block_on(async move {
-        let cx = asupersync::Cx::current()
-            .ok_or_else(|| anyhow::anyhow!("Cloudflare API runtime context unavailable"))?;
-        f(cx).await
+        let handle = asupersync::runtime::Runtime::current_handle()
+            .ok_or_else(|| anyhow::anyhow!("Cloudflare API runtime handle unavailable"))?;
+        let join = handle
+            .try_spawn(async move {
+                let cx = asupersync::Cx::current().ok_or_else(|| {
+                    anyhow::anyhow!("Cloudflare API task started without a Cx")
+                })?;
+                f(cx).await
+            })
+            .map_err(|e| anyhow::anyhow!("spawning Cloudflare API task: {e}"))?;
+        join.await
     })
 }
 

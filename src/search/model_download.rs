@@ -1002,21 +1002,48 @@ where
             DownloadError::NetworkError(format!("failed to build download runtime: {e}"))
         })?;
 
-    // `block_on` installs an ambient `Cx` backed by this runtime's drivers for
-    // the duration of the poll (asupersync #41), so the work runs inline on the
-    // root future and needs no spawned task to carry a context to it.
+    // The work runs on a spawned task and the result comes back through that
+    // task's `JoinHandle`. Both halves are load-bearing; see bead 759l7.
     //
-    // Spawning and reading the result back over a `std::sync::mpsc` receiver is
-    // what bead 759l7 records: that receiver has no async wakeup, which is what
-    // forced the wait to be a `yield_now` spin. That was wrong on every runtime
-    // version rather than a regression — the driver is byte-identical between
-    // 0.3.2 and 0.3.4 — and removing it was measured NOT to fix the 0.3.4 test
-    // hang, which is a separate open defect below this repo.
+    // THE AWAIT, not a spin. An earlier revision spawned the task and then read
+    // its result back over a `std::sync::mpsc` receiver. That receiver has no
+    // async wakeup, so the wait had to be a `yield_now` loop — the defect 759l7
+    // was filed for. `try_spawn` hands back a `JoinHandle` that does have one:
+    // its `poll` parks the awaiting waker under the same mutex `complete_task`
+    // takes to store the result, so the wake cannot be lost.
+    //
+    // THE SPAWN. Do not "simplify" this to running `f` inline on the `block_on`
+    // root, however redundant the task looks. That was tried and it hangs the
+    // four `test_download_with_mirror_*` tests on asupersync 0.3.2, the shipping
+    // pin, while this shape passes on both 0.3.2 and 0.3.10. WHY inline hangs is
+    // not root-caused — the spawn is kept because it is what is measured to
+    // work, not because the mechanism is understood.
+    //
+    // The spawned task gets its own `Cx`: the runtime synthesizes one for every
+    // task at admission and the worker installs it around each poll, so
+    // `Cx::current()` inside the task is the task's context, exactly the one
+    // `try_spawn_with_cx` would have passed as an argument.
+    //
+    // ceiling: awaiting a `JoinHandle` assumes the spawn was actually queued.
+    // asupersync's `inject_ready` silently drops a task while the Lyapunov
+    // governor is in drain mode, and `try_spawn` still returns `Ok` — so the
+    // await would hang. Inert here: the governor is off by default and cass
+    // never enables it. If that ever changes, this await needs a timeout.
     runtime.block_on(async move {
-        let cx = asupersync::Cx::current().ok_or_else(|| {
-            DownloadError::NetworkError("download runtime context unavailable".into())
+        let handle = asupersync::runtime::Runtime::current_handle().ok_or_else(|| {
+            DownloadError::NetworkError("download runtime handle unavailable".into())
         })?;
-        f(cx).await
+        let join = handle
+            .try_spawn(async move {
+                let cx = asupersync::Cx::current().ok_or_else(|| {
+                    DownloadError::NetworkError("download task started without a Cx".into())
+                })?;
+                f(cx).await
+            })
+            .map_err(|e| {
+                DownloadError::NetworkError(format!("failed to spawn download task: {e}"))
+            })?;
+        join.await
     })
 }
 

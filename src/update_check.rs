@@ -836,23 +836,37 @@ fn build_update_info(
 
 /// Fetch latest release using the native asupersync HTTP client.
 ///
-/// The context comes from the ambient `Cx` the runtime installs for the
-/// duration of the poll, so no task needs to be spawned to obtain one.
-/// `Runtime::block_on` sets it (asupersync #41, `runtime/builder.rs`), which is
-/// what makes `Cx::current()` sufficient here on both 0.3.2 and 0.3.4.
+/// Runs the fetch on a spawned task and awaits that task's `JoinHandle`. Same
+/// shape as `run_download_with_cx` in `src/search/model_download.rs` and
+/// `run_cloudflare_with_cx` in `src/pages/deploy_cloudflare.rs`, deliberately —
+/// one idiom for "async work that needs a `Cx`", so there is no per-site rule to
+/// get wrong. See bead 759l7.
 ///
-/// An earlier revision spawned a task purely to be handed a `Cx` and then read
-/// its result back over a `std::sync::mpsc` receiver. That receiver has no async
-/// wakeup, which is what forced the wait to be a `yield_now` spin: under
-/// `block_on`'s driver a self-wake counts as a budget event, so the loop
-/// degrades into a burst of polls followed by escalating sleeps, forever.
-/// See bead 759l7.
+/// An earlier revision spawned the task and then read its result back over a
+/// `std::sync::mpsc` receiver. That receiver has no async wakeup, which is what
+/// forced the wait to be a `yield_now` spin: under `block_on`'s driver a
+/// self-wake counts as a budget event, so the loop degraded into a burst of
+/// polls followed by escalating sleeps. `JoinHandle` has a real wakeup — its
+/// `poll` parks the waker under the same mutex that stores the task's result —
+/// so the spin is gone without changing where the work runs.
 ///
-/// That spin was wrong on every runtime version, not a regression. The driver
-/// (`block_on`, `run_future_with_budget`, `yield_now`) is byte-identical between
-/// 0.3.2 and 0.3.4, so it cannot be what changed — and removing the spin was
-/// measured NOT to fix the 0.3.4 test hang, which is a separate open defect.
+/// Running the fetch inline on the caller's task instead of spawning it does
+/// work here, and was measured green on both pins. It is not done, because the
+/// same inline shape hangs the download tests on asupersync 0.3.2 and nobody has
+/// root-caused the difference. One shape everywhere is worth more than shaving
+/// a task off the site where inline happens to be safe.
 async fn fetch_latest_release() -> Result<GitHubRelease> {
+    if let Some(handle) = asupersync::runtime::Runtime::current_handle() {
+        let join = handle
+            .try_spawn(async move {
+                let cx = asupersync::Cx::current()
+                    .context("update check task started without an asupersync Cx")?;
+                fetch_latest_release_with_cx(&cx).await
+            })
+            .context("spawning update check task")?;
+        return join.await;
+    }
+
     let cx = asupersync::Cx::current().context("update check requires an active asupersync Cx")?;
     fetch_latest_release_with_cx(&cx).await
 }
