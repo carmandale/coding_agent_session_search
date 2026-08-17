@@ -1658,7 +1658,23 @@ fn copyable_bundle_file_exists(path: &Path) -> Result<bool> {
     }
 }
 
-/// Helper to safely remove a database file and its potential WAL/SHM sidecars.
+/// Sidecars that must be removed whenever the database they belong to is
+/// removed. Leaving one behind is not cosmetic: an orphaned `-fsqlite-ns-use`
+/// still matches the salvage prefixes and is re-enumerated as a database root
+/// on the next discovery pass, which is the amplification class issue #236 was
+/// filed for.
+///
+/// This list is deliberately for REMOVAL only. Do not reuse it for copying or
+/// renaming a bundle: the `-fsqlite-ns-*` pair carries fsqlite's per-file
+/// identity record (fsqlite-vfs-0.1.19/src/namespace.rs, `write_identity_record`),
+/// not a path, so whether it may travel with a copy or a rename depends on
+/// whether that identity survives the operation. Deleting a stale record is
+/// always safe -- fsqlite recreates it on the next open -- while duplicating one
+/// onto a different file is not.
+pub(crate) const REMOVABLE_DB_SIDECAR_SUFFIXES: &[&str] =
+    &["-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"];
+
+/// Helper to safely remove a database file and its potential sidecars.
 pub(crate) fn remove_database_files(path: &Path) -> std::io::Result<()> {
     let mut removed_any = false;
 
@@ -1669,7 +1685,7 @@ pub(crate) fn remove_database_files(path: &Path) -> std::io::Result<()> {
     }
 
     // Best-effort removal of sidecar files (ignore errors if they don't exist)
-    for suffix in ["-wal", "-shm"] {
+    for suffix in REMOVABLE_DB_SIDECAR_SUFFIXES.iter().copied() {
         match fs::remove_file(database_sidecar_path(path, suffix)) {
             Ok(()) => removed_any = true,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -16331,6 +16347,81 @@ mod tests {
         assert!(!db_path.exists());
         assert!(!database_sidecar_path(&db_path, "-wal").exists());
         assert!(!database_sidecar_path(&db_path, "-shm").exists());
+    }
+
+    /// fsqlite >= 0.1.17 leaves a `-fsqlite-ns-gate`/`-fsqlite-ns-use` pair beside
+    /// every database it opens, including on the read-only path, and never unlinks
+    /// them itself. Removing a database without sweeping them orphans a 40-byte
+    /// file that still matches the salvage prefixes, which is the amplification
+    /// class issue #236 was filed for.
+    #[test]
+    fn remove_database_files_removes_fsqlite_namespace_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+
+        std::fs::write(&db_path, b"db").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-fsqlite-ns-gate"), b"").unwrap();
+        std::fs::write(
+            database_sidecar_path(&db_path, "-fsqlite-ns-use"),
+            [0_u8; 40],
+        )
+        .unwrap();
+
+        remove_database_files(&db_path).unwrap();
+
+        assert!(!db_path.exists());
+        assert!(
+            !database_sidecar_path(&db_path, "-fsqlite-ns-gate").exists(),
+            "the 0-byte gate sidecar must not be orphaned"
+        );
+        assert!(
+            !database_sidecar_path(&db_path, "-fsqlite-ns-use").exists(),
+            "the 40-byte identity record must not be orphaned -- it still matches \
+             the salvage prefixes and would be re-enumerated as a database root"
+        );
+    }
+
+    /// Discovery must not mistake fsqlite's namespace sidecars for database
+    /// bundles. The 40-byte `-fsqlite-ns-use` beside a quarantined
+    /// `agent_search.corrupt.<ts>` matches the corrupt prefix and clears the
+    /// `total_bytes > 0` filter, so without the allowlist entry it is counted as a
+    /// bundle -- and probing that phantom lays another sidecar beside it, so the
+    /// count grows on every pass. The chained name is asserted for that reason.
+    #[test]
+    fn historical_bundle_discovery_skips_fsqlite_namespace_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        std::fs::write(&db_path, b"canonical").unwrap();
+
+        let bundle = dir.path().join("agent_search.corrupt.1000");
+        std::fs::write(&bundle, b"quarantined bundle").unwrap();
+
+        // What fsqlite plants beside that bundle the first time it is probed.
+        std::fs::write(
+            dir.path().join("agent_search.corrupt.1000-fsqlite-ns-gate"),
+            b"",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("agent_search.corrupt.1000-fsqlite-ns-use"),
+            [0_u8; 40],
+        )
+        .unwrap();
+        // What the next pass plants beside the phantom, if the phantom was counted.
+        std::fs::write(
+            dir.path()
+                .join("agent_search.corrupt.1000-fsqlite-ns-use-fsqlite-ns-use"),
+            [0_u8; 40],
+        )
+        .unwrap();
+
+        let roots = historical_bundle_root_paths(&db_path);
+
+        assert_eq!(
+            roots,
+            vec![bundle],
+            "only the real quarantined bundle is a database root; got {roots:?}"
+        );
     }
 
     #[test]

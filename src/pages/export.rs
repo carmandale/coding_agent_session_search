@@ -628,8 +628,16 @@ fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) ->
 
 fn cleanup_sqlite_temp_artifacts(path: &Path) {
     let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(sidecar_path(path, "-wal"));
-    let _ = std::fs::remove_file(sidecar_path(path, "-shm"));
+    // Shares one list with the storage layer so the two cannot drift. fsqlite
+    // leaves its `-fsqlite-ns-*` pair beside every database it opens, including
+    // on the read-only path, and never unlinks them itself -- so a temp export
+    // database that is not swept here leaves permanent orphans behind.
+    for suffix in crate::storage::sqlite::REMOVABLE_DB_SIDECAR_SUFFIXES
+        .iter()
+        .copied()
+    {
+        let _ = std::fs::remove_file(sidecar_path(path, suffix));
+    }
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
