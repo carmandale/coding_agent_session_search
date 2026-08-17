@@ -198,8 +198,12 @@ production's 0, with the total under the file's 8,957 message-bearing bound.
   of the first worker at :18530). It is a **regression introduced 2026-05-13**,
   three weeks AFTER this bead was closed on 2026-04-22, and the bead's own April
   proof test structurally cannot see it — it calls the producer directly with
-  `planned_shard_plan = None`. It is NOT the same defect as p3kgr, which lives
-  ~5,800 lines away in the run_index preflight.
+  `planned_shard_plan = None`.
+  **That was the entering hypothesis. It has since been measured, and it is right
+  about the line and wrong about the mechanism — see *Open* below for the
+  diagnosis that replaces it.** In particular the note that this "is NOT the same
+  defect as p3kgr" is now wrong: different statements, but the same dependency and
+  the same shape.
 
 **Both P0 findings were adversarially verified** by independent lanes that opened
 every cited line. Both came back CONFIRMED, and the qtn0e verifier closed an open
@@ -334,8 +338,10 @@ strip correctly; it fails with `tmp/cass-gen8/src/lib.rs: No such file or direct
   boundary and is blind to the branch consuming it at `lib.rs:91682`. Catching Q2
   needs a behavioural test with a temp config and DB, or a subprocess test like
   `src/sources/probe.rs`'s `real_probe_*`.
-- **`3azjb` (P1, new) — disk, and it needs Dale.** Free is ~50 GiB against the
-  150 GiB floor. 113.85 GiB is reclaimable from five idle cargo targets
+- **`3azjb` (P1, new) — disk, and it needs Dale.** Free measured **141 GiB** on
+  2026-08-17 against the 150 GiB floor; the "~50 GiB" in an earlier revision of
+  this line was wrong, so re-measure with `df -h /` before acting rather than
+  trusting either number. 113.85 GiB is reclaimable from five idle cargo targets
   (`cass-repair-target` 37.16, `cass-nvq59-target` 32.25, `cass-gen3-golden-target`
   18.81, `cass-c6bfb589-target` 18.22, `cass-lane-golden` 7.41), all with **0 open
   handles** by `lsof` and all 23h+ stale. `jck92` deliberately kept four of them
