@@ -15010,7 +15010,29 @@ fn quarantine_failed_seed_bundle(db_path: &Path) -> Result<Option<PathBuf>> {
     sync_parent_directory(&backups_dir)?;
     let backup_root = unique_failed_seed_backup_root(&backups_dir, db_name);
 
-    for suffix in ["", "-wal", "-shm"] {
+    // The `-fsqlite-ns-*` pair MOVES with the bundle rather than being left
+    // behind or deleted. Settled by measurement against fsqlite 0.1.19 (bead
+    // `coding_agent_session_search-xybl9` step 2 left it open):
+    //
+    // - `fs::rename` preserves the inode, and fsqlite's identity record is an
+    //   (st_dev, st_ino) pair, so the record stays TRUE at the quarantine path.
+    //   A quarantined bundle carrying its own pair opened and read back fine.
+    // - Leaving them behind is fatal in one measured case. If any live
+    //   connection still holds the orphaned `-fsqlite-ns-use`, the re-create at
+    //   this same path takes fsqlite's join-shared arm, reads the stale inode,
+    //   mismatches the new one and fails with `CannotOpen`. Moving them makes
+    //   that same sequence succeed.
+    // - Unlinking them instead would also work, but `rename` is preferred for
+    //   upstream's own stated reason (namespace.rs:8-10): unlinking a locked
+    //   file splits the advisory-lock domain on Unix, leaving a live holder
+    //   locking an unlinked inode while a new connection locks a fresh one.
+    //
+    // Inert on the pin we ship today -- the 0.1.5 family never creates these
+    // files -- so this is forward-correctness, not a live behaviour change.
+    // The `-wal-fec` sidecar is NOT listed: it is derived redundancy over
+    // `-wal`, self-invalidating against WAL salts, so a stale one is ignored
+    // rather than misapplied.
+    for suffix in ["", "-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
         let src = if suffix.is_empty() {
             db_path.to_path_buf()
         } else {
@@ -46488,6 +46510,69 @@ mod tests {
             "repeated quarantines should not collide on backup path"
         );
         assert_eq!(std::fs::read(&second_backup).unwrap(), b"db-two");
+    }
+
+    /// fsqlite's namespace pair must MOVE with the quarantined bundle, not be
+    /// left orphaned at the canonical path.
+    ///
+    /// The identity record is an (st_dev, st_ino) pair, and `fs::rename`
+    /// preserves the inode, so the record stays true at its destination. Leaving
+    /// it behind was measured fatal in one case: if any live connection still
+    /// holds the orphaned `-fsqlite-ns-use`, the re-create at this same path
+    /// takes fsqlite's join-shared arm, reads the stale inode, mismatches the new
+    /// one and fails with `CannotOpen`.
+    ///
+    /// The byte payloads are distinctive on purpose -- they prove the files were
+    /// MOVED rather than coincidentally recreated at the destination.
+    #[test]
+    fn quarantine_failed_seed_bundle_moves_fsqlite_namespace_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+
+        let mut identity_record = b"FSQLNS01".to_vec();
+        identity_record.resize(40, 0x5a);
+
+        std::fs::write(&db_path, b"db-one").unwrap();
+        std::fs::write(tmp.path().join("agent_search.db-fsqlite-ns-gate"), b"").unwrap();
+        std::fs::write(
+            tmp.path().join("agent_search.db-fsqlite-ns-use"),
+            &identity_record,
+        )
+        .unwrap();
+
+        let backup = quarantine_failed_seed_bundle(&db_path)
+            .unwrap()
+            .expect("quarantine path");
+        let name = backup.file_name().unwrap().to_string_lossy().into_owned();
+
+        let moved_use = backup.with_file_name(format!("{name}-fsqlite-ns-use"));
+        assert!(
+            moved_use.exists(),
+            "the identity record must travel with the bundle it describes; it was \
+             left behind at the canonical path instead"
+        );
+        assert_eq!(
+            std::fs::read(&moved_use).unwrap(),
+            identity_record,
+            "the moved identity record must be the original bytes, not a fresh one"
+        );
+        assert!(
+            backup
+                .with_file_name(format!("{name}-fsqlite-ns-gate"))
+                .exists(),
+            "the gate sidecar must travel with the bundle"
+        );
+
+        assert!(!db_path.exists());
+        assert!(
+            !tmp.path().join("agent_search.db-fsqlite-ns-use").exists(),
+            "leaving the identity record at the canonical path orphans it, and a \
+             live holder of that file makes the re-create fail with CannotOpen"
+        );
+        assert!(
+            !tmp.path().join("agent_search.db-fsqlite-ns-gate").exists(),
+            "the gate sidecar must not be orphaned at the canonical path"
+        );
     }
 
     #[test]

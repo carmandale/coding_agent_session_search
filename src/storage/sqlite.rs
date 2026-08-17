@@ -1619,6 +1619,28 @@ fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<(
     Ok(())
 }
 
+/// Sidecars that travel with a bundle COPY.
+///
+/// Deliberately `-wal`/`-shm` only, and deliberately NOT the `-fsqlite-ns-*`
+/// pair. This was left open by bead `coding_agent_session_search-xybl9` step 2
+/// and is settled here by measurement against fsqlite 0.1.19 rather than by
+/// pattern-matching the removal list into this function:
+///
+/// - Copying them is INERT. fsqlite reads the identity record only when joining
+///   a generation another live connection already holds; otherwise it takes the
+///   exclusive lock and rewrites the record unconditionally. A copied bundle
+///   carrying the SOURCE's identity was opened and read back successfully, and
+///   the record was silently rewritten to the copy's own inode. A bundle copied
+///   WITHOUT the pair (today's behaviour) opened equally well and regenerated
+///   both sidecars from nothing.
+/// - Copying them is also the only variant that can HURT. The identity record is
+///   an (st_dev, st_ino) pair, so a copy's record is wrong by construction until
+///   the first open corrects it; and fsqlite additionally rejects the open
+///   outright if the sidecar's own inode metadata is off (`validate_secure_lock_file`
+///   checks uid, nlink and mode) -- a copy that ever lands at mode 0644 makes the
+///   destination unopenable with an error naming the sidecar.
+///
+/// So the correct copy set is the one already here. Do not "complete" it.
 fn copyable_bundle_sidecar_sources(source_root: &Path) -> Result<Vec<(PathBuf, &'static str)>> {
     let mut sidecars = Vec::new();
     for suffix in ["-wal", "-shm"] {
@@ -1665,14 +1687,46 @@ fn copyable_bundle_file_exists(path: &Path) -> Result<bool> {
 /// filed for.
 ///
 /// This list is deliberately for REMOVAL only. Do not reuse it for copying or
-/// renaming a bundle: the `-fsqlite-ns-*` pair carries fsqlite's per-file
-/// identity record (fsqlite-vfs-0.1.19/src/namespace.rs, `write_identity_record`),
-/// not a path, so whether it may travel with a copy or a rename depends on
-/// whether that identity survives the operation. Deleting a stale record is
-/// always safe -- fsqlite recreates it on the next open -- while duplicating one
-/// onto a different file is not.
-pub(crate) const REMOVABLE_DB_SIDECAR_SUFFIXES: &[&str] =
-    &["-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"];
+/// renaming a bundle -- the entries have three different travel rules, and only
+/// deletion is uniformly safe:
+///
+/// - The `-fsqlite-ns-*` pair carries fsqlite's per-file identity record
+///   (fsqlite-vfs-0.1.19/src/namespace.rs, `write_identity_record`), which is an
+///   (st_dev, st_ino) pair rather than a path. It therefore stays true across an
+///   `fs::rename` (inode preserved) and becomes a lie across an `fs::copy` (new
+///   inode). Measured: a copied record is silently rewritten to the copy's own
+///   inode on first open, so copying it is inert -- but it must never be treated
+///   as required baggage.
+/// - `-journal` is bound to its database by filename convention only, and its
+///   travel rule is the INVERSE: it must move WITH its database, never be
+///   duplicated onto another. A rollback journal replayed against the wrong
+///   database destroys it.
+/// - `-wal`/`-shm`/`-wal-fec` are self-invalidating: the FEC meta binds to WAL
+///   salts and page hashes, so a stale one is ignored rather than misapplied.
+///
+/// `-journal` is in this list despite that inverse rule, because REMOVAL is the
+/// one operation that is safe for it here. `remove_database_files` returns early
+/// on any non-`NotFound` error from the main-file unlink (see below), so the
+/// sidecar loop is never reached while a database it belongs to still exists;
+/// and the only live consumer, `cleanup_sqlite_temp_artifacts` in
+/// `src/pages/export.rs`, is discarding an abandoned temp export database with no
+/// committed user data.
+///
+/// Worth knowing when editing this list: it is currently shaped for the
+/// storage-layer consumer, which is production-unreachable today
+/// (`remove_database_files`'s only caller is `open_or_rebuild`, whose only
+/// callers are tests). The one LIVE consumer is the pages export, and that
+/// connection sets `PRAGMA journal_mode = 'delete'` on purpose, so `-journal` is
+/// the sidecar it actually produces while `-wal`/`-shm` are the ones it is
+/// configured never to produce in steady state.
+pub(crate) const REMOVABLE_DB_SIDECAR_SUFFIXES: &[&str] = &[
+    "-wal",
+    "-wal-fec",
+    "-shm",
+    "-journal",
+    "-fsqlite-ns-gate",
+    "-fsqlite-ns-use",
+];
 
 /// Helper to safely remove a database file and its potential sidecars.
 pub(crate) fn remove_database_files(path: &Path) -> std::io::Result<()> {
@@ -3033,14 +3087,48 @@ fn is_backup_root_name(name: &str, prefix: &str) -> bool {
 // next discovery counts that record as a database bundle, and probing the
 // phantom creates its own sidecar, so the count grows on every salvage run.
 //
+// -wal-fec and -journal are a different case from the pair above: both are
+// creatable on the pin we ship TODAY, so listing them is a live behaviour
+// change rather than a forward-compat no-op.
+//
+// -wal-fec is frankensqlite's RaptorQ WAL parity sidecar, and it is NOT new in
+// 0.1.19. fsqlite-wal-0.1.5/src/wal_fec.rs:2119 builds the name with `format!`
+// ("{wal_name}-fec"), and two functions in that same file create it with
+// `.create(true)` -- `ensure_wal_with_fec_sidecar` (:2237) and
+// `append_wal_fec_group` (:2251). Because the name ends in `-fec`, the `-wal`
+// entry above does NOT cover it; a `<backup>-wal-fec` would otherwise be
+// enumerated as a database bundle. (Whether cass's own configuration ever
+// drives fsqlite down that path is not established here -- the entry is
+// defensive, and the file can equally arrive from any other sqlite tooling.)
+//
+// -journal is the stock rollback journal. Of the two production paths that
+// shell out to the system `sqlite3` binary, only ONE can leave one behind:
+// `scrub_staged_derived_fts_metadata_via_sqlite3` writes
+// (DELETE FROM sqlite_master) with no `immutable=1` and no journal_mode
+// override, so a process killed mid-transaction leaves a `<db>-journal` that
+// persists. `probe_historical_bundle_via_sqlite3_metadata` opens with
+// `immutable=1` and never journals -- so the "either path" framing on the
+// originating bead is half wrong, and the entry rests on the scrub path alone.
+//
+// Neither addition can falsely exclude a real bundle root, and the reason is
+// terminal-character disjointness rather than any claim about letters: every
+// root-minting template ends in a decimal digit (`unique_backup_path` ends in
+// `{nonce}`; the corrupt-quarantine name in src/lib.rs ends in `%S`) or in the
+// literal `.bak` (`unique_failed_seed_backup_root` in src/indexer/mod.rs).
+// `-wal-fec` ends in `c` and `-journal` ends in `l`. That argument survives a
+// mint site this analysis missed, as long as the site ends in a digit -- which
+// an enumeration of mint sites would not.
+//
 // ceiling: this is suffix matching, so it cannot express fsqlite 0.1.19's
-// `<db>-wal-seg-<epoch>` family (namespace.rs:673 builds it as a *prefix*).
-// If that family ever appears beside a salvage root, this function needs a
-// predicate rather than another list entry.
+// `<db>-wal-seg-<epoch>` family (namespace.rs:673 builds it as a *prefix*),
+// nor the `.wal-fec.tmp` rewrite temporary. If either ever appears beside a
+// salvage root, this function needs a predicate rather than another list entry.
 fn has_db_sidecar_suffix(name: &str) -> bool {
     const SIDECAR_SUFFIXES: &[&str] = &[
         "-wal",
+        "-wal-fec",
         "-shm",
+        "-journal",
         "-lock-shared",
         "-lock-reserved",
         "-lock-pending",
@@ -16421,6 +16509,78 @@ mod tests {
             roots,
             vec![bundle],
             "only the real quarantined bundle is a database root; got {roots:?}"
+        );
+    }
+
+    /// Unlike the `-fsqlite-ns-*` pair, both of these are creatable on the pin
+    /// we ship today, so this guards live behaviour rather than the pin move.
+    ///
+    /// `-wal-fec` is the case worth stating: it does NOT end in `-wal`, so the
+    /// existing `-wal` entry never covered it. fsqlite-wal-0.1.5 builds the name
+    /// as `{wal_name}-fec` and creates the file in two places, so a
+    /// `<bundle>-wal-fec` can sit beside a salvage root on 0.1.5 and be counted
+    /// as a database. `-journal` is the stock rollback journal, which the
+    /// `sqlite3` scrub shell-out can leave behind if it is killed mid-transaction.
+    #[test]
+    fn historical_bundle_discovery_skips_wal_fec_and_journal_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        std::fs::write(&db_path, b"canonical").unwrap();
+
+        let bundle = dir.path().join("agent_search.corrupt.1000");
+        std::fs::write(&bundle, b"quarantined bundle").unwrap();
+
+        // Both are non-empty so they clear the `total_bytes > 0` filter, which is
+        // what makes them indistinguishable from a bundle to the enumeration.
+        std::fs::write(
+            dir.path().join("agent_search.corrupt.1000-wal-fec"),
+            b"raptorq parity groups",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("agent_search.corrupt.1000-journal"),
+            b"rollback journal",
+        )
+        .unwrap();
+        // The `-wal` beside it is already skipped today; it is seeded so that a
+        // failure names the two NEW entries rather than an unrelated regression.
+        std::fs::write(dir.path().join("agent_search.corrupt.1000-wal"), b"wal").unwrap();
+
+        let roots = historical_bundle_root_paths(&db_path);
+
+        assert_eq!(
+            roots,
+            vec![bundle],
+            "only the real quarantined bundle is a database root -- a -wal-fec or \
+             -journal beside it is a sidecar, not a bundle; got {roots:?}"
+        );
+    }
+
+    /// The removal list and the discovery list are separate, and this pins the
+    /// removal half. The live consumer of `REMOVABLE_DB_SIDECAR_SUFFIXES` is the
+    /// pages export, whose destination connection sets
+    /// `PRAGMA journal_mode = 'delete'` on purpose -- so `-journal` is precisely
+    /// the sidecar it produces, and leaving it unswept orphans a file in the
+    /// user's output directory that nothing will ever collect.
+    #[test]
+    fn remove_database_files_removes_wal_fec_and_journal_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+
+        std::fs::write(&db_path, b"db").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-wal-fec"), b"fec").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-journal"), b"journal").unwrap();
+
+        remove_database_files(&db_path).unwrap();
+
+        assert!(!db_path.exists());
+        assert!(
+            !database_sidecar_path(&db_path, "-wal-fec").exists(),
+            "the RaptorQ parity sidecar must not be orphaned"
+        );
+        assert!(
+            !database_sidecar_path(&db_path, "-journal").exists(),
+            "the rollback journal must not be orphaned beside a removed database"
         );
     }
 
