@@ -1,0 +1,41 @@
+=== APPLY ===
+mirror : /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search/raw-mirror/v1
+dest   : /Users/dalecarman/session-archive/rescued-from-cass
+mode   : APPLY
+
+scanning manifests for captures whose original_path is gone...
+  scanned 147844 manifests in 30s
+
+TO RESCUE: 6892 files, 1890766050 bytes (1.76 GiB) into 392 directories
+   claude_code                          3877 files     1787.28 MiB
+   openclaw-feature-dev-developer       1482 files        7.66 MiB
+   openclaw-feature-dev-planner         1533 files        8.23 MiB
+  ...1000/6892 (1s)
+  ...2000/6892 (2s)
+  ...3000/6892 (3s)
+  ...4000/6892 (3s)
+  ...5000/6892 (4s)
+  ...6000/6892 (5s)
+
+DONE written=6892 already_present=0 failed=0 in 6s
+index: /Users/dalecarman/session-archive/rescued-from-cass/index.tsv
+
+Now run --verify before deleting the mirror.
+APPLY_RC=0
+=== VERIFY ===
+mirror : /Users/dalecarman/Library/Application Support/com.coding-agent-search.coding-agent-search/raw-mirror/v1
+dest   : /Users/dalecarman/session-archive/rescued-from-cass
+mode   : VERIFY
+
+scanning manifests for captures whose original_path is gone...
+  scanned 147844 manifests in 27s
+
+TO RESCUE: 6892 files, 1890766050 bytes (1.76 GiB) into 392 directories
+   claude_code                          3877 files     1787.28 MiB
+   openclaw-feature-dev-developer       1482 files        7.66 MiB
+   openclaw-feature-dev-planner         1533 files        8.23 MiB
+
+VERIFY: 6892 ok / 0 mismatched / 0 missing
+VERIFY_RC=0
+1.8G	/Users/dalecarman/session-archive/rescued-from-cass
+    6894
