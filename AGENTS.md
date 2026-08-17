@@ -360,19 +360,59 @@ Integration and E2E tests live in the `tests/` directory. Benchmarks live in `be
 
 ### Unit Tests
 
+**Never share one `CARGO_TARGET_DIR` across two checkouts of this crate.** The
+literal `/tmp/cass-test-target` below is safe only while exactly one checkout
+exists, and that is no longer the normal case: agent work runs in worktrees
+under `.claude/worktrees/`, and pin experiments run in throwaway clones under
+`/tmp`. Derive the target dir from the checkout instead:
+
 ```bash
+# One target dir per checkout. Do this once per shell.
+export CARGO_TARGET_DIR="/tmp/cass-target-$(basename "$(git rev-parse --show-toplevel)")"
+
 # Run all tests
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-target cargo test
+rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo test
 
 # Run with output
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-target cargo test -- --nocapture
+rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo test -- --nocapture
 
 # Run a specific test
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-target cargo test test_name
+rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo test test_name
 
 # Run tests with all features enabled
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-target cargo test --all-features
+rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo test --all-features
 ```
+
+#### Why: a shared target dir silently runs the WRONG binary
+
+Both checkouts resolve to the same artifact name, so the later build clobbers
+the earlier one. Cargo's mtime freshness check is then satisfied, it prints
+something like `Finished in 0.41s`, and **it re-runs the other tree's test
+binary**. The suite passes or fails on code you are not looking at.
+
+- **The tell** is a panic at a line number that does not exist in the tree you
+  think you are testing.
+- **Before believing any cross-tree comparison**, confirm you saw
+  `Compiling coding-agent-search (<the path you mean>)`, or `touch` a source
+  file to force it.
+- **Verify a test binary by CONTENT, never by mtime.** This repo has a recorded
+  incident of a stale binary reporting a false green:
+
+  ```bash
+  strings <test-binary> | rg -o 'fsqlite-core-0\.1\.[0-9]+' | sort -u
+  ```
+
+- **The mirror mistake, and it costs just as much:** finding nothing under
+  `<target>/debug/deps` and concluding the tree is cold. This cargo can use a
+  build-dir layout, where the test binary lives at
+  `<target>/debug/build/coding-agent-search/<hash>/out/coding_agent_search-<hash>`.
+  A generation of agent work rebuilt a tree that was already warm because it
+  read `debug/deps` and stopped there. Locate the binary with `fd`, do not
+  assume the path.
+
+Note also that a target dir can be a **sibling** of its source tree rather than
+a child (`/tmp/cass-759l7-forward` builds into `/tmp/cass-759l7-forward-target`),
+so "no `target/` inside the checkout" does not mean "not built".
 
 ### Test Categories
 
