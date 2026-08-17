@@ -1140,6 +1140,12 @@ impl IndexingProgress {
                 )
             })
             .unwrap_or_default();
+        // Bead 9fnbr: the codex pre-envelope recovery pass reported itself only
+        // through `warn!`, and robot output pins the tracing filter to `error`
+        // (lib.rs:5769-5774), so a `--json` reader saw nothing at all when
+        // rollouts were dropped or when the check failed to run.
+        let (codex_recovered, codex_unrecoverable, codex_discovery_failures) =
+            crate::connectors::codex::pre_envelope_recovery_counts();
 
         // Derived rate + ETA for the indexing phase. Guard against divide-by-zero
         // and bogus values when `total` isn't set yet.
@@ -1170,6 +1176,9 @@ impl IndexingProgress {
             "eta_seconds": eta_seconds,
             "last_error": last_error,
             "quarantined_conversations": quarantined_conversations,
+            "codex_pre_envelope_recovered": codex_recovered,
+            "codex_rollouts_unrecoverable": codex_unrecoverable,
+            "codex_recovery_discovery_failures": codex_discovery_failures,
             "lexical_update_deferred": lexical_update_deferred,
             "rebuild_pipeline": {
                 "queue_depth": rebuild_pipeline_queue_depth,
@@ -9124,13 +9133,34 @@ fn plan_lexical_rebuild_shards_from_conversation_ids_with_settings(
     Ok(plan)
 }
 
+// The final `pstep!` reassigns `pt` for symmetry with the others and nothing
+// reads it after; that is the shape, not a bug.
+#[allow(unused_assignments)]
 fn plan_lexical_rebuild_shards_from_storage_with_settings(
     storage: &FrankenStorage,
     settings: &LexicalRebuildPipelineSettingsSnapshot,
     total_conversations: usize,
 ) -> Result<LexicalShardPlan> {
-    if !storage.lexical_rebuild_has_tail_footprint_metadata()? {
+    let pp = std::env::var_os("CASS_PREP_PROFILE").is_some();
+    let mut pt = std::time::Instant::now();
+    macro_rules! pstep {
+        ($name:expr) => {
+            if pp {
+                eprintln!(
+                    "CASS_PREP_PROFILE component=planner step={} step_ms={}",
+                    $name,
+                    pt.elapsed().as_millis()
+                );
+                pt = std::time::Instant::now();
+            }
+        };
+    }
+
+    let has_tail = storage.lexical_rebuild_has_tail_footprint_metadata()?;
+    pstep!("has_tail_footprint_metadata");
+    if !has_tail {
         let total_messages = count_total_messages_exact(storage)?;
+        pstep!("count_total_messages_exact");
         return plan_lexical_rebuild_shards_from_conversation_ids_with_settings(
             storage,
             settings,
@@ -9140,6 +9170,7 @@ fn plan_lexical_rebuild_shards_from_storage_with_settings(
     }
 
     let conversations = lexical_rebuild_shard_planner_conversations_from_storage(storage)?;
+    pstep!("list_conversation_footprints");
     let total_conversations = conversations.len();
     let total_messages = conversations
         .iter()
@@ -9156,6 +9187,7 @@ fn plan_lexical_rebuild_shards_from_storage_with_settings(
         total_message_bytes,
     );
     let mut plan = plan_lexical_rebuild_shards(&conversations, budgets);
+    pstep!("plan_lexical_rebuild_shards");
     for shard in &mut plan.shards {
         // Footprints are sizing estimates, not validation contracts: the
         // lexical sink can legitimately emit more than one Tantivy document
@@ -9172,6 +9204,7 @@ fn plan_lexical_rebuild_shards_from_storage_with_settings(
         plan.total_message_bytes,
         &plan.oversized_conversation_ids,
     );
+    pstep!("lexical_shard_plan_id");
     Ok(plan)
 }
 
@@ -12096,6 +12129,10 @@ pub fn run_index(
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
+    // Bead 9fnbr: these are process-global, so zero them here for the same
+    // reason `ACTIVE_SESSION_SOURCE_SKIP_OBSERVED` is zeroed here — the numbers
+    // a run reports must describe that run.
+    crate::connectors::codex::reset_pre_envelope_recovery_counts();
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
     set_progress_last_error(opts.progress.as_ref(), None);
     let initial_lock_mode = if opts.watch {

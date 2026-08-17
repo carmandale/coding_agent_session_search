@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -13,6 +14,52 @@ use super::{
 };
 
 const MAX_INDEXED_TOOL_OUTPUT_CHARS: usize = 128 * 1024;
+
+/// What `recover_rollouts_the_base_parser_dropped` did during this process.
+///
+/// Bead 9fnbr: the recovery's only output was three `warn!`s, and a `--json`
+/// run pins the tracing filter to `error` (lib.rs:5769-5774), so an operator
+/// reading machine output saw `quarantined_conversations: 0` and
+/// `last_error: null` over real drops. These make the drop countable.
+///
+/// Module-level rather than per-connector state because there is nowhere to
+/// hang an `Arc`: the archive-building scan constructs this connector from a
+/// bare `fn()` factory pointer and boxes it as `Box<dyn Connector + Send>`
+/// (`indexer::ConnectorFactory`), so no handle survives construction.
+/// ceiling: process-global, so a caller wanting per-run numbers resets first.
+static RECOVERED_PRE_ENVELOPE_ROLLOUTS: AtomicUsize = AtomicUsize::new(0);
+static UNRECOVERABLE_ROLLOUTS: AtomicUsize = AtomicUsize::new(0);
+static RECOVERY_DISCOVERY_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+/// What the recovery pass did: `(recovered, unrecoverable, discovery_failures)`.
+///
+/// The third number is not decoration. When discovery fails the pass returns
+/// `Ok(())` and the other two stay at zero, which is byte-identical to a clean
+/// run that found nothing to recover. Without it a reader cannot tell "no
+/// rollouts were dropped" from "the check never ran".
+#[must_use]
+pub fn pre_envelope_recovery_counts() -> (usize, usize, usize) {
+    (
+        RECOVERED_PRE_ENVELOPE_ROLLOUTS.load(Ordering::Relaxed),
+        UNRECOVERABLE_ROLLOUTS.load(Ordering::Relaxed),
+        RECOVERY_DISCOVERY_FAILURES.load(Ordering::Relaxed),
+    )
+}
+
+/// Serializes every test that reads the process-global recovery counters.
+///
+/// Also taken by `connectors::get_connector_factories`'s tests, which scan a
+/// codex home and would otherwise bump these counters underneath an assertion
+/// running in a sibling thread.
+#[cfg(test)]
+pub(crate) static RECOVERY_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Zero the counters so the next scan's numbers describe that scan alone.
+pub fn reset_pre_envelope_recovery_counts() {
+    RECOVERED_PRE_ENVELOPE_ROLLOUTS.store(0, Ordering::Relaxed);
+    UNRECOVERABLE_ROLLOUTS.store(0, Ordering::Relaxed);
+    RECOVERY_DISCOVERY_FAILURES.store(0, Ordering::Relaxed);
+}
 
 pub struct CodexConnector {
     inner: franken_agent_detection::CodexConnector,
@@ -105,6 +152,7 @@ fn recover_rollouts_the_base_parser_dropped(
     let discovered = match inner.discover_source_files(ctx) {
         Ok(discovered) => discovered,
         Err(error) => {
+            RECOVERY_DISCOVERY_FAILURES.fetch_add(1, Ordering::Relaxed);
             warn!(
                 error = %error,
                 "codex source discovery failed; rollouts the base parser dropped cannot be checked",
@@ -120,12 +168,14 @@ fn recover_rollouts_the_base_parser_dropped(
         let Some(conversation) =
             pre_envelope_conversation(&source.scan_root, &source.source_path)
         else {
+            UNRECOVERABLE_ROLLOUTS.fetch_add(1, Ordering::Relaxed);
             warn!(
                 source_path = %source.source_path.display(),
                 "codex rollout yielded no conversation and holds no recoverable records; skipping",
             );
             continue;
         };
+        RECOVERED_PRE_ENVELOPE_ROLLOUTS.fetch_add(1, Ordering::Relaxed);
         warn!(
             source_path = %conversation.source_path.display(),
             messages = conversation.messages.len(),
@@ -1054,5 +1104,56 @@ mod tests {
             &seen_call_ids,
             &fresh
         ));
+    }
+
+    /// Bead 9fnbr: a machine-readable run must REPORT what the recovery pass
+    /// did, not only log it.
+    ///
+    /// The assertion is on `snapshot_json` rather than on the counters,
+    /// deliberately: robot mode pins the tracing filter to `error`
+    /// (lib.rs:5769-5774), so the three `warn!`s in
+    /// `recover_rollouts_the_base_parser_dropped` reach nobody, and an operator
+    /// saw `quarantined_conversations: 0` with `last_error: null` over a real
+    /// drop. Counting without surfacing would leave that operator exactly where
+    /// they were, so this test goes red if the numbers stop reaching the
+    /// snapshot as much as if the counting stops.
+    #[test]
+    fn a_machine_readable_run_reports_what_the_recovery_pass_did() {
+        let _serialized = RECOVERY_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reset_pre_envelope_recovery_counts();
+
+        let dir = TempDir::new().unwrap();
+        let home = codex_home_with(
+            &dir,
+            &[
+                ("rollout-pre-envelope.jsonl", PRE_ENVELOPE_ROLLOUT),
+                ("rollout-empty-stub.jsonl", EMPTY_STUB_ROLLOUT),
+            ],
+        );
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass"),
+            vec![ScanRoot::local(home)],
+            None,
+        );
+        scan_streaming(&ctx);
+
+        let snapshot = crate::indexer::IndexingProgress::default().snapshot_json(0);
+        assert_eq!(
+            snapshot["codex_pre_envelope_recovered"], 1,
+            "one rollout was recovered and a --json reader must be told so; \
+             snapshot was {snapshot}"
+        );
+        assert_eq!(
+            snapshot["codex_rollouts_unrecoverable"], 1,
+            "the empty stub was discovered and could not be recovered; that is \
+             the number bead 9fnbr was filed about; snapshot was {snapshot}"
+        );
+        assert_eq!(
+            snapshot["codex_recovery_discovery_failures"], 0,
+            "discovery succeeded here, so a non-zero would mean the other two \
+             counts describe a check that never ran; snapshot was {snapshot}"
+        );
     }
 }

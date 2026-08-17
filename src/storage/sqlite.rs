@@ -7333,9 +7333,26 @@ impl FrankenStorage {
     /// message content for indexing. Rows missing both tail-cache sources fall
     /// back to `MAX(messages.idx) + 1`, which preserves legacy upgraded
     /// databases without treating populated conversations as empty.
+    // The final `pstep!` reassigns `pt` for symmetry with the others and
+    // nothing reads it after; that is the shape, not a bug.
+    #[allow(unused_assignments)]
     pub fn list_conversation_footprints_for_lexical_rebuild(
         &self,
     ) -> Result<Vec<LexicalRebuildConversationFootprintRow>> {
+        let pp = std::env::var_os("CASS_PREP_PROFILE").is_some();
+        let mut pt = std::time::Instant::now();
+        macro_rules! pstep {
+            ($name:expr) => {
+                if pp {
+                    eprintln!(
+                        "CASS_PREP_PROFILE component=footprints step={} step_ms={}",
+                        $name,
+                        pt.elapsed().as_millis()
+                    );
+                    pt = std::time::Instant::now();
+                }
+            };
+        }
         let tail_state_rows: Vec<(i64, Option<i64>)> = match self.conn.query_map_collect(
             "SELECT conversation_id, last_message_idx
              FROM conversation_tail_state
@@ -7349,6 +7366,7 @@ impl FrankenStorage {
                 return Err(err).with_context(|| "listing lexical rebuild tail-state estimates");
             }
         };
+        pstep!("read_conversation_tail_state");
         let tail_state_by_conversation: HashMap<i64, Option<i64>> =
             tail_state_rows.into_iter().collect();
 
@@ -7378,6 +7396,7 @@ impl FrankenStorage {
             }
         };
 
+        pstep!("read_conversations");
         let mut footprints = Vec::with_capacity(rows.len());
         let mut missing_tail_positions = HashMap::new();
         for (conversation_id, conversation_last_message_idx) in rows {
@@ -7402,15 +7421,18 @@ impl FrankenStorage {
             ));
         }
 
+        pstep!("build_footprint_rows");
         let every_footprint_was_missing_tail = missing_tail_positions.len() == footprints.len();
         if !missing_tail_positions.is_empty() {
             self.fill_missing_lexical_rebuild_footprint_tails(
                 &mut footprints,
                 &missing_tail_positions,
             )?;
+            pstep!("fill_missing_tails");
         }
         if !every_footprint_was_missing_tail {
             self.raise_lexical_rebuild_footprints_to_exact_message_counts(&mut footprints)?;
+            pstep!("raise_to_exact_message_counts");
         }
 
         Ok(footprints)

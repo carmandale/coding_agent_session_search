@@ -295,6 +295,9 @@ mod connector_factory_tests {
     /// does not take.
     #[test]
     fn codex_connector_from_the_factory_table_recovers_pre_envelope_rollouts() {
+        let _serialized = codex::RECOVERY_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = TempDir::new().unwrap();
         let home = codex_home_with_pre_envelope(&dir);
         let ctx = ScanContext::with_roots(
@@ -319,6 +322,9 @@ mod connector_factory_tests {
     /// re-adjudicated rather than kept out of habit.
     #[test]
     fn frankens_own_codex_factory_still_drops_pre_envelope_rollouts() {
+        let _serialized = codex::RECOVERY_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = TempDir::new().unwrap();
         let home = codex_home_with_pre_envelope(&dir);
         let ctx = ScanContext::with_roots(
