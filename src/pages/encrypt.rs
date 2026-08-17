@@ -1819,10 +1819,23 @@ mod tests {
     fn key_slot_id_for_len_rejects_overflow() {
         assert_eq!(key_slot_id_for_len(255).unwrap(), 255);
 
-        let err = key_slot_id_for_len(256).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "maximum of 256 key slots exceeded (256 slots already allocated): out of range integral type conversion attempted"
+        // cass owns the prefix; the trailing clause is std's Display for
+        // TryFromIntError, and std changed that wording between rustc 1.94
+        // ("out of range integral type conversion attempted") and 1.99
+        // ("number too large to fit in target type"). Pinning the whole string
+        // by equality made this test fail on a toolchain move that changes
+        // nothing about the behavior under test, so assert the half cass owns
+        // and require -- without quoting it -- that the cause is still there.
+        const EXPECTED_PREFIX: &str =
+            "maximum of 256 key slots exceeded (256 slots already allocated): ";
+        let err = key_slot_id_for_len(256).unwrap_err().to_string();
+        assert!(
+            err.starts_with(EXPECTED_PREFIX),
+            "unexpected error message: {err}"
+        );
+        assert!(
+            err.len() > EXPECTED_PREFIX.len(),
+            "the underlying conversion error must still be reported: {err}"
         );
     }
 

@@ -3005,6 +3005,22 @@ fn is_backup_root_name(name: &str, prefix: &str) -> bool {
 // enumeration paths in `historical_bundle_root_paths`; deliberately NOT used
 // by `is_backup_root_name`, because the existing backup-rotation cleanup must
 // continue to sweep up any pre-existing orphan lock sidecars.
+//
+// The -fsqlite-ns-* pair is frankensqlite's namespace record, added in fsqlite
+// 0.1.19 (fsqlite-vfs/src/namespace.rs) and absent from the 0.1.5 family we pin
+// today, so both entries are inert on the current pin. They are listed now
+// because that library writes them beside *every* opened database, on the
+// read-only path too, and its own module doc says they are deliberately never
+// unlinked -- so a read-only probe of a quarantined `agent_search.corrupt.<ts>`
+// leaves an `...-fsqlite-ns-use` next to it that matches the salvage prefix and
+// clears the `total_bytes > 0` filter at 40 bytes. Without these entries the
+// next discovery counts that record as a database bundle, and probing the
+// phantom creates its own sidecar, so the count grows on every salvage run.
+//
+// ceiling: this is suffix matching, so it cannot express fsqlite 0.1.19's
+// `<db>-wal-seg-<epoch>` family (namespace.rs:673 builds it as a *prefix*).
+// If that family ever appears beside a salvage root, this function needs a
+// predicate rather than another list entry.
 fn has_db_sidecar_suffix(name: &str) -> bool {
     const SIDECAR_SUFFIXES: &[&str] = &[
         "-wal",
@@ -3012,6 +3028,8 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
         "-lock-shared",
         "-lock-reserved",
         "-lock-pending",
+        "-fsqlite-ns-gate",
+        "-fsqlite-ns-use",
     ];
     SIDECAR_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
